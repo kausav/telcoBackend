@@ -171,6 +171,32 @@ def resolve_variables(scenario_id: str) -> tuple[list[dict[str, Any]], list[str]
     return (dyn["variables"], dyn["field_order"]) if dyn else None
 
 
+
+def resolve_data_type(scenario_id: str) -> str:
+    """Return the persisted data type for a scenario.
+
+    Old scenarios created before typeOfData was introduced are treated as
+    aggregational so existing scenarios continue to work unchanged.
+    """
+    meta = resolve_scenario_meta(scenario_id) or {}
+    value = str(meta.get("type_of_data", "aggregational")).strip().lower()
+    return value if value in {"transactional", "aggregational"} else "aggregational"
+
+
+
+
+def resolve_entity_key(scenario_id: str) -> str | None:
+    """Return the persisted grouping/entity key for a transactional scenario."""
+    meta = resolve_scenario_meta(scenario_id) or {}
+    value = meta.get("entity_key")
+    return str(value).strip() if value else None
+
+def resolve_events(scenario_id: str) -> list[dict[str, Any]]:
+    """Return transactional event definitions persisted with a scenario."""
+    meta = resolve_scenario_meta(scenario_id) or {}
+    events = meta.get("events", [])
+    return events if isinstance(events, list) else []
+
 def list_scenarios() -> list[dict[str, Any]]:
     out = [{"id": k, **v} for k, v in SCENARIOS.items()]
     with _connect() as conn:

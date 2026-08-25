@@ -58,10 +58,14 @@ class RulesAgent:
             f"Target industry: {profile['industry']}; country: {profile['country_name']} ({state.country})\n"
             f"Currency: {profile['currency']}; Regulator: {profile['regulator']}\n"
             f"Market character: {profile['market_character']}\n"
+            f"Output data type: {state.type_of_data}\n"
+            f"Transactional events: {sc.get('events', [])}\n"
             f"Typical product/plan types: {profile['product_types']}\n"
             f"Variables: {field_summary}\n\n"
             f"Produce a complete rules document covering all {len(VARS)} variables, "
-            f"consistent with this industry and country's real-world standards."
+            f"consistent with this industry and country's real-world standards. "
+            f"For transactional output, also validate event_sequence is increasing within each journey, "
+            f"transaction_id is unique, and event_timestamp is non-decreasing within each journey."
         )
 
         rules = self._llm.generate_json(_SYSTEM, prompt, temperature=0.1)

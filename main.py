@@ -18,7 +18,7 @@ from agents.rules_agent import RulesAgent
 from config.scenarios import SCENARIO_LABELS
 from config.industry_profiles import DEFAULT_COUNTRY
 from core.csv_scenario import parse_variables_csv
-from core.dynamic_scenarios import confirm_scenario
+from core.dynamic_scenarios import confirm_scenario, resolve_data_type
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
 
@@ -54,9 +54,10 @@ def register_scenario_from_csv(scenario: str, csv_path: str, label: str = "") ->
     logger.info("Registered scenario '%s' from CSV '%s' (%d variables)", scenario, csv_path, len(variables))
 
 
-def run_pipeline(scenario: str, count: int, industry: str = "generic", country: str = DEFAULT_COUNTRY, api_key: str = "") -> WorkflowState:
+def run_pipeline(scenario: str, count: int, industry: str = "generic", country: str = DEFAULT_COUNTRY, api_key: str = "", type_of_data: str | None = None) -> WorkflowState:
     llm = GeminiClient(api_key=api_key or None)
-    state = WorkflowState(scenario=scenario, count=count, industry=industry, country=country)
+    resolved_type = type_of_data or resolve_data_type(scenario)
+    state = WorkflowState(scenario=scenario, count=count, industry=industry, country=country, type_of_data=resolved_type)
 
     pipeline = [
         ("1. Orchestrator",   OrchestratorAgent(llm)),

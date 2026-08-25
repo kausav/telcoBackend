@@ -243,11 +243,20 @@ one-size-fits-all telecom template.
 
 """ + _GENERATOR_DOCS + """
 Return a JSON object with exactly these keys:
+  - "data_type": "transactional" or "aggregational"
+  - "entity_key": str or null — for transactional output, the variable name that identifies the business entity whose events should be grouped together (for example subscriber_id, customer_id, account_id, merchant_id). It MUST be one of the returned variable names. For aggregational output return null.
+  - "events": [ {"event_type": str, "sequence": int, "fields": [str]} ] — REQUIRED for transactional output; 3-8 ordered business events. For aggregational output return []
   - "label": str               — short human-readable scenario title
   - "journey": str              — the domain/journey name
   - "description": str          — 1-3 sentence description combining businessScenario, businessResponse, expectedOutcome
   - "variables": [ {name, dtype, description, gen, params, depends_on, nullable} ]
   - "field_order": [str]        — variable names in the exact order they should be generated/output
+
+For transactional output, events are the business events that create separate rows. Choose entity_key as the primary business entity identifier for the scenario. Do not assume it is subscriber_id; choose the most appropriate variable for the target industry/domain.
+Each event must have a unique event_type, increasing sequence starting at 1, and a fields
+list containing only variables that are meaningful on that event. Always include relevant
+identity/common fields through the generator; event fields should describe what happens
+at that step. Do not invent event types unrelated to the supplied business scenario.
 """
 
 
@@ -266,6 +275,7 @@ class ScenarioDesignerAgent:
         scenario_type: str | None = None,
         country: str | None = None,
         use_case: str | None = None,
+        type_of_data: str = "aggregational",
     ) -> dict:
         history = get_feedback_history(domain, business_scenario)
         feedback_block = (
@@ -291,6 +301,7 @@ class ScenarioDesignerAgent:
             f"Industry: {industry_type}\n"
             f"Domain: {domain}\n"
             f"Use case: {use_case or '(not provided — infer a sensible one from the business scenario)'}\n"
+            f"Output data type: {type_of_data}\n"
             f"Business scenario: {business_scenario}\n"
             f"Business response: {business_response or '(not provided — infer a sensible one)'}\n"
             f"Expected outcome: {expected_outcome or '(not provided — infer a sensible one)'}\n\n"
@@ -311,6 +322,7 @@ class ScenarioDesignerAgent:
 
         logger.info("[ScenarioDesigner] Proposing scenario for domain=%s industry=%s country=%s", domain, industry_type, country)
         result = self._llm.generate_json(_SYSTEM, prompt, temperature=0.3)
+        result["data_type"] = type_of_data
         llm_variables = [v for v in result.get("variables", []) if isinstance(v, dict) and v.get("name")]
         # Defensive: drop any base field the LLM ignored the instruction and re-emitted anyway.
         llm_variables = [v for v in llm_variables if v["name"] not in base_names]
@@ -320,7 +332,65 @@ class ScenarioDesignerAgent:
         combined = base_variables + llm_variables
         result["variables"] = self._enforce_variable_bounds(combined, prompt, base_names, industry_key)
         result["field_order"] = [v["name"] for v in result["variables"]]
+        result["events"] = self._normalize_events(result.get("events", []), result["variables"], type_of_data, industry_key)
+        result["entity_key"] = self._normalize_entity_key(result.get("entity_key"), result["variables"], type_of_data, industry_key)
         return result
+
+
+    def _normalize_entity_key(self, entity_key, variables: list[dict], type_of_data: str, industry_key: str) -> str | None:
+        """Return a valid variable name to use as the transactional grouping key.
+
+        The LLM chooses the business entity identifier. Python normalizes aliases and
+        verifies that the selected field actually exists in the scenario variables.
+        """
+        if type_of_data != "transactional":
+            return None
+
+        valid_names = {v["name"] for v in variables}
+        alias_map = _build_alias_map(industry_key)
+        candidate = str(entity_key or "").strip()
+        canonical = alias_map.get(candidate.lower(), candidate)
+        if canonical in valid_names:
+            return canonical
+
+        # Defensive fallback: use the canonical identifier concept for the industry
+        # when Gemini omitted/returned an invalid entity key.
+        fallback = _CONCEPT_CANONICAL.get("identifier", {}).get(industry_key) or \
+            _CONCEPT_CANONICAL.get("identifier", {}).get("generic")
+        if fallback in valid_names:
+            logger.warning("[ScenarioDesigner] Invalid/missing entity_key '%s'; falling back to '%s'", candidate, fallback)
+            return fallback
+
+        # Last-resort deterministic fallback to a clearly identifying field.
+        for name in ("account_id", "customer_id", "subscriber_id", "merchant_id", "entity_id"):
+            if name in valid_names:
+                logger.warning("[ScenarioDesigner] Invalid/missing entity_key '%s'; falling back to '%s'", candidate, name)
+                return name
+
+        raise ValueError("Transactional scenario must contain a valid entity_key variable")
+
+    def _normalize_events(self, events: list, variables: list[dict], type_of_data: str, industry_key: str) -> list[dict]:
+        """Normalize the LLM event definitions and keep event field references valid."""
+        if type_of_data != "transactional":
+            return []
+        alias_map = _build_alias_map(industry_key)
+        valid_names = {v["name"] for v in variables}
+        normalized = []
+        for index, event in enumerate(events if isinstance(events, list) else [], start=1):
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("event_type", "")).strip().upper().replace(" ", "_")
+            if not event_type:
+                continue
+            fields = []
+            for name in event.get("fields", []) if isinstance(event.get("fields", []), list) else []:
+                canonical = alias_map.get(str(name).strip().lower(), str(name).strip())
+                if canonical in valid_names and canonical not in fields:
+                    fields.append(canonical)
+            normalized.append({"event_type": event_type, "sequence": index, "fields": fields})
+        if not normalized:
+            normalized = [{"event_type": "BUSINESS_EVENT", "sequence": 1, "fields": []}]
+        return normalized[:8]
 
     def _normalize_field_names(self, variables: list[dict], industry_key: str = "generic") -> list[dict]:
         """Collapse known synonyms (customer_id, phone_number, ...) to the canonical name

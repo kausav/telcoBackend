@@ -7,6 +7,8 @@ are checked algorithmically; Gemini audits logical consistency in batches.
 from __future__ import annotations
 import json
 import logging
+import uuid
+from datetime import datetime, timezone
 
 from config.variables import VARIABLES
 from core.dynamic_scenarios import resolve_variables
@@ -29,12 +31,12 @@ Business rules:
 Cross-field rules:
 {cross_field_rules}
 
-For each record check:
-1. balance_after == balance_before + recharge_amount (within 0.01 tolerance)
-2. notification_dispatch_ts > event_timestamp
-3. customer_response_ts > notification_dispatch_ts
-4. balance_before <= low_balance_threshold_amt
-5. Required fields are not null.
+For each record check the rules that are applicable to the supplied fields.
+For aggregational records, check mathematical/temporal relationships such as balance_after,
+notification timestamps, and response timestamps when those fields exist.
+For transactional records, also check that transaction_id and journey_id exist, event_sequence
+is positive, and event_timestamp is present. Do not invent missing event-specific fields because
+transactional rows are intentionally sparse: a field may only exist on the event where it applies.
 
 Return JSON:
   - "valid_records": [ ... ]
@@ -108,7 +110,29 @@ class QAAgent:
         algo_fixed = 0
         checked: list[dict] = []
         for rec in records:
-            rec, issues = _algorithmic_check(rec, state.field_order, dtype_map)
+            if state.type_of_data == "transactional":
+                rec = dict(rec)
+                issues = []
+                if not rec.get("journey_id"):
+                    rec["journey_id"] = f"JRN-{uuid.uuid4().hex[:12].upper()}"
+                    issues.append("journey_id generated")
+                if not rec.get("transaction_id"):
+                    rec["transaction_id"] = f"TXN-{uuid.uuid4().hex[:12].upper()}"
+                    issues.append("transaction_id generated")
+                if not rec.get("event_type"):
+                    rec["event_type"] = "BUSINESS_EVENT"
+                    issues.append("event_type defaulted")
+                if rec.get("event_sequence") is None:
+                    rec["event_sequence"] = 1
+                    issues.append("event_sequence defaulted")
+                if not rec.get("event_timestamp"):
+                    rec["event_timestamp"] = datetime.now(timezone.utc).isoformat()
+                    issues.append("event_timestamp generated")
+                # Keep only known output fields plus transactional metadata.
+                allowed = set(state.field_order)
+                rec = {k: v for k, v in rec.items() if k in allowed}
+            else:
+                rec, issues = _algorithmic_check(rec, state.field_order, dtype_map)
             algo_fixed += len(issues)
             checked.append(rec)
 
@@ -147,7 +171,15 @@ class QAAgent:
         # LLM flagged (e.g. "required field null") so the output count matches state.count.
         recovered = 0
         for rec in dropped_all:
-            rec, _ = _fill_missing(dict(rec), state.field_order, dtype_map)
+            rec = dict(rec)
+            if state.type_of_data == "transactional":
+                rec.setdefault("journey_id", f"JRN-{uuid.uuid4().hex[:12].upper()}")
+                rec.setdefault("transaction_id", f"TXN-{uuid.uuid4().hex[:12].upper()}")
+                rec.setdefault("event_type", "BUSINESS_EVENT")
+                rec.setdefault("event_sequence", 1)
+                rec.setdefault("event_timestamp", datetime.now(timezone.utc).isoformat())
+            else:
+                rec, _ = _fill_missing(rec, state.field_order, dtype_map)
             rec = {k: rec[k] for k in state.field_order if k in rec}
             valid_all.append(rec)
             recovered += 1

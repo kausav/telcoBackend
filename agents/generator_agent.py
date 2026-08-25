@@ -11,7 +11,7 @@ import random
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from core.dynamic_scenarios import resolve_variables
+from core.dynamic_scenarios import resolve_variables, resolve_events
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
 
@@ -342,6 +342,53 @@ def _generate_record(variables: list[dict]) -> dict:
     return rec
 
 
+# ── Transactional generation helpers ─────────────────────────────────────────
+
+_TRANSACTIONAL_COMMON_FIELDS = {
+    "journey_id", "transaction_id", "subscriber_id", "customer_id",
+    "subscriber_msisdn", "phone_number", "account_id", "event_type",
+    "event_sequence", "event_timestamp",
+}
+
+def _journey_id() -> str:
+    return f"JRN-{uuid.uuid4().hex[:12].upper()}"
+
+def _transactional_records(variables: list[dict], events: list[dict], journey_count: int) -> list[dict]:
+    """Generate one transaction row for every event in every journey."""
+    if not events:
+        events = [{"event_type": "BUSINESS_EVENT", "sequence": 1, "fields": []}]
+    variable_names = [v["name"] for v in variables]
+    generated: list[dict] = []
+    for _ in range(journey_count):
+        journey_context = _generate_record(variables)
+        journey_id = _journey_id()
+        base_ts = _parse_dt(journey_context.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
+        elapsed_seconds = 0
+        for position, event in enumerate(events, start=1):
+            event_type = str(event.get("event_type", "BUSINESS_EVENT"))
+            sequence = int(event.get("sequence", position))
+            if position > 1:
+                elapsed_seconds += random.randint(5, 300)
+            event_ts = base_ts + timedelta(seconds=elapsed_seconds)
+            event_fields = event.get("fields", [])
+            if not isinstance(event_fields, list):
+                event_fields = []
+            selected = [name for name in event_fields if name in variable_names]
+            if not selected:
+                selected = [name for name in variable_names if name != "event_timestamp"]
+            row = {name: journey_context.get(name) for name in selected}
+            for name in variable_names:
+                if name in _TRANSACTIONAL_COMMON_FIELDS and name in journey_context:
+                    row.setdefault(name, journey_context[name])
+            row["journey_id"] = journey_id
+            row["transaction_id"] = f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}"
+            row["event_type"] = event_type
+            row["event_sequence"] = sequence
+            row["event_timestamp"] = event_ts.isoformat()
+            generated.append(row)
+    return generated
+
+
 # ── Agent ──────────────────────────────────────────────────────────────────────
 
 class DataGeneratorAgent:
@@ -355,13 +402,23 @@ class DataGeneratorAgent:
         else:
             from config.variables import VARIABLES as variables, FIELD_ORDER
 
-        state.field_order = FIELD_ORDER
+        if state.type_of_data == "transactional":
+            events = resolve_events(state.scenario)
+            records = _transactional_records(variables, events, state.count)
+            state.field_order = [
+                "journey_id", "transaction_id", "event_type", "event_sequence",
+                "event_timestamp",
+            ] + [name for name in FIELD_ORDER if name != "event_timestamp"]
+            logger.info(
+                "[DataGenerator] Generated %d transactional records from %d journeys and %d events.",
+                len(records), state.count, len(events),
+            )
+        else:
+            state.field_order = FIELD_ORDER
+            records = [_generate_record(variables) for _ in range(state.count)]
+            logger.info("[DataGenerator] Generated %d aggregational records with %d fields each.",
+                        len(records), len(variables))
 
-        logger.info("[DataGenerator] Generating %d records for scenario=%s",
-                    state.count, state.scenario)
-
-        records = [_generate_record(variables) for _ in range(state.count)]
         state.raw_records = records
-        logger.info("[DataGenerator] Done. Generated %d records with %d fields each.",
-                    len(records), len(variables))
         return state
+

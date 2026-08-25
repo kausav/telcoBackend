@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from config.industry_profiles import DEFAULT_COUNTRY
@@ -13,6 +13,7 @@ class WorkflowState(BaseModel):
     count: int          # total records requested
     industry: str = "generic"  # e.g. "Telecom", "Banking", "Retail" — drives industry conventions (see config/industry_profiles.py)
     country: str = DEFAULT_COUNTRY  # ISO 3166-1 alpha-2; drives country conventions (see config/industry_profiles.py)
+    type_of_data: Literal["transactional", "aggregational"] = "aggregational"
     batch_size: int = 50
 
     # ── Agent outputs (populated as pipeline runs) ────────────────────────
