@@ -1,0 +1,72 @@
+"""
+Agent 2 — Rules Agent
+Uses Gemini to articulate business rules and validation invariants for the
+selected scenario. Downstream QA agent uses these rules to validate records.
+"""
+from __future__ import annotations
+import logging
+
+from config.industry_profiles import get_profile
+from config.variables import VARIABLES
+from core.dynamic_scenarios import resolve_scenario_meta, resolve_variables
+from core.llm_client import GeminiClient
+from core.state import WorkflowState
+
+logger = logging.getLogger(__name__)
+
+_SYSTEM = """
+You are the Rules Agent for a synthetic data generation pipeline covering any
+business industry (telecom, banking, retail, healthcare, etc.).
+Given a scenario, its variable definitions, and the target industry's and
+country's real-world conventions (currency, product/plan types, regulator,
+market character), produce a precise JSON rules document consistent with that
+industry and country's actual standards.
+
+Return a JSON object with:
+  - "scenario_summary": str
+  - "business_rules": [str]   — logical invariants that MUST hold across all records
+  - "field_constraints": {field_name: {description: str, valid_values: str, nullable: bool}}
+  - "cross_field_rules": [str] — mathematical / temporal dependencies between fields
+"""
+
+
+class RulesAgent:
+    def __init__(self, llm: GeminiClient) -> None:
+        self._llm = llm
+
+    def run(self, state: WorkflowState) -> WorkflowState:
+        logger.info("[RulesAgent] Deriving rules for scenario=%s", state.scenario)
+
+        sc = resolve_scenario_meta(state.scenario)
+        dyn = resolve_variables(state.scenario)
+        if dyn is not None:
+            VARS, _ = dyn
+        else:
+            VARS = VARIABLES
+
+        field_summary = [
+            {"name": v["name"], "dtype": v["dtype"], "gen": v["gen"],
+             "depends_on": v.get("depends_on", [])}
+            for v in VARS
+        ]
+
+        profile = get_profile(state.industry, state.country)
+        prompt = (
+            f"Scenario: {sc['label']}\n"
+            f"Journey: {sc['journey']}\n"
+            f"Description: {sc['description']}\n"
+            f"Target industry: {profile['industry']}; country: {profile['country_name']} ({state.country})\n"
+            f"Currency: {profile['currency']}; Regulator: {profile['regulator']}\n"
+            f"Market character: {profile['market_character']}\n"
+            f"Typical product/plan types: {profile['product_types']}\n"
+            f"Variables: {field_summary}\n\n"
+            f"Produce a complete rules document covering all {len(VARS)} variables, "
+            f"consistent with this industry and country's real-world standards."
+        )
+
+        rules = self._llm.generate_json(_SYSTEM, prompt, temperature=0.1)
+        state.rules = rules
+        logger.info("[RulesAgent] Rules generated. Business rules: %d cross-field: %d",
+                    len(rules.get("business_rules", [])),
+                    len(rules.get("cross_field_rules", [])))
+        return state
