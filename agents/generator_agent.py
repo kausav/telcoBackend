@@ -347,7 +347,7 @@ def _generate_record(variables: list[dict]) -> dict:
 _TRANSACTIONAL_COMMON_FIELDS = {
     "journey_id", "transaction_id", "subscriber_id", "customer_id",
     "subscriber_msisdn", "phone_number", "account_id", "event_type",
-    "event_sequence", "event_timestamp",
+    "event_sequence", "event_timestamp", "event_occurrence",
 }
 
 def _journey_id() -> str:
@@ -372,32 +372,40 @@ def _transactional_records(variables: list[dict], events: list[dict], journey_co
         base_ts = _parse_dt(journey_context.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
         elapsed_seconds = 0
 
-        # One generated entity gets one row per defined event. Event-specific fields are
-        # strictly limited to the fields declared for that event; we do NOT fall back to
-        # copying the entire scenario into every transaction row.
+        # A business event can occur multiple times for the same entity. This is the
+        # key distinction from the old implementation, which emitted exactly one row
+        # per event and therefore made every event totalCount equal to 1.
         for position, event in enumerate(events, start=1):
             event_type = str(event.get("event_type", "BUSINESS_EVENT"))
             sequence = int(event.get("sequence", position))
-            if position > 1:
-                elapsed_seconds += random.randint(5, 300)
-            event_ts = base_ts + timedelta(seconds=elapsed_seconds)
+            min_occurrences = max(1, int(event.get("min_occurrences", 1)))
+            max_occurrences = max(min_occurrences, min(10, int(event.get("max_occurrences", 10))))
+            occurrence_count = random.randint(min_occurrences, max_occurrences)
+
             event_fields = event.get("fields", [])
             if not isinstance(event_fields, list):
                 event_fields = []
             selected = [name for name in event_fields if name in variable_names]
-            row = {name: journey_context.get(name) for name in selected}
 
-            # Always carry the primary business entity and other stable identity fields.
-            for name in variable_names:
-                if name in common_names and name in journey_context:
-                    row.setdefault(name, journey_context[name])
+            for occurrence in range(occurrence_count):
+                # Keep timestamps non-decreasing both across event types and within
+                # repeated occurrences of the same event.
+                elapsed_seconds += random.randint(5, 300)
+                event_ts = base_ts + timedelta(seconds=elapsed_seconds)
+                row = {name: journey_context.get(name) for name in selected}
 
-            row["journey_id"] = journey_id
-            row["transaction_id"] = f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}"
-            row["event_type"] = event_type
-            row["event_sequence"] = sequence
-            row["event_timestamp"] = event_ts.isoformat()
-            generated.append(row)
+                # Always carry the primary business entity and other stable identity fields.
+                for name in variable_names:
+                    if name in common_names and name in journey_context:
+                        row.setdefault(name, journey_context[name])
+
+                row["journey_id"] = journey_id
+                row["transaction_id"] = f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}"
+                row["event_type"] = event_type
+                row["event_sequence"] = sequence
+                row["event_occurrence"] = occurrence + 1
+                row["event_timestamp"] = event_ts.isoformat()
+                generated.append(row)
     return generated
 
 
@@ -420,7 +428,7 @@ class DataGeneratorAgent:
             records = _transactional_records(variables, events, state.count, entity_key)
             state.field_order = [
                 "journey_id", "transaction_id", "event_type", "event_sequence",
-                "event_timestamp",
+                "event_occurrence", "event_timestamp",
             ] + [name for name in FIELD_ORDER if name != "event_timestamp"]
             logger.info(
                 "[DataGenerator] Generated %d transactional records from %d journeys and %d events.",
@@ -434,4 +442,3 @@ class DataGeneratorAgent:
 
         state.raw_records = records
         return state
-

@@ -259,6 +259,11 @@ Each event must have a unique event_type, increasing sequence starting at 1, and
 list containing only variables that are meaningful on that event. Always include relevant
 identity/common fields through the generator; event fields should describe what happens
 at that step. Do not invent event types unrelated to the supplied business scenario.
+For transactional output, each event may occur multiple times for the same entity. You MAY
+include min_occurrences and max_occurrences on an event; if omitted, the backend defaults to
+1..10 occurrences per entity so the generated transactional response can contain multiple
+records per event. The response layer will still return only the latest 10 records while
+reporting the full event totalCount.
 """
 
 
@@ -377,9 +382,23 @@ class ScenarioDesignerAgent:
                 canonical = alias_map.get(str(name).strip().lower(), str(name).strip())
                 if canonical in valid_names and canonical not in fields:
                     fields.append(canonical)
-            normalized.append({"event_type": event_type, "sequence": index, "fields": fields})
+            min_occurrences = max(1, int(event.get("min_occurrences", 1)))
+            max_occurrences = max(min_occurrences, min(10, int(event.get("max_occurrences", 10))))
+            normalized.append({
+                "event_type": event_type,
+                "sequence": index,
+                "fields": fields,
+                "min_occurrences": min_occurrences,
+                "max_occurrences": max_occurrences,
+            })
         if not normalized:
-            normalized = [{"event_type": "BUSINESS_EVENT", "sequence": 1, "fields": []}]
+            normalized = [{
+                "event_type": "BUSINESS_EVENT",
+                "sequence": 1,
+                "fields": [],
+                "min_occurrences": 1,
+                "max_occurrences": 10,
+            }]
         return normalized[:8]
 
     def _normalize_field_names(self, variables: list[dict], industry_key: str = "generic") -> list[dict]:

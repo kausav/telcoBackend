@@ -34,6 +34,25 @@ def _get_field_order(scenario: str) -> list[str]:
     from config.variables import FIELD_ORDER
     return FIELD_ORDER
 
+
+def _is_placeholder(value) -> bool:
+    """Treat Swagger's default "string" placeholder, blanks, and null as "no value"."""
+    return value is None or (isinstance(value, str) and value.strip().lower() in ("", "string"))
+
+
+def _clean_dict(d: dict) -> dict:
+    """Drop keys whose value is a placeholder, recursing into nested dicts."""
+    cleaned = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            v = _clean_dict(v)
+            if not v:
+                continue
+        elif _is_placeholder(v):
+            continue
+        cleaned[k] = v
+    return cleaned
+
 logger = logging.getLogger(__name__)
 app = FastAPI(title="Telco Agentic SDG", version="2.0.0")
 
@@ -99,11 +118,25 @@ class VariableEdit(BaseModel):
     changes: dict
 
 
+class EventEdit(BaseModel):
+    event_type: str
+    changes: dict
+
+
 class ConfirmRequest(BaseModel):
     draft_id: str
-    add: list[dict] = Field(default_factory=list)
-    edit: list[VariableEdit] = Field(default_factory=list)
-    delete: list[str] = Field(default_factory=list)
+
+    # Variable-level changes (supported for all scenario types).
+    add: list[dict] = Field(default_factory=list, description="New variable definitions to add")
+    edit: list[VariableEdit] = Field(default_factory=list, description="Existing variables to edit by name")
+    delete: list[str] = Field(default_factory=list, description="Variable names to delete")
+
+    # Transactional event-level changes. Event changes are intentionally separate
+    # from variable changes so the API contract is explicit about the two grains.
+    eventAdd: list[dict] = Field(default_factory=list, description="Transactional events to add")
+    eventEdit: list[EventEdit] = Field(default_factory=list, description="Transactional events to edit by event_type")
+    eventDelete: list[str] = Field(default_factory=list, description="Transactional event_type values to delete")
+
     feedback: str | None = None
 
 
@@ -256,20 +289,113 @@ def confirm_scenario_route(req: ConfirmRequest):
     by_name = {v["name"]: v for v in variables}
 
     for name in req.delete:
+        if _is_placeholder(name):
+            continue
         by_name.pop(name, None)
     variables = list(by_name.values())
     by_name = {v["name"]: v for v in variables}
 
     for e in req.edit:
-        if e.name in by_name:
-            by_name[e.name].update(e.changes)
+        if _is_placeholder(e.name):
+            continue
+        changes = _clean_dict(e.changes or {})
+        if e.name in by_name and changes:
+            by_name[e.name].update(changes)
 
     for new_var in req.add:
-        if "name" in new_var:
-            by_name[new_var["name"]] = new_var
+        cleaned_var = _clean_dict(new_var)
+        if not _is_placeholder(cleaned_var.get("name")):
+            by_name[cleaned_var["name"]] = cleaned_var
 
     variables = list(by_name.values())
     field_order = [v["name"] for v in variables]
+
+    # Placeholder/blank event entries are no-ops, same as variable add/edit/delete above.
+    clean_event_delete = [v for v in req.eventDelete if not _is_placeholder(v)]
+    clean_event_edits: list[tuple[str, dict]] = []
+    for ee in req.eventEdit:
+        if _is_placeholder(ee.event_type):
+            continue
+        changes = _clean_dict(ee.changes or {})
+        if changes:
+            clean_event_edits.append((ee.event_type, changes))
+    clean_event_adds = [_clean_dict(ea) for ea in req.eventAdd if isinstance(ea, dict)]
+    clean_event_adds = [ea for ea in clean_event_adds if ea]
+
+    # Event-level changes are available ONLY for transactional scenarios.
+    # Aggregational scenarios have a variables-only confirm contract.
+    type_of_data = draft.get("type_of_data", "aggregational")
+    has_event_changes = bool(clean_event_adds or clean_event_edits or clean_event_delete)
+    if type_of_data != "transactional" and has_event_changes:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Event add/edit/delete is only supported for transactional scenarios",
+                "typeOfData": type_of_data,
+                "allowedChanges": ["add", "edit", "delete"],
+            },
+        )
+
+    events: list[dict] = [dict(e) for e in draft.get("events", []) if isinstance(e, dict)]
+    if type_of_data == "transactional":
+        delete_event_types = {str(v).strip().upper() for v in clean_event_delete}
+        events = [
+            e for e in events
+            if str(e.get("event_type", "")).strip().upper() not in delete_event_types
+        ]
+
+        event_by_type = {str(e.get("event_type", "")).strip().upper(): e for e in events}
+
+        # Apply edits against the pre-edit event_type. If an edit renames the event,
+        # rebuild the lookup map so subsequent edits/adds operate on the new name.
+        for event_type, changes in clean_event_edits:
+            old_key = event_type.strip().upper().replace(" ", "_")
+            if old_key not in event_by_type:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "Event not found", "event_type": old_key},
+                )
+            if "event_type" in changes:
+                new_key = str(changes["event_type"]).strip().upper().replace(" ", "_")
+                if not new_key:
+                    raise HTTPException(status_code=400, detail={"error": "event_type cannot be empty"})
+                if new_key != old_key and new_key in event_by_type:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error": "Event type already exists", "event_type": new_key},
+                    )
+                changes["event_type"] = new_key
+            event = event_by_type.pop(old_key)
+            event.update(changes)
+            new_key = str(event.get("event_type", old_key)).strip().upper().replace(" ", "_")
+            event["event_type"] = new_key
+            event_by_type[new_key] = event
+
+        for new_event in clean_event_adds:
+            event_type = str(new_event.get("event_type", "")).strip().upper().replace(" ", "_")
+            if not event_type:
+                raise HTTPException(status_code=400, detail={"error": "eventAdd requires event_type"})
+            if event_type in event_by_type:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "Event type already exists", "event_type": event_type},
+                )
+            event = dict(new_event)
+            event["event_type"] = event_type
+            event_by_type[event_type] = event
+
+        events = list(event_by_type.values())
+        for index, event in enumerate(events, start=1):
+            event["sequence"] = index
+            fields = event.get("fields", [])
+            event["fields"] = fields if isinstance(fields, list) else []
+            # Each transactional event can repeat for the same entity. The API
+            # returns at most 10 records per event; these defaults make newly
+            # proposed transactional events capable of producing multiple rows.
+            min_occ = max(1, int(event.get("min_occurrences", 1)))
+            max_occ = max(min_occ, min(10, int(event.get("max_occurrences", 10))))
+            event["min_occurrences"] = min_occ
+            event["max_occurrences"] = max_occ
 
     scenario_id = draft.get("scenario_id") or next_scenario_id()
     requested_scenario_id = draft.get("scenario_id")
@@ -291,13 +417,13 @@ def confirm_scenario_route(req: ConfirmRequest):
         "industry": draft.get("industry_type", "generic"),
         "country": draft.get("country"),
         "requested_scenario_id": requested_scenario_id,
-        "type_of_data": draft.get("type_of_data", "aggregational"),
-        "events": draft.get("events", []),
+        "type_of_data": type_of_data,
+        "events": events,
         "entity_key": draft.get("entity_key"),
     }
     confirm_scenario(scenario_id, meta, variables, field_order, draft_id=req.draft_id)
 
-    if req.feedback:
+    if not _is_placeholder(req.feedback):
         add_feedback(draft.get("domain", ""), draft.get("business_scenario", ""), req.feedback)
 
     pop_draft(req.draft_id)
