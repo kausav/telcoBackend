@@ -244,7 +244,7 @@ one-size-fits-all telecom template.
 """ + _GENERATOR_DOCS + """
 Return a JSON object with exactly these keys:
   - "data_type": "transactional" or "aggregational"
-  - "entity_key": str or null — for transactional output, the variable name that identifies the business entity whose events should be grouped together (for example subscriber_id, customer_id, account_id, merchant_id). It MUST be one of the returned variable names. For aggregational output return null.
+  - "entity_key": str — for transactional output, the primary business entity variable used to group events; MUST exactly match one variable name. For aggregational output return null
   - "events": [ {"event_type": str, "sequence": int, "fields": [str]} ] — REQUIRED for transactional output; 3-8 ordered business events. For aggregational output return []
   - "label": str               — short human-readable scenario title
   - "journey": str              — the domain/journey name
@@ -252,7 +252,9 @@ Return a JSON object with exactly these keys:
   - "variables": [ {name, dtype, description, gen, params, depends_on, nullable} ]
   - "field_order": [str]        — variable names in the exact order they should be generated/output
 
-For transactional output, events are the business events that create separate rows. Choose entity_key as the primary business entity identifier for the scenario. Do not assume it is subscriber_id; choose the most appropriate variable for the target industry/domain.
+For transactional output, choose entity_key as the variable that identifies the primary business entity whose events should be grouped together. For example subscriber_id, customer_id, account_id, merchant_id, shipment_id, patient_id, etc. Do not hard-code an industry; choose from the variables you actually define.
+
+For transactional output, events are the business events that create separate rows.
 Each event must have a unique event_type, increasing sequence starting at 1, and a fields
 list containing only variables that are meaningful on that event. Always include relevant
 identity/common fields through the generator; event fields should describe what happens
@@ -332,42 +334,30 @@ class ScenarioDesignerAgent:
         combined = base_variables + llm_variables
         result["variables"] = self._enforce_variable_bounds(combined, prompt, base_names, industry_key)
         result["field_order"] = [v["name"] for v in result["variables"]]
+        # Resolve entity_key only AFTER base variables are injected. The primary entity
+        # identifier is normally one of those auto-injected fields (e.g. subscriber_id),
+        # so validating against Gemini's scenario-specific variables alone is incorrect.
+        result["entity_key"] = self._normalize_entity_key(
+            result.get("entity_key"), result["variables"], industry_key, type_of_data
+        )
         result["events"] = self._normalize_events(result.get("events", []), result["variables"], type_of_data, industry_key)
-        result["entity_key"] = self._normalize_entity_key(result.get("entity_key"), result["variables"], type_of_data, industry_key)
         return result
 
 
-    def _normalize_entity_key(self, entity_key, variables: list[dict], type_of_data: str, industry_key: str) -> str | None:
-        """Return a valid variable name to use as the transactional grouping key.
-
-        The LLM chooses the business entity identifier. Python normalizes aliases and
-        verifies that the selected field actually exists in the scenario variables.
-        """
+    def _normalize_entity_key(self, entity_key: object, variables: list[dict], industry_key: str, type_of_data: str) -> str | None:
         if type_of_data != "transactional":
             return None
-
-        valid_names = {v["name"] for v in variables}
-        alias_map = _build_alias_map(industry_key)
-        candidate = str(entity_key or "").strip()
-        canonical = alias_map.get(candidate.lower(), candidate)
-        if canonical in valid_names:
-            return canonical
-
-        # Defensive fallback: use the canonical identifier concept for the industry
-        # when Gemini omitted/returned an invalid entity key.
-        fallback = _CONCEPT_CANONICAL.get("identifier", {}).get(industry_key) or \
-            _CONCEPT_CANONICAL.get("identifier", {}).get("generic")
+        valid_names = [str(v.get("name")) for v in variables if isinstance(v, dict) and v.get("name")]
+        requested = str(entity_key or "").strip()
+        if requested in valid_names:
+            return requested
+        # Safe deterministic fallback to the canonical primary identifier for the industry.
+        fallback = _canonical_name("identifier", industry_key)
         if fallback in valid_names:
-            logger.warning("[ScenarioDesigner] Invalid/missing entity_key '%s'; falling back to '%s'", candidate, fallback)
             return fallback
-
-        # Last-resort deterministic fallback to a clearly identifying field.
-        for name in ("account_id", "customer_id", "subscriber_id", "merchant_id", "entity_id"):
-            if name in valid_names:
-                logger.warning("[ScenarioDesigner] Invalid/missing entity_key '%s'; falling back to '%s'", candidate, name)
-                return name
-
-        raise ValueError("Transactional scenario must contain a valid entity_key variable")
+        # Last resort: first variable. This should be unreachable because base variables
+        # always inject an identifier.
+        return valid_names[0] if valid_names else None
 
     def _normalize_events(self, events: list, variables: list[dict], type_of_data: str, industry_key: str) -> list[dict]:
         """Normalize the LLM event definitions and keep event field references valid."""

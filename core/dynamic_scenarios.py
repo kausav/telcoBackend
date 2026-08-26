@@ -183,13 +183,11 @@ def resolve_data_type(scenario_id: str) -> str:
     return value if value in {"transactional", "aggregational"} else "aggregational"
 
 
-
-
 def resolve_entity_key(scenario_id: str) -> str | None:
-    """Return the persisted grouping/entity key for a transactional scenario."""
     meta = resolve_scenario_meta(scenario_id) or {}
     value = meta.get("entity_key")
-    return str(value).strip() if value else None
+    return str(value) if value else None
+
 
 def resolve_events(scenario_id: str) -> list[dict[str, Any]]:
     """Return transactional event definitions persisted with a scenario."""

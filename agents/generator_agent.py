@@ -11,7 +11,7 @@ import random
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from core.dynamic_scenarios import resolve_variables, resolve_events
+from core.dynamic_scenarios import resolve_variables, resolve_events, resolve_entity_key
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
 
@@ -353,17 +353,28 @@ _TRANSACTIONAL_COMMON_FIELDS = {
 def _journey_id() -> str:
     return f"JRN-{uuid.uuid4().hex[:12].upper()}"
 
-def _transactional_records(variables: list[dict], events: list[dict], journey_count: int) -> list[dict]:
-    """Generate one transaction row for every event in every journey."""
+def _transactional_records(variables: list[dict], events: list[dict], journey_count: int, entity_key: str | None) -> list[dict]:
+    """Generate transactional rows while preserving one entity's shared identity/context.
+
+    `journey_count` is the number of unique business entities/journeys requested. Each
+    event becomes a separate transaction row. The entity key is always copied onto every
+    event row, even when the LLM did not explicitly list it in an event's fields.
+    """
     if not events:
         events = [{"event_type": "BUSINESS_EVENT", "sequence": 1, "fields": []}]
     variable_names = [v["name"] for v in variables]
     generated: list[dict] = []
+    common_names = _TRANSACTIONAL_COMMON_FIELDS | ({entity_key} if entity_key else set())
+
     for _ in range(journey_count):
         journey_context = _generate_record(variables)
         journey_id = _journey_id()
         base_ts = _parse_dt(journey_context.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
         elapsed_seconds = 0
+
+        # One generated entity gets one row per defined event. Event-specific fields are
+        # strictly limited to the fields declared for that event; we do NOT fall back to
+        # copying the entire scenario into every transaction row.
         for position, event in enumerate(events, start=1):
             event_type = str(event.get("event_type", "BUSINESS_EVENT"))
             sequence = int(event.get("sequence", position))
@@ -374,12 +385,13 @@ def _transactional_records(variables: list[dict], events: list[dict], journey_co
             if not isinstance(event_fields, list):
                 event_fields = []
             selected = [name for name in event_fields if name in variable_names]
-            if not selected:
-                selected = [name for name in variable_names if name != "event_timestamp"]
             row = {name: journey_context.get(name) for name in selected}
+
+            # Always carry the primary business entity and other stable identity fields.
             for name in variable_names:
-                if name in _TRANSACTIONAL_COMMON_FIELDS and name in journey_context:
+                if name in common_names and name in journey_context:
                     row.setdefault(name, journey_context[name])
+
             row["journey_id"] = journey_id
             row["transaction_id"] = f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}"
             row["event_type"] = event_type
@@ -404,7 +416,8 @@ class DataGeneratorAgent:
 
         if state.type_of_data == "transactional":
             events = resolve_events(state.scenario)
-            records = _transactional_records(variables, events, state.count)
+            entity_key = resolve_entity_key(state.scenario)
+            records = _transactional_records(variables, events, state.count, entity_key)
             state.field_order = [
                 "journey_id", "transaction_id", "event_type", "event_sequence",
                 "event_timestamp",

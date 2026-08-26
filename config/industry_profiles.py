@@ -19,10 +19,7 @@ than hardcoding "telecom" anywhere.
 from __future__ import annotations
 import os
 
-# Used only as a last-resort fallback for malformed/legacy stored data (e.g. an old
-# confirmed scenario saved before country tracking existed) — NOT a default applied to
-# fresh user input. When a caller omits country, GLOBAL_COUNTRY (below) is used instead.
-DEFAULT_COUNTRY = os.environ.get("DEFAULT_COUNTRY", "US").strip().upper()
+# Country is intentionally optional. Missing country means GLOBAL/non-country-specific data.
 DEFAULT_INDUSTRY = "generic"
 GLOBAL_COUNTRY = "GLOBAL"
 

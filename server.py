@@ -6,7 +6,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Literal
 
-from config.industry_profiles import DEFAULT_COUNTRY
 from main import run_pipeline
 from agents.scenario_designer_agent import ScenarioDesignerAgent
 from core.csv_scenario import parse_variables_csv
@@ -20,7 +19,6 @@ from core.dynamic_scenarios import (
     resolve_scenario_id_from_draft,
     resolve_scenario_meta,
     resolve_data_type,
-    resolve_entity_key,
     resolve_variables,
     save_draft,
     scenario_exists,
@@ -57,7 +55,6 @@ class GenerateResponse(BaseModel):
     scenario_id: str
     typeOfData: Literal["transactional", "aggregational"]
     events: list[dict] = Field(default_factory=list)
-    entityKey: str | None = Field(None, description="Variable used to group transactional records into entities")
     requested_scenario_id: str | None = Field(None, description="The scenarioId originally requested at /scenario/propose time, persisted from confirm — may differ from scenario_id if it was reassigned due to a collision")
     draft_id: str | None = None
     scenario_label: str
@@ -65,7 +62,9 @@ class GenerateResponse(BaseModel):
     total_records: int
     validation_report: dict
     records: list[dict]
-    eventData: list[dict] = Field(default_factory=list, description="Transactional records grouped by event type; only the latest 10 records are returned per event, with totalCount for pagination")
+    entityKey: str | None = Field(None, description="Field used to group transactional records by business entity")
+    totalCount: int = Field(0, description="Total number of unique entities in the response dataset")
+    eventData: list[dict] = Field(default_factory=list, description="Deprecated compatibility field; transactional data is grouped under records by entityKey")
     errors: list[str]
 
 
@@ -79,7 +78,7 @@ class ProposeRequest(BaseModel):
     expectedOutcome: str | None = Field(None, examples=["Potential recharge opportunity identified"])
     country: str | None = Field(None, description="ISO 3166-1 alpha-2 country code; if omitted, generic/global (non-country-specific) conventions are used instead of assuming a country", examples=["US", "IN", "GB", "AE"])
     useCase: str | None = Field(None, description="Specific use case within the domain, gives the designer sharper context than domain alone", examples=["Proactive low-balance recharge nudge"])
-    typeOfData: Literal["transactional", "aggregational"] = Field("aggregational", description="Output data grain: one journey-level record or multiple event/transaction records per journey")
+    typeOfData: Literal["transactional", "aggregational"] = Field(..., description="Output data grain: one journey-level record or multiple event/transaction records per entity")
 
 
 class ProposeResponse(BaseModel):
@@ -92,7 +91,6 @@ class ProposeResponse(BaseModel):
     variables: list[dict]
     field_order: list[str]
     typeOfData: Literal["transactional", "aggregational"]
-    entityKey: str | None = None
     events: list[dict] = Field(default_factory=list)
 
 
@@ -120,7 +118,6 @@ class ConfirmResponse(BaseModel):
     variables: list[dict]
     field_order: list[str]
     typeOfData: Literal["transactional", "aggregational"]
-    entityKey: str | None = None
     events: list[dict] = Field(default_factory=list)
 
 
@@ -169,7 +166,6 @@ def propose_scenario(req: ProposeRequest):
     draft["country"] = req.country
     draft["use_case"] = req.useCase
     draft["type_of_data"] = req.typeOfData
-    draft["entity_key"] = draft.get("entity_key") if req.typeOfData == "transactional" else None
     save_draft(draft_id, draft)
     scenario_id_available = not scenario_exists(req.scenarioId)
     if not scenario_id_available:
@@ -188,7 +184,6 @@ def propose_scenario(req: ProposeRequest):
         variables=draft.get("variables", []),
         field_order=draft.get("field_order", []),
         typeOfData=draft.get("type_of_data", "aggregational"),
-        entityKey=draft.get("entity_key"),
         events=draft.get("events", []),
     )
 
@@ -246,7 +241,6 @@ def import_scenario_csv(
         variables=variables,
         field_order=field_order,
         typeOfData=draft.get("type_of_data", "aggregational"),
-        entityKey=draft.get("entity_key"),
         events=draft.get("events", []),
     )
 
@@ -295,11 +289,11 @@ def confirm_scenario_route(req: ConfirmRequest):
         "journey": draft.get("journey", draft.get("domain", "")),
         "description": draft.get("description", ""),
         "industry": draft.get("industry_type", "generic"),
-        "country": draft.get("country", DEFAULT_COUNTRY),
+        "country": draft.get("country"),
         "requested_scenario_id": requested_scenario_id,
         "type_of_data": draft.get("type_of_data", "aggregational"),
-        "entity_key": draft.get("entity_key"),
         "events": draft.get("events", []),
+        "entity_key": draft.get("entity_key"),
     }
     confirm_scenario(scenario_id, meta, variables, field_order, draft_id=req.draft_id)
 
@@ -319,7 +313,6 @@ def confirm_scenario_route(req: ConfirmRequest):
         variables=variables,
         field_order=field_order,
         typeOfData=meta["type_of_data"],
-        entityKey=meta.get("entity_key"),
         events=meta.get("events", []),
     )
 
@@ -347,7 +340,7 @@ def generate_dynamic(req: GenerateRequest):
         scenario=scenario_id,
         count=req.count,
         industry=resolve_scenario_meta(scenario_id).get("industry", "generic"),
-        country=resolve_scenario_meta(scenario_id).get("country", DEFAULT_COUNTRY),
+        country=resolve_scenario_meta(scenario_id).get("country"),
         type_of_data=resolve_data_type(scenario_id),
     )
     if state.errors and not state.final_records:
@@ -355,87 +348,84 @@ def generate_dynamic(req: GenerateRequest):
     meta = resolve_scenario_meta(scenario_id) or {}
     final_records = state.final_records
 
-    # Transactional responses are grouped by the scenario-selected entity key.
-    # We return only the latest 10 entities, and inside each entity only the latest
-    # 10 records for each event type. Every event also carries its own totalCount
-    # so the frontend can paginate an event independently.
+    # Transactional responses are grouped by the scenario-defined entity key.
+    # Only the latest 10 entities are returned. Within each entity, each event
+    # contains its own totalCount and latest 10 records.
     event_data: list[dict] = []
     response_records: list[dict] = final_records
-    entity_key = resolve_entity_key(scenario_id)
+    entity_key = meta.get("entity_key")
+    total_count = len(final_records)
 
     if state.type_of_data == "transactional":
         if not entity_key:
-            raise HTTPException(500, detail={"error": "Transactional scenario has no entity_key configured"})
+            raise HTTPException(500, detail={"error": "Transactional scenario is missing entity_key"})
 
-        invalid = [r for r in final_records if entity_key not in r or r.get(entity_key) is None]
-        if invalid:
-            raise HTTPException(500, detail={
-                "error": f"Transactional records are missing configured entity_key '{entity_key}'",
-                "missing_count": len(invalid),
-            })
-
-        # entity -> event_type -> records
-        grouped: dict[str, dict[str, list[dict]]] = {}
-        entity_display_values: dict[str, object] = {}
+        grouped_entities: dict[str, list[dict]] = {}
         for record in final_records:
-            entity_value = record.get(entity_key)
-            entity_id = str(entity_value)
-            entity_display_values[entity_id] = entity_value
-            event_type = str(record.get("event_type") or "BUSINESS_EVENT")
-            grouped.setdefault(entity_id, {}).setdefault(event_type, []).append(record)
+            if entity_key not in record or record.get(entity_key) in (None, ""):
+                continue
+            key = str(record[entity_key])
+            grouped_entities.setdefault(key, []).append(record)
 
-        # Preserve generation order so the final 10 entities are the latest 10 generated.
-        entity_ids = list(grouped.keys())[-10:]
-        scenario_event_order = []
-        for event in meta.get("events", []):
-            event_type = str(event.get("event_type", "BUSINESS_EVENT"))
-            if event_type not in scenario_event_order:
-                scenario_event_order.append(event_type)
+        total_count = len(grouped_entities)
+        # Generated records are ordered by generation time, so insertion order
+        # preserves the most recently generated entities at the end.
+        latest_entity_items = list(grouped_entities.items())[-10:]
 
-        for entity_id in entity_ids:
-            per_event = grouped[entity_id]
-            event_items: list[dict] = []
-            ordered_types = list(scenario_event_order)
-            for event_type in per_event:
-                if event_type not in ordered_types:
-                    ordered_types.append(event_type)
+        entity_records: list[dict] = []
+        for entity_value, entity_rows in latest_entity_items:
+            entity_output = {entity_key: entity_value}
 
-            for event_type in ordered_types:
-                records_for_event = per_event.get(event_type, [])
-                if not records_for_event:
+            # Include useful identity fields alongside the grouping key.
+            first = entity_rows[-1]
+            for common_name in ("subscriber_msisdn", "phone_number", "account_id", "customer_id"):
+                if common_name in first and common_name != entity_key:
+                    entity_output[common_name] = first[common_name]
+
+            grouped_events: dict[str, list[dict]] = {}
+            for row in entity_rows:
+                event_type = str(row.get("event_type") or "BUSINESS_EVENT")
+                grouped_events.setdefault(event_type, []).append(row)
+
+            ordered_event_types: list[str] = []
+            for event in meta.get("events", []):
+                event_type = str(event.get("event_type", "BUSINESS_EVENT"))
+                if event_type not in ordered_event_types:
+                    ordered_event_types.append(event_type)
+            for event_type in grouped_events:
+                if event_type not in ordered_event_types:
+                    ordered_event_types.append(event_type)
+
+            events_for_entity: list[dict] = []
+            for event_type in ordered_event_types:
+                rows = grouped_events.get(event_type, [])
+                if not rows:
                     continue
-                latest = records_for_event[-10:]
-                cleaned = []
-                for record in latest:
-                    # The grouping key is promoted to the parent entity object.
-                    # journey_id is an internal generation aid and is not required in
-                    # the response because grouping is now driven by entity_key.
-                    item = {k: v for k, v in record.items() if k != "journey_id" and k != entity_key}
-                    cleaned.append(item)
-                event_items.append({
+                events_for_entity.append({
                     "event_type": event_type,
-                    "totalCount": len(records_for_event),
-                    "records": cleaned,
+                    "totalCount": len(rows),
+                    "records": rows[-10:],
                 })
 
-            event_data.append({
-                entity_key: entity_display_values[entity_id],
-                "events": event_items,
-            })
+            entity_output["events"] = events_for_entity
+            entity_records.append(entity_output)
 
-        response_records = event_data
+        response_records = entity_records
+        # Keep eventData populated for backward compatibility, but it is no
+        # longer the primary transactional representation.
+        event_data = []
 
-    # For aggregational data the existing flat records response is unchanged.
     return GenerateResponse(
         scenario_id=scenario_id,
         typeOfData=state.type_of_data,
         entityKey=entity_key,
+        totalCount=total_count,
         events=meta.get("events", []),
         requested_scenario_id=meta.get("requested_scenario_id"),
         draft_id=req.draftId,
         scenario_label=meta["label"],
         fields=state.field_order or _get_field_order(scenario_id),
-        total_records=(len(grouped) if state.type_of_data == "transactional" else len(final_records)),
+        total_records=len(final_records),
         validation_report=state.validation_report,
         records=response_records,
         eventData=event_data,

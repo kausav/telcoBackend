@@ -16,7 +16,6 @@ from agents.orchestrator import OrchestratorAgent
 from agents.qa_agent import QAAgent
 from agents.rules_agent import RulesAgent
 from config.scenarios import SCENARIO_LABELS
-from config.industry_profiles import DEFAULT_COUNTRY
 from core.csv_scenario import parse_variables_csv
 from core.dynamic_scenarios import confirm_scenario, resolve_data_type
 from core.llm_client import GeminiClient
@@ -35,7 +34,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--scenario", required=True)
     p.add_argument("--count", type=int, default=20)
     p.add_argument("--industry", default="generic", help="Industry name driving industry conventions (see config/industry_profiles.py)")
-    p.add_argument("--country", default=DEFAULT_COUNTRY, help="ISO 3166-1 alpha-2 country code driving country conventions (see config/industry_profiles.py)")
+    p.add_argument("--country", default=None, help="ISO 3166-1 alpha-2 country code; omit for GLOBAL/non-country-specific data")
     p.add_argument("--variables-csv", default="", help="Path to an industry-supplied CSV variable catalog (see core/csv_scenario.py); "
                                                         "registers --scenario from this CSV instead of using the LLM-invented catalog")
     p.add_argument("--api-key", default="", dest="api_key")
@@ -54,7 +53,7 @@ def register_scenario_from_csv(scenario: str, csv_path: str, label: str = "") ->
     logger.info("Registered scenario '%s' from CSV '%s' (%d variables)", scenario, csv_path, len(variables))
 
 
-def run_pipeline(scenario: str, count: int, industry: str = "generic", country: str = DEFAULT_COUNTRY, api_key: str = "", type_of_data: str | None = None) -> WorkflowState:
+def run_pipeline(scenario: str, count: int, industry: str = "generic", country: str | None = None, api_key: str = "", type_of_data: str | None = None) -> WorkflowState:
     llm = GeminiClient(api_key=api_key or None)
     resolved_type = type_of_data or resolve_data_type(scenario)
     state = WorkflowState(scenario=scenario, count=count, industry=industry, country=country, type_of_data=resolved_type)
