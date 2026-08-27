@@ -342,6 +342,41 @@ def _generate_record(variables: list[dict]) -> dict:
     return rec
 
 
+def _generate_selected_record(
+    variables: list[dict],
+    selected_names: set[str],
+    base: dict | None = None,
+) -> dict:
+    """Generate only selected variables (plus their declared dependencies).
+
+    This is the hot-path primitive for transactional generation. Entity fields are
+    generated once and reused; event fields are generated only for the event row.
+    """
+    rec = dict(base or {})
+    required = set(selected_names)
+
+    changed = True
+    by_name = {v["name"]: v for v in variables}
+    while changed:
+        changed = False
+        for name in tuple(required):
+            var = by_name.get(name)
+            if not var:
+                continue
+            for dep in var.get("depends_on", []) or []:
+                if dep in by_name and dep not in required:
+                    required.add(dep)
+                    changed = True
+
+    for var in variables:
+        name = var["name"]
+        if name not in required or name in rec:
+            continue
+        generator = _GENERATORS.get(var["gen"])
+        rec[name] = generator(var, rec) if generator else None
+    return rec
+
+
 # ── Transactional generation helpers ─────────────────────────────────────────
 
 _TRANSACTIONAL_COMMON_FIELDS = {
@@ -350,62 +385,91 @@ _TRANSACTIONAL_COMMON_FIELDS = {
     "event_sequence", "event_timestamp", "event_occurrence",
 }
 
+# Publicly documented response behavior: at most 10 entities and 10 records/event/entity.
+MAX_RESPONSE_ENTITIES = 10
+MAX_EVENT_RECORDS = 10
+
+
 def _journey_id() -> str:
     return f"JRN-{uuid.uuid4().hex[:12].upper()}"
 
-def _transactional_records(variables: list[dict], events: list[dict], journey_count: int, entity_key: str | None) -> list[dict]:
-    """Generate transactional rows while preserving one entity's shared identity/context.
 
-    `journey_count` is the number of unique business entities/journeys requested. Each
-    event becomes a separate transaction row. The entity key is always copied onto every
-    event row, even when the LLM did not explicitly list it in an event's fields.
+def _transactional_records(compiled, journey_count: int, event_counts_out: dict[str, dict[str, int]] | None = None) -> list[dict]:
+    """Fast transactional generation.
+
+    Important optimization: the requested count represents entities, but the API only
+    returns the latest 10 entities and at most 10 records for each event/entity. We
+    therefore generate full data only for the response window instead of materializing
+    every historical transaction. Occurrence counts are still generated per event so
+    the response can expose an honest totalCount.
     """
+    events = compiled.events
+    variables = list(compiled.variables)
+    entity_key = compiled.entity_key
     if not events:
-        events = [{"event_type": "BUSINESS_EVENT", "sequence": 1, "fields": []}]
-    variable_names = [v["name"] for v in variables]
-    generated: list[dict] = []
-    common_names = _TRANSACTIONAL_COMMON_FIELDS | ({entity_key} if entity_key else set())
+        from types import SimpleNamespace
+        events = (SimpleNamespace(event_type="BUSINESS_EVENT", sequence=1, fields=(), min_occurrences=1, max_occurrences=10),)
 
-    for _ in range(journey_count):
-        journey_context = _generate_record(variables)
+    # Entity generation is deliberately outside the event loop: subscriber_id,
+    # customer_id, account_id, etc. are generated once and reused across all events.
+    # We only need the latest response window, so create at most 10 full entity states.
+    response_entity_count = min(journey_count, MAX_RESPONSE_ENTITIES)
+    generated: list[dict] = []
+    used_entity_keys: set[str] = set()
+
+    # The source generator creates records in order. The last entity is the latest one.
+    # Generate the response window in natural order so the last generated entity is last.
+    for entity_index in range(response_entity_count):
+        # Static variables not owned by an event form the entity context.
+        entity_context = _generate_selected_record(variables, set(compiled.entity_fields))
+
+        # Ensure the grouping key is unique where a generator can collide.
+        if entity_key and entity_key in entity_context:
+            attempts = 0
+            while str(entity_context[entity_key]) in used_entity_keys and attempts < 10:
+                # Regenerate just the key and any fields directly depending on it.
+                key_var = compiled.variable_by_name.get(entity_key)
+                if key_var:
+                    generator = _GENERATORS.get(key_var.get("gen"))
+                    if generator:
+                        entity_context[entity_key] = generator(key_var, entity_context)
+                attempts += 1
+            used_entity_keys.add(str(entity_context[entity_key]))
+
         journey_id = _journey_id()
-        base_ts = _parse_dt(journey_context.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
+        entity_value = str(entity_context.get(entity_key, "")) if entity_key else journey_id
+        if event_counts_out is not None:
+            event_counts_out.setdefault(entity_value, {})
+        base_ts = _parse_dt(entity_context.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
         elapsed_seconds = 0
 
-        # A business event can occur multiple times for the same entity. This is the
-        # key distinction from the old implementation, which emitted exactly one row
-        # per event and therefore made every event totalCount equal to 1.
-        for position, event in enumerate(events, start=1):
-            event_type = str(event.get("event_type", "BUSINESS_EVENT"))
-            sequence = int(event.get("sequence", position))
-            min_occurrences = max(1, int(event.get("min_occurrences", 1)))
-            max_occurrences = max(min_occurrences, min(10, int(event.get("max_occurrences", 10))))
-            occurrence_count = random.randint(min_occurrences, max_occurrences)
+        for event in events:
+            occurrence_count = random.randint(event.min_occurrences, event.max_occurrences)
+            if event_counts_out is not None:
+                event_counts_out[entity_value][event.event_type] = occurrence_count
+            # We do not materialize historical occurrences. Only the latest 10 are needed.
+            start_occurrence = max(0, occurrence_count - MAX_EVENT_RECORDS)
 
-            event_fields = event.get("fields", [])
-            if not isinstance(event_fields, list):
-                event_fields = []
-            selected = [name for name in event_fields if name in variable_names]
-
-            for occurrence in range(occurrence_count):
-                # Keep timestamps non-decreasing both across event types and within
-                # repeated occurrences of the same event.
+            for occurrence in range(start_occurrence, occurrence_count):
                 elapsed_seconds += random.randint(5, 300)
                 event_ts = base_ts + timedelta(seconds=elapsed_seconds)
-                row = {name: journey_context.get(name) for name in selected}
 
-                # Always carry the primary business entity and other stable identity fields.
-                for name in variable_names:
-                    if name in common_names and name in journey_context:
-                        row.setdefault(name, journey_context[name])
+                # Generate event-local fields and their dependencies. Stable entity fields
+                # are copied in; they are never regenerated here.
+                row = _generate_selected_record(
+                    variables,
+                    set(event.fields),
+                    base=entity_context,
+                )
 
                 row["journey_id"] = journey_id
                 row["transaction_id"] = f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}"
-                row["event_type"] = event_type
-                row["event_sequence"] = sequence
+                row["event_type"] = event.event_type
+                row["event_sequence"] = event.sequence
                 row["event_occurrence"] = occurrence + 1
                 row["event_timestamp"] = event_ts.isoformat()
                 generated.append(row)
+
     return generated
 
 
@@ -423,16 +487,18 @@ class DataGeneratorAgent:
             from config.variables import VARIABLES as variables, FIELD_ORDER
 
         if state.type_of_data == "transactional":
-            events = resolve_events(state.scenario)
-            entity_key = resolve_entity_key(state.scenario)
-            records = _transactional_records(variables, events, state.count, entity_key)
+            from core.compiled_schema import compile_scenario
+            compiled = compile_scenario(state.scenario)
+            entity_key = compiled.entity_key
+            state.transactional_event_counts = {}
+            records = _transactional_records(compiled, state.count, state.transactional_event_counts)
             state.field_order = [
                 "journey_id", "transaction_id", "event_type", "event_sequence",
                 "event_occurrence", "event_timestamp",
             ] + [name for name in FIELD_ORDER if name != "event_timestamp"]
             logger.info(
                 "[DataGenerator] Generated %d transactional records from %d journeys and %d events.",
-                len(records), state.count, len(events),
+                len(records), state.count, len(compiled.events),
             )
         else:
             state.field_order = FIELD_ORDER

@@ -10,6 +10,7 @@ from config.industry_profiles import get_profile
 from core.dynamic_scenarios import resolve_scenario_meta, scenario_exists
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
+from core.runtime_cache import get_orchestrator, set_orchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,15 @@ class OrchestratorAgent:
             )
             return state
 
+        cache_key = (state.scenario, state.industry, (state.country or "GLOBAL").upper())
+        cached = get_orchestrator(cache_key)
+        if cached is not None:
+            if not cached.get("valid", True):
+                state.errors.append(f"Orchestrator rejected: {cached.get('reason')}")
+            else:
+                logger.info("[Orchestrator] Cache hit; skipping LLM validation.")
+            return state
+
         sc = resolve_scenario_meta(state.scenario)
         profile = get_profile(state.industry, state.country)
         prompt = (
@@ -50,6 +60,7 @@ class OrchestratorAgent:
             "Validate and produce execution notes."
         )
         plan = self._llm.generate_json(_SYSTEM, prompt, temperature=0.1)
+        set_orchestrator(cache_key, plan)
         if not plan.get("valid", True):
             state.errors.append(f"Orchestrator rejected: {plan.get('reason')}")
             return state

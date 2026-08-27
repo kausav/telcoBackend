@@ -493,7 +493,9 @@ def generate_dynamic(req: GenerateRequest):
             key = str(record[entity_key])
             grouped_entities.setdefault(key, []).append(record)
 
-        total_count = len(grouped_entities)
+        # The requested count represents the full number of entities in the conceptual
+        # dataset. Only the latest 10 entities are materialized for the response.
+        total_count = state.count
         # Generated records are ordered by generation time, so insertion order
         # preserves the most recently generated entities at the end.
         latest_entity_items = list(grouped_entities.items())[-10:]
@@ -527,9 +529,10 @@ def generate_dynamic(req: GenerateRequest):
                 rows = grouped_events.get(event_type, [])
                 if not rows:
                     continue
+                actual_count = state.transactional_event_counts.get(str(entity_value), {}).get(event_type, len(rows))
                 events_for_entity.append({
                     "event_type": event_type,
-                    "totalCount": len(rows),
+                    "totalCount": actual_count,
                     "records": rows[-10:],
                 })
 

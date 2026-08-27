@@ -11,6 +11,7 @@ from config.variables import VARIABLES
 from core.dynamic_scenarios import resolve_scenario_meta, resolve_variables
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
+from core.runtime_cache import get_rules, set_rules
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,13 @@ class RulesAgent:
 
     def run(self, state: WorkflowState) -> WorkflowState:
         logger.info("[RulesAgent] Deriving rules for scenario=%s", state.scenario)
+
+        cache_key = (state.scenario, state.industry, (state.country or "GLOBAL").upper(), state.type_of_data)
+        cached = get_rules(cache_key)
+        if cached is not None:
+            state.rules = cached
+            logger.info("[RulesAgent] Cache hit; skipping LLM rules generation.")
+            return state
 
         sc = resolve_scenario_meta(state.scenario)
         dyn = resolve_variables(state.scenario)
@@ -69,6 +77,7 @@ class RulesAgent:
         )
 
         rules = self._llm.generate_json(_SYSTEM, prompt, temperature=0.1)
+        set_rules(cache_key, rules)
         state.rules = rules
         logger.info("[RulesAgent] Rules generated. Business rules: %d cross-field: %d",
                     len(rules.get("business_rules", [])),

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+import os
 from datetime import datetime, timezone
 
 from config.variables import VARIABLES
@@ -136,53 +137,80 @@ class QAAgent:
             algo_fixed += len(issues)
             checked.append(rec)
 
-        # Step 2: LLM semantic validation in chunks
+        # Step 2: Optional LLM semantic audit.
+        # The generator is deterministic/algorithmic, so validating every generated row
+        # with a remote LLM is a major latency multiplier (e.g. 400 rows => 8 calls at
+        # CHUNK=50). Default to no remote LLM audit during generation for low latency. Set
+        # QA_LLM_MODE=sample or full explicitly when an LLM audit is desired.
         rules_text = "\n".join(f"- {r}" for r in state.rules.get("business_rules", []))
         cross_text = "\n".join(f"- {r}" for r in state.rules.get("cross_field_rules", []))
         system_prompt = _SYSTEM.format(rules=rules_text or "Standard telecom rules.",
                                        cross_field_rules=cross_text or "See field constraints.")
 
-        valid_all: list[dict] = []
+        # All algorithmically checked records remain valid unless the caller explicitly
+        # opts into the legacy full LLM validation mode. This preserves record counts and
+        # avoids replacing the complete dataset with an LLM-generated subset.
+        valid_all: list[dict] = checked
         dropped_all: list[dict] = []
         llm_fixes = 0
         llm_issues = 0
+        qa_mode = os.getenv("QA_LLM_MODE", "off").strip().lower()
 
-        for i in range(0, len(checked), CHUNK):
-            chunk = checked[i: i + CHUNK]
+        if qa_mode == "full":
+            valid_all = []
+            for i in range(0, len(checked), CHUNK):
+                chunk = checked[i: i + CHUNK]
+                user_prompt = (
+                    f"Scenario: {state.scenario}\n"
+                    f"Records to validate:\n{json.dumps(chunk, default=str, indent=2)}"
+                )
+                try:
+                    result = self._llm.generate_json(system_prompt, user_prompt, temperature=0.1)
+                    validated = result.get("valid_records", chunk)
+                    validated = [{k: r[k] for k in state.field_order if k in r} for r in validated]
+                    dropped = result.get("dropped_records", [])
+                    valid_all.extend(validated)
+                    dropped_all.extend(dropped)
+                    llm_fixes += int(result.get("fixes_applied", 0))
+                    llm_issues += int(result.get("issues_found", 0))
+                except Exception as exc:
+                    logger.warning("[QAAgent] Chunk %d error: %s — passing through", i, exc)
+                    state.errors.append(f"QA chunk {i} error: {exc}")
+                    valid_all.extend(chunk)
+        elif qa_mode != "off" and checked:
+            sample_size = max(1, int(os.getenv("QA_LLM_SAMPLE_SIZE", "20")))
+            sample = checked[:sample_size]
             user_prompt = (
                 f"Scenario: {state.scenario}\n"
-                f"Records to validate:\n{json.dumps(chunk, default=str, indent=2)}"
+                f"This is a QA audit sample only. Do not return or rewrite the full dataset.\n"
+                f"Records to audit:\n{json.dumps(sample, default=str, indent=2)}"
             )
             try:
                 result = self._llm.generate_json(system_prompt, user_prompt, temperature=0.1)
-                validated = result.get("valid_records", chunk)
-                validated = [{k: r[k] for k in state.field_order if k in r} for r in validated]
-                dropped = result.get("dropped_records", [])
-                valid_all.extend(validated)
-                dropped_all.extend(dropped)
-                llm_fixes += int(result.get("fixes_applied", 0))
-                llm_issues += int(result.get("issues_found", 0))
+                llm_fixes = int(result.get("fixes_applied", 0))
+                llm_issues = int(result.get("issues_found", 0))
+                logger.info("[QAAgent] Sample audit completed on %d records; full dataset kept intact.", len(sample))
             except Exception as exc:
-                logger.warning("[QAAgent] Chunk %d error: %s — passing through", i, exc)
-                state.errors.append(f"QA chunk {i} error: {exc}")
-                valid_all.extend(chunk)
+                logger.warning("[QAAgent] Sample audit error: %s — algorithmic validation retained", exc)
+                state.errors.append(f"QA sample error: {exc}")
 
-        # Recover LLM-dropped records instead of losing them: default-fill any nulls the
-        # LLM flagged (e.g. "required field null") so the output count matches state.count.
+        # Legacy recovery path is intentionally retained only for full mode, where the
+        # LLM may have explicitly returned dropped records.
         recovered = 0
-        for rec in dropped_all:
-            rec = dict(rec)
-            if state.type_of_data == "transactional":
-                rec.setdefault("journey_id", f"JRN-{uuid.uuid4().hex[:12].upper()}")
-                rec.setdefault("transaction_id", f"TXN-{uuid.uuid4().hex[:12].upper()}")
-                rec.setdefault("event_type", "BUSINESS_EVENT")
-                rec.setdefault("event_sequence", 1)
-                rec.setdefault("event_timestamp", datetime.now(timezone.utc).isoformat())
-            else:
-                rec, _ = _fill_missing(rec, state.field_order, dtype_map)
-            rec = {k: rec[k] for k in state.field_order if k in rec}
-            valid_all.append(rec)
-            recovered += 1
+        if qa_mode == "full":
+            for rec in dropped_all:
+                rec = dict(rec)
+                if state.type_of_data == "transactional":
+                    rec.setdefault("journey_id", f"JRN-{uuid.uuid4().hex[:12].upper()}")
+                    rec.setdefault("transaction_id", f"TXN-{uuid.uuid4().hex[:12].upper()}")
+                    rec.setdefault("event_type", "BUSINESS_EVENT")
+                    rec.setdefault("event_sequence", 1)
+                    rec.setdefault("event_timestamp", datetime.now(timezone.utc).isoformat())
+                else:
+                    rec, _ = _fill_missing(rec, state.field_order, dtype_map)
+                rec = {k: rec[k] for k in state.field_order if k in rec}
+                valid_all.append(rec)
+                recovered += 1
 
         state.final_records = valid_all
         state.validation_report = {
