@@ -111,3 +111,164 @@ def parse_variables_csv(csv_text: str) -> tuple[list[dict], list[str]]:
 
     field_order = [v["name"] for v in variables]
     return variables, field_order
+# ---------------------------------------------------------------------------
+# Sample-data CSV import
+# ---------------------------------------------------------------------------
+
+def _infer_dtype(values: list[str]) -> str:
+    vals = [v.strip() for v in values if v.strip()]
+    if not vals:
+        return "string"
+    low = [v.lower() for v in vals]
+    if all(v in {"true", "false", "1", "0", "yes", "no"} for v in low):
+        return "boolean"
+    try:
+        for v in vals:
+            int(v)
+        return "int"
+    except ValueError:
+        pass
+    try:
+        for v in vals:
+            float(v)
+        return "float"
+    except ValueError:
+        pass
+    # Conservative ISO datetime detection.
+    from datetime import datetime
+    try:
+        for v in vals[:20]:
+            datetime.fromisoformat(v.replace("Z", "+00:00"))
+        return "datetime"
+    except ValueError:
+        return "string"
+
+
+def _sample_generator(dtype: str, values: list[str], field_name: str = "") -> tuple[str, dict]:
+    vals = [v.strip() for v in values if v.strip()]
+    # ID-like fields should not be generated as a finite weighted choice: the
+    # transactional generator needs fresh entity identifiers. Preserve a useful
+    # prefix/digit shape when possible.
+    if field_name.lower().endswith("_id") or field_name.lower() in {"id", "customer", "subscriber", "account"}:
+        import re
+        if vals:
+            m = re.match(r"^(.*?)(\d+)$", vals[0])
+            if m:
+                return "prefixed_int", {"prefix": m.group(1), "digits": len(m.group(2))}
+        return "prefixed_uuid", {"prefix": (field_name.upper().replace("_", "-") + "-")}
+    if dtype == "int":
+        nums = [int(v) for v in vals]
+        return "uniform", {"min": min(nums), "max": max(nums), "integer": True}
+    if dtype == "float":
+        nums = [float(v) for v in vals]
+        return "uniform", {"min": min(nums), "max": max(nums)}
+    if dtype == "boolean":
+        choices = list(dict.fromkeys(vals)) or ["true", "false"]
+        return "weighted_choice", {"choices": choices, "weights": [1] * len(choices)}
+    if dtype == "datetime":
+        return "recent_datetime", {"days": 30}
+    choices = list(dict.fromkeys(vals))
+    if choices and len(choices) <= 50:
+        return "weighted_choice", {"choices": choices, "weights": [1] * len(choices)}
+    return "constant", {"value": choices[0] if choices else ""}
+
+
+def _infer_entity_key(fieldnames: list[str], rows: list[dict[str, str]], explicit: str | None) -> str:
+    if explicit:
+        if explicit not in fieldnames:
+            raise ValueError(f"entityKey '{explicit}' is not present in the CSV header")
+        return explicit
+    candidates = []
+    for name in fieldnames:
+        lname = name.lower()
+        if name.lower() in {"event_type", "event_sequence", "event_timestamp"}:
+            continue
+        vals = [r.get(name, "") for r in rows if r.get(name, "")]
+        if vals and len(set(vals)) < len(vals):
+            # A repeated field is unlikely to be the entity key in transactional data.
+            continue
+        score = 0
+        if lname.endswith("_id") or lname in {"id", "customer", "subscriber", "account"}:
+            score += 10
+        if "subscriber" in lname or "customer" in lname or "account" in lname:
+            score += 5
+        if vals and len(set(vals)) == len(vals):
+            score += 3
+        candidates.append((score, name))
+    if not candidates:
+        raise ValueError("Unable to infer entityKey from transactional CSV; supply entityKey explicitly")
+    return max(candidates, key=lambda x: x[0])[1]
+
+
+def parse_sample_csv(csv_text: str, type_of_data: str, entity_key: str | None = None) -> tuple[list[dict], list[str], list[dict], str | None]:
+    """Infer a proposal from ordinary sample-data CSV rows.
+
+    Returns (variables, field_order, events, inferred_entity_key).
+    This is deliberately deterministic: no LLM is needed for CSV imports.
+    """
+    reader = csv.DictReader(io.StringIO(csv_text))
+    if not reader.fieldnames:
+        raise ValueError("CSV appears to be empty (no header row found)")
+    fieldnames = [str(h).strip() for h in reader.fieldnames if h is not None and str(h).strip()]
+    if len(fieldnames) != len(set(fieldnames)):
+        raise ValueError("CSV contains duplicate column names")
+    rows = [{k: (v or "").strip() for k, v in r.items()} for r in reader]
+    if not rows:
+        raise ValueError("CSV contains no data rows")
+
+    transactional = type_of_data == "transactional"
+    if transactional and "event_type" not in fieldnames:
+        raise ValueError("Transactional CSV must contain an 'event_type' column")
+
+    inferred_key = _infer_entity_key(fieldnames, rows, entity_key) if transactional else None
+    variables: list[dict] = []
+    field_order: list[str] = []
+
+    for name in fieldnames:
+        vals = [r.get(name, "") for r in rows]
+        dtype = _infer_dtype(vals)
+        gen, params = _sample_generator(dtype, vals, name)
+        # System transaction metadata is generated by the backend and should not be
+        # treated as ordinary scenario variables.
+        if transactional and name in {"event_type", "event_sequence", "event_timestamp", "transaction_id", "journey_id", "event_occurrence"}:
+            continue
+        variables.append({
+            "name": name,
+            "dtype": dtype,
+            "description": f"Imported from CSV column '{name}'",
+            "gen": gen,
+            "params": params,
+            "depends_on": [],
+            "nullable": any(not r.get(name, "") for r in rows),
+        })
+        field_order.append(name)
+
+    events: list[dict] = []
+    if transactional:
+        grouped: dict[str, dict] = {}
+        for row in rows:
+            et = str(row.get("event_type", "")).strip().upper().replace(" ", "_")
+            if not et:
+                continue
+            if et not in grouped:
+                grouped[et] = {"event_type": et, "fields": [], "sequence": None, "min_occurrences": 1, "max_occurrences": 10}
+            for name in fieldnames:
+                if name in {"event_type", "event_sequence", "event_timestamp", inferred_key}:
+                    continue
+                if row.get(name, "") and name not in grouped[et]["fields"]:
+                    grouped[et]["fields"].append(name)
+            seq = row.get("event_sequence", "")
+            if seq:
+                try:
+                    n = int(seq)
+                    grouped[et]["sequence"] = n if grouped[et]["sequence"] is None else min(grouped[et]["sequence"], n)
+                except ValueError:
+                    pass
+        ordered = sorted(grouped.values(), key=lambda e: (e["sequence"] is None, e["sequence"] or 0, e["event_type"]))
+        for i, event in enumerate(ordered, start=1):
+            event["sequence"] = i
+            events.append(event)
+        if not events:
+            raise ValueError("Transactional CSV contains no usable event_type values")
+
+    return variables, field_order, events, inferred_key

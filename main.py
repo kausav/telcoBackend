@@ -35,7 +35,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--count", type=int, default=20)
     p.add_argument("--industry", default="generic", help="Industry name driving industry conventions (see config/industry_profiles.py)")
     p.add_argument("--country", default=None, help="ISO 3166-1 alpha-2 country code; omit for GLOBAL/non-country-specific data")
-    p.add_argument("--variables-csv", default="", help="Path to an industry-supplied CSV variable catalog (see core/csv_scenario.py); "
+    p.add_argument("--variables-csv", default="", help="Path to an industry-supplied variable-definition CSV (see core/csv_scenario.py); "
                                                         "registers --scenario from this CSV instead of using the LLM-invented catalog")
     p.add_argument("--api-key", default="", dest="api_key")
     return p.parse_args()

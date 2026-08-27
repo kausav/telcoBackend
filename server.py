@@ -8,7 +8,7 @@ from typing import Literal
 
 from main import run_pipeline
 from agents.scenario_designer_agent import ScenarioDesignerAgent
-from core.csv_scenario import parse_variables_csv
+from core.csv_scenario import parse_definition_csv, parse_variables_csv
 from core.dynamic_scenarios import (
     add_feedback,
     confirm_scenario,
@@ -24,6 +24,8 @@ from core.dynamic_scenarios import (
     scenario_exists,
 )
 from core.llm_client import GeminiClient
+from core.compiled_schema import invalidate_scenario
+from core.runtime_cache import clear_scenario
 
 
 def _get_field_order(scenario: str) -> list[str]:
@@ -222,20 +224,26 @@ def propose_scenario(req: ProposeRequest):
 
 
 @app.post("/scenario/import-csv", response_model=ProposeResponse)
+@app.post("/importCsv", response_model=ProposeResponse)
 def import_scenario_csv(
-    file: UploadFile = File(..., description="CSV with columns: name, dtype, gen, params, description, depends_on, nullable, formula"),
+    file: UploadFile = File(..., description="CSV scenario definition: variables and, for transactional data, events"),
     scenarioId: str = Form(...),
     domain: str = Form(...),
+    typeOfData: Literal["transactional", "aggregational"] = Form(...),
     industryType: str = Form("generic"),
     country: str | None = Form(None),
     businessScenario: str = Form(""),
     scenarioType: str = Form(""),
     label: str = Form(""),
+    entityKey: str | None = Form(None),
 ):
-    """Alternative to API 1 — instead of asking the LLM to invent variables,
-    load an industry-supplied CSV variable catalog directly. Produces a draft
-    in the same shape /scenario/propose does, so it goes through the same
-    /scenario/confirm review step before becoming a usable scenario."""
+    """CSV alternative to /scenario/propose.
+
+    The uploaded CSV is a *scenario definition*, not sample/output data. It tells
+    the backend which variables the user wants and, for transactional scenarios,
+    which events and event fields the user wants. The resulting draft is stored in
+    exactly the same draft store consumed by /scenario/confirm and /scenario/generate.
+    """
     raw = file.file.read()
     try:
         csv_text = raw.decode("utf-8-sig")
@@ -243,9 +251,24 @@ def import_scenario_csv(
         raise HTTPException(400, detail={"error": f"CSV must be UTF-8 encoded: {exc}"}) from exc
 
     try:
-        variables, field_order = parse_variables_csv(csv_text)
+        variables, field_order, events = parse_definition_csv(
+            csv_text, type_of_data=typeOfData
+        )
     except ValueError as exc:
         raise HTTPException(400, detail={"error": str(exc)}) from exc
+
+    if typeOfData == "transactional":
+        if not entityKey:
+            raise HTTPException(400, detail={
+                "error": "entityKey is required for transactional CSV imports",
+                "example": "subscriber_id",
+            })
+        if entityKey not in {v["name"] for v in variables}:
+            raise HTTPException(400, detail={
+                "error": f"entityKey '{entityKey}' must be one of the CSV variable names"
+            })
+    else:
+        entityKey = None
 
     draft_id = new_draft_id()
     draft = {
@@ -260,8 +283,9 @@ def import_scenario_csv(
         "scenario_type": scenarioType,
         "industry_type": industryType,
         "country": country,
-        "type_of_data": "aggregational",
-        "events": [],
+        "type_of_data": typeOfData,
+        "entity_key": entityKey,
+        "events": events,
     }
     save_draft(draft_id, draft)
     return ProposeResponse(
@@ -273,8 +297,8 @@ def import_scenario_csv(
         description=draft["description"],
         variables=variables,
         field_order=field_order,
-        typeOfData=draft.get("type_of_data", "aggregational"),
-        events=draft.get("events", []),
+        typeOfData=typeOfData,
+        events=events,
     )
 
 
@@ -393,7 +417,7 @@ def confirm_scenario_route(req: ConfirmRequest):
             # returns at most 10 records per event; these defaults make newly
             # proposed transactional events capable of producing multiple rows.
             min_occ = max(1, int(event.get("min_occurrences", 1)))
-            max_occ = max(min_occ, min(10, int(event.get("max_occurrences", 10))))
+            max_occ = max(min_occ, min(1000, int(event.get("max_occurrences", 10))))
             event["min_occurrences"] = min_occ
             event["max_occurrences"] = max_occ
 
@@ -422,6 +446,9 @@ def confirm_scenario_route(req: ConfirmRequest):
         "entity_key": draft.get("entity_key"),
     }
     confirm_scenario(scenario_id, meta, variables, field_order, draft_id=req.draft_id)
+    # Confirmed scenario changed: invalidate all runtime artifacts compiled from the old version.
+    invalidate_scenario(scenario_id)
+    clear_scenario(scenario_id)
 
     if not _is_placeholder(req.feedback):
         add_feedback(draft.get("domain", ""), draft.get("business_scenario", ""), req.feedback)

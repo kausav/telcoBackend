@@ -383,7 +383,7 @@ class ScenarioDesignerAgent:
                 if canonical in valid_names and canonical not in fields:
                     fields.append(canonical)
             min_occurrences = max(1, int(event.get("min_occurrences", 1)))
-            max_occurrences = max(min_occurrences, min(10, int(event.get("max_occurrences", 10))))
+            max_occurrences = max(min_occurrences, min(1000, int(event.get("max_occurrences", 10))))
             normalized.append({
                 "event_type": event_type,
                 "sequence": index,
