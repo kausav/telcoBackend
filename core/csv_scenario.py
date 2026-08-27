@@ -230,7 +230,7 @@ def parse_definition_csv(
         if sequence < 1:
             raise ValueError(f"Row {row_number} ('{event_type}'): sequence must be >= 1")
 
-        fields = [f.strip() for f in row.get("fields", "").split(";") if f.strip()]
+        fields = [f.strip() for f in re.split(r"[;|,]", row.get("fields", "")) if f.strip()]
         events_raw.append({
             "event_type": event_type,
             "sequence": sequence,
