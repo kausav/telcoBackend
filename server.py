@@ -224,7 +224,6 @@ def propose_scenario(req: ProposeRequest):
 
 
 @app.post("/scenario/import-csv", response_model=ProposeResponse)
-@app.post("/importCsv", response_model=ProposeResponse)
 def import_scenario_csv(
     file: UploadFile = File(..., description="CSV scenario definition: variables and, for transactional data, events"),
     scenarioId: str = Form(...),

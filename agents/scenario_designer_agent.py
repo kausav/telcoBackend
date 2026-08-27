@@ -245,7 +245,7 @@ one-size-fits-all telecom template.
 Return a JSON object with exactly these keys:
   - "data_type": "transactional" or "aggregational"
   - "entity_key": str — for transactional output, the primary business entity variable used to group events; MUST exactly match one variable name. For aggregational output return null
-  - "events": [ {"event_type": str, "sequence": int, "fields": [str]} ] — REQUIRED for transactional output; 3-8 ordered business events. For aggregational output return []
+  - "events": [ {"event_type": str, "sequence": int, "fields": [str]} ] — REQUIRED for transactional output; ordered business events; choose the number appropriate to the scenario. For aggregational output return []
   - "label": str               — short human-readable scenario title
   - "journey": str              — the domain/journey name
   - "description": str          — 1-3 sentence description combining businessScenario, businessResponse, expectedOutcome

@@ -12,7 +12,7 @@ Variable rows use these columns (header row required):
   params       (optional) — JSON object string, e.g. {"min": 0, "max": 100}
                              (default: {})
   description  (optional) — plain-English description of the field
-  depends_on   (optional) — semicolon-separated list of field names this one
+  depends_on   (optional) — separated list of field names this one
                              depends on, e.g. "subscriber_id;event_timestamp"
   nullable     (optional) — true/false (default: false)
   formula      (optional) — required instead of params when gen == "formula"
@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 
 from agents.generator_agent import get_known_generator_types
 
@@ -72,7 +73,7 @@ def parse_variables_csv(csv_text: str) -> tuple[list[dict], list[str]]:
                 f"Row {i} ('{name}'): unknown gen type '{gen}'. Known types: {sorted(known_gens)}"
             )
 
-        depends_on = [d.strip() for d in row.get("depends_on", "").split(";") if d.strip()]
+        depends_on = [d.strip() for d in re.split(r"[;|,]", row.get("depends_on", "")) if d.strip()]
         for dep in depends_on:
             if dep not in seen_names:
                 raise ValueError(
@@ -176,7 +177,7 @@ def parse_definition_csv(
                     f"Row {row_number} ('{name}'): unknown gen type '{gen}'. Known types: {sorted(known_gens)}"
                 )
 
-            depends_on = [d.strip() for d in row.get("depends_on", "").split(";") if d.strip()]
+            depends_on = [d.strip() for d in re.split(r"[;|,]", row.get("depends_on", "")) if d.strip()]
             for dep in depends_on:
                 if dep not in seen_names:
                     raise ValueError(
