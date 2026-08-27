@@ -1,10 +1,10 @@
 """
-Import a variable catalog directly from an industry-supplied CSV instead of
-having the Scenario Designer Agent (LLM) invent one. Useful when the business/
-industry team already has their own spec (e.g. an Excel/CSV export of their
-data dictionary) and wants that used verbatim for generation.
+Parse a scenario-definition CSV for /importCsv instead of asking the Scenario
+Designer Agent (LLM) to invent variables/events. The uploaded CSV contains
+only definitions of the data the user wants generated; it is never treated as
+sample/output records.
 
-Expected CSV columns (header row required):
+Variable rows use these columns (header row required):
   name         (required) — field name, e.g. "subscriber_id"
   dtype        (required) — one of: string, int, float, categorical, datetime, bool
   gen          (required) — a generator type known to agents/generator_agent.py
@@ -111,164 +111,174 @@ def parse_variables_csv(csv_text: str) -> tuple[list[dict], list[str]]:
 
     field_order = [v["name"] for v in variables]
     return variables, field_order
-# ---------------------------------------------------------------------------
-# Sample-data CSV import
-# ---------------------------------------------------------------------------
 
-def _infer_dtype(values: list[str]) -> str:
-    vals = [v.strip() for v in values if v.strip()]
-    if not vals:
-        return "string"
-    low = [v.lower() for v in vals]
-    if all(v in {"true", "false", "1", "0", "yes", "no"} for v in low):
-        return "boolean"
-    try:
-        for v in vals:
-            int(v)
-        return "int"
-    except ValueError:
-        pass
-    try:
-        for v in vals:
-            float(v)
-        return "float"
-    except ValueError:
-        pass
-    # Conservative ISO datetime detection.
-    from datetime import datetime
-    try:
-        for v in vals[:20]:
-            datetime.fromisoformat(v.replace("Z", "+00:00"))
-        return "datetime"
-    except ValueError:
-        return "string"
+def parse_definition_csv(
+    csv_text: str,
+    type_of_data: str,
+) -> tuple[list[dict], list[str], list[dict]]:
+    """Parse a scenario-definition CSV for /importCsv.
 
+    IMPORTANT: this parser does *not* read sample/output records. Every row is a
+    definition telling the system what the user wants in the eventual synthetic
+    dataset.
 
-def _sample_generator(dtype: str, values: list[str], field_name: str = "") -> tuple[str, dict]:
-    vals = [v.strip() for v in values if v.strip()]
-    # ID-like fields should not be generated as a finite weighted choice: the
-    # transactional generator needs fresh entity identifiers. Preserve a useful
-    # prefix/digit shape when possible.
-    if field_name.lower().endswith("_id") or field_name.lower() in {"id", "customer", "subscriber", "account"}:
-        import re
-        if vals:
-            m = re.match(r"^(.*?)(\d+)$", vals[0])
-            if m:
-                return "prefixed_int", {"prefix": m.group(1), "digits": len(m.group(2))}
-        return "prefixed_uuid", {"prefix": (field_name.upper().replace("_", "-") + "-")}
-    if dtype == "int":
-        nums = [int(v) for v in vals]
-        return "uniform", {"min": min(nums), "max": max(nums), "integer": True}
-    if dtype == "float":
-        nums = [float(v) for v in vals]
-        return "uniform", {"min": min(nums), "max": max(nums)}
-    if dtype == "boolean":
-        choices = list(dict.fromkeys(vals)) or ["true", "false"]
-        return "weighted_choice", {"choices": choices, "weights": [1] * len(choices)}
-    if dtype == "datetime":
-        return "recent_datetime", {"days": 30}
-    choices = list(dict.fromkeys(vals))
-    if choices and len(choices) <= 50:
-        return "weighted_choice", {"choices": choices, "weights": [1] * len(choices)}
-    return "constant", {"value": choices[0] if choices else ""}
+    Required columns:
+      record_type — ``variable`` or ``event``
 
+    Variable rows use the same generator contract as /scenario/propose:
+      name,dtype,gen,params,description,depends_on,nullable,formula
 
-def _infer_entity_key(fieldnames: list[str], rows: list[dict[str, str]], explicit: str | None) -> str:
-    if explicit:
-        if explicit not in fieldnames:
-            raise ValueError(f"entityKey '{explicit}' is not present in the CSV header")
-        return explicit
-    candidates = []
-    for name in fieldnames:
-        lname = name.lower()
-        if name.lower() in {"event_type", "event_sequence", "event_timestamp"}:
-            continue
-        vals = [r.get(name, "") for r in rows if r.get(name, "")]
-        if vals and len(set(vals)) < len(vals):
-            # A repeated field is unlikely to be the entity key in transactional data.
-            continue
-        score = 0
-        if lname.endswith("_id") or lname in {"id", "customer", "subscriber", "account"}:
-            score += 10
-        if "subscriber" in lname or "customer" in lname or "account" in lname:
-            score += 5
-        if vals and len(set(vals)) == len(vals):
-            score += 3
-        candidates.append((score, name))
-    if not candidates:
-        raise ValueError("Unable to infer entityKey from transactional CSV; supply entityKey explicitly")
-    return max(candidates, key=lambda x: x[0])[1]
+    Transactional event rows use:
+      record_type,event_type,sequence,fields,min_occurrences,max_occurrences
 
-
-def parse_sample_csv(csv_text: str, type_of_data: str, entity_key: str | None = None) -> tuple[list[dict], list[str], list[dict], str | None]:
-    """Infer a proposal from ordinary sample-data CSV rows.
-
-    Returns (variables, field_order, events, inferred_entity_key).
-    This is deliberately deterministic: no LLM is needed for CSV imports.
+    ``fields`` is a semicolon-separated list of variable names owned by the event.
+    Event fields are validated against variables declared in the same CSV.
+    Aggregational CSVs may contain variable rows only.
     """
     reader = csv.DictReader(io.StringIO(csv_text))
     if not reader.fieldnames:
         raise ValueError("CSV appears to be empty (no header row found)")
-    fieldnames = [str(h).strip() for h in reader.fieldnames if h is not None and str(h).strip()]
-    if len(fieldnames) != len(set(fieldnames)):
+
+    headers = [str(h).strip().lower() for h in reader.fieldnames if h is not None]
+    if len(headers) != len(set(headers)):
         raise ValueError("CSV contains duplicate column names")
-    rows = [{k: (v or "").strip() for k, v in r.items()} for r in reader]
-    if not rows:
-        raise ValueError("CSV contains no data rows")
+    if "record_type" not in headers:
+        raise ValueError("CSV is missing required column 'record_type'. Use 'variable' or 'event' rows.")
 
-    transactional = type_of_data == "transactional"
-    if transactional and "event_type" not in fieldnames:
-        raise ValueError("Transactional CSV must contain an 'event_type' column")
-
-    inferred_key = _infer_entity_key(fieldnames, rows, entity_key) if transactional else None
+    known_gens = get_known_generator_types()
     variables: list[dict] = []
     field_order: list[str] = []
+    events_raw: list[dict] = []
+    seen_names: set[str] = set()
 
-    for name in fieldnames:
-        vals = [r.get(name, "") for r in rows]
-        dtype = _infer_dtype(vals)
-        gen, params = _sample_generator(dtype, vals, name)
-        # System transaction metadata is generated by the backend and should not be
-        # treated as ordinary scenario variables.
-        if transactional and name in {"event_type", "event_sequence", "event_timestamp", "transaction_id", "journey_id", "event_occurrence"}:
-            continue
-        variables.append({
-            "name": name,
-            "dtype": dtype,
-            "description": f"Imported from CSV column '{name}'",
-            "gen": gen,
-            "params": params,
-            "depends_on": [],
-            "nullable": any(not r.get(name, "") for r in rows),
-        })
-        field_order.append(name)
+    for row_number, raw_row in enumerate(reader, start=2):
+        row = {(k or "").strip().lower(): (v or "").strip() for k, v in raw_row.items()}
+        record_type = row.get("record_type", "").lower()
+        if record_type not in {"variable", "event"}:
+            raise ValueError(f"Row {row_number}: record_type must be 'variable' or 'event'")
 
-    events: list[dict] = []
-    if transactional:
-        grouped: dict[str, dict] = {}
-        for row in rows:
-            et = str(row.get("event_type", "")).strip().upper().replace(" ", "_")
-            if not et:
-                continue
-            if et not in grouped:
-                grouped[et] = {"event_type": et, "fields": [], "sequence": None, "min_occurrences": 1, "max_occurrences": 10}
-            for name in fieldnames:
-                if name in {"event_type", "event_sequence", "event_timestamp", inferred_key}:
-                    continue
-                if row.get(name, "") and name not in grouped[et]["fields"]:
-                    grouped[et]["fields"].append(name)
-            seq = row.get("event_sequence", "")
-            if seq:
+        if record_type == "variable":
+            name = row.get("name", "")
+            if not name:
+                raise ValueError(f"Row {row_number}: variable 'name' is empty")
+            if name in seen_names:
+                raise ValueError(f"Row {row_number}: duplicate variable name '{name}'")
+
+            dtype = row.get("dtype", "").lower()
+            if dtype not in ALLOWED_DTYPES:
+                raise ValueError(
+                    f"Row {row_number} ('{name}'): invalid dtype '{dtype}'. Must be one of {sorted(ALLOWED_DTYPES)}"
+                )
+
+            gen = row.get("gen", "")
+            if gen not in known_gens:
+                raise ValueError(
+                    f"Row {row_number} ('{name}'): unknown gen type '{gen}'. Known types: {sorted(known_gens)}"
+                )
+
+            depends_on = [d.strip() for d in row.get("depends_on", "").split(";") if d.strip()]
+            for dep in depends_on:
+                if dep not in seen_names:
+                    raise ValueError(
+                        f"Row {row_number} ('{name}'): depends_on references '{dep}', which must be defined in an earlier variable row"
+                    )
+
+            params_raw = row.get("params", "")
+            if params_raw:
                 try:
-                    n = int(seq)
-                    grouped[et]["sequence"] = n if grouped[et]["sequence"] is None else min(grouped[et]["sequence"], n)
-                except ValueError:
-                    pass
-        ordered = sorted(grouped.values(), key=lambda e: (e["sequence"] is None, e["sequence"] or 0, e["event_type"]))
-        for i, event in enumerate(ordered, start=1):
-            event["sequence"] = i
-            events.append(event)
-        if not events:
-            raise ValueError("Transactional CSV contains no usable event_type values")
+                    params = json.loads(params_raw)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Row {row_number} ('{name}'): 'params' must be valid JSON: {exc}") from exc
+                if not isinstance(params, dict):
+                    raise ValueError(f"Row {row_number} ('{name}'): 'params' must be a JSON object")
+            else:
+                params = {}
 
-    return variables, field_order, events, inferred_key
+            variable = {
+                "name": name,
+                "dtype": "boolean" if dtype == "bool" else dtype,
+                "description": row.get("description", ""),
+                "gen": gen,
+                "params": params,
+                "depends_on": depends_on,
+                "nullable": row.get("nullable", "").lower() in _TRUE_STRINGS,
+            }
+            if gen == "formula":
+                formula = row.get("formula", "")
+                if not formula:
+                    raise ValueError(f"Row {row_number} ('{name}'): gen='formula' requires 'formula'")
+                variable["formula"] = formula
+
+            variables.append(variable)
+            field_order.append(name)
+            seen_names.add(name)
+            continue
+
+        # Event row
+        if type_of_data != "transactional":
+            raise ValueError(f"Row {row_number}: event rows are only allowed when typeOfData='transactional'")
+        event_type = (row.get("event_type") or row.get("name", "")).strip().upper().replace(" ", "_")
+        if not event_type:
+            raise ValueError(f"Row {row_number}: event row requires 'event_type'")
+
+        sequence_raw = row.get("sequence", "")
+        try:
+            sequence = int(sequence_raw) if sequence_raw else len(events_raw) + 1
+        except ValueError as exc:
+            raise ValueError(f"Row {row_number} ('{event_type}'): sequence must be an integer") from exc
+        if sequence < 1:
+            raise ValueError(f"Row {row_number} ('{event_type}'): sequence must be >= 1")
+
+        fields = [f.strip() for f in row.get("fields", "").split(";") if f.strip()]
+        events_raw.append({
+            "event_type": event_type,
+            "sequence": sequence,
+            "fields": fields,
+            "min_occurrences": row.get("min_occurrences", "1"),
+            "max_occurrences": row.get("max_occurrences", "10"),
+        })
+
+    if not variables:
+        raise ValueError("CSV must contain at least one variable row")
+
+    # Validate event references only after all variable rows have been read so
+    # event rows can appear anywhere in the CSV without creating a dependency
+    # on CSV row ordering. Variable dependencies themselves remain ordered.
+    if type_of_data == "aggregational" and events_raw:
+        raise ValueError("Aggregational CSV cannot contain event rows")
+
+    if type_of_data == "transactional":
+        seen_events: set[str] = set()
+        events: list[dict] = []
+        for event in sorted(events_raw, key=lambda e: (e["sequence"], e["event_type"])):
+            event_type = event["event_type"]
+            if event_type in seen_events:
+                raise ValueError(f"Duplicate event_type '{event_type}'")
+            seen_events.add(event_type)
+            missing_fields = [f for f in event["fields"] if f not in seen_names]
+            if missing_fields:
+                raise ValueError(
+                    f"Event '{event_type}' references undefined variable(s): {missing_fields}"
+                )
+            try:
+                min_occ = max(1, int(event["min_occurrences"]))
+                max_occ = max(min_occ, min(1000, int(event["max_occurrences"])))
+            except ValueError as exc:
+                raise ValueError(
+                    f"Event '{event_type}': min_occurrences/max_occurrences must be integers"
+                ) from exc
+            events.append({
+                "event_type": event_type,
+                "sequence": event["sequence"],
+                "fields": event["fields"],
+                "min_occurrences": min_occ,
+                "max_occurrences": max_occ,
+            })
+        if not events:
+            raise ValueError("Transactional CSV must contain at least one event row")
+        # Normalize sequences to 1..N while preserving requested order.
+        for index, event in enumerate(events, start=1):
+            event["sequence"] = index
+        return variables, field_order, events
+
+    return variables, field_order, []
