@@ -87,7 +87,7 @@ def compile_scenario(scenario_id: str, force: bool = False) -> CompiledScenario:
             )
             event_field_names.update(fields)
             min_occ = max(1, int(event.get("min_occurrences", 1)))
-            max_occ = max(min_occ, min(10, int(event.get("max_occurrences", 10))))
+            max_occ = max(min_occ, int(event.get("max_occurrences", 20)))
             compiled_events.append(CompiledEvent(event_type, sequence, fields, min_occ, max_occ))
 
         # Everything not explicitly owned by an event is stable entity/context data.

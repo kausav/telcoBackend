@@ -20,3 +20,6 @@ class WorkflowState(BaseModel):
     validation_report: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
     field_order: list[str] = Field(default_factory=list)
+    # Total generated occurrences per entity and event. Kept separately because
+    # transactional responses materialize only the latest 10 records.
+    transactional_event_counts: dict[str, dict[str, int]] = Field(default_factory=dict)
