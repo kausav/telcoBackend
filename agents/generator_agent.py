@@ -767,15 +767,23 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
         candidate_order.append(candidate_rows[idx])
 
     # Ensure distinct candidates if rounding produced duplicates.
-    seen_ids: set[int] = set()
-    candidate_order = [r for r in candidate_order if not (id(r) in seen_ids or seen_ids.add(id(r)))]
-    if len(candidate_order) < target_edge_records:
+    # De-duplicate the target list, but keep a separate set for rows already used
+    # successfully. Do not use the target-list set to exclude fallback candidates.
+    target_seen: set[int] = set()
+    unique_targets: list[dict] = []
+    for row in candidate_order:
+        rid = id(row)
+        if rid not in target_seen:
+            target_seen.add(rid)
+            unique_targets.append(row)
+    if len(unique_targets) < target_edge_records:
         for row in candidate_rows:
-            if id(row) not in seen_ids:
-                candidate_order.append(row)
-                seen_ids.add(id(row))
-            if len(candidate_order) == target_edge_records:
+            if id(row) not in target_seen:
+                unique_targets.append(row)
+                target_seen.add(id(row))
+            if len(unique_targets) == target_edge_records:
                 break
+    candidate_order = unique_targets
 
     success_count = 0
     used_edge_ids: set[int] = set()
@@ -821,7 +829,7 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
             # labelling a record whose condition is not satisfied.
             found = False
             for alternative in candidate_rows:
-                if id(alternative) in seen_ids or id(alternative) in used_edge_ids:
+                if id(alternative) in used_edge_ids:
                     continue
                 alt_entity_context, alt_entity_rows = row_to_entity[id(alternative)]
                 alt_candidate = _apply_edge_case_overrides(
@@ -843,7 +851,6 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                     alternative.clear()
                     alternative.update(alt_candidate)
                     alternative["isEdgeCaseData"] = True
-                    seen_ids.add(id(alternative))
                     used_edge_ids.add(id(alternative))
                     found = True
                     success_count += 1

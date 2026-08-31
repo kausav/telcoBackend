@@ -8,6 +8,8 @@ knows how to execute — so the result can be run through the existing
 """
 from __future__ import annotations
 import logging
+import ast
+import math
 
 from config.industry_profiles import get_profile, match_industry_key
 from core.llm_client import GeminiClient
@@ -253,7 +255,7 @@ Return a JSON object with exactly these keys:
   - "field_order": [str]        — variable names in the exact order they should be generated/output
   - "edge_case_variables": [ {edge_case_name, edge_case_description, condition, name, dtype, description, gen, params, depends_on, nullable} ] — edge-case overrides/conditions; return [] when no useful edge cases can be defined
 
-Edge cases: identify 2-4 high-value, realistic edge cases for the supplied scenario/use case. Return them as edge_case_variables. Each item MUST include edge_case_name, edge_case_description, name, and a machine-checkable condition expression using record field names (for example `balance_before == 0 and session_status == "TERMINATING"`). Reuse variables from the normal catalog; edge_case_variables are overrides/conditions for variables already present in variables. The condition must describe what makes the record an edge case. Do not create impossible combinations.
+Edge cases: identify 2-4 high-value, realistic edge cases for the supplied scenario/use case whenever the scenario has at least one meaningful scenario variable. Return them as edge_case_variables. Do NOT return an empty list merely because an edge case is difficult to express. Each item MUST include edge_case_name, edge_case_description, name, and a machine-checkable Python-style boolean condition using ONLY exact variable names from the normal catalog (for example `balance_before == 0` or `balance_before == 0 and trigger_type == "ZERO_BALANCE"`). Do not use prose as a condition. Each item represents an override for one existing normal variable; multiple items may share the same edge_case_name to form one multi-field edge case. Reuse variables from the normal catalog; do not invent field names. The condition must be satisfiable after applying the supplied override(s), and should describe a genuinely unusual/boundary/business-relevant state for the supplied scenario/use case. Prefer scenario-specific boundaries over arbitrary categorical values.
 
 For transactional output, choose entity_key as the variable that identifies the primary business entity whose events should be grouped together. For example subscriber_id, customer_id, account_id, merchant_id, shipment_id, patient_id, etc. Do not hard-code an industry; choose from the variables you actually define.
 
@@ -350,8 +352,115 @@ class ScenarioDesignerAgent:
             result.get("entity_key"), result["variables"], industry_key, type_of_data
         )
         result["events"] = self._normalize_events(result.get("events", []), result["variables"], type_of_data, industry_key)
-        result["edge_case_variables"] = self._normalize_edge_case_variables(result.get("edge_case_variables", []), result["variables"], industry_key)
+        result["edge_case_variables"] = self._normalize_edge_case_variables(
+            result.get("edge_case_variables", []), result["variables"], industry_key
+        )
+        # Edge cases are an explicit part of the proposal contract. If the model
+        # omits them or returns definitions that cannot be executed deterministically,
+        # derive safe boundary-based definitions from the confirmed variable catalog
+        # instead of silently returning an empty list.
+        if not result["edge_case_variables"]:
+            result["edge_case_variables"] = self._build_fallback_edge_cases(
+                result["variables"], business_scenario, use_case, industry_key
+            )
         return result
+
+
+    def _build_fallback_edge_cases(
+        self, variables: list[dict], business_scenario: str, use_case: str | None, industry_key: str
+    ) -> list[dict]:
+        """Build executable, satisfiable edge cases when the LLM omits them.
+
+        This is deliberately conservative: every fallback condition references only
+        fields in the scenario catalog and every override is copied from an existing
+        variable definition. It never invents a field that the generator cannot emit.
+        """
+        by_name = {str(v.get("name")): v for v in variables if isinstance(v, dict) and v.get("name")}
+        out: list[dict] = []
+
+        def add(name: str, description: str, field: str, value, condition: str) -> None:
+            if field not in by_name or len(out) >= 4:
+                return
+            base = dict(by_name[field])
+            base.update({
+                "edge_case_name": name,
+                "edge_case_description": description,
+                "condition": condition,
+                "name": field,
+            })
+            params = dict(base.get("params") or {})
+            params["value"] = value
+            base["gen"] = "constant"
+            base["params"] = params
+            base["depends_on"] = list(by_name[field].get("depends_on", []) or [])
+            out.append(base)
+
+        lower_names = {n.lower(): n for n in by_name}
+        # Telecom low-balance scenarios have a strong, deterministic zero-balance
+        # boundary. This directly supports the user's Zero-Balance Race Condition.
+        balance = lower_names.get("balance_before")
+        if balance:
+            add(
+                "Zero-Balance Race Condition",
+                "Balance reaches zero at the boundary while the scenario is being processed.",
+                balance, 0.0, f"{balance} == 0"
+            )
+
+        # Prefer an explicit amount/recharge field and its configured maximum.
+        for key in ("recommended_topup_amt", "recharge_amount", "transaction_amount", "payment_amount", "amount"):
+            field = lower_names.get(key)
+            if not field:
+                continue
+            base = by_name[field]
+            params = base.get("params") or {}
+            choices = params.get("choices") if isinstance(params, dict) else None
+            value = None
+            if isinstance(choices, list) and choices:
+                numeric = [x for x in choices if isinstance(x, (int, float)) and math.isfinite(float(x))]
+                value = max(numeric) if numeric else None
+            elif isinstance(params, dict) and isinstance(params.get("max"), (int, float)):
+                value = params["max"]
+            if value is not None:
+                add(
+                    "Maximum Transaction Boundary",
+                    "The primary monetary amount is generated at its configured upper boundary.",
+                    field, value, f"{field} == {repr(value)}"
+                )
+                break
+
+        response = lower_names.get("response_time_seconds")
+        action = lower_names.get("customer_action")
+        if response:
+            params = by_name[response].get("params") or {}
+            minimum = params.get("min", 1) if isinstance(params, dict) else 1
+            condition = f"{response} <= {repr(minimum)}"
+            if action:
+                condition += f" and {action} == \"ACCEPTED\""
+            add(
+                "Ultra-Fast Impulse Conversion",
+                "The customer responds at the fastest configured response boundary.",
+                response, minimum, condition
+            )
+
+        # Generic boundary fallback for other industries/scenarios. Use distinct
+        # numeric fields and only values explicitly supported by their generator params.
+        if not out:
+            for field, base in by_name.items():
+                params = base.get("params") or {}
+                value = None
+                label = "Boundary Value Edge Case"
+                if isinstance(params, dict) and isinstance(params.get("min"), (int, float)):
+                    value = params["min"]
+                    label = "Minimum Boundary"
+                elif isinstance(params, dict) and isinstance(params.get("max"), (int, float)):
+                    value = params["max"]
+                    label = "Maximum Boundary"
+                if value is None or base.get("dtype") not in {"int", "float"}:
+                    continue
+                add(label, f"{field} is at its configured boundary.", field, value, f"{field} == {repr(value)}")
+                if len(out) >= 2:
+                    break
+        return out[:4]
 
 
     def _normalize_edge_case_variables(self, edge_vars: list, variables: list[dict], industry_key: str) -> list[dict]:

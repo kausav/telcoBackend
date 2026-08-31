@@ -1,0 +1,6 @@
+record_type,name,dtype,description,gen,params,depends_on,nullable,formula,event_type,sequence,fields,min_occurrences,max_occurrences,edge_case_name,edge_case_description,condition,edge_case_percentage,value
+variable,subscriber_id,string,Unique subscriber identifier,prefixed_int,"{""prefix"":""SUB-"",""digits"":8}",,false,,,,,,,,,,,
+variable,balance,float,Current balance,uniform,"{""min"":0,""max"":500}",,false,,,,,,,,,,,
+variable,plan_type,categorical,Subscription type,weighted_choice,"{""choices"":[""prepaid"",""postpaid""],""weights"":[0.7,0.3]}",,false,,,,,,,,,,,
+edge_case_variable,balance,float,Zero balance edge override,constant,"{""value"":0}",,false,,,,,,,Zero-Balance,Balance reaches zero,balance == 0,,
+metadata,,,,,,,,,,,,,,,,,0.02,
