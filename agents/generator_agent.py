@@ -195,18 +195,32 @@ def _weighted_choice(params: dict, rec: dict):
 
 
 def _uniform(params: dict, _rec: dict) -> float:
-    return round(random.uniform(params["min"], params["max"]), 2)
+    lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
+    hi = _to_finite_float(params.get("max", params.get("hi")), lo)
+    if lo is None:
+        lo = 0.0
+    if hi is None:
+        hi = lo
+    return round(random.uniform(lo, max(lo, hi)), 2)
 
 
 def _lognormal(params: dict, _rec: dict) -> float:
-    raw = math.exp(random.gauss(params["mu"], params["sigma"]))
-    clipped = max(params["min"], min(params["max"], raw))
+    mu = _to_finite_float(params.get("mu"), 0.0)
+    sigma = _to_finite_float(params.get("sigma"), 1.0)
+    lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
+    hi = _to_finite_float(params.get("max", params.get("hi")), lo)
+    raw = math.exp(random.gauss(mu if mu is not None else 0.0, sigma if sigma is not None else 1.0))
+    clipped = max(lo if lo is not None else 0.0, min(hi if hi is not None else raw, raw))
     return round(clipped, 2)
 
 
 def _lognormal_int(params: dict, _rec: dict) -> int:
-    raw = int(math.exp(random.gauss(params["mu"], params["sigma"])))
-    return max(params["min"], min(params["max"], raw))
+    mu = _to_finite_float(params.get("mu"), 0.0)
+    sigma = _to_finite_float(params.get("sigma"), 1.0)
+    lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
+    hi = _to_finite_float(params.get("max", params.get("hi")), lo)
+    raw = int(math.exp(random.gauss(mu if mu is not None else 0.0, sigma if sigma is not None else 1.0)))
+    return int(max(lo if lo is not None else 0.0, min(hi if hi is not None else raw, raw)))
 
 
 def _beta(params: dict, _rec: dict) -> float:
@@ -835,51 +849,107 @@ def _recalculate_formulas(candidate: dict, variables: list[dict]) -> dict:
 
 
 def _condition_compatible_with_schema(expression: str, variables: list[dict]) -> bool:
-    """Check that at least one deterministic condition branch fits the schema."""
-    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    """Check whether an edge condition is structurally satisfiable by the schema.
+
+    This is deliberately *not* a check against the normal generator distribution.
+    Numeric min/max values describe normal data generation and an edge case is allowed
+    to sit outside that distribution.  Hard categorical/boolean domains are still
+    enforced.  Numeric-looking schema definitions are inferred as numeric even when
+    an upstream LLM/CSV accidentally labels the dtype as ``string``.
+
+    The function answers only: "can this expression be represented by these field
+    types/domains?" It does not try to prove a random generator will hit the value.
+    The generator itself constructs and validates the concrete record later.
+    """
+    by_name = {str(v.get("name")): v for v in variables if isinstance(v, dict) and v.get("name")}
     branches = _condition_branches(expression)
     if not branches:
         return False
+
+    def _kind(var: dict) -> str:
+        dtype = str(var.get("dtype", "string")).strip().lower()
+        params = var.get("params") if isinstance(var.get("params"), dict) else {}
+        choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+        # Schema data can arrive from Gemini/CSV with inconsistent dtype labels.
+        # Infer the semantic kind from an explicit choice/domain before falling back
+        # to min/max metadata.
+        if dtype in {"boolean", "bool"}:
+            return "boolean"
+        if dtype in {"int", "integer"}:
+            return "int"
+        if dtype in {"float", "number", "double", "decimal"}:
+            return "number"
+        if dtype == "categorical" or choices:
+            return "string"
+        lo, hi = params.get("min"), params.get("max")
+        if isinstance(lo, (int, float)) and not isinstance(lo, bool):
+            if isinstance(hi, (int, float)) and not isinstance(hi, bool):
+                return "number"
+        if dtype in {"datetime", "date", "timestamp"}:
+            return "datetime"
+        return "string"
+
+    def _compatible_value(var: dict, value: object, kind: str) -> bool:
+        if kind in {"int", "number"}:
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+        if kind == "boolean":
+            return isinstance(value, bool)
+        if kind == "datetime":
+            # Conditions may compare datetimes to ISO literals; equality and ordering
+            # are handled by the runtime evaluator. We only require a string literal.
+            return isinstance(value, str)
+        return isinstance(value, str)
+
     for branch in branches:
         ok = True
         for name, value in branch.items():
             if name == "__not_eq__":
                 field, forbidden = value
                 var = by_name.get(field)
-                if not var or var.get("formula"):
-                    ok = False; break
+                if not var:
+                    ok = False
+                    break
+                kind = _kind(var)
+                if not _compatible_value(var, forbidden, kind):
+                    ok = False
+                    break
                 params = var.get("params") if isinstance(var.get("params"), dict) else {}
                 choices = params.get("choices") if isinstance(params.get("choices"), list) else []
-                if choices and not any(str(c).strip().lower() != str(forbidden).strip().lower() for c in choices):
-                    ok = False; break
+                if choices and all(str(c).strip().lower() == str(forbidden).strip().lower() for c in choices):
+                    ok = False
+                    break
                 continue
+
             if name == "__not_in__":
                 field, forbidden = value
                 var = by_name.get(field)
-                if not var or var.get("formula"):
-                    ok = False; break
+                if not var:
+                    ok = False
+                    break
                 params = var.get("params") if isinstance(var.get("params"), dict) else {}
                 choices = params.get("choices") if isinstance(params.get("choices"), list) else []
-                if choices and not any(c not in forbidden for c in choices):
-                    ok = False; break
+                if choices and all(c in forbidden for c in choices):
+                    ok = False
+                    break
                 continue
+
             var = by_name.get(name)
             if not var:
-                ok = False; break
-            dtype = str(var.get("dtype", "string"))
-            params = var.get("params") if isinstance(var.get("params"), dict) else {}
-            if dtype in {"int", "float"} and isinstance(value, (int, float)) and not isinstance(value, bool):
-                try:
-                    min_value = params.get("min", params.get("lo"))
-                    max_value = params.get("max", params.get("hi"))
-                    if min_value is not None and float(value) < float(min_value): ok = False
-                    if max_value is not None and float(value) > float(max_value): ok = False
-                except (TypeError, ValueError):
-                    ok = False
-            choices = params.get("choices") if isinstance(params.get("choices"), list) else []
-            if choices and str(value).strip().lower() not in {str(c).strip().lower() for c in choices}:
                 ok = False
-            if not ok: break
+                break
+            kind = _kind(var)
+            if not _compatible_value(var, value, kind):
+                ok = False
+                break
+
+            # Only categorical/choice domains are hard. Normal numeric min/max is not
+            # an edge-case ceiling/floor.
+            if kind == "string":
+                params = var.get("params") if isinstance(var.get("params"), dict) else {}
+                choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+                if choices and str(value).strip().lower() not in {str(c).strip().lower() for c in choices}:
+                    ok = False
+                    break
         if ok:
             return True
     return False

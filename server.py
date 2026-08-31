@@ -526,9 +526,10 @@ def confirm_scenario_route(req: ConfirmRequest):
             variable_by_name[name] = promoted
 
     # Validate every configured edge condition against the canonical schema before
-    # persisting the scenario. This catches impossible definitions (for example
-    # latency > 180 when the declared maximum is 180) at confirm time instead of
-    # producing a /scenario/generate 500 later.
+    # persisting the scenario. Normal numeric min/max values describe the ordinary
+    # generation distribution; explicit edge-case conditions are allowed to target
+    # values outside that ordinary range. Hard categorical/boolean domains and
+    # undefined fields are still rejected here.
     edge_groups_for_validation: dict[str, dict] = {}
     for item in edge_case_variables:
         group_name = str(item.get("edge_case_name") or "Scenario Edge Case")
