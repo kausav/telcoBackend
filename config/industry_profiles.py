@@ -29,30 +29,35 @@ COUNTRY_BASE: dict[str, dict] = {
         "currency": "USD",
         "phone_country_code": "+1",
         "phone_format": "Generic E.164-style mobile number (no specific national numbering plan enforced)",
+        "payment_methods": ["credit_card", "debit_card", "bank_transfer", "digital_wallet", "cash"],
     },
     "US": {
         "country_name": "United States",
         "currency": "USD",
         "phone_country_code": "+1",
         "phone_format": "NANP: +1 followed by 3-digit area code (200-999) + 3-digit exchange (200-999) + 4-digit line number",
+        "payment_methods": ["credit_card", "debit_card", "bank_account", "bank_transfer", "ach", "digital_wallet", "paypal", "cash"],
     },
     "IN": {
         "country_name": "India",
         "currency": "INR",
         "phone_country_code": "+91",
         "phone_format": "10-digit mobile number starting with 6, 7, 8, or 9 (no leading 0 in E.164 form)",
+        "payment_methods": ["upi", "credit_card", "debit_card", "net_banking", "bank_transfer", "digital_wallet", "cash", "cod"],
     },
     "GB": {
         "country_name": "United Kingdom",
         "currency": "GBP",
         "phone_country_code": "+44",
         "phone_format": "UK mobile: +44 followed by 10 digits, first digit 7 (e.g. 7xxx xxxxxx)",
+        "payment_methods": ["credit_card", "debit_card", "bank_transfer", "direct_debit", "digital_wallet", "paypal", "cash"],
     },
     "AE": {
         "country_name": "United Arab Emirates",
         "currency": "AED",
         "phone_country_code": "+971",
         "phone_format": "+971 5X XXX XXXX (mobile prefixes 50, 52, 54, 55, 56, 58)",
+        "payment_methods": ["credit_card", "debit_card", "bank_transfer", "digital_wallet", "cash"],
     },
 }
 
@@ -128,6 +133,7 @@ _GENERIC_NOTES = {
     "product_types": ["Standard Product", "Premium Product"],
     "identity_notes": "No specific identity/KYC convention modeled (country not specified)",
     "typical_denominations": [10.00, 25.00, 50.00, 100.00],
+    "payment_methods": ["credit_card", "debit_card", "bank_transfer", "digital_wallet", "cash"],
 }
 
 
@@ -139,6 +145,33 @@ def match_industry_key(industry: str | None) -> str:
         if known in key or key in known:
             return known
     return DEFAULT_INDUSTRY
+
+
+def payment_methods_for_profile(profile: dict) -> list[str]:
+    """Return country-appropriate payment methods for generation/validation.
+
+    Values are normalized to lowercase snake_case so they can be compared against
+    generator choices such as ``UPI`` or ``CREDIT_CARD``.
+    """
+    return list(profile.get("payment_methods", _GENERIC_NOTES["payment_methods"]))
+
+
+def country_allowed_value(field_name: str, value, profile: dict):
+    """Return True when a value is compatible with a known country-sensitive field.
+
+    Unknown fields are left alone. This deliberately avoids pretending that every
+    categorical field is country-specific.
+    """
+    if value is None:
+        return True
+    name = str(field_name or "").strip().lower()
+    normalized = str(value).strip().lower().replace(" ", "_").replace("-", "_")
+    if "currency" in name:
+        currency = str(profile.get("currency", "")).strip().lower()
+        return normalized in {currency, profile.get("currency", "").upper().lower()}
+    if "payment" in name or "pay_method" in name or name in {"payment_method", "payment_method_type"}:
+        return normalized in {m.lower().replace(" ", "_").replace("-", "_") for m in payment_methods_for_profile(profile)}
+    return True
 
 
 def get_profile(industry: str | None, country: str | None) -> dict:

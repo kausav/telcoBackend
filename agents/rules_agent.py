@@ -65,6 +65,7 @@ class RulesAgent:
             f"Description: {sc['description']}\n"
             f"Target industry: {profile['industry']}; country: {profile['country_name']} ({state.country})\n"
             f"Currency: {profile['currency']}; Regulator: {profile['regulator']}\n"
+            f"Country-appropriate payment methods: {profile.get('payment_methods', [])}\n"
             f"Market character: {profile['market_character']}\n"
             f"Output data type: {state.type_of_data}\n"
             f"Transactional events: {sc.get('events', [])}\n"

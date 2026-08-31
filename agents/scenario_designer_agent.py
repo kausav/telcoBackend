@@ -315,6 +315,7 @@ class ScenarioDesignerAgent:
             f"Target country: {profile['country_name']} ({country or 'not specified'})\n"
             f"Regulator: {profile['regulator']}\n"
             f"Currency: {profile['currency']}\n"
+            f"Country-appropriate payment methods: {profile.get('payment_methods', [])}\n"
             f"Phone country code: {profile['phone_country_code']}; format: {profile['phone_format']}\n"
             f"Market character: {profile['market_character']}\n"
             f"Typical product/plan types in this industry+country: {profile['product_types']}\n"

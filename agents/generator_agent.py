@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from core.dynamic_scenarios import resolve_variables, resolve_events, resolve_entity_key
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
+from config.industry_profiles import get_profile, country_allowed_value, payment_methods_for_profile
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +47,33 @@ def _e164_phone(params: dict, _rec: dict) -> str:
     return f"{cc}{npa}{nxx}{xxxx}"
 
 
-def _constant(params: dict, _rec: dict):
+def _constant(params: dict, rec: dict):
+    field_name = str(rec.get("__current_field__", "")).lower()
+    profile = rec.get("__country_profile__")
+    if profile and "currency" in field_name:
+        return profile.get("currency", params.get("value"))
     return params["value"]
 
 
-def _weighted_choice(params: dict, _rec: dict):
-    return random.choices(params["choices"], weights=params["weights"], k=1)[0]
+def _weighted_choice(params: dict, rec: dict):
+    choices = list(params.get("choices", []))
+    weights = list(params.get("weights", []))
+    field_name = str(rec.get("__current_field__", ""))
+    profile = rec.get("__country_profile__")
+    if profile and ("payment" in field_name.lower() or "pay_method" in field_name.lower()):
+        allowed = {m.lower().replace(" ", "_").replace("-", "_") for m in payment_methods_for_profile(profile)}
+        filtered = [(c, w) for c, w in zip(choices, weights) if str(c).strip().lower().replace(" ", "_").replace("-", "_") in allowed]
+        if filtered:
+            choices, weights = zip(*filtered)
+            choices, weights = list(choices), list(weights)
+        elif allowed:
+            choices = payment_methods_for_profile(profile)
+            weights = [1.0] * len(choices)
+    if not choices:
+        return None
+    if len(weights) != len(choices) or sum(weights) <= 0:
+        weights = [1.0] * len(choices)
+    return random.choices(choices, weights=weights, k=1)[0]
 
 
 def _uniform(params: dict, _rec: dict) -> float:
@@ -329,14 +351,17 @@ def get_known_generator_types() -> set[str]:
     return set(_GENERATORS.keys())
 
 
-def _generate_record(variables: list[dict]) -> dict:
+def _generate_record(variables: list[dict], profile: dict | None = None) -> dict:
     """Generate one record by resolving variables in dependency order."""
     rec: dict = {}
     for var in variables:
         gen_type = var["gen"]
         generator = _GENERATORS.get(gen_type)
         if generator:
-            rec[var["name"]] = generator(var, rec)
+            helper_rec = dict(rec)
+            helper_rec["__current_field__"] = var["name"]
+            helper_rec["__country_profile__"] = profile
+            rec[var["name"]] = generator(var, helper_rec)
         else:
             rec[var["name"]] = None
     return rec
@@ -346,6 +371,7 @@ def _generate_selected_record(
     variables: list[dict],
     selected_names: set[str],
     base: dict | None = None,
+    profile: dict | None = None,
 ) -> dict:
     """Generate only selected variables (plus their declared dependencies).
 
@@ -373,7 +399,14 @@ def _generate_selected_record(
         if name not in required or name in rec:
             continue
         generator = _GENERATORS.get(var["gen"])
-        rec[name] = generator(var, rec) if generator else None
+        if generator:
+            helper_rec = dict(rec)
+            helper_rec["__current_field__"] = name
+            helper_rec["__country_profile__"] = profile
+            value = generator(var, helper_rec)
+        else:
+            value = None
+        rec[name] = value
     return rec
 
 
@@ -394,7 +427,7 @@ def _journey_id() -> str:
     return f"JRN-{uuid.uuid4().hex[:12].upper()}"
 
 
-def _transactional_records(compiled, journey_count: int, event_counts_out: dict[str, dict[str, int]] | None = None) -> list[dict]:
+def _transactional_records(compiled, journey_count: int, event_counts_out: dict[str, dict[str, int]] | None = None, profile: dict | None = None) -> list[dict]:
     """Fast transactional generation.
 
     Important optimization: the requested count represents entities, but the API only
@@ -421,7 +454,7 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
     # Generate the response window in natural order so the last generated entity is last.
     for entity_index in range(response_entity_count):
         # Static variables not owned by an event form the entity context.
-        entity_context = _generate_selected_record(variables, set(compiled.entity_fields))
+        entity_context = _generate_selected_record(variables, set(compiled.entity_fields), profile=profile)
 
         # Ensure the grouping key is unique where a generator can collide.
         if entity_key and entity_key in entity_context:
@@ -460,6 +493,7 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                     variables,
                     set(event.fields),
                     base=entity_context,
+                    profile=profile,
                 )
 
                 row["journey_id"] = journey_id
@@ -491,7 +525,8 @@ class DataGeneratorAgent:
             compiled = compile_scenario(state.scenario)
             entity_key = compiled.entity_key
             state.transactional_event_counts = {}
-            records = _transactional_records(compiled, state.count, state.transactional_event_counts)
+            profile = get_profile(state.industry, state.country)
+            records = _transactional_records(compiled, state.count, state.transactional_event_counts, profile=profile)
             state.field_order = [
                 "journey_id", "transaction_id", "event_type", "event_sequence",
                 "event_occurrence", "event_timestamp",
@@ -502,7 +537,8 @@ class DataGeneratorAgent:
             )
         else:
             state.field_order = FIELD_ORDER
-            records = [_generate_record(variables) for _ in range(state.count)]
+            profile = get_profile(state.industry, state.country)
+            records = [_generate_record(variables, profile=profile) for _ in range(state.count)]
             logger.info("[DataGenerator] Generated %d aggregational records with %d fields each.",
                         len(records), len(variables))
 

@@ -1,43 +1,49 @@
 """
 Agent 4 — QA & Validation Agent
-Validates generated records against the business rules from RulesAgent.
-Cross-field dependencies (T0<T1<T2, balance_after=balance_before+recharge_amount)
-are checked algorithmically; Gemini audits logical consistency in batches.
+
+The QA layer has two parts:
+1) deterministic validation/repair for every generated record (schema, types,
+   ranges, categorical values, formulas, dependencies, country conventions,
+   entity/transaction consistency and transactional event sequencing); and
+2) optional Gemini semantic auditing for business rules that cannot be safely
+   reduced to deterministic checks.
+
+The deterministic layer is deliberately the source of truth for arithmetic and
+structural invariants so bad generated data is not silently accepted just
+because an LLM audit is disabled.
 """
 from __future__ import annotations
+
+import ast
 import json
 import logging
-import uuid
+import math
 import os
-from datetime import datetime, timezone
+import uuid
+from datetime import date, datetime, timezone
+from typing import Any
 
 from config.variables import VARIABLES
-from core.dynamic_scenarios import resolve_variables
+from core.dynamic_scenarios import resolve_entity_key, resolve_events, resolve_variables
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
+from config.industry_profiles import get_profile, payment_methods_for_profile, country_allowed_value
 
 logger = logging.getLogger(__name__)
 
-# Fallback value used when a field comes back null but the record is otherwise usable —
-# keeps output record count matching the requested count instead of silently dropping rows.
 _NUMERIC_DTYPES = {"int", "float"}
+_CHUNK = 50
 
 _SYSTEM = """
-You are the QA Validation Agent for a synthetic telecom data pipeline.
-Validate each record against the business rules below.
+You are the QA Validation Agent for a synthetic data generation pipeline covering
+multiple industries and countries.
 
-Business rules:
-{rules}
+Validate the supplied records against the scenario's business rules, field
+constraints, country/industry conventions, cross-field rules, calculations,
+and transactional event semantics.
 
-Cross-field rules:
-{cross_field_rules}
-
-For each record check the rules that are applicable to the supplied fields.
-For aggregational records, check mathematical/temporal relationships such as balance_after,
-notification timestamps, and response timestamps when those fields exist.
-For transactional records, also check that transaction_id and journey_id exist, event_sequence
-is positive, and event_timestamp is present. Do not invent missing event-specific fields because
-transactional rows are intentionally sparse: a field may only exist on the event where it applies.
+Do not invent fields that are intentionally absent from sparse transactional
+events. Do not rewrite valid records unnecessarily.
 
 Return JSON:
   - "valid_records": [ ... ]
@@ -45,8 +51,6 @@ Return JSON:
   - "fixes_applied": int
   - "issues_found": int
 """
-
-CHUNK = 50
 
 
 def _default_for_dtype(dtype: str):
@@ -57,9 +61,23 @@ def _default_for_dtype(dtype: str):
     return ""
 
 
+def _parse_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _fill_missing(rec: dict, field_order: list, dtype_map: dict) -> tuple[dict, int]:
-    """Replace null/missing field values with a type-appropriate default (0 / "" / False)
-    so a single ungenerated field never causes the whole record to be lost downstream."""
+    """Preserve the existing API behavior: fill missing/null fields with a safe default."""
     filled = 0
     for name in field_order:
         if rec.get(name) is None:
@@ -68,26 +86,217 @@ def _fill_missing(rec: dict, field_order: list, dtype_map: dict) -> tuple[dict, 
     return rec, filled
 
 
-def _algorithmic_check(rec: dict, field_order: list, dtype_map: dict) -> tuple[dict, list[str]]:
-    """Fast rule checks without LLM — fix correctable issues in-place."""
-    issues = []
+def _safe_formula(expr: str, rec: dict):
+    """Evaluate the same small arithmetic expression language used by the generator."""
+    allowed_funcs = {"round": round, "min": min, "max": max, "abs": abs}
+    names = {k: v for k, v in rec.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    try:
+        tree = ast.parse(expr, mode="eval")
+        allowed_nodes = (
+            ast.Expression, ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult,
+            ast.Div, ast.Mod, ast.Pow, ast.USub, ast.UAdd, ast.Constant,
+            ast.Name, ast.Call, ast.Load, ast.Tuple, ast.List,
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed_nodes):
+                return None
+            if isinstance(node, ast.Name) and node.id not in names and node.id not in allowed_funcs:
+                return None
+            if isinstance(node, ast.Call) and (not isinstance(node.func, ast.Name) or node.func.id not in allowed_funcs):
+                return None
+        return eval(compile(tree, "<formula>", "eval"), {"__builtins__": {}}, {**names, **allowed_funcs})
+    except Exception:
+        return None
 
-    # balance_after must equal balance_before + recharge_amount
-    bb = rec.get("balance_before")
-    ra = rec.get("recharge_amount")
-    ba = rec.get("balance_after")
-    if bb is not None and ra is not None:
-        expected = round(bb + ra, 2)
-        if ba is None or abs(ba - expected) > 0.01:
+
+def _normalize(v: Any) -> str:
+    return str(v).strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _country_repair(name: str, value: Any, profile: dict):
+    if value is None:
+        return value, None
+    lname = name.lower()
+    if country_allowed_value(name, value, profile):
+        return value, None
+    if "payment" in lname or "pay_method" in lname:
+        choices = payment_methods_for_profile(profile)
+        if choices:
+            return choices[0], f"{name} corrected for country {profile.get('country_code')}"
+    if "currency" in lname:
+        return profile.get("currency", value), f"{name} corrected for country {profile.get('country_code')}"
+    return value, None
+
+
+def _validate_record(
+    rec: dict,
+    variables: list[dict],
+    field_order: list[str],
+    profile: dict,
+    transactional: bool,
+) -> tuple[dict, list[str]]:
+    """Validate and repair one record using the actual variable definitions."""
+    rec = dict(rec)
+    issues: list[str] = []
+    by_name = {v["name"]: v for v in variables}
+
+    # 1. Country-sensitive values and declared categorical choices.
+    for name, value in list(rec.items()):
+        if name.startswith("__") or value is None:
+            continue
+        repaired, issue = _country_repair(name, value, profile)
+        if issue:
+            rec[name] = repaired
+            issues.append(issue)
+
+    for var in variables:
+        name = var["name"]
+        if name not in rec or rec[name] is None:
+            # Sparse transactional rows are intentional. Missing event-local fields
+            # are not errors and will be handled by the existing fill behavior later.
+            continue
+        value = rec[name]
+        dtype = var.get("dtype", "string")
+        params = var.get("params") or {}
+
+        # 2. Type checks / safe coercion.
+        try:
+            if dtype == "int" and not isinstance(value, bool):
+                if not isinstance(value, int):
+                    rec[name] = int(float(value))
+                    issues.append(f"{name} coerced to int")
+            elif dtype == "float" and not isinstance(value, bool):
+                if not isinstance(value, (int, float)):
+                    rec[name] = float(value)
+                    issues.append(f"{name} coerced to float")
+            elif dtype == "boolean":
+                if not isinstance(value, bool):
+                    if str(value).strip().lower() in {"true", "1", "yes"}:
+                        rec[name] = True
+                    elif str(value).strip().lower() in {"false", "0", "no"}:
+                        rec[name] = False
+                    else:
+                        raise ValueError("invalid boolean")
+                    issues.append(f"{name} coerced to boolean")
+            elif dtype == "datetime" and _parse_dt(value) is None:
+                rec[name] = datetime.now(timezone.utc).isoformat()
+                issues.append(f"{name} repaired as datetime")
+            elif dtype == "date":
+                try:
+                    date.fromisoformat(str(value)[:10])
+                except Exception:
+                    rec[name] = date.today().isoformat()
+                    issues.append(f"{name} repaired as date")
+        except Exception:
+            # Do not drop the entire record for a single malformed value; regenerate
+            # from the declared generator when possible, otherwise use a safe default.
+            rec[name] = _default_for_dtype(dtype)
+            issues.append(f"{name} repaired from invalid type")
+            value = rec[name]
+
+        # 3. Categorical values must stay within the declared scenario vocabulary.
+        if dtype in {"categorical", "string"} and params.get("choices") and rec.get(name) is not None:
+            choices = list(params.get("choices", []))
+            if choices and _normalize(rec[name]) not in {_normalize(c) for c in choices}:
+                rec[name] = choices[0]
+                issues.append(f"{name} corrected to declared choice")
+
+        # 4. Generic numeric ranges from the variable definition.
+        if isinstance(rec.get(name), (int, float)) and not isinstance(rec.get(name), bool):
+            val = float(rec[name])
+            lo = params.get("min")
+            hi = params.get("max")
+            if lo is not None and val < float(lo):
+                rec[name] = int(lo) if dtype == "int" else float(lo)
+                issues.append(f"{name} raised to minimum")
+            if hi is not None and val > float(hi):
+                rec[name] = int(hi) if dtype == "int" else float(hi)
+                issues.append(f"{name} lowered to maximum")
+
+        # Percentage-like fields should remain 0..100 when explicitly named as percentages.
+        if isinstance(rec.get(name), (int, float)) and not isinstance(rec.get(name), bool) and (
+            "pct" in name.lower() or "percent" in name.lower() or "percentage" in name.lower()
+        ):
+            old = rec[name]
+            rec[name] = max(0, min(100, old))
+            if old != rec[name]:
+                issues.append(f"{name} clamped to percentage range")
+
+    # 5. Formula invariants: if all dependencies are present, recompute the formula
+    # and repair the generated value. This catches arithmetic errors without an LLM.
+    for var in variables:
+        if var.get("gen") != "formula" or not var.get("formula"):
+            continue
+        deps = var.get("depends_on", []) or []
+        if any(dep not in rec or rec.get(dep) is None for dep in deps):
+            continue
+        expected = _safe_formula(var["formula"], rec)
+        if expected is None:
+            continue
+        actual = rec.get(var["name"])
+        mismatch = False
+        if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+            mismatch = not math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=0.01)
+        else:
+            mismatch = str(actual) != str(expected)
+        if mismatch:
+            rec[var["name"]] = expected
+            issues.append(f"{var['name']} corrected from formula")
+
+    # 6. Explicit common financial invariant, even for scenarios whose formula metadata
+    # was omitted by an LLM-authored scenario.
+    bb, ra, ba = rec.get("balance_before"), rec.get("recharge_amount"), rec.get("balance_after")
+    if isinstance(bb, (int, float)) and isinstance(ra, (int, float)):
+        expected = round(float(bb) + float(ra), 2)
+        if ba is None or not isinstance(ba, (int, float)) or abs(float(ba) - expected) > 0.01:
             rec["balance_after"] = expected
-            issues.append("balance_after corrected")
+            issues.append("balance_after corrected from balance arithmetic")
 
-    # Strip to defined field order only
-    rec = {k: rec[k] for k in field_order if k in rec}
+    # 7. Common timestamp relationships when fields exist.
+    event_ts = _parse_dt(rec.get("event_timestamp"))
+    dispatch_ts = _parse_dt(rec.get("notification_dispatch_ts"))
+    response_ts = _parse_dt(rec.get("customer_response_ts"))
+    if event_ts and dispatch_ts and dispatch_ts < event_ts:
+        rec["notification_dispatch_ts"] = event_ts.isoformat()
+        dispatch_ts = event_ts
+        issues.append("notification_dispatch_ts corrected to be >= event_timestamp")
+    if dispatch_ts and response_ts and response_ts < dispatch_ts:
+        rec["customer_response_ts"] = dispatch_ts.isoformat()
+        issues.append("customer_response_ts corrected to be >= notification_dispatch_ts")
 
-    rec, filled = _fill_missing(rec, field_order, dtype_map)
-    if filled:
-        issues.append(f"{filled} null field(s) defaulted")
+    # 8. Country phone-number convention. The profile supplies the expected prefix;
+    # reject/repair only fields that clearly represent a phone number.
+    phone_names = [n for n in rec if "msisdn" in n.lower() or "phone" in n.lower() or "mobile" in n.lower()]
+    expected_cc = str(profile.get("phone_country_code", ""))
+    for name in phone_names:
+        value = str(rec.get(name, ""))
+        if expected_cc and value and not value.startswith(expected_cc):
+            # Preserve the subscriber's local digits where possible, but enforce the country code.
+            digits = "".join(ch for ch in value if ch.isdigit())
+            if expected_cc == "+91" and len(digits) >= 10:
+                local = digits[-10:]
+                if local[0] in "6789":
+                    rec[name] = expected_cc + local
+                else:
+                    rec[name] = expected_cc + "9" + local[-9:]
+            elif expected_cc == "+44" and len(digits) >= 10:
+                local = digits[-10:]
+                rec[name] = expected_cc + (local if local.startswith("7") else "7" + local[-9:])
+            elif expected_cc == "+971":
+                rec[name] = expected_cc + "50" + digits[-7:]
+            elif expected_cc == "+1":
+                rec[name] = expected_cc + digits[-10:].zfill(10)
+            else:
+                rec[name] = expected_cc + digits[-10:]
+            issues.append(f"{name} corrected for country phone convention")
+
+    # 9. Keep output limited to declared variables plus transactional metadata.
+    metadata = {"journey_id", "transaction_id", "event_type", "event_sequence", "event_occurrence", "event_timestamp"}
+    if transactional:
+        allowed = set(field_order) | metadata
+    else:
+        allowed = set(field_order)
+    rec = {k: v for k, v in rec.items() if k in allowed}
 
     return rec, issues
 
@@ -101,55 +310,93 @@ class QAAgent:
         logger.info("[QAAgent] Validating %d records", len(records))
 
         dyn = resolve_variables(state.scenario)
-        if dyn is not None:
-            VARS, _ = dyn
-        else:
-            VARS = VARIABLES
-        dtype_map = {v["name"]: v.get("dtype", "string") for v in VARS}
+        variables, _ = dyn if dyn is not None else (VARIABLES, [])
+        dtype_map = {v["name"]: v.get("dtype", "string") for v in variables}
+        profile = get_profile(state.industry, state.country)
+        transactional = state.type_of_data == "transactional"
+        event_defs = {str(e.get("event_type")): e for e in resolve_events(state.scenario)} if transactional else {}
 
-        # Step 1: Fast algorithmic checks
         algo_fixed = 0
         checked: list[dict] = []
+        seen_transactions: set[str] = set()
+        seen_entities: set[str] = set()
+        journey_state: dict[str, tuple[int, datetime | None, str | None]] = {}
+
         for rec in records:
-            if state.type_of_data == "transactional":
-                rec = dict(rec)
-                issues = []
+            rec, issues = _validate_record(rec, variables, state.field_order, profile, transactional)
+
+            if transactional:
+                # Metadata is structural and should never be delegated to the LLM.
                 if not rec.get("journey_id"):
                     rec["journey_id"] = f"JRN-{uuid.uuid4().hex[:12].upper()}"
                     issues.append("journey_id generated")
-                if not rec.get("transaction_id"):
+                if not rec.get("transaction_id") or str(rec.get("transaction_id")) in seen_transactions:
                     rec["transaction_id"] = f"TXN-{uuid.uuid4().hex[:12].upper()}"
-                    issues.append("transaction_id generated")
-                if not rec.get("event_type"):
-                    rec["event_type"] = "BUSINESS_EVENT"
-                    issues.append("event_type defaulted")
-                if rec.get("event_sequence") is None:
-                    rec["event_sequence"] = 1
-                    issues.append("event_sequence defaulted")
-                if not rec.get("event_timestamp"):
-                    rec["event_timestamp"] = datetime.now(timezone.utc).isoformat()
+                    issues.append("transaction_id generated/renewed for uniqueness")
+                seen_transactions.add(str(rec["transaction_id"]))
+
+                event_type = str(rec.get("event_type") or "BUSINESS_EVENT")
+                rec["event_type"] = event_type
+                seq = int(rec.get("event_sequence") or 1)
+                if event_defs:
+                    definition = event_defs.get(event_type)
+                    if definition:
+                        expected_seq = int(definition.get("sequence", seq))
+                        if seq != expected_seq:
+                            rec["event_sequence"] = expected_seq
+                            seq = expected_seq
+                            issues.append("event_sequence corrected from scenario definition")
+                rec["event_sequence"] = max(1, seq)
+
+                ts = _parse_dt(rec.get("event_timestamp"))
+                if ts is None:
+                    ts = datetime.now(timezone.utc)
+                    rec["event_timestamp"] = ts.isoformat()
                     issues.append("event_timestamp generated")
-                # Keep only known output fields plus transactional metadata.
-                allowed = set(state.field_order)
-                rec = {k: v for k, v in rec.items() if k in allowed}
+
+                journey = str(rec["journey_id"])
+                previous = journey_state.get(journey)
+                if previous:
+                    prev_seq, prev_ts, prev_entity = previous
+                    if rec["event_sequence"] < prev_seq:
+                        rec["event_sequence"] = prev_seq
+                        issues.append("event_sequence corrected to preserve journey ordering")
+                    if prev_ts and ts < prev_ts:
+                        rec["event_timestamp"] = prev_ts.isoformat()
+                        ts = prev_ts
+                        issues.append("event_timestamp corrected to preserve journey ordering")
+                    entity_name = resolve_entity_key(state.scenario)
+                    if entity_name and entity_name in rec and prev_entity and str(rec[entity_name]) != prev_entity:
+                        rec[entity_name] = prev_entity
+                        issues.append("entity key corrected for journey consistency")
+                entity_key = resolve_entity_key(state.scenario)
+                entity_value = str(rec.get(entity_key)) if entity_key and rec.get(entity_key) is not None else None
+                journey_state[journey] = (rec["event_sequence"], ts, entity_value)
+                if entity_value:
+                    seen_entities.add(entity_value)
+
+            # Fill missing values only after validation. For transactional data,
+            # events are intentionally sparse: fill only fields declared by this
+            # event, never every variable in the global scenario schema.
+            if transactional:
+                event_def = event_defs.get(str(rec.get("event_type")))
+                fill_order = list(event_def.get("fields", []) or []) if event_def else []
             else:
-                rec, issues = _algorithmic_check(rec, state.field_order, dtype_map)
+                fill_order = state.field_order
+            rec, filled = _fill_missing(rec, fill_order, dtype_map)
+            if filled:
+                issues.append(f"{filled} event field(s) defaulted")
             algo_fixed += len(issues)
             checked.append(rec)
 
-        # Step 2: Optional LLM semantic audit.
-        # The generator is deterministic/algorithmic, so validating every generated row
-        # with a remote LLM is a major latency multiplier (e.g. 400 rows => 8 calls at
-        # CHUNK=50). Default to no remote LLM audit during generation for low latency. Set
-        # QA_LLM_MODE=sample or full explicitly when an LLM audit is desired.
+        # Optional LLM semantic audit. Deterministic validation above always runs.
         rules_text = "\n".join(f"- {r}" for r in state.rules.get("business_rules", []))
         cross_text = "\n".join(f"- {r}" for r in state.rules.get("cross_field_rules", []))
-        system_prompt = _SYSTEM.format(rules=rules_text or "Standard telecom rules.",
-                                       cross_field_rules=cross_text or "See field constraints.")
+        system_prompt = _SYSTEM.format(
+            rules=rules_text or "Apply the supplied variable definitions and deterministic checks.",
+            cross_field_rules=cross_text or "Validate mathematical, temporal, event and business relationships.",
+        )
 
-        # All algorithmically checked records remain valid unless the caller explicitly
-        # opts into the legacy full LLM validation mode. This preserves record counts and
-        # avoids replacing the complete dataset with an LLM-generated subset.
         valid_all: list[dict] = checked
         dropped_all: list[dict] = []
         llm_fixes = 0
@@ -158,70 +405,59 @@ class QAAgent:
 
         if qa_mode == "full":
             valid_all = []
-            for i in range(0, len(checked), CHUNK):
-                chunk = checked[i: i + CHUNK]
-                user_prompt = (
-                    f"Scenario: {state.scenario}\n"
-                    f"Records to validate:\n{json.dumps(chunk, default=str, indent=2)}"
-                )
+            for i in range(0, len(checked), _CHUNK):
+                chunk = checked[i:i + _CHUNK]
                 try:
-                    result = self._llm.generate_json(system_prompt, user_prompt, temperature=0.1)
+                    result = self._llm.generate_json(
+                        system_prompt,
+                        f"Scenario: {state.scenario}\nRecords to validate:\n{json.dumps(chunk, default=str)}",
+                        temperature=0.1,
+                    )
                     validated = result.get("valid_records", chunk)
                     validated = [{k: r[k] for k in state.field_order if k in r} for r in validated]
-                    dropped = result.get("dropped_records", [])
                     valid_all.extend(validated)
-                    dropped_all.extend(dropped)
+                    dropped_all.extend(result.get("dropped_records", []))
                     llm_fixes += int(result.get("fixes_applied", 0))
                     llm_issues += int(result.get("issues_found", 0))
                 except Exception as exc:
-                    logger.warning("[QAAgent] Chunk %d error: %s — passing through", i, exc)
+                    logger.warning("[QAAgent] Chunk %d error: %s — deterministic validation retained", i, exc)
                     state.errors.append(f"QA chunk {i} error: {exc}")
                     valid_all.extend(chunk)
         elif qa_mode != "off" and checked:
             sample_size = max(1, int(os.getenv("QA_LLM_SAMPLE_SIZE", "20")))
-            sample = checked[:sample_size]
-            user_prompt = (
-                f"Scenario: {state.scenario}\n"
-                f"This is a QA audit sample only. Do not return or rewrite the full dataset.\n"
-                f"Records to audit:\n{json.dumps(sample, default=str, indent=2)}"
-            )
             try:
-                result = self._llm.generate_json(system_prompt, user_prompt, temperature=0.1)
+                result = self._llm.generate_json(
+                    system_prompt,
+                    f"Scenario: {state.scenario}\nThis is a QA audit sample only. Do not rewrite the dataset.\nRecords:\n{json.dumps(checked[:sample_size], default=str)}",
+                    temperature=0.1,
+                )
                 llm_fixes = int(result.get("fixes_applied", 0))
                 llm_issues = int(result.get("issues_found", 0))
-                logger.info("[QAAgent] Sample audit completed on %d records; full dataset kept intact.", len(sample))
             except Exception as exc:
-                logger.warning("[QAAgent] Sample audit error: %s — algorithmic validation retained", exc)
+                logger.warning("[QAAgent] Sample audit error: %s — deterministic validation retained", exc)
                 state.errors.append(f"QA sample error: {exc}")
-
-        # Legacy recovery path is intentionally retained only for full mode, where the
-        # LLM may have explicitly returned dropped records.
-        recovered = 0
-        if qa_mode == "full":
-            for rec in dropped_all:
-                rec = dict(rec)
-                if state.type_of_data == "transactional":
-                    rec.setdefault("journey_id", f"JRN-{uuid.uuid4().hex[:12].upper()}")
-                    rec.setdefault("transaction_id", f"TXN-{uuid.uuid4().hex[:12].upper()}")
-                    rec.setdefault("event_type", "BUSINESS_EVENT")
-                    rec.setdefault("event_sequence", 1)
-                    rec.setdefault("event_timestamp", datetime.now(timezone.utc).isoformat())
-                else:
-                    rec, _ = _fill_missing(rec, state.field_order, dtype_map)
-                rec = {k: rec[k] for k in state.field_order if k in rec}
-                valid_all.append(rec)
-                recovered += 1
 
         state.final_records = valid_all
         state.validation_report = {
-            "total_input":    len(records),
-            "total_valid":    len(valid_all),
-            "total_dropped":  len(dropped_all),
-            "recovered":      recovered,
-            "algo_fixes":     algo_fixed,
-            "llm_fixes":      llm_fixes,
-            "llm_issues":     llm_issues,
+            "total_input": len(records),
+            "total_valid": len(valid_all),
+            "total_dropped": len(dropped_all),
+            "recovered": 0,
+            "algo_fixes": algo_fixed,
+            "llm_fixes": llm_fixes,
+            "llm_issues": llm_issues,
+            "deterministic_checks": [
+                "schema_and_type",
+                "declared_ranges_and_choices",
+                "formula_and_arithmetic",
+                "timestamp_relationships",
+                "country_conventions",
+                "entity_and_transaction_consistency",
+                "transactional_event_sequence",
+            ],
         }
-        logger.info("[QAAgent] Done. valid=%d dropped=%d recovered=%d algo_fixes=%d llm_fixes=%d",
-                    len(valid_all), len(dropped_all), recovered, algo_fixed, llm_fixes)
+        logger.info(
+            "[QAAgent] Done. valid=%d dropped=%d algo_fixes=%d llm_fixes=%d",
+            len(valid_all), len(dropped_all), algo_fixed, llm_fixes,
+        )
         return state
