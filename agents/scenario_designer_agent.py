@@ -9,7 +9,6 @@ knows how to execute — so the result can be run through the existing
 from __future__ import annotations
 import logging
 import ast
-import math
 
 from config.industry_profiles import get_profile, match_industry_key
 from core.llm_client import GeminiClient
@@ -255,7 +254,7 @@ Return a JSON object with exactly these keys:
   - "field_order": [str]        — variable names in the exact order they should be generated/output
   - "edge_case_variables": [ {edge_case_name, edge_case_description, condition, name, dtype, description, gen, params, depends_on, nullable} ] — edge-case overrides/conditions; return [] when no useful edge cases can be defined
 
-Edge cases: identify 2-4 high-value, realistic edge cases for the supplied scenario/use case whenever the scenario has at least one meaningful scenario variable. Return them as edge_case_variables. Do NOT return an empty list merely because an edge case is difficult to express. Each item MUST include edge_case_name, edge_case_description, name, and a machine-checkable Python-style boolean condition using ONLY exact variable names from the normal catalog (for example `balance_before == 0` or `balance_before == 0 and trigger_type == "ZERO_BALANCE"`). Do not use prose as a condition. Each item represents an override for one existing normal variable; multiple items may share the same edge_case_name to form one multi-field edge case. Reuse variables from the normal catalog; do not invent field names. The condition must be satisfiable after applying the supplied override(s), and should describe a genuinely unusual/boundary/business-relevant state for the supplied scenario/use case. Prefer scenario-specific boundaries over arbitrary categorical values.
+Edge cases: identify 2-4 high-value, realistic edge cases for the supplied scenario/use case. Return them as edge_case_variables. Each item MUST include edge_case_name, edge_case_description, name, and a machine-checkable condition expression using record field names. Reuse variables from the normal catalog whenever possible. Each edge-case item is an override for one variable and may share an edge_case_name with other variables that jointly define the same edge case. Conditions must be satisfiable by the supplied variable definitions and must not reference undefined fields. Do not create impossible combinations. If no domain-specific edge case is appropriate, create conservative boundary-value edge cases from existing numeric/categorical variables rather than returning an empty list.
 
 For transactional output, choose entity_key as the variable that identifies the primary business entity whose events should be grouped together. For example subscriber_id, customer_id, account_id, merchant_id, shipment_id, patient_id, etc. Do not hard-code an industry; choose from the variables you actually define.
 
@@ -352,163 +351,110 @@ class ScenarioDesignerAgent:
             result.get("entity_key"), result["variables"], industry_key, type_of_data
         )
         result["events"] = self._normalize_events(result.get("events", []), result["variables"], type_of_data, industry_key)
-        result["edge_case_variables"] = self._normalize_edge_case_variables(
-            result.get("edge_case_variables", []), result["variables"], industry_key
-        )
-        # Edge cases are an explicit part of the proposal contract. If the model
-        # omits them or returns definitions that cannot be executed deterministically,
-        # derive safe boundary-based definitions from the confirmed variable catalog
-        # instead of silently returning an empty list.
-        if not result["edge_case_variables"]:
-            result["edge_case_variables"] = self._build_fallback_edge_cases(
-                result["variables"], business_scenario, use_case, industry_key
-            )
+        result["edge_case_variables"] = self._normalize_edge_case_variables(result.get("edge_case_variables", []), result["variables"], industry_key)
         return result
 
 
-    def _build_fallback_edge_cases(
-        self, variables: list[dict], business_scenario: str, use_case: str | None, industry_key: str
-    ) -> list[dict]:
-        """Build executable, satisfiable edge cases when the LLM omits them.
+    def _normalize_edge_case_variables(self, edge_vars: list, variables: list[dict], industry_key: str) -> list[dict]:
+        """Normalize edge-case overrides and guarantee usable definitions.
 
-        This is deliberately conservative: every fallback condition references only
-        fields in the scenario catalog and every override is copied from an existing
-        variable definition. It never invents a field that the generator cannot emit.
+        The LLM may omit edge cases or return an invalid expression. We never let that
+        silently disable the feature: when possible, deterministic boundary-value edge
+        cases are derived from the confirmed variable catalog. This keeps the mechanism
+        industry-agnostic (telecom, banking, retail, healthcare, etc.).
         """
-        by_name = {str(v.get("name")): v for v in variables if isinstance(v, dict) and v.get("name")}
+        alias_map = _build_alias_map(industry_key)
+        valid_names = {str(v.get("name")) for v in variables if isinstance(v, dict) and v.get("name")}
+        variable_by_name = {str(v.get("name")): v for v in variables if isinstance(v, dict) and v.get("name")}
         out: list[dict] = []
 
-        def add(name: str, description: str, field: str, value, condition: str) -> None:
-            if field not in by_name or len(out) >= 4:
-                return
-            base = dict(by_name[field])
-            base.update({
-                "edge_case_name": name,
-                "edge_case_description": description,
-                "condition": condition,
-                "name": field,
-            })
-            params = dict(base.get("params") or {})
-            params["value"] = value
-            base["gen"] = "constant"
-            base["params"] = params
-            base["depends_on"] = list(by_name[field].get("depends_on", []) or [])
-            out.append(base)
+        allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Not,
+                   ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt,
+                   ast.GtE, ast.In, ast.NotIn, ast.Is, ast.IsNot, ast.Name,
+                   ast.Constant, ast.List, ast.Tuple, ast.UnaryOp, ast.USub,
+                   ast.UAdd, ast.Load)
 
-        lower_names = {n.lower(): n for n in by_name}
-        # Telecom low-balance scenarios have a strong, deterministic zero-balance
-        # boundary. This directly supports the user's Zero-Balance Race Condition.
-        balance = lower_names.get("balance_before")
-        if balance:
-            add(
-                "Zero-Balance Race Condition",
-                "Balance reaches zero at the boundary while the scenario is being processed.",
-                balance, 0.0, f"{balance} == 0"
-            )
-
-        # Prefer an explicit amount/recharge field and its configured maximum.
-        for key in ("recommended_topup_amt", "recharge_amount", "transaction_amount", "payment_amount", "amount"):
-            field = lower_names.get(key)
-            if not field:
-                continue
-            base = by_name[field]
-            params = base.get("params") or {}
-            choices = params.get("choices") if isinstance(params, dict) else None
-            value = None
-            if isinstance(choices, list) and choices:
-                numeric = [x for x in choices if isinstance(x, (int, float)) and math.isfinite(float(x))]
-                value = max(numeric) if numeric else None
-            elif isinstance(params, dict) and isinstance(params.get("max"), (int, float)):
-                value = params["max"]
-            if value is not None:
-                add(
-                    "Maximum Transaction Boundary",
-                    "The primary monetary amount is generated at its configured upper boundary.",
-                    field, value, f"{field} == {repr(value)}"
-                )
-                break
-
-        response = lower_names.get("response_time_seconds")
-        action = lower_names.get("customer_action")
-        if response:
-            params = by_name[response].get("params") or {}
-            minimum = params.get("min", 1) if isinstance(params, dict) else 1
-            condition = f"{response} <= {repr(minimum)}"
-            if action:
-                condition += f" and {action} == \"ACCEPTED\""
-            add(
-                "Ultra-Fast Impulse Conversion",
-                "The customer responds at the fastest configured response boundary.",
-                response, minimum, condition
-            )
-
-        # Generic boundary fallback for other industries/scenarios. Use distinct
-        # numeric fields and only values explicitly supported by their generator params.
-        if not out:
-            for field, base in by_name.items():
-                params = base.get("params") or {}
-                value = None
-                label = "Boundary Value Edge Case"
-                if isinstance(params, dict) and isinstance(params.get("min"), (int, float)):
-                    value = params["min"]
-                    label = "Minimum Boundary"
-                elif isinstance(params, dict) and isinstance(params.get("max"), (int, float)):
-                    value = params["max"]
-                    label = "Maximum Boundary"
-                if value is None or base.get("dtype") not in {"int", "float"}:
-                    continue
-                add(label, f"{field} is at its configured boundary.", field, value, f"{field} == {repr(value)}")
-                if len(out) >= 2:
-                    break
-        return out[:4]
-
-
-    def _normalize_edge_case_variables(self, edge_vars: list, variables: list[dict], industry_key: str) -> list[dict]:
-        """Normalize edge-case definitions while keeping them separate from normal variables."""
-        alias_map = _build_alias_map(industry_key)
-        valid_names = {v["name"] for v in variables}
-        out = []
-        for item in edge_vars if isinstance(edge_vars, list) else []:
+        def normalize_item(item: dict) -> dict | None:
             if not isinstance(item, dict) or not item.get("name"):
-                continue
+                return None
             v = dict(item)
-            v["name"] = alias_map.get(str(v["name"]).strip().lower(), str(v["name"]).strip())
+            raw_name = str(v.get("name")).strip()
+            v["name"] = alias_map.get(raw_name.lower(), raw_name)
             v["edge_case_name"] = str(v.get("edge_case_name") or "Scenario Edge Case").strip()
             v["edge_case_description"] = str(v.get("edge_case_description") or "").strip()
             v["condition"] = str(v.get("condition") or "").strip()
-            # Edge conditions are executable expressions, not prose. Reject invalid
-            # syntax or references to fields outside the confirmed variable catalog so
-            # the generator can deterministically prove that an edge record is real.
-            if v.get("condition"):
-                try:
-                    tree = ast.parse(v["condition"], mode="eval")
-                    allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Not,
-                               ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt,
-                               ast.GtE, ast.In, ast.NotIn, ast.Is, ast.IsNot, ast.Name,
-                               ast.Constant, ast.List, ast.Tuple, ast.UnaryOp, ast.USub,
-                               ast.UAdd, ast.Load)
-                    if any(not isinstance(n, allowed) for n in ast.walk(tree)):
-                        continue
-                    refs = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-                    if not refs.issubset(valid_names):
-                        continue
-                except Exception:
-                    continue
-            # If the edge field already exists in normal variables, inherit its schema
-            # and only keep edge-specific overrides/condition.
-            base = next((x for x in variables if x.get("name") == v["name"]), None)
+            # Normalize common LLM synonyms inside the executable condition too.
+            # This is essential for non-telecom industries where, for example, the
+            # canonical field is transaction_amount but the model may write payment_amount.
+            if v["condition"]:
+                import re
+                for alias, canonical in sorted(alias_map.items(), key=lambda kv: -len(kv[0])):
+                    v["condition"] = re.sub(r"\b" + re.escape(alias) + r"\b", canonical, v["condition"])
+            if v["name"] not in valid_names or not v["condition"]:
+                return None
+            try:
+                tree = ast.parse(v["condition"], mode="eval")
+                if any(not isinstance(n, allowed) for n in ast.walk(tree)):
+                    return None
+                refs = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+                if not refs.issubset(valid_names):
+                    return None
+            except Exception:
+                return None
+            base = variable_by_name.get(v["name"])
             if base:
                 merged = dict(base)
                 merged.update({k: val for k, val in v.items() if val not in (None, "")})
                 v = merged
-            else:
-                if v.get("dtype") not in {"string", "float", "int", "categorical", "datetime", "boolean", "bool"}:
+            return v
+
+        for item in edge_vars if isinstance(edge_vars, list) else []:
+            normalized = normalize_item(item)
+            if normalized is not None:
+                out.append(normalized)
+
+        # Guarantee a usable edge-case catalog when the LLM omitted/invalidated all
+        # definitions. Prefer scenario-specific numeric boundaries, then categorical
+        # boundaries. These definitions work for any industry because they are derived
+        # solely from the scenario's own variable schema.
+        if not out:
+            for v in variables:
+                if not isinstance(v, dict) or not v.get("name"):
                     continue
-                if v.get("gen") not in _GENERATOR_DOCS:
-                    # Do not attempt to validate free text here; normalize below only.
-                    pass
-            if v.get("condition"):
-                out.append(v)
+                name = str(v["name"])
+                params = v.get("params") or {}
+                dtype = str(v.get("dtype") or "").lower()
+                candidate = None
+                if dtype in {"float", "int"} or v.get("gen") in {"uniform", "uniform_bounded", "lognormal", "lognormal_int", "beta", "segment_range"}:
+                    lo = params.get("min")
+                    hi = params.get("max")
+                    if lo is not None:
+                        candidate = (f"{name} == {repr(lo)}", lo, f"{name} boundary minimum")
+                    elif hi is not None:
+                        candidate = (f"{name} == {repr(hi)}", hi, f"{name} boundary maximum")
+                elif isinstance(params.get("choices"), list) and params.get("choices"):
+                    value = params["choices"][0]
+                    candidate = (f"{name} == {repr(value)}", value, f"{name} categorical boundary")
+                if candidate:
+                    condition, value, desc = candidate
+                    item = {
+                        "edge_case_name": f"Boundary Edge Case - {name}",
+                        "edge_case_description": f"{desc} for the scenario-defined variable.",
+                        "condition": condition,
+                        "name": name,
+                        "dtype": v.get("dtype"),
+                        "description": v.get("description", ""),
+                        "gen": "constant",
+                        "params": {"value": value},
+                        "depends_on": [],
+                        "nullable": False,
+                    }
+                    normalized = normalize_item(item)
+                    if normalized is not None:
+                        out.append(normalized)
+                if len(out) >= 4:
+                    break
+
         return out[:50]
 
     def _normalize_entity_key(self, entity_key: object, variables: list[dict], industry_key: str, type_of_data: str) -> str | None:

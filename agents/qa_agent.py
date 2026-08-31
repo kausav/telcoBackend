@@ -501,39 +501,24 @@ class QAAgent:
                                        "event_occurrence", "event_timestamp", "isEdgeCaseData"} and value is not None:
                             ctx[key] = value
 
-        # Transactional edge-case flags are record-level. A sparse event may need
-        # the complete journey context to validate its condition, but a valid edge
-        # record must not cause every sibling event to become an edge record.
+        # Finalize transactional edge-case labels at RECORD grain. A transactional
+        # event row is intentionally sparse, so a condition may need the complete journey
+        # context to validate. However, do NOT propagate the flag to every event in that
+        # journey: only the record explicitly selected by the generator remains an edge
+        # case. Normal records that happen to satisfy a condition are not promoted.
         if transactional and checked:
-            journey_edge_context = {}
-            for rec in checked:
-                journey_id = str(rec.get("journey_id") or "")
-                if not journey_id:
-                    continue
-                ctx = journey_edge_context.setdefault(journey_id, {})
-                for key, value in rec.items():
-                    if key not in {
-                        "journey_id", "transaction_id", "event_type", "event_sequence",
-                        "event_occurrence", "event_timestamp", "isEdgeCaseData"
-                    } and value is not None:
-                        ctx[key] = value
-
             for rec in checked:
                 if rec.get("isEdgeCaseData") is not True:
                     rec["isEdgeCaseData"] = False
                     continue
                 journey_id = str(rec.get("journey_id") or "")
-                ctx = dict(journey_edge_context.get(journey_id, {}))
-                for key, value in rec.items():
-                    if key != "isEdgeCaseData" and value is not None:
-                        ctx[key] = value
+                ctx = journey_edge_context.get(journey_id, {})
                 matched = any(
                     _safe_edge_condition(group.get("condition", ""), ctx)
                     for group in edge_groups.values()
                 )
                 if not matched:
                     rec["isEdgeCaseData"] = False
-                    issues.append("isEdgeCaseData reset because no edge-case condition was satisfied")
 
         # Optional LLM semantic audit. Deterministic validation above always runs.
         rules_text = "\n".join(f"- {r}" for r in state.rules.get("business_rules", []))
