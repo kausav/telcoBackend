@@ -495,6 +495,12 @@ def confirm_scenario_route(req: ConfirmRequest):
     if not math.isfinite(edge_case_percentage) or not 0.0 <= edge_case_percentage <= 1.0:
         raise HTTPException(400, detail={"error": "edgeCasePercentage must be between 0 and 1", "value": edge_case_percentage})
 
+    # Edge cases are optional. If the confirmed scenario has no edge-case
+    # definitions, percentage is normalized to 0 rather than producing an
+    # impossible request.
+    if not edge_case_variables:
+        edge_case_percentage = 0.0
+
     scenario_id = draft.get("scenario_id") or next_scenario_id()
     requested_scenario_id = draft.get("scenario_id")
     # scenarioId is user-chosen at propose time, so two different users' drafts can pick the
@@ -615,7 +621,12 @@ def generate_dynamic(req: GenerateRequest):
 
         entity_records: list[dict] = []
         for entity_value, entity_rows in latest_entity_items:
-            entity_output = {entity_key: entity_value}
+            # Transactional edgeCasePercentage is defined at the entity/journey
+            # grain. Expose the flag once on the entity, not once per event row;
+            # otherwise one edge journey with many events would appear to exceed
+            # the requested percentage when consumers count event rows.
+            entity_is_edge = any(row.get("isEdgeCaseData") is True for row in entity_rows)
+            entity_output = {entity_key: entity_value, "isEdgeCaseData": entity_is_edge}
 
             # Include useful identity fields alongside the grouping key.
             first = entity_rows[-1]
@@ -643,10 +654,17 @@ def generate_dynamic(req: GenerateRequest):
                 if not rows:
                     continue
                 actual_count = state.transactional_event_counts.get(str(entity_value), {}).get(event_type, len(rows))
+                # The edge-case flag belongs to the entity for transactional
+                # scenarios. Keep event records otherwise unchanged.
+                clean_rows = []
+                for event_row in rows[-10:]:
+                    clean_row = dict(event_row)
+                    clean_row.pop("isEdgeCaseData", None)
+                    clean_rows.append(clean_row)
                 events_for_entity.append({
                     "event_type": event_type,
                     "totalCount": actual_count,
-                    "records": rows[-10:],
+                    "records": clean_rows,
                 })
 
             entity_output["events"] = events_for_entity

@@ -505,15 +505,28 @@ class QAAgent:
         # event row is intentionally sparse, so checking the condition against one event can
         # produce false negatives when the condition references fields from another event.
         if transactional and checked:
+            # Transactional edgeCasePercentage is applied at the entity/journey
+            # grain. Do NOT discover new edge cases merely because a normal journey
+            # happens to satisfy a condition; only journeys explicitly selected by
+            # the generator are eligible. Validate the selected journeys and preserve
+            # their label across every event row.
+            selected_journeys = {
+                str(rec.get("journey_id") or "")
+                for rec in checked
+                if rec.get("isEdgeCaseData") is True
+            }
             edge_journey_match: dict[str, bool] = {}
-            for journey_id, ctx in journey_edge_context.items():
+            for journey_id in selected_journeys:
+                ctx = journey_edge_context.get(journey_id, {})
                 edge_journey_match[journey_id] = any(
                     _safe_edge_condition(group.get("condition", ""), ctx)
                     for group in edge_groups.values()
                 )
             for rec in checked:
                 journey_id = str(rec.get("journey_id") or "")
-                rec["isEdgeCaseData"] = bool(edge_journey_match.get(journey_id, False))
+                rec["isEdgeCaseData"] = bool(
+                    journey_id in selected_journeys and edge_journey_match.get(journey_id, False)
+                )
 
         # Optional LLM semantic audit. Deterministic validation above always runs.
         rules_text = "\n".join(f"- {r}" for r in state.rules.get("business_rules", []))

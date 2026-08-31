@@ -102,8 +102,36 @@ def _apply_edge_case_overrides(rec: dict, edge_group: dict, variables: list[dict
     return rec
 
 def _edge_case_count(total: int, percentage: float) -> int:
-    import math
+    """Return the deterministic number of edge-case units requested.
+
+    Percentage is always applied to the scenario's declared grain: records for
+    aggregational data and entities/journeys for transactional data.  We use
+    floor so the generator never creates more edge-case units than requested.
+    """
+    if total <= 0 or percentage <= 0:
+        return 0
     return max(0, min(total, math.floor(total * percentage + 1e-12)))
+
+
+def _edge_case_indices(total: int, edge_count: int) -> set[int]:
+    """Choose conceptual indexes evenly across the full dataset.
+
+    Transactional generation intentionally materializes only the latest response
+    window for performance.  Edge cases are selected against the *full* conceptual
+    entity set, never against that truncated window.  Consequently the visible
+    latest-10 window may contain zero, one, or several edge entities; we never
+    inflate the requested percentage just to force edge cases into the response.
+    """
+    if total <= 0 or edge_count <= 0:
+        return set()
+    if edge_count >= total:
+        return set(range(total))
+    # Evenly distribute edge units over the conceptual dataset.  The +0.5 center
+    # avoids clustering them at the beginning and is deterministic for a given count.
+    return {
+        min(total - 1, max(0, int(((i + 0.5) * total) / edge_count)))
+        for i in range(edge_count)
+    }
 
 # ── Generator functions ────────────────────────────────────────────────────────
 
@@ -657,12 +685,8 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
     response_entity_count = min(journey_count, MAX_RESPONSE_ENTITIES)
     edge_groups = _edge_case_groups(edge_case_variables)
     conceptual_edge_count = _edge_case_count(journey_count, edge_case_percentage) if edge_groups else 0
-    # Only the latest response_entity_count entities are materialized. Place the
-    # edge-case entities at the tail of the conceptual dataset so requested edge
-    # cases are visible in the API response instead of being hidden in omitted
-    # historical entities.
-    visible_edge_count = min(conceptual_edge_count, response_entity_count)
-    visible_start = response_entity_count - visible_edge_count
+    conceptual_edge_indices = _edge_case_indices(journey_count, conceptual_edge_count)
+    response_start_index = max(0, journey_count - response_entity_count)
     edge_names = list(edge_groups)
     generated: list[dict] = []
     used_entity_keys: set[str] = set()
@@ -686,8 +710,14 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                 attempts += 1
             used_entity_keys.add(str(entity_context[entity_key]))
 
-        is_edge_entity = entity_index >= visible_start and bool(edge_names)
-        edge_group = edge_groups[edge_names[entity_index % len(edge_names)]] if is_edge_entity else None
+        # entity_index is the zero-based index in the full conceptual dataset.
+        # Only the latest response window is materialized, but edge selection is made
+        # against the full dataset so edgeCasePercentage is never recalculated from
+        # the truncated response size.
+        conceptual_index = response_start_index + entity_index
+        is_edge_entity = conceptual_index in conceptual_edge_indices and bool(edge_names)
+        edge_rank = sorted(conceptual_edge_indices).index(conceptual_index) if is_edge_entity else -1
+        edge_group = edge_groups[edge_names[edge_rank % len(edge_names)]] if is_edge_entity else None
         # Apply edge overrides to stable entity fields before event generation.
         if edge_group:
             entity_context = _apply_edge_case_overrides(entity_context, edge_group, variables, profile, rules, active_fields=set(compiled.entity_fields))
@@ -750,8 +780,17 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                                    "isEdgeCaseData"} and value is not None:
                         condition_context[key] = value
             edge_valid = _safe_edge_condition(edge_group.get("condition", ""), condition_context)
+            if not edge_valid:
+                # This entity was selected as an edge-case unit, so silently
+                # labelling it false would violate edgeCasePercentage. Fail rather
+                # than return data that claims a requested edge case was generated
+                # when its condition was not actually satisfied.
+                raise ValueError(
+                    f"Unable to satisfy transactional edge-case condition "
+                    f"'{edge_group.get('condition', '')}' for entity '{entity_value}'"
+                )
             for row in entity_rows:
-                row["isEdgeCaseData"] = bool(edge_valid)
+                row["isEdgeCaseData"] = True
         else:
             for row in entity_rows:
                 row["isEdgeCaseData"] = False
@@ -823,14 +862,17 @@ class DataGeneratorAgent:
                         # get another opportunity; deterministic overrides still win.
                         rec = _generate_record(variables, profile=profile, rules=state.rules)
                     if not matched:
-                        rec["isEdgeCaseData"] = False
+                        raise ValueError(
+                            f"Unable to generate an aggregational edge-case record satisfying "
+                            f"'{group.get('condition', '')}' after {_MAX_EDGE_CASE_ATTEMPTS} attempts"
+                        )
                 else:
                     rec["isEdgeCaseData"] = False
                 records.append(rec)
             if "isEdgeCaseData" not in state.field_order:
                 state.field_order = list(state.field_order) + ["isEdgeCaseData"]
             logger.info("[DataGenerator] Generated %d aggregational records with %d fields each; edge cases=%d.",
-                        len(records), len(variables), visible_edge_count if state.type_of_data == "transactional" else edge_count)
+                        len(records), len(variables), edge_count)
 
         state.raw_records = records
         return state
