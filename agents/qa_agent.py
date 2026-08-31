@@ -134,6 +134,7 @@ def _validate_record(
     field_order: list[str],
     profile: dict,
     transactional: bool,
+    event_fields: set[str] | None = None,
 ) -> tuple[dict, list[str]]:
     """Validate and repair one record using the actual variable definitions."""
     rec = dict(rec)
@@ -222,10 +223,15 @@ def _validate_record(
             if old != rec[name]:
                 issues.append(f"{name} clamped to percentage range")
 
-    # 5. Formula invariants: if all dependencies are present, recompute the formula
-    # and repair the generated value. This catches arithmetic errors without an LLM.
+    # 5. Formula invariants: recompute every scenario-declared formula that belongs
+    # to this record. This is industry-agnostic: the scenario definition is the
+    # source of truth, so retail totals, banking balances, telecom balances,
+    # healthcare amounts, insurance premiums, etc. are all handled identically.
+    active_fields = set(field_order) if not transactional else (event_fields or set())
     for var in variables:
         if var.get("gen") != "formula" or not var.get("formula"):
+            continue
+        if var.get("name") not in active_fields:
             continue
         deps = var.get("depends_on", []) or []
         if any(dep not in rec or rec.get(dep) is None for dep in deps):
@@ -243,14 +249,9 @@ def _validate_record(
             rec[var["name"]] = expected
             issues.append(f"{var['name']} corrected from formula")
 
-    # 6. Explicit common financial invariant, even for scenarios whose formula metadata
-    # was omitted by an LLM-authored scenario.
-    bb, ra, ba = rec.get("balance_before"), rec.get("recharge_amount"), rec.get("balance_after")
-    if isinstance(bb, (int, float)) and isinstance(ra, (int, float)):
-        expected = round(float(bb) + float(ra), 2)
-        if ba is None or not isinstance(ba, (int, float)) or abs(float(ba) - expected) > 0.01:
-            rec["balance_after"] = expected
-            issues.append("balance_after corrected from balance arithmetic")
+    # 6. Do not hard-code industry-specific arithmetic here.
+    # All calculations must come from scenario-declared formulas so the same
+    # validator works across every industry.
 
     # 7. Common timestamp relationships when fields exist.
     event_ts = _parse_dt(rec.get("event_timestamp"))
@@ -323,7 +324,12 @@ class QAAgent:
         journey_state: dict[str, tuple[int, datetime | None, str | None]] = {}
 
         for rec in records:
-            rec, issues = _validate_record(rec, variables, state.field_order, profile, transactional)
+            pre_event_def = event_defs.get(str(rec.get("event_type"))) if transactional else None
+            pre_event_fields = set(pre_event_def.get("fields", []) or []) if pre_event_def else set()
+            rec, issues = _validate_record(
+                rec, variables, state.field_order, profile, transactional,
+                event_fields=pre_event_fields,
+            )
 
             if transactional:
                 # Metadata is structural and should never be delegated to the LLM.
@@ -410,7 +416,12 @@ class QAAgent:
                 try:
                     result = self._llm.generate_json(
                         system_prompt,
-                        f"Scenario: {state.scenario}\nRecords to validate:\n{json.dumps(chunk, default=str)}",
+                        f"Scenario: {state.scenario}\n"
+                        f"Industry: {state.industry}\nCountry: {state.country or 'GLOBAL'}\n"
+                        f"Domain: {state.domain}\nBusiness scenario: {state.business_scenario}\n"
+                        f"Business response: {state.business_response or ''}\nExpected outcome: {state.expected_outcome or ''}\n"
+                        f"Use case: {state.use_case or ''}\nScenario type: {state.scenario_type or ''}\n"
+                        f"Records to validate:\n{json.dumps(chunk, default=str)}",
                         temperature=0.1,
                     )
                     validated = result.get("valid_records", chunk)
@@ -428,7 +439,11 @@ class QAAgent:
             try:
                 result = self._llm.generate_json(
                     system_prompt,
-                    f"Scenario: {state.scenario}\nThis is a QA audit sample only. Do not rewrite the dataset.\nRecords:\n{json.dumps(checked[:sample_size], default=str)}",
+                    f"Scenario: {state.scenario}\n"
+                    f"Industry: {state.industry}\nCountry: {state.country or 'GLOBAL'}\n"
+                    f"Domain: {state.domain}\nBusiness scenario: {state.business_scenario}\n"
+                    f"Use case: {state.use_case or ''}\n"
+                    f"This is a QA audit sample only. Do not rewrite the dataset.\nRecords:\n{json.dumps(checked[:sample_size], default=str)}",
                     temperature=0.1,
                 )
                 llm_fixes = int(result.get("fixes_applied", 0))

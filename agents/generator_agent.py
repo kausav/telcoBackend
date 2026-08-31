@@ -9,6 +9,7 @@ import logging
 import math
 import random
 import uuid
+import ast
 from datetime import datetime, timedelta, timezone
 
 from core.dynamic_scenarios import resolve_variables, resolve_events, resolve_entity_key
@@ -351,19 +352,111 @@ def get_known_generator_types() -> set[str]:
     return set(_GENERATORS.keys())
 
 
-def _generate_record(variables: list[dict], profile: dict | None = None) -> dict:
+def _rule_constraint_for(field_name: str, rules: dict | None) -> dict:
+    """Return machine-readable generation constraints for a field.
+
+    RulesAgent produces these once per confirmed scenario. Keeping this lookup
+    deterministic means use-case/business-context rules influence generation
+    without making an LLM call for every record.
+    """
+    if not isinstance(rules, dict):
+        return {}
+    constraints = rules.get("generation_constraints", {})
+    if not isinstance(constraints, dict):
+        return {}
+    value = constraints.get(field_name, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _coerce_rule_values(value):
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        # RulesAgent normally returns a JSON list, but tolerate compact text.
+        for sep in ("|", ";", ","):
+            if sep in text:
+                return [x.strip() for x in text.split(sep) if x.strip()]
+        return [text]
+    return []
+
+
+def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None):
+    """Apply safe machine-readable RulesAgent constraints to a generated value."""
+    constraint = _rule_constraint_for(str(var.get("name", "")), rules)
+    if not constraint or value is None:
+        return value
+
+    allowed = _coerce_rule_values(constraint.get("preferred_values"))
+    if not allowed:
+        allowed = _coerce_rule_values(constraint.get("valid_values"))
+    if allowed:
+        # Match case/format while preserving the canonical value supplied by rules.
+        norm = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+        matches = [x for x in allowed if str(x).strip().lower().replace("-", "_").replace(" ", "_") == norm]
+        if matches:
+            return matches[0]
+        # If the generator produced a value outside an authoritative categorical
+        # constraint, choose from the constrained set instead of leaking invalid data.
+        return random.choice(allowed)
+
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            lo = constraint.get("min")
+            hi = constraint.get("max")
+            if lo is not None:
+                value = max(value, float(lo))
+            if hi is not None:
+                value = min(value, float(hi))
+            if isinstance(value, float):
+                value = round(value, 2)
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _formula_from_rules(field_name: str, rules: dict | None):
+    if not isinstance(rules, dict):
+        return None
+    for item in rules.get("formula_rules", []) or []:
+        if isinstance(item, dict) and str(item.get("field", "")) == field_name and item.get("expression"):
+            return str(item["expression"])
+    return None
+
+
+def _formula_dependencies(expression: str) -> set[str]:
+    """Extract field names referenced by a simple formula expression."""
+    try:
+        tree = ast.parse(expression, mode="eval")
+        return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+                and node.id not in {"round", "min", "max", "abs", "sum"}}
+    except Exception:
+        return set()
+
+
+def _generate_record(variables: list[dict], profile: dict | None = None, rules: dict | None = None) -> dict:
     """Generate one record by resolving variables in dependency order."""
     rec: dict = {}
     for var in variables:
         gen_type = var["gen"]
         generator = _GENERATORS.get(gen_type)
+        effective_var = var
+        rule_formula = _formula_from_rules(var["name"], rules)
+        if rule_formula and var.get("gen") != "formula":
+            effective_var = dict(var)
+            effective_var["gen"] = "formula"
+            effective_var["formula"] = rule_formula
+        generator = _GENERATORS.get(effective_var.get("gen"))
         if generator:
             helper_rec = dict(rec)
             helper_rec["__current_field__"] = var["name"]
             helper_rec["__country_profile__"] = profile
-            rec[var["name"]] = generator(var, helper_rec)
+            value = generator(effective_var, helper_rec)
         else:
-            rec[var["name"]] = None
+            value = None
+        rec[var["name"]] = _apply_generation_constraint(var, value, rec, rules)
     return rec
 
 
@@ -372,6 +465,7 @@ def _generate_selected_record(
     selected_names: set[str],
     base: dict | None = None,
     profile: dict | None = None,
+    rules: dict | None = None,
 ) -> dict:
     """Generate only selected variables (plus their declared dependencies).
 
@@ -398,15 +492,21 @@ def _generate_selected_record(
         name = var["name"]
         if name not in required or name in rec:
             continue
-        generator = _GENERATORS.get(var["gen"])
+        effective_var = var
+        rule_formula = _formula_from_rules(name, rules)
+        if rule_formula and var.get("gen") != "formula":
+            effective_var = dict(var)
+            effective_var["gen"] = "formula"
+            effective_var["formula"] = rule_formula
+        generator = _GENERATORS.get(effective_var.get("gen"))
         if generator:
             helper_rec = dict(rec)
             helper_rec["__current_field__"] = name
             helper_rec["__country_profile__"] = profile
-            value = generator(var, helper_rec)
+            value = generator(effective_var, helper_rec)
         else:
             value = None
-        rec[name] = value
+        rec[name] = _apply_generation_constraint(var, value, rec, rules)
     return rec
 
 
@@ -427,7 +527,7 @@ def _journey_id() -> str:
     return f"JRN-{uuid.uuid4().hex[:12].upper()}"
 
 
-def _transactional_records(compiled, journey_count: int, event_counts_out: dict[str, dict[str, int]] | None = None, profile: dict | None = None) -> list[dict]:
+def _transactional_records(compiled, journey_count: int, event_counts_out: dict[str, dict[str, int]] | None = None, profile: dict | None = None, rules: dict | None = None) -> list[dict]:
     """Fast transactional generation.
 
     Important optimization: the requested count represents entities, but the API only
@@ -454,7 +554,7 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
     # Generate the response window in natural order so the last generated entity is last.
     for entity_index in range(response_entity_count):
         # Static variables not owned by an event form the entity context.
-        entity_context = _generate_selected_record(variables, set(compiled.entity_fields), profile=profile)
+        entity_context = _generate_selected_record(variables, set(compiled.entity_fields), profile=profile, rules=rules)
 
         # Ensure the grouping key is unique where a generator can collide.
         if entity_key and entity_key in entity_context:
@@ -494,6 +594,7 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                     set(event.fields),
                     base=entity_context,
                     profile=profile,
+                    rules=rules,
                 )
 
                 row["journey_id"] = journey_id
@@ -514,6 +615,10 @@ class DataGeneratorAgent:
         self._llm = llm  # available for future contextual enrichment
 
     def run(self, state: WorkflowState) -> WorkflowState:
+        logger.info(
+            "[DataGenerator] Context: domain=%s business_scenario=%s use_case=%s scenario_type=%s",
+            state.domain, state.business_scenario, state.use_case, state.scenario_type,
+        )
         dyn = resolve_variables(state.scenario)
         if dyn is not None:
             variables, FIELD_ORDER = dyn
@@ -526,7 +631,7 @@ class DataGeneratorAgent:
             entity_key = compiled.entity_key
             state.transactional_event_counts = {}
             profile = get_profile(state.industry, state.country)
-            records = _transactional_records(compiled, state.count, state.transactional_event_counts, profile=profile)
+            records = _transactional_records(compiled, state.count, state.transactional_event_counts, profile=profile, rules=state.rules)
             state.field_order = [
                 "journey_id", "transaction_id", "event_type", "event_sequence",
                 "event_occurrence", "event_timestamp",
@@ -538,7 +643,7 @@ class DataGeneratorAgent:
         else:
             state.field_order = FIELD_ORDER
             profile = get_profile(state.industry, state.country)
-            records = [_generate_record(variables, profile=profile) for _ in range(state.count)]
+            records = [_generate_record(variables, profile=profile, rules=state.rules) for _ in range(state.count)]
             logger.info("[DataGenerator] Generated %d aggregational records with %d fields each.",
                         len(records), len(variables))
 

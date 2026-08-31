@@ -17,7 +17,7 @@ from agents.qa_agent import QAAgent
 from agents.rules_agent import RulesAgent
 from config.scenarios import SCENARIO_LABELS
 from core.csv_scenario import parse_variables_csv
-from core.dynamic_scenarios import confirm_scenario, resolve_data_type
+from core.dynamic_scenarios import confirm_scenario, resolve_data_type, resolve_scenario_context
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
 
@@ -53,10 +53,24 @@ def register_scenario_from_csv(scenario: str, csv_path: str, label: str = "") ->
     logger.info("Registered scenario '%s' from CSV '%s' (%d variables)", scenario, csv_path, len(variables))
 
 
-def run_pipeline(scenario: str, count: int, industry: str = "generic", country: str | None = None, api_key: str = "", type_of_data: str | None = None) -> WorkflowState:
+def run_pipeline(scenario: str, count: int, industry: str = "generic", country: str | None = None, api_key: str = "", type_of_data: str | None = None, scenario_context: dict | None = None) -> WorkflowState:
     llm = GeminiClient(api_key=api_key or None)
     resolved_type = type_of_data or resolve_data_type(scenario)
-    state = WorkflowState(scenario=scenario, count=count, industry=industry, country=country, type_of_data=resolved_type)
+    context = scenario_context or resolve_scenario_context(scenario)
+    # For static/CLI scenarios the resolver may only have partial metadata;
+    # never let that override explicit function arguments.
+    context["industry"] = industry
+    context["country"] = country
+    context["type_of_data"] = resolved_type
+    state = WorkflowState(
+        scenario=scenario, count=count, industry=industry, country=country,
+        type_of_data=resolved_type, domain=context.get("domain", ""),
+        business_scenario=context.get("business_scenario", ""),
+        business_response=context.get("business_response"),
+        expected_outcome=context.get("expected_outcome"),
+        scenario_type=context.get("scenario_type"), use_case=context.get("use_case"),
+        entity_key=context.get("entity_key"), scenario_context=context,
+    )
 
     pipeline = [
         ("1. Orchestrator",   OrchestratorAgent(llm)),

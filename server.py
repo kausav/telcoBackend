@@ -19,6 +19,7 @@ from core.dynamic_scenarios import (
     resolve_scenario_id_from_draft,
     resolve_scenario_meta,
     resolve_data_type,
+    resolve_scenario_context,
     resolve_variables,
     save_draft,
     scenario_exists,
@@ -200,6 +201,8 @@ def propose_scenario(req: ProposeRequest):
     draft["industry_type"] = req.industryType
     draft["country"] = req.country
     draft["use_case"] = req.useCase
+    draft["business_response"] = req.businessResponse
+    draft["expected_outcome"] = req.expectedOutcome
     draft["type_of_data"] = req.typeOfData
     save_draft(draft_id, draft)
     scenario_id_available = not scenario_exists(req.scenarioId)
@@ -232,7 +235,10 @@ def import_scenario_csv(
     industryType: str = Form("generic"),
     country: str | None = Form(None),
     businessScenario: str = Form(""),
+    businessResponse: str | None = Form(None),
+    expectedOutcome: str | None = Form(None),
     scenarioType: str = Form(""),
+    useCase: str | None = Form(None),
     label: str = Form(""),
     entityKey: str | None = Form(None),
 ):
@@ -278,6 +284,9 @@ def import_scenario_csv(
         "field_order": field_order,
         "domain": domain,
         "business_scenario": businessScenario,
+        "business_response": businessResponse,
+        "expected_outcome": expectedOutcome,
+        "use_case": useCase,
         "scenario_id": scenarioId,
         "scenario_type": scenarioType,
         "industry_type": industryType,
@@ -437,6 +446,12 @@ def confirm_scenario_route(req: ConfirmRequest):
         "label": draft.get("label", scenario_id),
         "journey": draft.get("journey", draft.get("domain", "")),
         "description": draft.get("description", ""),
+        "domain": draft.get("domain", ""),
+        "business_scenario": draft.get("business_scenario", ""),
+        "business_response": draft.get("business_response"),
+        "expected_outcome": draft.get("expected_outcome"),
+        "scenario_type": draft.get("scenario_type"),
+        "use_case": draft.get("use_case"),
         "industry": draft.get("industry_type", "generic"),
         "country": draft.get("country"),
         "requested_scenario_id": requested_scenario_id,
@@ -488,12 +503,14 @@ def generate_dynamic(req: GenerateRequest):
         raise HTTPException(400, detail={"error": "Either 'scenario' or 'draftId' is required"})
     if not scenario_exists(scenario_id):
         raise HTTPException(400, detail={"error": f"Unknown scenario '{scenario_id}'"})
+    scenario_context = resolve_scenario_context(scenario_id)
     state = run_pipeline(
         scenario=scenario_id,
         count=req.count,
-        industry=resolve_scenario_meta(scenario_id).get("industry", "generic"),
-        country=resolve_scenario_meta(scenario_id).get("country"),
-        type_of_data=resolve_data_type(scenario_id),
+        industry=scenario_context.get("industry", "generic"),
+        country=scenario_context.get("country"),
+        type_of_data=scenario_context.get("type_of_data", resolve_data_type(scenario_id)),
+        scenario_context=scenario_context,
     )
     if state.errors and not state.final_records:
         raise HTTPException(500, detail={"errors": state.errors})

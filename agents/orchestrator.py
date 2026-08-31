@@ -39,7 +39,12 @@ class OrchestratorAgent:
             )
             return state
 
-        cache_key = (state.scenario, state.industry, (state.country or "GLOBAL").upper())
+        cache_key = (
+            state.scenario, state.industry, (state.country or "GLOBAL").upper(), state.type_of_data,
+            state.domain or "", state.business_scenario or "", state.business_response or "",
+            state.expected_outcome or "", state.scenario_type or "", state.use_case or "",
+            state.entity_key or "", str(state.scenario_context.get("events", [])),
+        )
         cached = get_orchestrator(cache_key)
         if cached is not None:
             if not cached.get("valid", True):
@@ -54,6 +59,12 @@ class OrchestratorAgent:
             f"Scenario: {sc['label']}\n"
             f"Journey: {sc['journey']}\n"
             f"Description: {sc['description']}\n"
+            f"Domain: {state.domain or sc.get('domain', '')}\n"
+            f"Business scenario: {state.business_scenario or sc.get('business_scenario', '')}\n"
+            f"Business response: {state.business_response or sc.get('business_response', '')}\n"
+            f"Expected outcome: {state.expected_outcome or sc.get('expected_outcome', '')}\n"
+            f"Use case: {state.use_case or sc.get('use_case', '')}\n"
+            f"Scenario type: {state.scenario_type or sc.get('scenario_type', '')}\n"
             f"Records requested: {state.count}\n"
             f"Target industry: {profile['industry']}; country: {profile['country_name']} ({state.country}) — "
             f"regulator {profile['regulator']}, market character: {profile['market_character']}\n"

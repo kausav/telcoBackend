@@ -172,6 +172,28 @@ def resolve_variables(scenario_id: str) -> tuple[list[dict[str, Any]], list[str]
 
 
 
+def resolve_scenario_context(scenario_id: str) -> dict[str, Any]:
+    """Return the complete confirmed scenario context used by generation agents."""
+    meta = resolve_scenario_meta(scenario_id) or {}
+    return {
+        "scenario_id": scenario_id,
+        "label": meta.get("label", scenario_id),
+        "journey": meta.get("journey", ""),
+        "description": meta.get("description", ""),
+        "domain": meta.get("domain", ""),
+        "business_scenario": meta.get("business_scenario", ""),
+        "business_response": meta.get("business_response"),
+        "expected_outcome": meta.get("expected_outcome"),
+        "scenario_type": meta.get("scenario_type"),
+        "use_case": meta.get("use_case"),
+        "industry": meta.get("industry", "generic"),
+        "country": meta.get("country"),
+        "type_of_data": meta.get("type_of_data", "aggregational"),
+        "entity_key": meta.get("entity_key"),
+        "events": meta.get("events", []),
+    }
+
+
 def resolve_data_type(scenario_id: str) -> str:
     """Return the persisted data type for a scenario.
 
