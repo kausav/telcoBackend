@@ -57,6 +57,42 @@ def _safe_edge_condition(expression: str, rec: dict) -> bool:
     except Exception:
         return False
 
+def _condition_literal_overrides(expression: str) -> dict[str, object]:
+    """Extract safe equality/boundary literals from an edge condition.
+
+    This is a deterministic safety net for LLM-generated edge definitions. If the
+    condition says ``auto_topup_enabled == True`` but the LLM forgot to emit an
+    override row for that field, the condition itself still tells us the required
+    value. Only simple comparisons against literals are used; ambiguous expressions
+    are left to normal generation and final condition validation.
+    """
+    overrides: dict[str, object] = {}
+    if not expression:
+        return overrides
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except Exception:
+        return overrides
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1 or len(node.comparators) != 1:
+            continue
+        op = node.ops[0]
+        left, right = node.left, node.comparators[0]
+        if isinstance(left, ast.Name) and isinstance(right, ast.Constant):
+            name, value = left.id, right.value
+        elif isinstance(right, ast.Name) and isinstance(left, ast.Constant):
+            name, value = right.id, left.value
+        else:
+            continue
+        if isinstance(op, (ast.Eq, ast.Is)):
+            overrides[name] = value
+        elif isinstance(op, ast.GtE) and isinstance(value, (int, float)) and not isinstance(value, bool):
+            overrides.setdefault(name, value)
+        elif isinstance(op, ast.LtE) and isinstance(value, (int, float)) and not isinstance(value, bool):
+            overrides.setdefault(name, value)
+    return overrides
+
+
 def _apply_edge_case_overrides(rec: dict, edge_group: dict, variables: list[dict], profile: dict | None = None, rules: dict | None = None, active_fields: set[str] | None = None) -> dict:
     """Apply only relevant edge-case overrides, then recalculate available formulas.
 
@@ -66,12 +102,19 @@ def _apply_edge_case_overrides(rec: dict, edge_group: dict, variables: list[dict
     """
     by_name = {v["name"]: v for v in variables}
     for edge_var in edge_group.get("variables", []):
-        name = str(edge_var.get("name", ""))
-        if name not in by_name:
+        name = str(edge_var.get("name", "")).strip()
+        if not name:
             continue
+        # Edge-case variables may be edge-only fields.  In that case use the
+        # edge definition itself as the schema instead of silently dropping it.
+        # This is important for conditions such as auto_topup_enabled == True
+        # where the field is intentionally introduced only for the edge case.
+        base_var = by_name.get(name)
+        effective = dict(base_var or edge_var)
+        if not effective.get("name"):
+            effective["name"] = name
         if active_fields is not None and name not in active_fields and name not in rec:
             continue
-        effective = dict(by_name[name])
         for key in ("gen", "params", "formula", "dtype", "nullable"):
             if key in edge_var and edge_var[key] not in (None, ""):
                 effective[key] = edge_var[key]
@@ -81,7 +124,19 @@ def _apply_edge_case_overrides(rec: dict, edge_group: dict, variables: list[dict
             helper["__current_field__"] = name
             helper["__country_profile__"] = profile
             value = generator(effective, helper)
-            rec[name] = _apply_generation_constraint(by_name[name], value, rec, rules)
+            rec[name] = _apply_generation_constraint(base_var or effective, value, rec, rules)
+
+    # Deterministically satisfy simple condition literals even when the LLM omitted
+    # a corresponding edge-variable row. This is especially important for booleans
+    # and categorical states such as auto_topup_enabled == True or status == "FAILED".
+    literal_overrides = _condition_literal_overrides(str(edge_group.get("condition") or ""))
+    for name, value in literal_overrides.items():
+        if active_fields is not None and name not in active_fields and name not in rec:
+            continue
+        base_var = by_name.get(name)
+        if base_var is not None:
+            value = _apply_generation_constraint(base_var, value, rec, rules)
+        rec[name] = value
 
     # Recalculate every formula whose dependencies are now available. Edge-case
     # overrides must not leave derived fields inconsistent.
@@ -784,18 +839,17 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
         # carry the fields required by its condition. Cross-event conditions may use
         # journey context, so only fields that are absent from the complete context
         # need to be present in the candidate itself.
-        base_context = build_context(entity_context, entity_rows, row)
-        missing_refs = {ref for ref in refs if ref not in base_context}
-        if missing_refs:
-            return False
-
-        # Apply overrides to fields that are relevant to this record or are required
-        # by the condition. Do not leak unrelated edge-case fields into sparse events.
+        # Apply overrides first.  An edge-case condition may intentionally reference
+        # an edge-only field (for example auto_topup_enabled), so checking the base
+        # context before applying the edge definition incorrectly rejects valid cases.
         active_fields = set(row.keys()) | set(compiled.entity_fields) | refs
         candidate = _apply_edge_case_overrides(
             dict(row), group, variables, profile, rules, active_fields=active_fields
         )
         context = build_context(entity_context, entity_rows, candidate)
+        missing_refs = {ref for ref in refs if ref not in context}
+        if missing_refs:
+            return False
         if not _safe_edge_condition(group.get("condition", ""), context):
             return False
 

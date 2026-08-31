@@ -190,6 +190,7 @@ def _validate_record(
     field_order: list[str],
     profile: dict,
     transactional: bool,
+    edge_case_variables: list[dict] | None = None,
     event_fields: set[str] | None = None,
     rules: dict | None = None,
 ) -> tuple[dict, list[str]]:
@@ -357,10 +358,14 @@ def _validate_record(
 
     # 9. Keep output limited to declared variables plus transactional metadata.
     metadata = {"journey_id", "transaction_id", "event_type", "event_sequence", "event_occurrence", "event_timestamp", "isEdgeCaseData"}
+    edge_field_names = {
+        str(item.get("name")) for item in (edge_case_variables or [])
+        if isinstance(item, dict) and item.get("name")
+    }
     if transactional:
-        allowed = set(field_order) | metadata
+        allowed = set(field_order) | edge_field_names | metadata
     else:
-        allowed = set(field_order)
+        allowed = set(field_order) | edge_field_names
     rec = {k: v for k, v in rec.items() if k in allowed}
 
     return rec, issues
@@ -403,6 +408,7 @@ class QAAgent:
                 rec, variables, state.field_order, profile, transactional,
                 event_fields=pre_event_fields,
                 rules=state.rules,
+                edge_case_variables=state.edge_case_variables,
             )
 
             # Edge-case labels are trusted only after the configured condition is checked.
@@ -502,23 +508,25 @@ class QAAgent:
                             ctx[key] = value
 
         # Finalize transactional edge-case labels at RECORD grain. A transactional
-        # event row is intentionally sparse, so a condition may need the complete journey
-        # context to validate. However, do NOT propagate the flag to every event in that
-        # journey: only the record explicitly selected by the generator remains an edge
-        # case. Normal records that happen to satisfy a condition are not promoted.
+        # condition may reference fields from another event, so evaluate each already-
+        # selected record against the complete journey context. Never promote a normal
+        # record to an edge case merely because another record in the journey matches.
         if transactional and checked:
             for rec in checked:
                 if rec.get("isEdgeCaseData") is not True:
                     rec["isEdgeCaseData"] = False
                     continue
                 journey_id = str(rec.get("journey_id") or "")
-                ctx = journey_edge_context.get(journey_id, {})
+                ctx = dict(journey_edge_context.get(journey_id, {}))
+                for key, value in rec.items():
+                    if key not in {"journey_id", "transaction_id", "event_type", "event_sequence",
+                                   "event_occurrence", "event_timestamp", "isEdgeCaseData"} and value is not None:
+                        ctx[key] = value
                 matched = any(
                     _safe_edge_condition(group.get("condition", ""), ctx)
                     for group in edge_groups.values()
                 )
-                if not matched:
-                    rec["isEdgeCaseData"] = False
+                rec["isEdgeCaseData"] = bool(matched)
 
         # Optional LLM semantic audit. Deterministic validation above always runs.
         rules_text = "\n".join(f"- {r}" for r in state.rules.get("business_rules", []))
@@ -550,7 +558,14 @@ class QAAgent:
                         temperature=0.1,
                     )
                     validated = result.get("valid_records", chunk)
-                    validated = [{k: r[k] for k in state.field_order if k in r} for r in validated]
+                    allowed_output = set(state.field_order) | {
+                        str(item.get("name")) for item in state.edge_case_variables
+                        if isinstance(item, dict) and item.get("name")
+                    } | {
+                        "journey_id", "transaction_id", "event_type", "event_sequence",
+                        "event_occurrence", "event_timestamp", "isEdgeCaseData"
+                    }
+                    validated = [{k: r[k] for k in allowed_output if k in r} for r in validated]
                     valid_all.extend(validated)
                     dropped_all.extend(result.get("dropped_records", []))
                     llm_fixes += int(result.get("fixes_applied", 0))
