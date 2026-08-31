@@ -40,6 +40,23 @@ def _edge_case_groups(edge_case_variables: list[dict] | None) -> dict[str, dict]
         group["variables"].append(item)
     return groups
 
+def _boolean_semantic(value):
+    """Return True/False for common boolean encodings, otherwise None.
+
+    This is intentionally data-driven and does not depend on any field name.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"true", "yes", "y", "1", "enabled", "on"}:
+            return True
+        if token in {"false", "no", "n", "0", "disabled", "off"}:
+            return False
+    return None
+
 def _safe_edge_condition(expression: str, rec: dict) -> bool:
     """Evaluate a configured condition against the actual record deterministically.
 
@@ -92,6 +109,12 @@ def _safe_edge_condition(expression: str, rec: dict) -> bool:
                         n = _num(actual)
                         if n is not None:
                             node.left = ast.Constant(value=n)
+                    # Boolean-semantic values may be serialized as YES/NO, Y/N,
+                    # enabled/disabled, 1/0, etc. Compare by semantic value.
+                    elif isinstance(right, ast.Constant) and isinstance(right.value, bool):
+                        actual_bool = _boolean_semantic(actual)
+                        if actual_bool is not None:
+                            node.left = ast.Constant(value=actual_bool)
                     # String equality/membership: canonicalize literal casing to the
                     # actual record value when they are equal ignoring case.
                     elif isinstance(actual, str) and isinstance(right, ast.Constant) and isinstance(right.value, str):
@@ -871,10 +894,18 @@ def _apply_condition_assignments(
         params = var.get("params") if isinstance(var.get("params"), dict) else {}
         choices = params.get("choices") if isinstance(params.get("choices"), list) else []
         if choices:
+            # The condition is an explicit edge constraint. Prefer an existing
+            # schema representation when one matches; otherwise keep the literal
+            # condition value instead of silently dropping it. This is generic and
+            # allows an edge state to sit outside the normal categorical distribution.
             match = next((c for c in choices if str(c).strip().lower() == str(value).strip().lower()), None)
-            if match is None:
-                continue
-            value = match
+            if match is not None:
+                value = match
+            elif isinstance(value, bool):
+                # Preserve a schema's common YES/NO representation when possible.
+                desired = value
+                match = next((c for c in choices if _boolean_semantic(c) is desired), None)
+                value = match if match is not None else value
         if dtype == "int" and isinstance(value, (int,float)) and not isinstance(value,bool):
             value = int(round(value))
         elif dtype == "float" and isinstance(value, (int,float)) and not isinstance(value,bool):
@@ -901,133 +932,164 @@ def _recalculate_formulas(candidate: dict, variables: list[dict]) -> dict:
     return candidate
 
 
-def _condition_compatible_with_schema(expression: str, variables: list[dict]) -> bool:
-    """Check structural satisfiability without confusing normal ranges with hard domains.
+def _condition_compatible_with_schema(
+    expression: str,
+    variables: list[dict],
+    edge_override_names: set[str] | None = None,
+) -> bool:
+    """Validate an edge condition structurally and generically.
 
-    The condition itself supplies semantic hints: a numeric literal used with an
-    ordering operator means the referenced value must be numeric, even when a CSV/LLM
-    definition labelled it as ``string``. Choice lists remain hard domains. Numeric
-    min/max metadata is a normal-generation distribution, not an edge-case boundary.
+    This function answers only: "Can this condition be represented by the
+    effective scenario schema?"  It deliberately does *not* try to prove the
+    condition from normal-generation distributions.  Normal min/max values are
+    distributions, not hard limits for an explicitly requested edge case.
+
+    ``edge_override_names`` identifies fields for which the edge-case definition
+    supplies an explicit value/domain.  Such overrides are authoritative over
+    normal categorical choices.  This prevents /scenario/confirm from rejecting
+    valid edge cases simply because an ordinary generator definition cannot
+    produce the exceptional value.
     """
-    by_name = {str(v.get("name")): v for v in variables if isinstance(v, dict) and v.get("name")}
-    branches = _condition_branches(expression)
-    if not branches:
+    by_name = {
+        str(v.get("name")): v for v in variables
+        if isinstance(v, dict) and v.get("name")
+    }
+    override_names = {str(x) for x in (edge_override_names or set())}
+
+    try:
+        tree = ast.parse(str(expression or ""), mode="eval")
+    except Exception:
         return False
 
-    def _num(value):
-        if isinstance(value, bool):
+    allowed = (
+        ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Not, ast.Compare,
+        ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+        ast.In, ast.NotIn, ast.Is, ast.IsNot, ast.Name, ast.Constant,
+        ast.List, ast.Tuple, ast.UnaryOp, ast.USub, ast.UAdd, ast.Load,
+    )
+    if any(not isinstance(n, allowed) for n in ast.walk(tree)):
+        return False
+
+    refs = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    if not refs.issubset(by_name):
+        return False
+
+    def literal(node):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, (ast.List, ast.Tuple)):
+            values = []
+            for child in node.elts:
+                if not isinstance(child, ast.Constant):
+                    return None
+                values.append(child.value)
+            return values
+        return None
+
+    def numeric(v):
+        if isinstance(v, bool):
             return None
-        if isinstance(value, (int, float)) and math.isfinite(float(value)):
-            return float(value)
-        if isinstance(value, str):
+        if isinstance(v, (int, float)) and math.isfinite(float(v)):
+            return float(v)
+        if isinstance(v, str):
             try:
-                x = float(value.strip())
+                x = float(v.strip())
                 return x if math.isfinite(x) else None
-            except ValueError:
+            except (TypeError, ValueError):
                 return None
         return None
 
-    def _has_numeric_domain(var: dict) -> bool:
-        params = var.get("params") if isinstance(var.get("params"), dict) else {}
-        lo, hi = params.get("min"), params.get("max")
-        return _num(lo) is not None and _num(hi) is not None
-
-    def _kind(var: dict, expected: object = None) -> str:
+    def semantic_kind(var: dict):
         dtype = str(var.get("dtype", "string")).strip().lower()
         params = var.get("params") if isinstance(var.get("params"), dict) else {}
         choices = params.get("choices") if isinstance(params.get("choices"), list) else []
         if dtype in {"boolean", "bool"}:
             return "boolean"
         if dtype in {"int", "integer"}:
-            return "int"
+            return "number"
         if dtype in {"float", "number", "double", "decimal"}:
             return "number"
-        if choices:
-            # If all declared choices are numeric, the semantic domain is numeric.
-            if choices and all(_num(c) is not None for c in choices):
-                return "number"
-            return "string"
-        if _has_numeric_domain(var):
+        boolean_values = [_boolean_semantic(x) for x in choices] if choices else []
+        if choices and all(x is not None for x in boolean_values) and len(set(boolean_values)) <= 2:
+            return "boolean"
+        if choices and all(numeric(x) is not None for x in choices):
             return "number"
+        if params.get("min") is not None and params.get("max") is not None:
+            if numeric(params.get("min")) is not None and numeric(params.get("max")) is not None:
+                return "number"
         if dtype in {"datetime", "date", "timestamp"}:
             return "datetime"
-        # A numeric assignment produced from an ordering condition is itself a strong
-        # semantic signal, even when the upstream dtype is noisy.
-        if isinstance(expected, (int, float)) and not isinstance(expected, bool):
-            return "number"
         return "string"
 
-    for branch in branches:
-        ok = True
-        for name, value in branch.items():
-            if name == "__not_eq__":
-                field, forbidden = value
-                var = by_name.get(field)
-                if not var:
-                    ok = False
-                    break
-                kind = _kind(var, forbidden)
-                if kind in {"number", "int"} and _num(forbidden) is None:
-                    ok = False
-                    break
-                if kind == "boolean" and not isinstance(forbidden, bool):
-                    ok = False
-                    break
-                params = var.get("params") if isinstance(var.get("params"), dict) else {}
-                choices = params.get("choices") if isinstance(params.get("choices"), list) else []
-                if choices and all(str(c).strip().lower() == str(forbidden).strip().lower() for c in choices):
-                    ok = False
-                    break
-                continue
+    def compatible_scalar(name: str, op, value) -> bool:
+        var = by_name[name]
+        kind = semantic_kind(var)
+        if kind == "number":
+            if numeric(value) is None:
+                return False
+        elif kind == "boolean":
+            if not isinstance(value, bool):
+                return False
+        elif kind == "datetime":
+            if not isinstance(value, str):
+                return False
+        else:
+            # String/categorical variables accept string literals.  Do not reject
+            # a value merely because its normal choices omit it when an explicit
+            # edge override exists; the override is precisely how an exceptional
+            # categorical state is declared.
+            if not isinstance(value, str):
+                return False
 
-            if name == "__not_in__":
-                field, forbidden = value
-                var = by_name.get(field)
-                if not var:
-                    ok = False
-                    break
-                params = var.get("params") if isinstance(var.get("params"), dict) else {}
-                choices = params.get("choices") if isinstance(params.get("choices"), list) else []
-                if choices and all(any(str(c).strip().lower() == str(f).strip().lower() for f in forbidden) for c in choices):
-                    ok = False
-                    break
-                continue
+        params = var.get("params") if isinstance(var.get("params"), dict) else {}
+        choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+        # For an explicit edge condition, the condition literal itself is an edge
+        # constraint. Normal categorical choices describe ordinary generation and must
+        # not make confirmation fail. If an explicit edge override exists it is even
+        # more authoritative; generation will materialize the condition value.
+        return True
 
-            var = by_name.get(name)
-            if not var:
-                ok = False
-                break
-            kind = _kind(var, value)
-            if kind in {"int", "number"}:
-                if _num(value) is None:
-                    ok = False
-                    break
-            elif kind == "boolean":
-                if not isinstance(value, bool):
-                    ok = False
-                    break
-            elif kind == "datetime":
-                if not isinstance(value, str):
-                    ok = False
-                    break
-            else:
-                if not isinstance(value, str):
-                    ok = False
-                    break
-
-            params = var.get("params") if isinstance(var.get("params"), dict) else {}
-            choices = params.get("choices") if isinstance(params.get("choices"), list) else []
-            if choices:
-                normalized_choices = {str(c).strip().lower() for c in choices}
-                if str(value).strip().lower() not in normalized_choices:
-                    # Numeric choices may be represented as numbers while the condition
-                    # parser produced an int/float. Compare semantically as numbers.
-                    if not (_num(value) is not None and any(_num(c) is not None and math.isclose(_num(c), _num(value), abs_tol=1e-12) for c in choices)):
-                        ok = False
-                        break
-        if ok:
+    def validate(node) -> bool:
+        if isinstance(node, ast.Expression):
+            return validate(node.body)
+        if isinstance(node, ast.BoolOp):
+            return all(validate(x) for x in node.values)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return validate(node.operand)
+        if isinstance(node, ast.Compare):
+            if len(node.ops) != len(node.comparators):
+                return False
+            left = node.left
+            for op, right in zip(node.ops, node.comparators):
+                if isinstance(left, ast.Name):
+                    value = literal(right)
+                    if isinstance(right, ast.Name):
+                        # Field-to-field comparisons are supported only when both
+                        # fields are declared; actual satisfiability is handled at
+                        # generation time from the generated record.
+                        if right.id not in by_name:
+                            return False
+                    elif value is None and not (isinstance(right, ast.Constant) and right.value is None):
+                        return False
+                    elif isinstance(value, list) and isinstance(op, (ast.In, ast.NotIn)):
+                        if not all(compatible_scalar(left.id, op, x) for x in value):
+                            return False
+                    elif not isinstance(right, ast.Name) and not compatible_scalar(left.id, op, value):
+                        return False
+                elif isinstance(right, ast.Name) and isinstance(left, ast.Constant):
+                    if right.id not in by_name:
+                        return False
+                    if not compatible_scalar(right.id, op, literal(left)):
+                        return False
+                else:
+                    return False
+                left = right
             return True
-    return False
+        if isinstance(node, ast.Name):
+            return node.id in by_name
+        return False
+
+    return validate(tree)
 
 def _condition_literals(expression: str) -> dict[str, object]:
     """Backward-compatible first branch of the generic condition constraint solver."""
@@ -1296,7 +1358,10 @@ def _transactional_records(
             if configured_event and configured_event != str(row.get("event_type") or "").strip().upper().replace(" ", "_"):
                 continue
             refs = _condition_refs(group.get("condition", ""))
-            if not _condition_compatible_with_schema(group.get("condition", ""), variables):
+            if not _condition_compatible_with_schema(
+                group.get("condition", ""), variables,
+                edge_override_names={str(v.get("name")) for v in group.get("variables", []) if v.get("name")},
+            ):
                 continue
             # If a condition references fields that are neither present in the row nor
             # explicitly supplied by this edge definition, this event cannot represent it.
@@ -1387,7 +1452,10 @@ class DataGeneratorAgent:
             groups = _edge_case_groups(state.edge_case_variables)
             for group_name, group in groups.items():
                 condition = str(group.get("condition") or "").strip()
-                if condition and not _condition_compatible_with_schema(condition, variables):
+                if condition and not _condition_compatible_with_schema(
+                    condition, variables,
+                    edge_override_names={str(v.get("name")) for v in group.get("variables", []) if v.get("name")},
+                ):
                     raise ValueError(
                         f"Edge case '{group_name}' has an unsatisfiable condition under the "
                         f"declared variable constraints: {condition}. Reconfirm the scenario "

@@ -580,7 +580,10 @@ def confirm_scenario_route(req: ConfirmRequest):
             for key in ("dtype", "gen", "params", "formula", "depends_on", "nullable"):
                 if key in edge_var and edge_var[key] not in (None, ""):
                     base[key] = edge_var[key]
-        if not _condition_compatible_with_schema(condition, effective_variables):
+        if not _condition_compatible_with_schema(
+            condition, effective_variables,
+            edge_override_names={str(v.get("name")) for v in group.get("variables", []) if v.get("name")},
+        ): 
             raise HTTPException(400, detail={
                 "error": f"Edge case '{group_name}' condition is incompatible with its effective variable schema",
                 "condition": condition,
