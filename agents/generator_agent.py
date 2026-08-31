@@ -57,12 +57,19 @@ def _safe_edge_condition(expression: str, rec: dict) -> bool:
     except Exception:
         return False
 
-def _apply_edge_case_overrides(rec: dict, edge_group: dict, variables: list[dict], profile: dict | None = None, rules: dict | None = None) -> dict:
-    """Apply edge-case variable generation/overrides, then recalculate formulas."""
+def _apply_edge_case_overrides(rec: dict, edge_group: dict, variables: list[dict], profile: dict | None = None, rules: dict | None = None, active_fields: set[str] | None = None) -> dict:
+    """Apply only relevant edge-case overrides, then recalculate available formulas.
+
+    ``active_fields`` prevents an edge-case override belonging to another event from
+    leaking into sparse transactional rows.  Entity-level generation calls this with
+    the entity fields; event generation calls it with the event fields.
+    """
     by_name = {v["name"]: v for v in variables}
     for edge_var in edge_group.get("variables", []):
         name = str(edge_var.get("name", ""))
         if name not in by_name:
+            continue
+        if active_fields is not None and name not in active_fields and name not in rec:
             continue
         effective = dict(by_name[name])
         for key in ("gen", "params", "formula", "dtype", "nullable"):
@@ -181,9 +188,31 @@ def _segment_range(params: dict, rec: dict) -> float:
     return round(random.uniform(rng["min"], rng["max"]), 4)
 
 
+def _to_finite_float(value, default: float | None = None) -> float | None:
+    """Coerce numeric-looking values safely for dependent generators.
+
+    Scenario definitions can come from an LLM or CSV, so numeric params may be
+    strings. Dependent fields can also be represented as strings (for example
+    ``"20.0"``). Never pass a raw string into random.uniform/max.
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+        if not math.isfinite(number):
+            return default
+        return number
+    except (TypeError, ValueError):
+        return default
+
+
 def _uniform_bounded(params: dict, rec: dict) -> float:
-    hi = rec.get(params["hi_field"], 1.00)
-    lo = params.get("lo", 0.00)
+    hi = _to_finite_float(rec.get(params.get("hi_field")), None)
+    if hi is None:
+        hi = _to_finite_float(params.get("hi"), 1.00)
+    lo = _to_finite_float(params.get("lo"), 0.00)
+    if lo is None:
+        lo = 0.00
     return round(random.uniform(lo, max(lo, hi)), 2)
 
 
@@ -627,7 +656,13 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
     # We only need the latest response window, so create at most 10 full entity states.
     response_entity_count = min(journey_count, MAX_RESPONSE_ENTITIES)
     edge_groups = _edge_case_groups(edge_case_variables)
-    edge_count = min(_edge_case_count(journey_count, edge_case_percentage), response_entity_count)
+    conceptual_edge_count = _edge_case_count(journey_count, edge_case_percentage) if edge_groups else 0
+    # Only the latest response_entity_count entities are materialized. Place the
+    # edge-case entities at the tail of the conceptual dataset so requested edge
+    # cases are visible in the API response instead of being hidden in omitted
+    # historical entities.
+    visible_edge_count = min(conceptual_edge_count, response_entity_count)
+    visible_start = response_entity_count - visible_edge_count
     edge_names = list(edge_groups)
     generated: list[dict] = []
     used_entity_keys: set[str] = set()
@@ -651,11 +686,11 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                 attempts += 1
             used_entity_keys.add(str(entity_context[entity_key]))
 
-        is_edge_entity = entity_index < edge_count and bool(edge_names)
+        is_edge_entity = entity_index >= visible_start and bool(edge_names)
         edge_group = edge_groups[edge_names[entity_index % len(edge_names)]] if is_edge_entity else None
         # Apply edge overrides to stable entity fields before event generation.
         if edge_group:
-            entity_context = _apply_edge_case_overrides(entity_context, edge_group, variables, profile, rules)
+            entity_context = _apply_edge_case_overrides(entity_context, edge_group, variables, profile, rules, active_fields=set(compiled.entity_fields))
 
         journey_id = _journey_id()
         entity_value = str(entity_context.get(entity_key, "")) if entity_key else journey_id
@@ -664,6 +699,7 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
         base_ts = _parse_dt(entity_context.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
         elapsed_seconds = 0
 
+        entity_rows: list[dict] = []
         for event in events:
             occurrence_count = random.randint(event.min_occurrences, event.max_occurrences)
             if event_counts_out is not None:
@@ -675,8 +711,6 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                 elapsed_seconds += random.randint(5, 300)
                 event_ts = base_ts + timedelta(seconds=elapsed_seconds)
 
-                # Generate event-local fields and their dependencies. Stable entity fields
-                # are copied in; they are never regenerated here.
                 row = _generate_selected_record(
                     variables,
                     set(event.fields),
@@ -691,18 +725,38 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                 row["event_sequence"] = event.sequence
                 row["event_occurrence"] = occurrence + 1
                 row["event_timestamp"] = event_ts.isoformat()
+
+                # Apply only event-relevant edge overrides. The full condition is
+                # evaluated later against the complete entity/journey context.
                 if edge_group:
-                    for _ in range(_MAX_EDGE_CASE_ATTEMPTS):
-                        candidate = _apply_edge_case_overrides(dict(row), edge_group, variables, profile, rules)
-                        if _safe_edge_condition(edge_group.get("condition", ""), candidate):
-                            row = candidate
-                            row["isEdgeCaseData"] = True
-                            break
-                    else:
-                        row["isEdgeCaseData"] = False
-                else:
-                    row["isEdgeCaseData"] = False
-                generated.append(row)
+                    row = _apply_edge_case_overrides(
+                        row, edge_group, variables, profile, rules,
+                        active_fields=set(event.fields) | set(compiled.entity_fields),
+                    )
+                entity_rows.append(row)
+
+        if edge_group and entity_rows:
+            # For transactional scenarios the percentage is defined at the entity
+            # level. Evaluate the edge condition against the complete journey context
+            # (stable entity fields + fields emitted by all relevant events), rather
+            # than against one sparse event row. This prevents valid edge journeys from
+            # being labelled false simply because the condition references a field that
+            # belongs to another event.
+            condition_context = dict(entity_context)
+            for row in entity_rows:
+                for key, value in row.items():
+                    if key not in {"journey_id", "transaction_id", "event_type",
+                                   "event_sequence", "event_occurrence", "event_timestamp",
+                                   "isEdgeCaseData"} and value is not None:
+                        condition_context[key] = value
+            edge_valid = _safe_edge_condition(edge_group.get("condition", ""), condition_context)
+            for row in entity_rows:
+                row["isEdgeCaseData"] = bool(edge_valid)
+        else:
+            for row in entity_rows:
+                row["isEdgeCaseData"] = False
+
+        generated.extend(entity_rows)
 
     return generated
 
@@ -754,13 +808,21 @@ class DataGeneratorAgent:
                 rec = _generate_record(variables, profile=profile, rules=state.rules)
                 if index < edge_count and edge_names:
                     group = edge_groups[edge_names[index % len(edge_names)]]
+                    matched = False
                     for _ in range(_MAX_EDGE_CASE_ATTEMPTS):
-                        candidate = _apply_edge_case_overrides(dict(rec), group, variables, profile, state.rules)
+                        candidate = _apply_edge_case_overrides(
+                            dict(rec), group, variables, profile, state.rules,
+                            active_fields=set(FIELD_ORDER),
+                        )
                         if _safe_edge_condition(group.get("condition", ""), candidate):
                             rec = candidate
                             rec["isEdgeCaseData"] = True
+                            matched = True
                             break
-                    else:
+                        # Regenerate the normal base so random-dependent conditions
+                        # get another opportunity; deterministic overrides still win.
+                        rec = _generate_record(variables, profile=profile, rules=state.rules)
+                    if not matched:
                         rec["isEdgeCaseData"] = False
                 else:
                     rec["isEdgeCaseData"] = False
@@ -768,7 +830,7 @@ class DataGeneratorAgent:
             if "isEdgeCaseData" not in state.field_order:
                 state.field_order = list(state.field_order) + ["isEdgeCaseData"]
             logger.info("[DataGenerator] Generated %d aggregational records with %d fields each; edge cases=%d.",
-                        len(records), len(variables), edge_count)
+                        len(records), len(variables), visible_edge_count if state.type_of_data == "transactional" else edge_count)
 
         state.raw_records = records
         return state

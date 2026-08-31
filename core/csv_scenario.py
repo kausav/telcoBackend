@@ -23,6 +23,7 @@ generation order, so a field must appear AFTER anything it depends on.
 """
 from __future__ import annotations
 import csv
+import ast
 import io
 import json
 import re
@@ -283,6 +284,22 @@ def parse_definition_csv(
                     raise ValueError(f"Row {row_number} ('{name}'): edge_case_name is required")
                 if not condition:
                     raise ValueError(f"Row {row_number} ('{name}'): condition is required")
+                try:
+                    tree = ast.parse(condition, mode="eval")
+                    allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Not,
+                               ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt,
+                               ast.GtE, ast.In, ast.NotIn, ast.Is, ast.IsNot, ast.Name,
+                               ast.Constant, ast.List, ast.Tuple, ast.UnaryOp, ast.USub,
+                               ast.UAdd, ast.Load)
+                    if any(not isinstance(n, allowed) for n in ast.walk(tree)):
+                        raise ValueError("condition contains unsupported expression syntax")
+                    refs = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+                    declared_names = {v["name"] for v in variables}
+                    if not refs.issubset(declared_names):
+                        missing = sorted(refs - declared_names)
+                        raise ValueError(f"condition references undefined variable(s): {missing}")
+                except SyntaxError as exc:
+                    raise ValueError(f"Row {row_number} ('{name}'): condition is not a valid expression: {exc}") from exc
                 edge_item = dict(variable)
                 edge_item["edge_case_name"] = edge_name
                 edge_item["edge_case_description"] = edge_description

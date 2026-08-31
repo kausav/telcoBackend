@@ -367,6 +367,24 @@ class ScenarioDesignerAgent:
             v["edge_case_name"] = str(v.get("edge_case_name") or "Scenario Edge Case").strip()
             v["edge_case_description"] = str(v.get("edge_case_description") or "").strip()
             v["condition"] = str(v.get("condition") or "").strip()
+            # Edge conditions are executable expressions, not prose. Reject invalid
+            # syntax or references to fields outside the confirmed variable catalog so
+            # the generator can deterministically prove that an edge record is real.
+            if v.get("condition"):
+                try:
+                    tree = ast.parse(v["condition"], mode="eval")
+                    allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Not,
+                               ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt,
+                               ast.GtE, ast.In, ast.NotIn, ast.Is, ast.IsNot, ast.Name,
+                               ast.Constant, ast.List, ast.Tuple, ast.UnaryOp, ast.USub,
+                               ast.UAdd, ast.Load)
+                    if any(not isinstance(n, allowed) for n in ast.walk(tree)):
+                        continue
+                    refs = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+                    if not refs.issubset(valid_names):
+                        continue
+                except Exception:
+                    continue
             # If the edge field already exists in normal variables, inherit its schema
             # and only keep edge-specific overrides/condition.
             base = next((x for x in variables if x.get("name") == v["name"]), None)
