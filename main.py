@@ -70,6 +70,8 @@ def run_pipeline(scenario: str, count: int, industry: str = "generic", country: 
         expected_outcome=context.get("expected_outcome"),
         scenario_type=context.get("scenario_type"), use_case=context.get("use_case"),
         entity_key=context.get("entity_key"), scenario_context=context,
+        edge_case_variables=context.get("edge_case_variables", []),
+        edge_case_percentage=float(context.get("edge_case_percentage", 0.0) or 0.0),
     )
 
     pipeline = [

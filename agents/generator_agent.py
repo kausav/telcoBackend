@@ -19,6 +19,85 @@ from config.industry_profiles import get_profile, country_allowed_value, payment
 
 logger = logging.getLogger(__name__)
 
+_MAX_EDGE_CASE_ATTEMPTS = 20
+
+def _edge_case_groups(edge_case_variables: list[dict] | None) -> dict[str, dict]:
+    groups: dict[str, dict] = {}
+    for item in edge_case_variables or []:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        name = str(item.get("edge_case_name") or "Scenario Edge Case").strip()
+        group = groups.setdefault(name, {
+            "description": str(item.get("edge_case_description") or ""),
+            "condition": str(item.get("condition") or "").strip(),
+            "variables": [],
+        })
+        if item.get("condition") and not group.get("condition"):
+            group["condition"] = str(item["condition"]).strip()
+        group["variables"].append(item)
+    return groups
+
+def _safe_edge_condition(expression: str, rec: dict) -> bool:
+    if not expression:
+        return True
+    try:
+        tree = ast.parse(expression, mode="eval")
+        allowed_nodes = (
+            ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Not, ast.Compare,
+            ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In, ast.NotIn,
+            ast.Is, ast.IsNot, ast.Name, ast.Constant, ast.List, ast.Tuple,
+            ast.UnaryOp, ast.USub, ast.UAdd, ast.Load,
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed_nodes):
+                return False
+            if isinstance(node, ast.Name) and node.id not in rec:
+                return False
+        return bool(eval(compile(tree, "<edge-condition>", "eval"), {"__builtins__": {}}, dict(rec)))
+    except Exception:
+        return False
+
+def _apply_edge_case_overrides(rec: dict, edge_group: dict, variables: list[dict], profile: dict | None = None, rules: dict | None = None) -> dict:
+    """Apply edge-case variable generation/overrides, then recalculate formulas."""
+    by_name = {v["name"]: v for v in variables}
+    for edge_var in edge_group.get("variables", []):
+        name = str(edge_var.get("name", ""))
+        if name not in by_name:
+            continue
+        effective = dict(by_name[name])
+        for key in ("gen", "params", "formula", "dtype", "nullable"):
+            if key in edge_var and edge_var[key] not in (None, ""):
+                effective[key] = edge_var[key]
+        generator = _GENERATORS.get(effective.get("gen"))
+        if generator:
+            helper = dict(rec)
+            helper["__current_field__"] = name
+            helper["__country_profile__"] = profile
+            value = generator(effective, helper)
+            rec[name] = _apply_generation_constraint(by_name[name], value, rec, rules)
+
+    # Recalculate every formula whose dependencies are now available. Edge-case
+    # overrides must not leave derived fields inconsistent.
+    formula_vars = [v for v in variables if v.get("formula") and v.get("name") in rec]
+    for _ in range(len(formula_vars) + 1):
+        changed = False
+        for var in formula_vars:
+            expr = str(var["formula"])
+            deps = _formula_dependencies(expr)
+            if deps and not all(rec.get(d) is not None for d in deps):
+                continue
+            value = _formula(var, rec)
+            if value is not None and rec.get(var["name"]) != value:
+                rec[var["name"]] = value
+                changed = True
+        if not changed:
+            break
+    return rec
+
+def _edge_case_count(total: int, percentage: float) -> int:
+    import math
+    return max(0, min(total, math.floor(total * percentage + 1e-12)))
+
 # ── Generator functions ────────────────────────────────────────────────────────
 
 def _prefixed_int(params: dict, _rec: dict) -> str:
@@ -527,7 +606,7 @@ def _journey_id() -> str:
     return f"JRN-{uuid.uuid4().hex[:12].upper()}"
 
 
-def _transactional_records(compiled, journey_count: int, event_counts_out: dict[str, dict[str, int]] | None = None, profile: dict | None = None, rules: dict | None = None) -> list[dict]:
+def _transactional_records(compiled, journey_count: int, event_counts_out: dict[str, dict[str, int]] | None = None, profile: dict | None = None, rules: dict | None = None, edge_case_variables: list[dict] | None = None, edge_case_percentage: float = 0.0) -> list[dict]:
     """Fast transactional generation.
 
     Important optimization: the requested count represents entities, but the API only
@@ -547,6 +626,9 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
     # customer_id, account_id, etc. are generated once and reused across all events.
     # We only need the latest response window, so create at most 10 full entity states.
     response_entity_count = min(journey_count, MAX_RESPONSE_ENTITIES)
+    edge_groups = _edge_case_groups(edge_case_variables)
+    edge_count = min(_edge_case_count(journey_count, edge_case_percentage), response_entity_count)
+    edge_names = list(edge_groups)
     generated: list[dict] = []
     used_entity_keys: set[str] = set()
 
@@ -568,6 +650,12 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                         entity_context[entity_key] = generator(key_var, entity_context)
                 attempts += 1
             used_entity_keys.add(str(entity_context[entity_key]))
+
+        is_edge_entity = entity_index < edge_count and bool(edge_names)
+        edge_group = edge_groups[edge_names[entity_index % len(edge_names)]] if is_edge_entity else None
+        # Apply edge overrides to stable entity fields before event generation.
+        if edge_group:
+            entity_context = _apply_edge_case_overrides(entity_context, edge_group, variables, profile, rules)
 
         journey_id = _journey_id()
         entity_value = str(entity_context.get(entity_key, "")) if entity_key else journey_id
@@ -603,6 +691,17 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                 row["event_sequence"] = event.sequence
                 row["event_occurrence"] = occurrence + 1
                 row["event_timestamp"] = event_ts.isoformat()
+                if edge_group:
+                    for _ in range(_MAX_EDGE_CASE_ATTEMPTS):
+                        candidate = _apply_edge_case_overrides(dict(row), edge_group, variables, profile, rules)
+                        if _safe_edge_condition(edge_group.get("condition", ""), candidate):
+                            row = candidate
+                            row["isEdgeCaseData"] = True
+                            break
+                    else:
+                        row["isEdgeCaseData"] = False
+                else:
+                    row["isEdgeCaseData"] = False
                 generated.append(row)
 
     return generated
@@ -616,9 +715,13 @@ class DataGeneratorAgent:
 
     def run(self, state: WorkflowState) -> WorkflowState:
         logger.info(
-            "[DataGenerator] Context: domain=%s business_scenario=%s use_case=%s scenario_type=%s",
-            state.domain, state.business_scenario, state.use_case, state.scenario_type,
+            "[DataGenerator] Context: industry=%s country=%s type=%s domain=%s business_scenario=%s use_case=%s scenario_type=%s entity_key=%s",
+            state.industry, state.country or "GLOBAL", state.type_of_data, state.domain,
+            state.business_scenario, state.use_case, state.scenario_type, state.entity_key,
         )
+        # The confirmed scenario context is the source of truth. RulesAgent has already
+        # compiled its business/use-case constraints into state.rules; generation below
+        # applies those constraints deterministically without an LLM call per record.
         dyn = resolve_variables(state.scenario)
         if dyn is not None:
             variables, FIELD_ORDER = dyn
@@ -631,11 +734,11 @@ class DataGeneratorAgent:
             entity_key = compiled.entity_key
             state.transactional_event_counts = {}
             profile = get_profile(state.industry, state.country)
-            records = _transactional_records(compiled, state.count, state.transactional_event_counts, profile=profile, rules=state.rules)
+            records = _transactional_records(compiled, state.count, state.transactional_event_counts, profile=profile, rules=state.rules, edge_case_variables=state.edge_case_variables, edge_case_percentage=state.edge_case_percentage)
             state.field_order = [
                 "journey_id", "transaction_id", "event_type", "event_sequence",
                 "event_occurrence", "event_timestamp",
-            ] + [name for name in FIELD_ORDER if name != "event_timestamp"]
+            ] + [name for name in FIELD_ORDER if name != "event_timestamp"] + (["isEdgeCaseData"] if "isEdgeCaseData" not in FIELD_ORDER else [])
             logger.info(
                 "[DataGenerator] Generated %d transactional records from %d journeys and %d events.",
                 len(records), state.count, len(compiled.events),
@@ -643,9 +746,29 @@ class DataGeneratorAgent:
         else:
             state.field_order = FIELD_ORDER
             profile = get_profile(state.industry, state.country)
-            records = [_generate_record(variables, profile=profile, rules=state.rules) for _ in range(state.count)]
-            logger.info("[DataGenerator] Generated %d aggregational records with %d fields each.",
-                        len(records), len(variables))
+            edge_groups = _edge_case_groups(state.edge_case_variables)
+            edge_count = _edge_case_count(state.count, state.edge_case_percentage)
+            edge_names = list(edge_groups)
+            records = []
+            for index in range(state.count):
+                rec = _generate_record(variables, profile=profile, rules=state.rules)
+                if index < edge_count and edge_names:
+                    group = edge_groups[edge_names[index % len(edge_names)]]
+                    for _ in range(_MAX_EDGE_CASE_ATTEMPTS):
+                        candidate = _apply_edge_case_overrides(dict(rec), group, variables, profile, state.rules)
+                        if _safe_edge_condition(group.get("condition", ""), candidate):
+                            rec = candidate
+                            rec["isEdgeCaseData"] = True
+                            break
+                    else:
+                        rec["isEdgeCaseData"] = False
+                else:
+                    rec["isEdgeCaseData"] = False
+                records.append(rec)
+            if "isEdgeCaseData" not in state.field_order:
+                state.field_order = list(state.field_order) + ["isEdgeCaseData"]
+            logger.info("[DataGenerator] Generated %d aggregational records with %d fields each; edge cases=%d.",
+                        len(records), len(variables), edge_count)
 
         state.raw_records = records
         return state

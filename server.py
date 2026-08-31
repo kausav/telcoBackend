@@ -88,6 +88,7 @@ class GenerateResponse(BaseModel):
     totalCount: int = Field(0, description="Total number of unique entities in the response dataset")
     eventData: list[dict] = Field(default_factory=list, description="Deprecated compatibility field; transactional data is grouped under records by entityKey")
     errors: list[str]
+    edgeCasePercentage: float = Field(0.0, ge=0.0, le=1.0)
 
 
 class ProposeRequest(BaseModel):
@@ -114,6 +115,7 @@ class ProposeResponse(BaseModel):
     field_order: list[str]
     typeOfData: Literal["transactional", "aggregational"]
     events: list[dict] = Field(default_factory=list)
+    edgeCaseVariables: list[dict] = Field(default_factory=list)
 
 
 class VariableEdit(BaseModel):
@@ -140,6 +142,12 @@ class ConfirmRequest(BaseModel):
     eventEdit: list[EventEdit] = Field(default_factory=list, description="Transactional events to edit by event_type")
     eventDelete: list[str] = Field(default_factory=list, description="Transactional event_type values to delete")
 
+    # Edge-case variable changes are supported for both data types.
+    edgeCaseAdd: list[dict] = Field(default_factory=list, description="Edge-case variable definitions to add")
+    edgeCaseEdit: list[VariableEdit] = Field(default_factory=list, description="Edge-case variables to edit by name")
+    edgeCaseDelete: list[str] = Field(default_factory=list, description="Edge-case variable names to delete")
+    edgeCasePercentage: float | None = Field(None, ge=0.0, le=1.0, description="Fraction of generated records/entities that must be edge-case data (0.02 = 2%)")
+
     feedback: str | None = None
 
 
@@ -155,6 +163,8 @@ class ConfirmResponse(BaseModel):
     field_order: list[str]
     typeOfData: Literal["transactional", "aggregational"]
     events: list[dict] = Field(default_factory=list)
+    edgeCaseVariables: list[dict] = Field(default_factory=list)
+    edgeCasePercentage: float = Field(0.0, ge=0.0, le=1.0)
 
 
 @app.get("/")
@@ -204,6 +214,8 @@ def propose_scenario(req: ProposeRequest):
     draft["business_response"] = req.businessResponse
     draft["expected_outcome"] = req.expectedOutcome
     draft["type_of_data"] = req.typeOfData
+    draft.setdefault("edge_case_variables", [])
+    draft.setdefault("edge_case_percentage", 0.0)
     save_draft(draft_id, draft)
     scenario_id_available = not scenario_exists(req.scenarioId)
     if not scenario_id_available:
@@ -223,6 +235,7 @@ def propose_scenario(req: ProposeRequest):
         field_order=draft.get("field_order", []),
         typeOfData=draft.get("type_of_data", "aggregational"),
         events=draft.get("events", []),
+        edgeCaseVariables=draft.get("edge_case_variables", []),
     )
 
 
@@ -294,6 +307,8 @@ def import_scenario_csv(
         "type_of_data": typeOfData,
         "entity_key": entityKey,
         "events": events,
+        "edge_case_variables": [],
+        "edge_case_percentage": 0.0,
     }
     save_draft(draft_id, draft)
     return ProposeResponse(
@@ -307,6 +322,7 @@ def import_scenario_csv(
         field_order=field_order,
         typeOfData=typeOfData,
         events=events,
+        edgeCaseVariables=[],
     )
 
 
@@ -429,6 +445,35 @@ def confirm_scenario_route(req: ConfirmRequest):
             event["min_occurrences"] = min_occ
             event["max_occurrences"] = max_occ
 
+    # Edge-case variables: add/edit/delete independently from normal variables.
+    edge_case_variables: list[dict] = [dict(v) for v in draft.get("edge_case_variables", []) if isinstance(v, dict)]
+    edge_by_name = {str(v.get("name", "")): v for v in edge_case_variables if v.get("name")}
+    for name in req.edgeCaseDelete:
+        if not _is_placeholder(name):
+            edge_by_name.pop(str(name), None)
+    for e in req.edgeCaseEdit:
+        if _is_placeholder(e.name):
+            continue
+        changes = _clean_dict(e.changes or {})
+        if e.name in edge_by_name and changes:
+            edge_by_name[e.name].update(changes)
+    for new_var in req.edgeCaseAdd:
+        cleaned = _clean_dict(new_var)
+        if not _is_placeholder(cleaned.get("name")):
+            edge_by_name[str(cleaned["name"])] = cleaned
+    edge_case_variables = list(edge_by_name.values())
+
+    edge_case_percentage = draft.get("edge_case_percentage", 0.0)
+    if req.edgeCasePercentage is not None:
+        edge_case_percentage = req.edgeCasePercentage
+    try:
+        edge_case_percentage = float(edge_case_percentage or 0.0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, detail={"error": "edgeCasePercentage must be a finite float between 0 and 1"}) from exc
+    import math
+    if not math.isfinite(edge_case_percentage) or not 0.0 <= edge_case_percentage <= 1.0:
+        raise HTTPException(400, detail={"error": "edgeCasePercentage must be between 0 and 1", "value": edge_case_percentage})
+
     scenario_id = draft.get("scenario_id") or next_scenario_id()
     requested_scenario_id = draft.get("scenario_id")
     # scenarioId is user-chosen at propose time, so two different users' drafts can pick the
@@ -458,6 +503,8 @@ def confirm_scenario_route(req: ConfirmRequest):
         "type_of_data": type_of_data,
         "events": events,
         "entity_key": draft.get("entity_key"),
+        "edge_case_variables": edge_case_variables,
+        "edge_case_percentage": edge_case_percentage,
     }
     confirm_scenario(scenario_id, meta, variables, field_order, draft_id=req.draft_id)
     # Confirmed scenario changed: invalidate all runtime artifacts compiled from the old version.
@@ -481,6 +528,8 @@ def confirm_scenario_route(req: ConfirmRequest):
         field_order=field_order,
         typeOfData=meta["type_of_data"],
         events=meta.get("events", []),
+        edgeCaseVariables=edge_case_variables,
+        edgeCasePercentage=edge_case_percentage,
     )
 
 
@@ -602,4 +651,5 @@ def generate_dynamic(req: GenerateRequest):
         records=response_records,
         eventData=event_data,
         errors=state.errors,
+        edgeCasePercentage=float(meta.get("edge_case_percentage", 0.0) or 0.0),
     )

@@ -24,6 +24,8 @@ class WorkflowState(BaseModel):
     use_case: str | None = None
     entity_key: str | None = None
     scenario_context: dict[str, Any] = Field(default_factory=dict)
+    edge_case_variables: list[dict[str, Any]] = Field(default_factory=list)
+    edge_case_percentage: float = 0.0
 
     # ── Agent outputs (populated as pipeline runs) ────────────────────────
     rules: dict[str, Any] = Field(default_factory=dict)

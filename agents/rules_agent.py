@@ -5,6 +5,7 @@ selected scenario. Downstream QA agent uses these rules to validate records.
 """
 from __future__ import annotations
 import logging
+import json
 
 from config.industry_profiles import get_profile
 from config.variables import VARIABLES
@@ -85,7 +86,8 @@ class RulesAgent:
             f"Output data type: {state.type_of_data}\n"
             f"Transactional events: {sc.get('events', [])}\n"
             f"Typical product/plan types: {profile['product_types']}\n"
-            f"Variables: {field_summary}\n\n"
+            f"Variables: {field_summary}\n"
+            f"Complete confirmed scenario context (source of truth): {json.dumps(state.scenario_context, default=str, sort_keys=True)}\n\n"
             "IMPORTANT: generation_constraints and formula_rules are machine-readable and must be "
             "derived from the supplied scenario/use case, not generic filler. Do not invent a constraint "
             "unless it is supported by the scenario, industry, country, or explicit variable definition.\n"

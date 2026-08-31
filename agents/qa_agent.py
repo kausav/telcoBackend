@@ -24,7 +24,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from config.variables import VARIABLES
-from core.dynamic_scenarios import resolve_entity_key, resolve_events, resolve_variables
+from core.dynamic_scenarios import resolve_entity_key, resolve_events, resolve_variables, resolve_scenario_context
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
 from config.industry_profiles import get_profile, payment_methods_for_profile, country_allowed_value
@@ -109,8 +109,43 @@ def _safe_formula(expr: str, rec: dict):
         return None
 
 
+def _formula_dependencies(expr: str) -> set[str]:
+    """Return field names referenced by a formula expression."""
+    try:
+        tree = ast.parse(expr, mode="eval")
+        allowed_funcs = {"round", "min", "max", "abs"}
+        return {
+            node.id for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and node.id not in allowed_funcs
+        }
+    except Exception:
+        return set()
+
+
 def _normalize(v: Any) -> str:
     return str(v).strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _safe_edge_condition(expression: str, rec: dict) -> bool:
+    """Safely evaluate a machine-checkable edge-case condition against one record."""
+    if not expression:
+        return True
+    try:
+        tree = ast.parse(expression, mode="eval")
+        allowed_nodes = (
+            ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Not, ast.Compare,
+            ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In, ast.NotIn,
+            ast.Is, ast.IsNot, ast.Name, ast.Constant, ast.List, ast.Tuple,
+            ast.UnaryOp, ast.USub, ast.UAdd, ast.Load,
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed_nodes):
+                return False
+            if isinstance(node, ast.Name) and node.id not in rec:
+                return False
+        return bool(eval(compile(tree, "<edge-condition>", "eval"), {"__builtins__": {}}, dict(rec)))
+    except Exception:
+        return False
 
 
 def _country_repair(name: str, value: Any, profile: dict):
@@ -128,6 +163,27 @@ def _country_repair(name: str, value: Any, profile: dict):
     return value, None
 
 
+def _collect_formula_specs(variables: list[dict], rules: dict | None) -> list[tuple[str, str]]:
+    """Collect authoritative formulas, preferring explicit variable definitions."""
+    specs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for var in variables:
+        field = str(var.get("name", ""))
+        expr = var.get("formula")
+        if field and expr and field not in seen:
+            specs.append((field, str(expr)))
+            seen.add(field)
+    for item in (rules or {}).get("formula_rules", []) or []:
+        if not isinstance(item, dict):
+            continue
+        field = str(item.get("field", ""))
+        expr = item.get("expression")
+        if field and expr and field not in seen:
+            specs.append((field, str(expr)))
+            seen.add(field)
+    return specs
+
+
 def _validate_record(
     rec: dict,
     variables: list[dict],
@@ -135,11 +191,13 @@ def _validate_record(
     profile: dict,
     transactional: bool,
     event_fields: set[str] | None = None,
+    rules: dict | None = None,
 ) -> tuple[dict, list[str]]:
     """Validate and repair one record using the actual variable definitions."""
     rec = dict(rec)
     issues: list[str] = []
     by_name = {v["name"]: v for v in variables}
+    active_fields = set(event_fields or field_order) if transactional else set(field_order)
 
     # 1. Country-sensitive values and declared categorical choices.
     for name, value in list(rec.items()):
@@ -223,31 +281,37 @@ def _validate_record(
             if old != rec[name]:
                 issues.append(f"{name} clamped to percentage range")
 
-    # 5. Formula invariants: recompute every scenario-declared formula that belongs
-    # to this record. This is industry-agnostic: the scenario definition is the
-    # source of truth, so retail totals, banking balances, telecom balances,
-    # healthcare amounts, insurance premiums, etc. are all handled identically.
-    active_fields = set(field_order) if not transactional else (event_fields or set())
-    for var in variables:
-        if var.get("gen") != "formula" or not var.get("formula"):
+    # 5. Formula invariants: recompute every active scenario formula.
+    # Formulas are the source of truth across ALL industries; there are no
+    # telecom-specific arithmetic assumptions here. RulesAgent formulas are
+    # also considered when a business rule adds a formula not present on the
+    # variable definition itself.
+    formula_specs = _collect_formula_specs(variables, rules)
+    for field, expr in formula_specs:
+        if field not in active_fields:
             continue
-        if var.get("name") not in active_fields:
+        deps = _formula_dependencies(expr)
+        missing = [dep for dep in deps if rec.get(dep) is None]
+        if missing:
+            # Do not invent a numeric default for a formula when its inputs are
+            # absent. For sparse transactional events this is intentional; when
+            # the formula field is explicitly part of the event, the record is
+            # left for the generator/schema to repair rather than fabricating a value.
+            issues.append(f"{field} formula could not be evaluated; missing dependencies: {missing}")
             continue
-        deps = var.get("depends_on", []) or []
-        if any(dep not in rec or rec.get(dep) is None for dep in deps):
-            continue
-        expected = _safe_formula(var["formula"], rec)
+        expected = _safe_formula(expr, rec)
         if expected is None:
+            issues.append(f"{field} formula could not be evaluated")
             continue
-        actual = rec.get(var["name"])
+        actual = rec.get(field)
         mismatch = False
         if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
             mismatch = not math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=0.01)
         else:
             mismatch = str(actual) != str(expected)
         if mismatch:
-            rec[var["name"]] = expected
-            issues.append(f"{var['name']} corrected from formula")
+            rec[field] = expected
+            issues.append(f"{field} corrected from formula")
 
     # 6. Do not hard-code industry-specific arithmetic here.
     # All calculations must come from scenario-declared formulas so the same
@@ -292,7 +356,7 @@ def _validate_record(
             issues.append(f"{name} corrected for country phone convention")
 
     # 9. Keep output limited to declared variables plus transactional metadata.
-    metadata = {"journey_id", "transaction_id", "event_type", "event_sequence", "event_occurrence", "event_timestamp"}
+    metadata = {"journey_id", "transaction_id", "event_type", "event_sequence", "event_occurrence", "event_timestamp", "isEdgeCaseData"}
     if transactional:
         allowed = set(field_order) | metadata
     else:
@@ -309,6 +373,13 @@ class QAAgent:
     def run(self, state: WorkflowState) -> WorkflowState:
         records = state.raw_records
         logger.info("[QAAgent] Validating %d records", len(records))
+        edge_groups = {}
+        for item in state.edge_case_variables:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            group = str(item.get("edge_case_name") or "Scenario Edge Case")
+            edge_groups.setdefault(group, {"condition": str(item.get("condition") or ""), "variables": []})
+            edge_groups[group]["variables"].append(item)
 
         dyn = resolve_variables(state.scenario)
         variables, _ = dyn if dyn is not None else (VARIABLES, [])
@@ -316,6 +387,7 @@ class QAAgent:
         profile = get_profile(state.industry, state.country)
         transactional = state.type_of_data == "transactional"
         event_defs = {str(e.get("event_type")): e for e in resolve_events(state.scenario)} if transactional else {}
+        formula_specs = _collect_formula_specs(variables, state.rules)
 
         algo_fixed = 0
         checked: list[dict] = []
@@ -329,7 +401,19 @@ class QAAgent:
             rec, issues = _validate_record(
                 rec, variables, state.field_order, profile, transactional,
                 event_fields=pre_event_fields,
+                rules=state.rules,
             )
+
+            # Edge-case labels are trusted only after the configured condition is checked.
+            if rec.get("isEdgeCaseData") is True:
+                matched = False
+                for group in edge_groups.values():
+                    if _safe_edge_condition(group.get("condition", ""), rec):
+                        matched = True
+                        break
+                if not matched:
+                    rec["isEdgeCaseData"] = False
+                    issues.append("isEdgeCaseData reset because no edge-case condition was satisfied")
 
             if transactional:
                 # Metadata is structural and should never be delegated to the LLM.
@@ -381,15 +465,30 @@ class QAAgent:
                 if entity_value:
                     seen_entities.add(entity_value)
 
-            # Fill missing values only after validation. For transactional data,
-            # events are intentionally sparse: fill only fields declared by this
-            # event, never every variable in the global scenario schema.
+            # Fill missing values only after validation. Formula fields are
+            # calculated first whenever their dependencies are available; never
+            # replace a calculable formula with an arbitrary dtype default.
+            active_fill_fields = set(event_defs.get(str(rec.get("event_type")), {}).get("fields", []) or []) if transactional else set(state.field_order)
+            for formula_field, formula_expr in formula_specs:
+                if formula_field not in active_fill_fields or rec.get(formula_field) is not None:
+                    continue
+                deps = _formula_dependencies(formula_expr)
+                if deps and all(rec.get(dep) is not None for dep in deps):
+                    calculated = _safe_formula(formula_expr, rec)
+                    if calculated is not None:
+                        rec[formula_field] = calculated
+                        issues.append(f"{formula_field} calculated from formula")
+
+            # For transactional data, events are intentionally sparse: fill only
+            # fields declared by this event, never every variable in the global schema.
             if transactional:
                 event_def = event_defs.get(str(rec.get("event_type")))
                 fill_order = list(event_def.get("fields", []) or []) if event_def else []
             else:
                 fill_order = state.field_order
-            rec, filled = _fill_missing(rec, fill_order, dtype_map)
+            formula_field_names = {field for field, _ in formula_specs}
+            safe_fill_order = [f for f in fill_order if f not in formula_field_names or rec.get(f) is not None]
+            rec, filled = _fill_missing(rec, safe_fill_order, dtype_map)
             if filled:
                 issues.append(f"{filled} event field(s) defaulted")
             algo_fixed += len(issues)

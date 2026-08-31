@@ -191,6 +191,8 @@ def resolve_scenario_context(scenario_id: str) -> dict[str, Any]:
         "type_of_data": meta.get("type_of_data", "aggregational"),
         "entity_key": meta.get("entity_key"),
         "events": meta.get("events", []),
+        "edge_case_variables": meta.get("edge_case_variables", []),
+        "edge_case_percentage": float(meta.get("edge_case_percentage", 0.0) or 0.0),
     }
 
 

@@ -4,6 +4,7 @@ Validates the scenario, then delegates to the remaining agents in order.
 """
 from __future__ import annotations
 import logging
+import json
 
 from config.scenarios import SCENARIOS
 from config.industry_profiles import get_profile
@@ -66,6 +67,7 @@ class OrchestratorAgent:
             f"Use case: {state.use_case or sc.get('use_case', '')}\n"
             f"Scenario type: {state.scenario_type or sc.get('scenario_type', '')}\n"
             f"Records requested: {state.count}\n"
+            f"Complete confirmed scenario context (source of truth): {json.dumps(state.scenario_context, default=str, sort_keys=True)}\n"
             f"Target industry: {profile['industry']}; country: {profile['country_name']} ({state.country}) — "
             f"regulator {profile['regulator']}, market character: {profile['market_character']}\n"
             "Validate and produce execution notes."

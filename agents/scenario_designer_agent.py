@@ -251,6 +251,9 @@ Return a JSON object with exactly these keys:
   - "description": str          — 1-3 sentence description combining businessScenario, businessResponse, expectedOutcome
   - "variables": [ {name, dtype, description, gen, params, depends_on, nullable} ]
   - "field_order": [str]        — variable names in the exact order they should be generated/output
+  - "edge_case_variables": [ {edge_case_name, edge_case_description, condition, name, dtype, description, gen, params, depends_on, nullable} ] — edge-case overrides/conditions; return [] when no useful edge cases can be defined
+
+Edge cases: identify 2-4 high-value, realistic edge cases for the supplied scenario/use case. Return them as edge_case_variables. Each item MUST include edge_case_name, edge_case_description, name, and a machine-checkable condition expression using record field names (for example `balance_before == 0 and session_status == "TERMINATING"`). Reuse variables from the normal catalog; edge_case_variables are overrides/conditions for variables already present in variables. The condition must describe what makes the record an edge case. Do not create impossible combinations.
 
 For transactional output, choose entity_key as the variable that identifies the primary business entity whose events should be grouped together. For example subscriber_id, customer_id, account_id, merchant_id, shipment_id, patient_id, etc. Do not hard-code an industry; choose from the variables you actually define.
 
@@ -347,8 +350,39 @@ class ScenarioDesignerAgent:
             result.get("entity_key"), result["variables"], industry_key, type_of_data
         )
         result["events"] = self._normalize_events(result.get("events", []), result["variables"], type_of_data, industry_key)
+        result["edge_case_variables"] = self._normalize_edge_case_variables(result.get("edge_case_variables", []), result["variables"], industry_key)
         return result
 
+
+    def _normalize_edge_case_variables(self, edge_vars: list, variables: list[dict], industry_key: str) -> list[dict]:
+        """Normalize edge-case definitions while keeping them separate from normal variables."""
+        alias_map = _build_alias_map(industry_key)
+        valid_names = {v["name"] for v in variables}
+        out = []
+        for item in edge_vars if isinstance(edge_vars, list) else []:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            v = dict(item)
+            v["name"] = alias_map.get(str(v["name"]).strip().lower(), str(v["name"]).strip())
+            v["edge_case_name"] = str(v.get("edge_case_name") or "Scenario Edge Case").strip()
+            v["edge_case_description"] = str(v.get("edge_case_description") or "").strip()
+            v["condition"] = str(v.get("condition") or "").strip()
+            # If the edge field already exists in normal variables, inherit its schema
+            # and only keep edge-specific overrides/condition.
+            base = next((x for x in variables if x.get("name") == v["name"]), None)
+            if base:
+                merged = dict(base)
+                merged.update({k: val for k, val in v.items() if val not in (None, "")})
+                v = merged
+            else:
+                if v.get("dtype") not in {"string", "float", "int", "categorical", "datetime", "boolean", "bool"}:
+                    continue
+                if v.get("gen") not in _GENERATOR_DOCS:
+                    # Do not attempt to validate free text here; normalize below only.
+                    pass
+            if v.get("condition"):
+                out.append(v)
+        return out[:50]
 
     def _normalize_entity_key(self, entity_key: object, variables: list[dict], industry_key: str, type_of_data: str) -> str | None:
         if type_of_data != "transactional":
