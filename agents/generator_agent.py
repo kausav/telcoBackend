@@ -240,8 +240,8 @@ def _to_finite_float(value, default: float | None = None) -> float | None:
 def _uniform_bounded(params: dict, rec: dict) -> float:
     hi = _to_finite_float(rec.get(params.get("hi_field")), None)
     if hi is None:
-        hi = _to_finite_float(params.get("hi"), 1.00)
-    lo = _to_finite_float(params.get("lo"), 0.00)
+        hi = _to_finite_float(params.get("hi", params.get("max")), 1.00)
+    lo = _to_finite_float(params.get("lo", params.get("min")), 0.00)
     if lo is None:
         lo = 0.00
     return round(random.uniform(lo, max(lo, hi)), 2)
@@ -679,76 +679,210 @@ def _condition_refs(expression: str) -> set[str]:
 
 
 def _condition_branches(expression: str) -> list[dict[str, object]]:
-    """Return deterministic literal assignments for common boolean conditions.
+    """Compile supported edge conditions into deterministic assignments.
 
-    The edge-case contract is intentionally limited to comparisons/boolean logic.
-    For ``A and B`` both constraints are required. For ``A or B`` we try each branch
-    and the generator will validate the resulting candidate. This turns conditions
-    into data-generation constraints instead of relying on random chance.
+    This is deliberately schema-driven rather than industry/field-name driven.
+    Each returned branch is sufficient to make the corresponding boolean branch
+    true.  Equality/range/membership and boolean combinations are supported.
     """
     try:
         tree = ast.parse(str(expression or ""), mode="eval")
     except Exception:
         return []
 
+    def _literal(node):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, (ast.List, ast.Tuple)):
+            vals=[]
+            for x in node.elts:
+                if not isinstance(x, ast.Constant):
+                    return None
+                vals.append(x.value)
+            return vals
+        return None
+
     def compare(node: ast.Compare) -> list[dict[str, object]]:
         if len(node.ops) != 1 or len(node.comparators) != 1:
             return []
-        op = node.ops[0]
-        left, right = node.left, node.comparators[0]
-        if isinstance(left, ast.Name) and isinstance(right, ast.Constant):
-            name, literal = left.id, right.value
-            if isinstance(op, (ast.Eq, ast.Is)):
-                return [{name: literal}]
-            if isinstance(op, ast.Gt) and isinstance(literal, (int, float)) and not isinstance(literal, bool):
-                return [{name: literal + (1 if isinstance(literal, int) else 0.01)}]
-            if isinstance(op, ast.GtE) and isinstance(literal, (int, float)) and not isinstance(literal, bool):
-                return [{name: literal}]
-            if isinstance(op, ast.Lt) and isinstance(literal, (int, float)) and not isinstance(literal, bool):
-                return [{name: literal - (1 if isinstance(literal, int) else 0.01)}]
-            if isinstance(op, ast.LtE) and isinstance(literal, (int, float)) and not isinstance(literal, bool):
-                return [{name: literal}]
-            if isinstance(op, ast.In) and isinstance(right, (ast.List, ast.Tuple)):
-                vals = [x.value for x in right.elts if isinstance(x, ast.Constant)]
-                return [{name: vals[0]}] if vals else []
+        op, left, right = node.ops[0], node.left, node.comparators[0]
+        if isinstance(left, ast.Name):
+            name = left.id
+            lit = _literal(right)
+            if isinstance(op, (ast.Eq, ast.Is)) and not isinstance(right, (ast.List, ast.Tuple)):
+                return [{name: lit}]
+            if isinstance(op, ast.Gt) and isinstance(lit, (int,float)) and not isinstance(lit,bool):
+                return [{name: lit + (1 if isinstance(lit,int) else 0.01)}]
+            if isinstance(op, ast.GtE) and isinstance(lit, (int,float)) and not isinstance(lit,bool):
+                return [{name: lit}]
+            if isinstance(op, ast.Lt) and isinstance(lit, (int,float)) and not isinstance(lit,bool):
+                return [{name: lit - (1 if isinstance(lit,int) else 0.01)}]
+            if isinstance(op, ast.LtE) and isinstance(lit, (int,float)) and not isinstance(lit,bool):
+                return [{name: lit}]
+            if isinstance(op, ast.In) and isinstance(lit,list):
+                return [{name: x} for x in lit]
+            if isinstance(op, ast.NotIn) and isinstance(lit,list):
+                # A concrete alternative is selected later from the declared schema.
+                return [{"__not_in__": (name, tuple(lit))}]
+            if isinstance(op, (ast.NotEq, ast.IsNot)):
+                return [{"__not_eq__": (name, lit)}]
         if isinstance(right, ast.Name) and isinstance(left, ast.Constant):
             if isinstance(op, (ast.Eq, ast.Is)):
                 return [{right.id: left.value}]
         return []
 
     def walk(node: ast.AST) -> list[dict[str, object]]:
-        if isinstance(node, ast.Expression):
-            return walk(node.body)
-        if isinstance(node, ast.Compare):
-            return compare(node)
-        if isinstance(node, ast.Name):
-            return [{node.id: True}]
+        if isinstance(node, ast.Expression): return walk(node.body)
+        if isinstance(node, ast.Compare): return compare(node)
+        if isinstance(node, ast.Name): return [{node.id: True}]
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not) and isinstance(node.operand, ast.Name):
             return [{node.operand.id: False}]
         if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
-            branches = [{}]
+            branches=[{}]
             for child in node.values:
-                child_branches = walk(child)
-                if not child_branches:
-                    return []
-                merged: list[dict[str, object]] = []
+                cb=walk(child)
+                if not cb: return []
+                merged=[]
                 for a in branches:
-                    for b in child_branches:
-                        overlap = set(a).intersection(b)
-                        if any(a[k] != b[k] for k in overlap):
-                            continue
-                        merged.append({**a, **b})
-                branches = merged
+                    for b in cb:
+                        special = {k:v for k,v in b.items() if k.startswith("__") }
+                        normal = {k:v for k,v in b.items() if not k.startswith("__") }
+                        if any(k in a and a[k] != v for k,v in normal.items()): continue
+                        merged.append({**a, **normal, **special})
+                branches=merged
             return branches
         if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
-            out: list[dict[str, object]] = []
-            for child in node.values:
-                out.extend(walk(child))
+            out=[]
+            for child in node.values: out.extend(walk(child))
             return out
         return []
-
     return walk(tree)
 
+def _apply_condition_assignments(
+    candidate: dict,
+    expression: str,
+    variables: list[dict],
+    assignments: dict[str, object],
+) -> dict:
+    """Apply deterministic condition constraints to an edge-case candidate.
+
+    Missing fields are allowed here because an edge case may intentionally introduce
+    a field that is sparse in the normal event.  Formula outputs are never assigned
+    directly; their inputs are assigned and formulas are recalculated afterwards.
+    """
+    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    formula_names = {str(v.get("name")) for v in variables if v.get("formula")}
+    for key, raw_value in assignments.items():
+        if key.startswith("__"):
+            if key == "__not_eq__":
+                name, forbidden = raw_value
+                var = by_name.get(name, {})
+                if name in formula_names: continue
+                params = var.get("params") if isinstance(var.get("params"), dict) else {}
+                choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+                alternatives = [c for c in choices if str(c).strip().lower() != str(forbidden).strip().lower()]
+                if alternatives:
+                    candidate[name] = alternatives[0]
+                elif isinstance(candidate.get(name), (int,float)) and not isinstance(candidate.get(name), bool):
+                    candidate[name] = float(forbidden) + (1 if isinstance(forbidden, int) else 0.01)
+                continue
+            if key == "__not_in__":
+                name, forbidden = raw_value
+                var = by_name.get(name, {})
+                if name in formula_names: continue
+                params = var.get("params") if isinstance(var.get("params"), dict) else {}
+                choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+                alternatives = [c for c in choices if c not in forbidden]
+                if alternatives:
+                    candidate[name] = alternatives[0]
+                continue
+            continue
+        name, value = key, raw_value
+        if name in formula_names: continue
+        var = by_name.get(name, {})
+        dtype = str(var.get("dtype", "string"))
+        params = var.get("params") if isinstance(var.get("params"), dict) else {}
+        choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+        if choices:
+            match = next((c for c in choices if str(c).strip().lower() == str(value).strip().lower()), None)
+            if match is None:
+                continue
+            value = match
+        if dtype == "int" and isinstance(value, (int,float)) and not isinstance(value,bool):
+            value = int(round(value))
+        elif dtype == "float" and isinstance(value, (int,float)) and not isinstance(value,bool):
+            value = float(value)
+        elif dtype in {"boolean","bool"} and isinstance(value, bool):
+            pass
+        candidate[name] = value
+    return candidate
+
+def _recalculate_formulas(candidate: dict, variables: list[dict]) -> dict:
+    formula_vars = [v for v in variables if v.get("formula") and v.get("name") in candidate]
+    for _ in range(len(formula_vars) + 1):
+        changed = False
+        for var in formula_vars:
+            deps = _formula_dependencies(str(var.get("formula", "")))
+            if deps and not all(candidate.get(d) is not None for d in deps):
+                continue
+            value = _formula(var, candidate)
+            if value is not None and candidate.get(var["name"]) != value:
+                candidate[var["name"]] = value
+                changed = True
+        if not changed:
+            break
+    return candidate
+
+
+def _condition_compatible_with_schema(expression: str, variables: list[dict]) -> bool:
+    """Check that at least one deterministic condition branch fits the schema."""
+    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    branches = _condition_branches(expression)
+    if not branches:
+        return False
+    for branch in branches:
+        ok = True
+        for name, value in branch.items():
+            if name == "__not_eq__":
+                field, forbidden = value
+                var = by_name.get(field)
+                if not var or var.get("formula"):
+                    ok = False; break
+                params = var.get("params") if isinstance(var.get("params"), dict) else {}
+                choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+                if choices and not any(str(c).strip().lower() != str(forbidden).strip().lower() for c in choices):
+                    ok = False; break
+                continue
+            if name == "__not_in__":
+                field, forbidden = value
+                var = by_name.get(field)
+                if not var or var.get("formula"):
+                    ok = False; break
+                params = var.get("params") if isinstance(var.get("params"), dict) else {}
+                choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+                if choices and not any(c not in forbidden for c in choices):
+                    ok = False; break
+                continue
+            var = by_name.get(name)
+            if not var:
+                ok = False; break
+            dtype = str(var.get("dtype", "string"))
+            params = var.get("params") if isinstance(var.get("params"), dict) else {}
+            if dtype in {"int", "float"} and isinstance(value, (int, float)) and not isinstance(value, bool):
+                try:
+                    min_value = params.get("min", params.get("lo"))
+                    max_value = params.get("max", params.get("hi"))
+                    if min_value is not None and float(value) < float(min_value): ok = False
+                    if max_value is not None and float(value) > float(max_value): ok = False
+                except (TypeError, ValueError):
+                    ok = False
+            choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+            if choices and str(value).strip().lower() not in {str(c).strip().lower() for c in choices}:
+                ok = False
+            if not ok: break
+        if ok:
+            return True
+    return False
 
 def _condition_literals(expression: str) -> dict[str, object]:
     """Backward-compatible first branch of the generic condition constraint solver."""
@@ -785,9 +919,14 @@ def _edge_candidate(
     for name in refs:
         if name in candidate:
             continue
-        definition = edge_by_name.get(name)
+        # A condition is an explicit request that this field participate in the
+        # edge-case record. If the sparse event did not normally contain it,
+        # materialize it from the edge definition when present, otherwise from the
+        # canonical scenario variable. This is generic and avoids variable-name
+        # specific bypasses. The field is only introduced on records selected as
+        # edge cases; normal sparse records are unchanged.
+        definition = edge_by_name.get(name) or variable_by_name.get(name)
         if definition is None:
-            # A normal variable absent from this sparse event is not materialized.
             continue
         effective = dict(variable_by_name.get(name, definition))
         for key in ("gen", "params", "formula", "dtype", "nullable"):
@@ -807,7 +946,7 @@ def _edge_candidate(
     # but only for this record when the field is part of the event or condition.
     for edge_var in edge_group.get("variables", []):
         name = str(edge_var.get("name", ""))
-        if not name or (name not in event_fields and name not in refs and name not in candidate):
+        if not name:
             continue
         base_var = variable_by_name.get(name, edge_var)
         effective = dict(base_var)
@@ -825,30 +964,11 @@ def _edge_candidate(
     # Apply condition constraints after generation. For OR conditions, each branch is
     # tried by the caller; here the first branch is sufficient for candidate creation.
     assignments = assignments if assignments is not None else _condition_literals(edge_group.get("condition", ""))
-    for name, value in assignments.items():
-        if name not in candidate:
-            # Never add an undeclared field merely because it appears in text.
-            continue
-        # Formula outputs remain authoritative; their inputs must determine them.
-        if name in formula_names:
-            continue
-        candidate[name] = value
+    candidate = _apply_condition_assignments(candidate, edge_group.get("condition", ""), variables, assignments)
 
     # Recalculate formulas in declaration/dependency order. This is intentionally done
     # after edge overrides so derived values stay mathematically consistent.
-    formula_vars = [v for v in variables if v.get("formula") and v.get("name") in candidate]
-    for _ in range(len(formula_vars) + 1):
-        changed = False
-        for var in formula_vars:
-            deps = _formula_dependencies(str(var.get("formula", "")))
-            if deps and not all(candidate.get(d) is not None for d in deps):
-                continue
-            value = _formula(var, candidate)
-            if value is not None and candidate.get(var["name"]) != value:
-                candidate[var["name"]] = value
-                changed = True
-        if not changed:
-            break
+    candidate = _recalculate_formulas(candidate, variables)
     return candidate
 
 
@@ -885,8 +1005,9 @@ def _transactional_records(
 
     ``journey_count`` remains the requested number of conceptual entities, while
     the API materializes only the latest response window for performance.  The
-    edge-case percentage is applied to the *materialized event records* because
-    ``isEdgeCaseData`` belongs inside ``events[].records[]``.  Every true flag is
+    edge-case percentage is applied to the requested transactional dataset count
+    (the user's ``count``), while the resulting flag is placed on actual event
+    records inside ``events[].records[]``. Every true flag is
     independently proven against that actual record; normal records are never
     promoted to edge cases merely because they happen to match a condition.
     """
@@ -954,7 +1075,11 @@ def _transactional_records(
     if not edge_groups or edge_case_percentage <= 0 or not generated:
         return generated
 
-    target = _edge_case_count(len(generated), edge_case_percentage)
+    # The API's ``count`` is the user's requested dataset count. For transactional
+    # scenarios we keep the existing response optimization (latest 10 entities /
+    # latest 10 records per event), but edgeCasePercentage is still interpreted
+    # against the requested count so 100 × 0.02 always means 2 edge-case units.
+    target = _edge_case_count(journey_count, edge_case_percentage)
     if target <= 0:
         return generated
 
@@ -971,6 +1096,8 @@ def _transactional_records(
             if configured_event and configured_event != str(row.get("event_type") or "").strip().upper().replace(" ", "_"):
                 continue
             refs = _condition_refs(group.get("condition", ""))
+            if not _condition_compatible_with_schema(group.get("condition", ""), variables):
+                continue
             # If a condition references fields that are neither present in the row nor
             # explicitly supplied by this edge definition, this event cannot represent it.
             edge_names = {str(v.get("name")) for v in group.get("variables", []) if v.get("name")}
@@ -1050,6 +1177,22 @@ class DataGeneratorAgent:
             variables, FIELD_ORDER = dyn
         else:
             from config.variables import VARIABLES as variables, FIELD_ORDER
+
+        # Preflight edge-case definitions before any records are generated. A condition
+        # that is syntactically valid but mathematically impossible under the declared
+        # variable schema must never reach the hot generation path. This is generic and
+        # prevents the recurring "unable to generate ... condition" failures caused by
+        # incompatible LLM definitions.
+        if state.edge_case_variables and state.edge_case_percentage > 0:
+            groups = _edge_case_groups(state.edge_case_variables)
+            for group_name, group in groups.items():
+                condition = str(group.get("condition") or "").strip()
+                if condition and not _condition_compatible_with_schema(condition, variables):
+                    raise ValueError(
+                        f"Edge case '{group_name}' has an unsatisfiable condition under the "
+                        f"declared variable constraints: {condition}. Reconfirm the scenario "
+                        "with a valid edge-case definition."
+                    )
 
         if state.type_of_data == "transactional":
             from core.compiled_schema import compile_scenario

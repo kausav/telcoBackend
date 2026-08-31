@@ -26,6 +26,7 @@ from core.dynamic_scenarios import (
 )
 from core.llm_client import GeminiClient
 from core.compiled_schema import invalidate_scenario
+from agents.generator_agent import _condition_compatible_with_schema
 from core.runtime_cache import clear_scenario
 
 
@@ -499,6 +500,72 @@ def confirm_scenario_route(req: ConfirmRequest):
         edge_by_key[(edge_name, str(name))] = cleaned
     edge_case_variables = list(edge_by_key.values())
 
+    # Edge-case variables are allowed to introduce fields that are not present in
+    # the normal catalog, but those fields must have a complete executable schema.
+    # Promote them into the persisted scenario schema so generation and QA share one
+    # canonical definition rather than guessing at runtime.
+    variable_by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    for edge_var in edge_case_variables:
+        name = str(edge_var.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, detail={"error": "edge-case variable requires name"})
+        if name not in variable_by_name:
+            if not edge_var.get("gen") or not edge_var.get("dtype"):
+                raise HTTPException(400, detail={
+                    "error": f"Edge-case-only variable '{name}' must include dtype and gen"
+                })
+            promoted = {k: edge_var[k] for k in (
+                "name", "dtype", "description", "gen", "params", "depends_on",
+                "nullable", "formula"
+            ) if k in edge_var}
+            promoted.setdefault("params", {})
+            promoted.setdefault("depends_on", [])
+            promoted.setdefault("nullable", False)
+            variables.append(promoted)
+            field_order.append(name)
+            variable_by_name[name] = promoted
+
+    # Validate every configured edge condition against the canonical schema before
+    # persisting the scenario. This catches impossible definitions (for example
+    # latency > 180 when the declared maximum is 180) at confirm time instead of
+    # producing a /scenario/generate 500 later.
+    edge_groups_for_validation: dict[str, dict] = {}
+    for item in edge_case_variables:
+        group_name = str(item.get("edge_case_name") or "Scenario Edge Case")
+        group = edge_groups_for_validation.setdefault(group_name, {
+            "condition": str(item.get("condition") or "").strip(),
+            "variables": [],
+        })
+        group["variables"].append(item)
+        if item.get("condition") and not group.get("condition"):
+            group["condition"] = str(item["condition"]).strip()
+    for group_name, group in edge_groups_for_validation.items():
+        condition = group.get("condition", "")
+        if not condition:
+            raise HTTPException(400, detail={"error": f"Edge case '{group_name}' requires a condition"})
+        refs = set()
+        try:
+            import ast
+            tree = ast.parse(condition, mode="eval")
+            allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Not, ast.Compare,
+                       ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In, ast.NotIn,
+                       ast.Is, ast.IsNot, ast.Name, ast.Constant, ast.List, ast.Tuple,
+                       ast.UnaryOp, ast.USub, ast.UAdd, ast.Load)
+            if any(not isinstance(n, allowed) for n in ast.walk(tree)):
+                raise ValueError("unsupported condition syntax")
+            refs = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        except Exception as exc:
+            raise HTTPException(400, detail={"error": f"Invalid edge-case condition for '{group_name}': {exc}"}) from exc
+        declared = {str(v.get("name")) for v in variables if v.get("name")}
+        missing = sorted(refs - declared)
+        if missing:
+            raise HTTPException(400, detail={"error": f"Edge case '{group_name}' references undefined variable(s): {missing}"})
+        if not _condition_compatible_with_schema(condition, variables):
+            raise HTTPException(400, detail={
+                "error": f"Edge case '{group_name}' condition is incompatible with the declared variable constraints",
+                "condition": condition,
+            })
+
     edge_case_percentage = draft.get("edge_case_percentage", 0.0)
     if req.edgeCasePercentage is not None:
         edge_case_percentage = req.edgeCasePercentage
@@ -595,14 +662,19 @@ def generate_dynamic(req: GenerateRequest):
     if not scenario_exists(scenario_id):
         raise HTTPException(400, detail={"error": f"Unknown scenario '{scenario_id}'"})
     scenario_context = resolve_scenario_context(scenario_id)
-    state = run_pipeline(
-        scenario=scenario_id,
-        count=req.count,
-        industry=scenario_context.get("industry", "generic"),
-        country=scenario_context.get("country"),
-        type_of_data=scenario_context.get("type_of_data", resolve_data_type(scenario_id)),
-        scenario_context=scenario_context,
-    )
+    try:
+        state = run_pipeline(
+            scenario=scenario_id,
+            count=req.count,
+            industry=scenario_context.get("industry", "generic"),
+            country=scenario_context.get("country"),
+            type_of_data=scenario_context.get("type_of_data", resolve_data_type(scenario_id)),
+            scenario_context=scenario_context,
+        )
+    except ValueError as exc:
+        # Deterministic scenario-definition/data-contract failures are client/config
+        # errors, not server crashes. Surface the exact reason as HTTP 400.
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
     if state.errors and not state.final_records:
         raise HTTPException(500, detail={"errors": state.errors})
     meta = resolve_scenario_meta(scenario_id) or {}

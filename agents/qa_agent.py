@@ -28,6 +28,12 @@ from core.dynamic_scenarios import resolve_entity_key, resolve_events, resolve_v
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
 from config.industry_profiles import get_profile, payment_methods_for_profile, country_allowed_value
+from agents.generator_agent import (
+    _condition_branches as _generator_condition_branches,
+    _apply_condition_assignments as _generator_apply_condition_assignments,
+    _recalculate_formulas as _generator_recalculate_formulas,
+    _edge_candidate as _generator_edge_candidate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +372,41 @@ def _validate_record(
     return rec, issues
 
 
+def _repair_edge_record(
+    rec: dict,
+    edge_groups: dict,
+    variables: list[dict],
+    profile: dict | None = None,
+    rules: dict | None = None,
+    event_fields: set[str] | None = None,
+) -> tuple[dict, bool]:
+    """Make an edge-labelled record satisfy its configured condition.
+
+    Edge constraints are authoritative for an edge-labelled record.  We use the same
+    deterministic solver as the generator so QA cannot accidentally invalidate a valid
+    edge case by clamping/replacing one of its condition fields.  Missing sparse-event
+    fields may be materialized only for the edge record.
+    """
+    if rec.get("isEdgeCaseData") is not True:
+        return rec, False
+    for group in edge_groups.values():
+        condition = str(group.get("condition") or "").strip()
+        if not condition:
+            continue
+        branches = _generator_condition_branches(condition) or [{}]
+        for assignments in branches:
+            try:
+                candidate = _generator_edge_candidate(
+                    dict(rec), group, variables, profile, rules, event_fields or set(), assignments=assignments
+                )
+            except Exception:
+                continue
+            if _safe_edge_condition(condition, candidate):
+                candidate["isEdgeCaseData"] = True
+                return candidate, True
+    return rec, False
+
+
 class QAAgent:
     def __init__(self, llm: GeminiClient) -> None:
         self._llm = llm
@@ -399,11 +440,20 @@ class QAAgent:
         for rec in records:
             pre_event_def = event_defs.get(str(rec.get("event_type"))) if transactional else None
             pre_event_fields = set(pre_event_def.get("fields", []) or []) if pre_event_def else set()
+            rec, pre_repaired_edge = _repair_edge_record(dict(rec), edge_groups, variables, profile=profile, rules=state.rules, event_fields=pre_event_fields)
             rec, issues = _validate_record(
                 rec, variables, state.field_order, profile, transactional,
                 event_fields=pre_event_fields,
                 rules=state.rules,
             )
+
+            if rec.get("isEdgeCaseData") is True:
+                rec, repaired_ok = _repair_edge_record(rec, edge_groups, variables, profile=profile, rules=state.rules, event_fields=pre_event_fields)
+                if not repaired_ok:
+                    raise ValueError(
+                        "Generated edge-case record failed deterministic validation: "
+                        "the configured edge-case condition cannot be satisfied by the validated record"
+                    )
 
             # Edge-case labels are trusted only after the configured condition is checked.
             # Aggregational rows are self-contained. Transactional rows are sparse, so their
@@ -499,6 +549,32 @@ class QAAgent:
             rec, filled = _fill_missing(rec, safe_fill_order, dtype_map)
             if filled:
                 issues.append(f"{filled} event field(s) defaulted")
+
+            # FINAL EDGE-CASE RECONCILIATION: all deterministic QA repairs/fills are
+            # complete now.  Re-apply the edge definition one last time so a normal
+            # range/choice/default repair cannot invalidate an edge condition.  This
+            # is the single source of truth for the edge flag and is intentionally
+            # generic for every industry and field name.
+            if rec.get("isEdgeCaseData") is True:
+                final_event_def = event_defs.get(str(rec.get("event_type"))) if transactional else None
+                final_event_fields = set(final_event_def.get("fields", []) or []) if final_event_def else set()
+                rec, repaired_ok = _repair_edge_record(
+                    rec, edge_groups, variables, profile=profile, rules=state.rules,
+                    event_fields=final_event_fields
+                )
+                if not repaired_ok:
+                    raise ValueError(
+                        "Generated edge-case record failed deterministic validation: "
+                        "isEdgeCaseData=true but the configured edge-case condition could "
+                        "not be satisfied after final QA reconciliation"
+                    )
+                if not any(_safe_edge_condition(g.get("condition", ""), rec)
+                           for g in edge_groups.values() if g.get("condition")):
+                    raise ValueError(
+                        "Generated edge-case record failed deterministic validation: "
+                        "isEdgeCaseData=true but no configured edge-case condition is satisfied"
+                    )
+
             algo_fixed += len(issues)
             checked.append(rec)
             if transactional:
