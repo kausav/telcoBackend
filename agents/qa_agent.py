@@ -33,6 +33,7 @@ from agents.generator_agent import (
     _apply_condition_assignments as _generator_apply_condition_assignments,
     _recalculate_formulas as _generator_recalculate_formulas,
     _edge_candidate as _generator_edge_candidate,
+    _safe_edge_condition as _generator_safe_edge_condition,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,26 +134,8 @@ def _normalize(v: Any) -> str:
 
 
 def _safe_edge_condition(expression: str, rec: dict) -> bool:
-    """Safely evaluate a machine-checkable edge-case condition against one record."""
-    if not expression:
-        return True
-    try:
-        tree = ast.parse(expression, mode="eval")
-        allowed_nodes = (
-            ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Not, ast.Compare,
-            ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In, ast.NotIn,
-            ast.Is, ast.IsNot, ast.Name, ast.Constant, ast.List, ast.Tuple,
-            ast.UnaryOp, ast.USub, ast.UAdd, ast.Load,
-        )
-        for node in ast.walk(tree):
-            if not isinstance(node, allowed_nodes):
-                return False
-            if isinstance(node, ast.Name) and node.id not in rec:
-                return False
-        return bool(eval(compile(tree, "<edge-condition>", "eval"), {"__builtins__": {}}, dict(rec)))
-    except Exception:
-        return False
-
+    """Use the generator's single deterministic condition evaluator."""
+    return _generator_safe_edge_condition(expression, rec)
 
 def _country_repair(name: str, value: Any, profile: dict):
     if value is None:
@@ -390,6 +373,10 @@ def _repair_edge_record(
     if rec.get("isEdgeCaseData") is not True:
         return rec, False
     for group in edge_groups.values():
+        configured_event = str(group.get("event_type") or "").strip().upper().replace(" ", "_")
+        record_event = str(rec.get("event_type") or "").strip().upper().replace(" ", "_")
+        if configured_event and configured_event != record_event:
+            continue
         condition = str(group.get("condition") or "").strip()
         if not condition:
             continue
@@ -405,6 +392,22 @@ def _repair_edge_record(
                 candidate["isEdgeCaseData"] = True
                 return candidate, True
     return rec, False
+
+
+def _applicable_edge_groups(rec: dict, edge_groups: dict[str, dict], transactional: bool) -> list[dict]:
+    """Return edge definitions applicable to the actual record/event.
+
+    Event-scoped definitions are never evaluated against unrelated sparse events.
+    Unscoped definitions remain eligible for any record that contains their fields.
+    """
+    event_type = str(rec.get("event_type") or "").strip().upper().replace(" ", "_")
+    out = []
+    for group in edge_groups.values():
+        configured = str(group.get("event_type") or "").strip().upper().replace(" ", "_")
+        if transactional and configured and configured != event_type:
+            continue
+        out.append(group)
+    return out
 
 
 class QAAgent:
@@ -461,7 +464,7 @@ class QAAgent:
             if rec.get("isEdgeCaseData") is True:
                 matched = any(
                     _safe_edge_condition(group.get("condition", ""), rec)
-                    for group in edge_groups.values()
+                    for group in _applicable_edge_groups(rec, edge_groups, transactional)
                     if group.get("condition")
                 )
                 if not matched:
@@ -472,6 +475,21 @@ class QAAgent:
                         "Generated edge-case record failed deterministic validation: "
                         "isEdgeCaseData=true but no configured edge-case condition is satisfied"
                     )
+
+            # Classification is deterministic: a normal record must not satisfy an
+            # applicable edge condition. Otherwise identical condition-relevant data
+            # could legitimately receive both true and false labels. Generator-side
+            # normal-record exclusion is the primary guard; QA repeats the invariant
+            # after all repairs/fills so it cannot be broken here.
+            if rec.get("isEdgeCaseData") is not True and any(
+                _safe_edge_condition(group.get("condition", ""), rec)
+                for group in _applicable_edge_groups(rec, edge_groups, transactional)
+                if group.get("condition")
+            ):
+                raise ValueError(
+                    "Generated record isEdgeCaseData=false but its actual values satisfy "
+                    "a configured edge-case condition"
+                )
 
             if transactional:
                 # Metadata is structural and should never be delegated to the LLM.
@@ -569,7 +587,7 @@ class QAAgent:
                         "not be satisfied after final QA reconciliation"
                     )
                 if not any(_safe_edge_condition(g.get("condition", ""), rec)
-                           for g in edge_groups.values() if g.get("condition")):
+                           for g in _applicable_edge_groups(rec, edge_groups, transactional) if g.get("condition")):
                     raise ValueError(
                         "Generated edge-case record failed deterministic validation: "
                         "isEdgeCaseData=true but no configured edge-case condition is satisfied"
@@ -595,7 +613,7 @@ class QAAgent:
                     continue
                 matched = any(
                     _safe_edge_condition(group.get("condition", ""), rec)
-                    for group in edge_groups.values()
+                    for group in _applicable_edge_groups(rec, edge_groups, transactional)
                     if group.get("condition")
                 )
                 if not matched:

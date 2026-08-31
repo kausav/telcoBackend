@@ -561,9 +561,28 @@ def confirm_scenario_route(req: ConfirmRequest):
         missing = sorted(refs - declared)
         if missing:
             raise HTTPException(400, detail={"error": f"Edge case '{group_name}' references undefined variable(s): {missing}"})
-        if not _condition_compatible_with_schema(condition, variables):
+        # Validate against the effective schema for THIS edge case. An edge definition
+        # may override dtype/choices/generator/params for a field. Normal-generation
+        # metadata must not make a valid edge condition look impossible. Numeric min/max
+        # remain ordinary-generation bounds; explicit categorical choices remain hard
+        # domains unless the edge definition explicitly supplies a replacement domain.
+        effective_variables = [dict(v) for v in variables]
+        effective_by_name = {str(v.get("name")): v for v in effective_variables if v.get("name")}
+        for edge_var in group.get("variables", []):
+            edge_name = str(edge_var.get("name") or "").strip()
+            if not edge_name:
+                continue
+            base = effective_by_name.get(edge_name)
+            if base is None:
+                effective_by_name[edge_name] = dict(edge_var)
+                effective_variables.append(effective_by_name[edge_name])
+                continue
+            for key in ("dtype", "gen", "params", "formula", "depends_on", "nullable"):
+                if key in edge_var and edge_var[key] not in (None, ""):
+                    base[key] = edge_var[key]
+        if not _condition_compatible_with_schema(condition, effective_variables):
             raise HTTPException(400, detail={
-                "error": f"Edge case '{group_name}' condition is incompatible with the declared variable constraints",
+                "error": f"Edge case '{group_name}' condition is incompatible with its effective variable schema",
                 "condition": condition,
             })
 

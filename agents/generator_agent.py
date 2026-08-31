@@ -41,10 +41,17 @@ def _edge_case_groups(edge_case_variables: list[dict] | None) -> dict[str, dict]
     return groups
 
 def _safe_edge_condition(expression: str, rec: dict) -> bool:
+    """Evaluate a configured condition against the actual record deterministically.
+
+    The evaluator is schema/value aware: numeric-looking strings can participate in
+    numeric comparisons and categorical equality/membership is case-insensitive.
+    This keeps conditions stable across LLM/CSV casing and serialization differences
+    without hard-coding any industry or field names.
+    """
     if not expression:
         return True
     try:
-        tree = ast.parse(expression, mode="eval")
+        tree = ast.parse(str(expression), mode="eval")
         allowed_nodes = (
             ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Not, ast.Compare,
             ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In, ast.NotIn,
@@ -56,6 +63,52 @@ def _safe_edge_condition(expression: str, rec: dict) -> bool:
                 return False
             if isinstance(node, ast.Name) and node.id not in rec:
                 return False
+
+        def _num(value):
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    x = float(value.strip())
+                    return x if math.isfinite(x) else None
+                except (TypeError, ValueError):
+                    return None
+            return None
+
+        class _Transformer(ast.NodeTransformer):
+            def visit_Compare(self, node):
+                self.generic_visit(node)
+                if len(node.ops) != 1 or len(node.comparators) != 1:
+                    return node
+                op = node.ops[0]
+                right = node.comparators[0]
+                if isinstance(node.left, ast.Name):
+                    name = node.left.id
+                    actual = rec.get(name)
+                    # Numeric comparison: make a numeric-looking actual value numeric.
+                    if isinstance(right, ast.Constant) and isinstance(right.value, (int, float)) and not isinstance(right.value, bool):
+                        n = _num(actual)
+                        if n is not None:
+                            node.left = ast.Constant(value=n)
+                    # String equality/membership: canonicalize literal casing to the
+                    # actual record value when they are equal ignoring case.
+                    elif isinstance(actual, str) and isinstance(right, ast.Constant) and isinstance(right.value, str):
+                        if actual.strip().lower() == right.value.strip().lower():
+                            node.comparators[0] = ast.Constant(value=actual)
+                    elif isinstance(actual, str) and isinstance(right, (ast.List, ast.Tuple)):
+                        new_elts = []
+                        for element in right.elts:
+                            if isinstance(element, ast.Constant) and isinstance(element.value, str) and actual.strip().lower() == element.value.strip().lower():
+                                new_elts.append(ast.Constant(value=actual))
+                            else:
+                                new_elts.append(element)
+                        right.elts = new_elts
+                return node
+
+        tree = _Transformer().visit(tree)
+        ast.fix_missing_locations(tree)
         return bool(eval(compile(tree, "<edge-condition>", "eval"), {"__builtins__": {}}, dict(rec)))
     except Exception:
         return False
@@ -849,56 +902,60 @@ def _recalculate_formulas(candidate: dict, variables: list[dict]) -> dict:
 
 
 def _condition_compatible_with_schema(expression: str, variables: list[dict]) -> bool:
-    """Check whether an edge condition is structurally satisfiable by the schema.
+    """Check structural satisfiability without confusing normal ranges with hard domains.
 
-    This is deliberately *not* a check against the normal generator distribution.
-    Numeric min/max values describe normal data generation and an edge case is allowed
-    to sit outside that distribution.  Hard categorical/boolean domains are still
-    enforced.  Numeric-looking schema definitions are inferred as numeric even when
-    an upstream LLM/CSV accidentally labels the dtype as ``string``.
-
-    The function answers only: "can this expression be represented by these field
-    types/domains?" It does not try to prove a random generator will hit the value.
-    The generator itself constructs and validates the concrete record later.
+    The condition itself supplies semantic hints: a numeric literal used with an
+    ordering operator means the referenced value must be numeric, even when a CSV/LLM
+    definition labelled it as ``string``. Choice lists remain hard domains. Numeric
+    min/max metadata is a normal-generation distribution, not an edge-case boundary.
     """
     by_name = {str(v.get("name")): v for v in variables if isinstance(v, dict) and v.get("name")}
     branches = _condition_branches(expression)
     if not branches:
         return False
 
-    def _kind(var: dict) -> str:
+    def _num(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                x = float(value.strip())
+                return x if math.isfinite(x) else None
+            except ValueError:
+                return None
+        return None
+
+    def _has_numeric_domain(var: dict) -> bool:
+        params = var.get("params") if isinstance(var.get("params"), dict) else {}
+        lo, hi = params.get("min"), params.get("max")
+        return _num(lo) is not None and _num(hi) is not None
+
+    def _kind(var: dict, expected: object = None) -> str:
         dtype = str(var.get("dtype", "string")).strip().lower()
         params = var.get("params") if isinstance(var.get("params"), dict) else {}
         choices = params.get("choices") if isinstance(params.get("choices"), list) else []
-        # Schema data can arrive from Gemini/CSV with inconsistent dtype labels.
-        # Infer the semantic kind from an explicit choice/domain before falling back
-        # to min/max metadata.
         if dtype in {"boolean", "bool"}:
             return "boolean"
         if dtype in {"int", "integer"}:
             return "int"
         if dtype in {"float", "number", "double", "decimal"}:
             return "number"
-        if dtype == "categorical" or choices:
-            return "string"
-        lo, hi = params.get("min"), params.get("max")
-        if isinstance(lo, (int, float)) and not isinstance(lo, bool):
-            if isinstance(hi, (int, float)) and not isinstance(hi, bool):
+        if choices:
+            # If all declared choices are numeric, the semantic domain is numeric.
+            if choices and all(_num(c) is not None for c in choices):
                 return "number"
+            return "string"
+        if _has_numeric_domain(var):
+            return "number"
         if dtype in {"datetime", "date", "timestamp"}:
             return "datetime"
+        # A numeric assignment produced from an ordering condition is itself a strong
+        # semantic signal, even when the upstream dtype is noisy.
+        if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+            return "number"
         return "string"
-
-    def _compatible_value(var: dict, value: object, kind: str) -> bool:
-        if kind in {"int", "number"}:
-            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
-        if kind == "boolean":
-            return isinstance(value, bool)
-        if kind == "datetime":
-            # Conditions may compare datetimes to ISO literals; equality and ordering
-            # are handled by the runtime evaluator. We only require a string literal.
-            return isinstance(value, str)
-        return isinstance(value, str)
 
     for branch in branches:
         ok = True
@@ -909,8 +966,11 @@ def _condition_compatible_with_schema(expression: str, variables: list[dict]) ->
                 if not var:
                     ok = False
                     break
-                kind = _kind(var)
-                if not _compatible_value(var, forbidden, kind):
+                kind = _kind(var, forbidden)
+                if kind in {"number", "int"} and _num(forbidden) is None:
+                    ok = False
+                    break
+                if kind == "boolean" and not isinstance(forbidden, bool):
                     ok = False
                     break
                 params = var.get("params") if isinstance(var.get("params"), dict) else {}
@@ -928,7 +988,7 @@ def _condition_compatible_with_schema(expression: str, variables: list[dict]) ->
                     break
                 params = var.get("params") if isinstance(var.get("params"), dict) else {}
                 choices = params.get("choices") if isinstance(params.get("choices"), list) else []
-                if choices and all(c in forbidden for c in choices):
+                if choices and all(any(str(c).strip().lower() == str(f).strip().lower() for f in forbidden) for c in choices):
                     ok = False
                     break
                 continue
@@ -937,19 +997,34 @@ def _condition_compatible_with_schema(expression: str, variables: list[dict]) ->
             if not var:
                 ok = False
                 break
-            kind = _kind(var)
-            if not _compatible_value(var, value, kind):
-                ok = False
-                break
-
-            # Only categorical/choice domains are hard. Normal numeric min/max is not
-            # an edge-case ceiling/floor.
-            if kind == "string":
-                params = var.get("params") if isinstance(var.get("params"), dict) else {}
-                choices = params.get("choices") if isinstance(params.get("choices"), list) else []
-                if choices and str(value).strip().lower() not in {str(c).strip().lower() for c in choices}:
+            kind = _kind(var, value)
+            if kind in {"int", "number"}:
+                if _num(value) is None:
                     ok = False
                     break
+            elif kind == "boolean":
+                if not isinstance(value, bool):
+                    ok = False
+                    break
+            elif kind == "datetime":
+                if not isinstance(value, str):
+                    ok = False
+                    break
+            else:
+                if not isinstance(value, str):
+                    ok = False
+                    break
+
+            params = var.get("params") if isinstance(var.get("params"), dict) else {}
+            choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+            if choices:
+                normalized_choices = {str(c).strip().lower() for c in choices}
+                if str(value).strip().lower() not in normalized_choices:
+                    # Numeric choices may be represented as numbers while the condition
+                    # parser produced an int/float. Compare semantically as numbers.
+                    if not (_num(value) is not None and any(_num(c) is not None and math.isclose(_num(c), _num(value), abs_tol=1e-12) for c in choices)):
+                        ok = False
+                        break
         if ok:
             return True
     return False
@@ -959,6 +1034,34 @@ def _condition_literals(expression: str) -> dict[str, object]:
     branches = _condition_branches(expression)
     return branches[0] if branches else {}
 
+
+def _apply_edge_generation_value(var: dict, value, rec: dict, rules: dict | None):
+    """Apply hard categorical/rule domains to an edge value without clamping normal numeric ranges."""
+    if value is None:
+        return value
+    params = var.get("params") if isinstance(var.get("params"), dict) else {}
+    choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+    if choices:
+        match = next((c for c in choices if str(c).strip().lower() == str(value).strip().lower()), None)
+        if match is not None:
+            return match
+        # A configured edge condition may use a semantically equivalent numeric choice.
+        try:
+            nv = float(value)
+            for c in choices:
+                if not isinstance(c, bool) and math.isclose(float(c), nv, abs_tol=1e-12):
+                    return c
+        except (TypeError, ValueError):
+            pass
+        return value
+    # RuleAgent preferred/valid values are hard domains; numeric min/max rules are not.
+    constraint = _rule_constraint_for(str(var.get("name", "")), rules)
+    if constraint:
+        allowed = _coerce_rule_values(constraint.get("preferred_values")) or _coerce_rule_values(constraint.get("valid_values"))
+        if allowed:
+            match = next((x for x in allowed if str(x).strip().lower().replace("-", "_").replace(" ", "_") == str(value).strip().lower().replace("-", "_").replace(" ", "_")), None)
+            return match if match is not None else value
+    return value
 
 def _edge_candidate(
     row: dict,
@@ -1008,7 +1111,7 @@ def _edge_candidate(
             helper["__current_field__"] = name
             helper["__country_profile__"] = profile
             value = generator(effective, helper)
-            candidate[name] = _apply_generation_constraint(
+            candidate[name] = _apply_edge_generation_value(
                 variable_by_name.get(name, effective), value, candidate, rules
             )
 
@@ -1029,7 +1132,7 @@ def _edge_candidate(
             helper["__current_field__"] = name
             helper["__country_profile__"] = profile
             value = generator(effective, helper)
-            candidate[name] = _apply_generation_constraint(base_var, value, candidate, rules)
+            candidate[name] = _apply_edge_generation_value(base_var, value, candidate, rules)
 
     # Apply condition constraints after generation. For OR conditions, each branch is
     # tried by the caller; here the first branch is sufficient for candidate creation.
@@ -1062,6 +1165,15 @@ def _edge_case_candidate_for_aggregation(
     )
 
 
+def _matches_any_edge_condition(rec: dict, edge_groups: dict[str, dict]) -> bool:
+    """Return whether the actual record is already an edge case by definition."""
+    for group in edge_groups.values():
+        condition = str(group.get("condition") or "").strip()
+        if condition and _safe_edge_condition(condition, rec):
+            return True
+    return False
+
+
 def _transactional_records(
     compiled,
     journey_count: int,
@@ -1088,6 +1200,8 @@ def _transactional_records(
         from types import SimpleNamespace
         events = (SimpleNamespace(event_type="BUSINESS_EVENT", sequence=1, fields=(), min_occurrences=1, max_occurrences=10),)
 
+    edge_groups = _edge_case_groups(edge_case_variables)
+    edge_enabled = bool(edge_groups) and edge_case_percentage > 0
     response_entity_count = min(journey_count, MAX_RESPONSE_ENTITIES)
     response_start_index = max(0, journey_count - response_entity_count)
     generated: list[dict] = []
@@ -1123,25 +1237,41 @@ def _transactional_records(
             for occurrence in range(start_occurrence, occurrence_count):
                 elapsed_seconds += random.randint(5, 300)
                 event_ts = base_ts + timedelta(seconds=elapsed_seconds)
-                row = _generate_selected_record(
-                    variables,
-                    set(event.fields),
-                    base=entity_context,
-                    profile=profile,
-                    rules=rules,
-                )
-                row.update({
-                    "journey_id": journey_id,
-                    "transaction_id": f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}",
-                    "event_type": event.event_type,
-                    "event_sequence": event.sequence,
-                    "event_occurrence": occurrence + 1,
-                    "event_timestamp": event_ts.isoformat(),
-                    "isEdgeCaseData": False,
-                })
+                row = None
+                for _attempt in range(_MAX_EDGE_CASE_ATTEMPTS if edge_enabled else 1):
+                    candidate_row = _generate_selected_record(
+                        variables,
+                        set(event.fields),
+                        base=entity_context,
+                        profile=profile,
+                        rules=rules,
+                    )
+                    candidate_row.update({
+                        "journey_id": journey_id,
+                        "transaction_id": f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}",
+                        "event_type": event.event_type,
+                        "event_sequence": event.sequence,
+                        "event_occurrence": occurrence + 1,
+                        "event_timestamp": event_ts.isoformat(),
+                        "isEdgeCaseData": False,
+                    })
+                    # Edge classification is deterministic: if a normal generated
+                    # record already satisfies an edge condition, it cannot be labelled
+                    # false. Regenerate it instead. This prevents two identical records
+                    # from receiving contradictory edge labels.
+                    if edge_enabled and _matches_any_edge_condition(candidate_row, edge_groups):
+                        row = None
+                        continue
+                    row = candidate_row
+                    break
+                if row is None:
+                    raise ValueError(
+                        "Unable to generate a normal transactional record that does not "
+                        "satisfy any configured edge-case condition. The edge-case definitions "
+                        "leave no valid normal-domain value for this event."
+                    )
                 generated.append(row)
 
-    edge_groups = _edge_case_groups(edge_case_variables)
     if not edge_groups or edge_case_percentage <= 0 or not generated:
         return generated
 
@@ -1313,6 +1443,24 @@ class DataGeneratorAgent:
                             f"'{group.get('condition', '')}' after {_MAX_EDGE_CASE_ATTEMPTS} attempts"
                         )
                 else:
+                    # A record whose actual values satisfy a configured edge condition
+                    # cannot be labelled false. Regenerate normal records until they are
+                    # outside every edge condition. This makes the flag a deterministic
+                    # property of the record, so identical condition-relevant data can
+                    # never receive contradictory true/false labels.
+                    if edge_groups and state.edge_case_percentage > 0:
+                        normal_ok = False
+                        for _attempt in range(_MAX_EDGE_CASE_ATTEMPTS):
+                            if not _matches_any_edge_condition(rec, edge_groups):
+                                normal_ok = True
+                                break
+                            rec = _generate_record(variables, profile=profile, rules=state.rules)
+                        if not normal_ok:
+                            raise ValueError(
+                                "Unable to generate a normal aggregational record that does not "
+                                "satisfy any configured edge-case condition. The edge-case "
+                                "definitions leave no valid normal-domain value."
+                            )
                     rec["isEdgeCaseData"] = False
                 records.append(rec)
             if "isEdgeCaseData" not in state.field_order:
