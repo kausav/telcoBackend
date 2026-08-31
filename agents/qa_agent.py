@@ -190,7 +190,6 @@ def _validate_record(
     field_order: list[str],
     profile: dict,
     transactional: bool,
-    edge_case_variables: list[dict] | None = None,
     event_fields: set[str] | None = None,
     rules: dict | None = None,
 ) -> tuple[dict, list[str]]:
@@ -358,14 +357,10 @@ def _validate_record(
 
     # 9. Keep output limited to declared variables plus transactional metadata.
     metadata = {"journey_id", "transaction_id", "event_type", "event_sequence", "event_occurrence", "event_timestamp", "isEdgeCaseData"}
-    edge_field_names = {
-        str(item.get("name")) for item in (edge_case_variables or [])
-        if isinstance(item, dict) and item.get("name")
-    }
     if transactional:
-        allowed = set(field_order) | edge_field_names | metadata
+        allowed = set(field_order) | metadata
     else:
-        allowed = set(field_order) | edge_field_names
+        allowed = set(field_order)
     rec = {k: v for k, v in rec.items() if k in allowed}
 
     return rec, issues
@@ -408,17 +403,25 @@ class QAAgent:
                 rec, variables, state.field_order, profile, transactional,
                 event_fields=pre_event_fields,
                 rules=state.rules,
-                edge_case_variables=state.edge_case_variables,
             )
 
             # Edge-case labels are trusted only after the configured condition is checked.
             # Aggregational rows are self-contained. Transactional rows are sparse, so their
             # final edge status is validated later against the complete journey context.
-            if not transactional and rec.get("isEdgeCaseData") is True:
-                matched = any(_safe_edge_condition(group.get("condition", ""), rec) for group in edge_groups.values())
+            if rec.get("isEdgeCaseData") is True:
+                matched = any(
+                    _safe_edge_condition(group.get("condition", ""), rec)
+                    for group in edge_groups.values()
+                    if group.get("condition")
+                )
                 if not matched:
-                    rec["isEdgeCaseData"] = False
-                    issues.append("isEdgeCaseData reset because no edge-case condition was satisfied")
+                    # Never silently turn a generated edge case into a normal record.
+                    # If QA changed a value so the condition no longer holds, the
+                    # dataset is internally inconsistent and must fail visibly.
+                    raise ValueError(
+                        "Generated edge-case record failed deterministic validation: "
+                        "isEdgeCaseData=true but no configured edge-case condition is satisfied"
+                    )
 
             if transactional:
                 # Metadata is structural and should never be delegated to the LLM.
@@ -507,26 +510,23 @@ class QAAgent:
                                        "event_occurrence", "event_timestamp", "isEdgeCaseData"} and value is not None:
                             ctx[key] = value
 
-        # Finalize transactional edge-case labels at RECORD grain. A transactional
-        # condition may reference fields from another event, so evaluate each already-
-        # selected record against the complete journey context. Never promote a normal
-        # record to an edge case merely because another record in the journey matches.
+        # Transactional edge-case labels are record-level. A sparse event must
+        # satisfy an edge condition using the fields actually present on that
+        # record; never promote a match on one event to every event in the journey.
         if transactional and checked:
             for rec in checked:
                 if rec.get("isEdgeCaseData") is not True:
-                    rec["isEdgeCaseData"] = False
                     continue
-                journey_id = str(rec.get("journey_id") or "")
-                ctx = dict(journey_edge_context.get(journey_id, {}))
-                for key, value in rec.items():
-                    if key not in {"journey_id", "transaction_id", "event_type", "event_sequence",
-                                   "event_occurrence", "event_timestamp", "isEdgeCaseData"} and value is not None:
-                        ctx[key] = value
                 matched = any(
-                    _safe_edge_condition(group.get("condition", ""), ctx)
+                    _safe_edge_condition(group.get("condition", ""), rec)
                     for group in edge_groups.values()
+                    if group.get("condition")
                 )
-                rec["isEdgeCaseData"] = bool(matched)
+                if not matched:
+                    raise ValueError(
+                        "Generated transactional edge-case record failed deterministic validation: "
+                        "isEdgeCaseData=true but no configured edge-case condition is satisfied"
+                    )
 
         # Optional LLM semantic audit. Deterministic validation above always runs.
         rules_text = "\n".join(f"- {r}" for r in state.rules.get("business_rules", []))
@@ -558,14 +558,7 @@ class QAAgent:
                         temperature=0.1,
                     )
                     validated = result.get("valid_records", chunk)
-                    allowed_output = set(state.field_order) | {
-                        str(item.get("name")) for item in state.edge_case_variables
-                        if isinstance(item, dict) and item.get("name")
-                    } | {
-                        "journey_id", "transaction_id", "event_type", "event_sequence",
-                        "event_occurrence", "event_timestamp", "isEdgeCaseData"
-                    }
-                    validated = [{k: r[k] for k in allowed_output if k in r} for r in validated]
+                    validated = [{k: r[k] for k in state.field_order if k in r} for r in validated]
                     valid_all.extend(validated)
                     dropped_all.extend(result.get("dropped_records", []))
                     llm_fixes += int(result.get("fixes_applied", 0))

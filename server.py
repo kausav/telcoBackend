@@ -468,21 +468,36 @@ def confirm_scenario_route(req: ConfirmRequest):
 
     # Edge-case variables: add/edit/delete independently from normal variables.
     edge_case_variables: list[dict] = [dict(v) for v in draft.get("edge_case_variables", []) if isinstance(v, dict)]
-    edge_by_name = {str(v.get("name", "")): v for v in edge_case_variables if v.get("name")}
+    # Edge-case definitions may legitimately reuse the same variable name in
+    # different edge cases. Use (edge_case_name, variable_name) as the identity
+    # rather than collapsing all definitions with the same field name.
+    edge_by_key = {
+        (str(v.get("edge_case_name") or "Scenario Edge Case"), str(v.get("name"))): v
+        for v in edge_case_variables if v.get("name")
+    }
     for name in req.edgeCaseDelete:
         if not _is_placeholder(name):
-            edge_by_name.pop(str(name), None)
+            target = str(name)
+            edge_by_key = {k: v for k, v in edge_by_key.items() if k[1] != target}
     for e in req.edgeCaseEdit:
         if _is_placeholder(e.name):
             continue
         changes = _clean_dict(e.changes or {})
-        if e.name in edge_by_name and changes:
-            edge_by_name[e.name].update(changes)
+        if not changes:
+            continue
+        target = str(e.name)
+        for key, value in list(edge_by_key.items()):
+            if key[1] == target:
+                value.update(changes)
     for new_var in req.edgeCaseAdd:
         cleaned = _clean_dict(new_var)
-        if not _is_placeholder(cleaned.get("name")):
-            edge_by_name[str(cleaned["name"])] = cleaned
-    edge_case_variables = list(edge_by_name.values())
+        name = cleaned.get("name")
+        if _is_placeholder(name):
+            continue
+        edge_name = str(cleaned.get("edge_case_name") or "Scenario Edge Case")
+        cleaned["edge_case_name"] = edge_name
+        edge_by_key[(edge_name, str(name))] = cleaned
+    edge_case_variables = list(edge_by_key.values())
 
     edge_case_percentage = draft.get("edge_case_percentage", 0.0)
     if req.edgeCasePercentage is not None:
@@ -621,10 +636,9 @@ def generate_dynamic(req: GenerateRequest):
 
         entity_records: list[dict] = []
         for entity_value, entity_rows in latest_entity_items:
-            # Transactional edgeCasePercentage is defined at the entity/journey
-            # grain, but the public flag belongs to the individual event record.
-            # Do not expose isEdgeCaseData at the entity level. The generator has
-            # already assigned the journey-consistent flag to each event row.
+            # isEdgeCaseData is a property of the actual event record.  Do not
+            # promote it to the entity/journey wrapper: one edge-case event must
+            # not turn every event for that subscriber into an edge case.
             entity_output = {entity_key: entity_value}
 
             # Include useful identity fields alongside the grouping key.
@@ -653,8 +667,7 @@ def generate_dynamic(req: GenerateRequest):
                 if not rows:
                     continue
                 actual_count = state.transactional_event_counts.get(str(entity_value), {}).get(event_type, len(rows))
-                # isEdgeCaseData intentionally lives inside each event record.
-                # Preserve it here; do not move it to the entity wrapper.
+                # Preserve the edge-case flag on the actual event record.
                 clean_rows = [dict(event_row) for event_row in rows[-10:]]
                 events_for_entity.append({
                     "event_type": event_type,

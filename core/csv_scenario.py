@@ -207,12 +207,6 @@ def parse_definition_csv(
             # that existing field and may repeat the same field across edge cases.
             if record_type == "variable" and name in seen_names:
                 raise ValueError(f"Row {row_number}: duplicate variable name '{name}'")
-            if record_type == "edge_case_variable" and name not in seen_names:
-                raise ValueError(
-                    f"Row {row_number} ('{name}'): edge-case variable must reference a "
-                    "variable defined by an earlier 'variable' row"
-                )
-
             base_variable = next((v for v in variables if v.get("name") == name), None)
             dtype = row.get("dtype", "").lower()
             gen = row.get("gen", "")
@@ -277,6 +271,13 @@ def parse_definition_csv(
                 field_order.append(name)
                 seen_names.add(name)
             else:
+                if base_variable is None:
+                    # Make the edge-only field part of the declared output schema.
+                    # This is intentional: an edge-case record cannot be valid if its
+                    # defining field is unknown to the compiled schema.
+                    variables.append(variable)
+                    field_order.append(name)
+                    seen_names.add(name)
                 edge_name = row.get("edge_case_name", "").strip()
                 edge_description = row.get("edge_case_description", "").strip()
                 condition = row.get("condition", "").strip()
@@ -304,6 +305,8 @@ def parse_definition_csv(
                 edge_item["edge_case_name"] = edge_name
                 edge_item["edge_case_description"] = edge_description
                 edge_item["condition"] = condition
+                if row.get("event_type"):
+                    edge_item["event_type"] = row.get("event_type").strip().upper().replace(" ", "_")
                 edge_case_variables_raw.append(edge_item)
             continue
 

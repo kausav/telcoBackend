@@ -30,10 +30,13 @@ def _edge_case_groups(edge_case_variables: list[dict] | None) -> dict[str, dict]
         group = groups.setdefault(name, {
             "description": str(item.get("edge_case_description") or ""),
             "condition": str(item.get("condition") or "").strip(),
+            "event_type": str(item.get("event_type") or "").strip().upper().replace(" ", "_"),
             "variables": [],
         })
         if item.get("condition") and not group.get("condition"):
             group["condition"] = str(item["condition"]).strip()
+        if item.get("event_type") and not group.get("event_type"):
+            group["event_type"] = str(item["event_type"]).strip().upper().replace(" ", "_")
         group["variables"].append(item)
     return groups
 
@@ -57,42 +60,6 @@ def _safe_edge_condition(expression: str, rec: dict) -> bool:
     except Exception:
         return False
 
-def _condition_literal_overrides(expression: str) -> dict[str, object]:
-    """Extract safe equality/boundary literals from an edge condition.
-
-    This is a deterministic safety net for LLM-generated edge definitions. If the
-    condition says ``auto_topup_enabled == True`` but the LLM forgot to emit an
-    override row for that field, the condition itself still tells us the required
-    value. Only simple comparisons against literals are used; ambiguous expressions
-    are left to normal generation and final condition validation.
-    """
-    overrides: dict[str, object] = {}
-    if not expression:
-        return overrides
-    try:
-        tree = ast.parse(expression, mode="eval")
-    except Exception:
-        return overrides
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare) or len(node.ops) != 1 or len(node.comparators) != 1:
-            continue
-        op = node.ops[0]
-        left, right = node.left, node.comparators[0]
-        if isinstance(left, ast.Name) and isinstance(right, ast.Constant):
-            name, value = left.id, right.value
-        elif isinstance(right, ast.Name) and isinstance(left, ast.Constant):
-            name, value = right.id, left.value
-        else:
-            continue
-        if isinstance(op, (ast.Eq, ast.Is)):
-            overrides[name] = value
-        elif isinstance(op, ast.GtE) and isinstance(value, (int, float)) and not isinstance(value, bool):
-            overrides.setdefault(name, value)
-        elif isinstance(op, ast.LtE) and isinstance(value, (int, float)) and not isinstance(value, bool):
-            overrides.setdefault(name, value)
-    return overrides
-
-
 def _apply_edge_case_overrides(rec: dict, edge_group: dict, variables: list[dict], profile: dict | None = None, rules: dict | None = None, active_fields: set[str] | None = None) -> dict:
     """Apply only relevant edge-case overrides, then recalculate available formulas.
 
@@ -102,19 +69,12 @@ def _apply_edge_case_overrides(rec: dict, edge_group: dict, variables: list[dict
     """
     by_name = {v["name"]: v for v in variables}
     for edge_var in edge_group.get("variables", []):
-        name = str(edge_var.get("name", "")).strip()
-        if not name:
+        name = str(edge_var.get("name", ""))
+        if name not in by_name:
             continue
-        # Edge-case variables may be edge-only fields.  In that case use the
-        # edge definition itself as the schema instead of silently dropping it.
-        # This is important for conditions such as auto_topup_enabled == True
-        # where the field is intentionally introduced only for the edge case.
-        base_var = by_name.get(name)
-        effective = dict(base_var or edge_var)
-        if not effective.get("name"):
-            effective["name"] = name
         if active_fields is not None and name not in active_fields and name not in rec:
             continue
+        effective = dict(by_name[name])
         for key in ("gen", "params", "formula", "dtype", "nullable"):
             if key in edge_var and edge_var[key] not in (None, ""):
                 effective[key] = edge_var[key]
@@ -124,19 +84,7 @@ def _apply_edge_case_overrides(rec: dict, edge_group: dict, variables: list[dict
             helper["__current_field__"] = name
             helper["__country_profile__"] = profile
             value = generator(effective, helper)
-            rec[name] = _apply_generation_constraint(base_var or effective, value, rec, rules)
-
-    # Deterministically satisfy simple condition literals even when the LLM omitted
-    # a corresponding edge-variable row. This is especially important for booleans
-    # and categorical states such as auto_topup_enabled == True or status == "FAILED".
-    literal_overrides = _condition_literal_overrides(str(edge_group.get("condition") or ""))
-    for name, value in literal_overrides.items():
-        if active_fields is not None and name not in active_fields and name not in rec:
-            continue
-        base_var = by_name.get(name)
-        if base_var is not None:
-            value = _apply_generation_constraint(base_var, value, rec, rules)
-        rec[name] = value
+            rec[name] = _apply_generation_constraint(by_name[name], value, rec, rules)
 
     # Recalculate every formula whose dependencies are now available. Edge-case
     # overrides must not leave derived fields inconsistent.
@@ -718,17 +666,229 @@ def _journey_id() -> str:
     return f"JRN-{uuid.uuid4().hex[:12].upper()}"
 
 
-def _transactional_records(compiled, journey_count: int, event_counts_out: dict[str, dict[str, int]] | None = None, profile: dict | None = None, rules: dict | None = None, edge_case_variables: list[dict] | None = None, edge_case_percentage: float = 0.0) -> list[dict]:
-    """Generate transactional records with record-level edge-case marking.
+def _condition_refs(expression: str) -> set[str]:
+    """Return field names referenced by an edge-case expression."""
+    try:
+        tree = ast.parse(str(expression or ""), mode="eval")
+        return {
+            node.id for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+        }
+    except Exception:
+        return set()
 
-    ``edgeCasePercentage`` is applied to the materialized event records, because
-    ``isEdgeCaseData`` lives on ``events[].records[]``.  An edge-case flag is only
-    written after the candidate record (and its complete journey context) actually
-    satisfies the selected edge-case condition.
 
-    Performance is preserved by materializing only the normal response window.  Edge
-    candidates are selected from that materialized window; we never manufacture a
-    flag merely to hit a percentage.
+def _condition_branches(expression: str) -> list[dict[str, object]]:
+    """Return deterministic literal assignments for common boolean conditions.
+
+    The edge-case contract is intentionally limited to comparisons/boolean logic.
+    For ``A and B`` both constraints are required. For ``A or B`` we try each branch
+    and the generator will validate the resulting candidate. This turns conditions
+    into data-generation constraints instead of relying on random chance.
+    """
+    try:
+        tree = ast.parse(str(expression or ""), mode="eval")
+    except Exception:
+        return []
+
+    def compare(node: ast.Compare) -> list[dict[str, object]]:
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            return []
+        op = node.ops[0]
+        left, right = node.left, node.comparators[0]
+        if isinstance(left, ast.Name) and isinstance(right, ast.Constant):
+            name, literal = left.id, right.value
+            if isinstance(op, (ast.Eq, ast.Is)):
+                return [{name: literal}]
+            if isinstance(op, ast.Gt) and isinstance(literal, (int, float)) and not isinstance(literal, bool):
+                return [{name: literal + (1 if isinstance(literal, int) else 0.01)}]
+            if isinstance(op, ast.GtE) and isinstance(literal, (int, float)) and not isinstance(literal, bool):
+                return [{name: literal}]
+            if isinstance(op, ast.Lt) and isinstance(literal, (int, float)) and not isinstance(literal, bool):
+                return [{name: literal - (1 if isinstance(literal, int) else 0.01)}]
+            if isinstance(op, ast.LtE) and isinstance(literal, (int, float)) and not isinstance(literal, bool):
+                return [{name: literal}]
+            if isinstance(op, ast.In) and isinstance(right, (ast.List, ast.Tuple)):
+                vals = [x.value for x in right.elts if isinstance(x, ast.Constant)]
+                return [{name: vals[0]}] if vals else []
+        if isinstance(right, ast.Name) and isinstance(left, ast.Constant):
+            if isinstance(op, (ast.Eq, ast.Is)):
+                return [{right.id: left.value}]
+        return []
+
+    def walk(node: ast.AST) -> list[dict[str, object]]:
+        if isinstance(node, ast.Expression):
+            return walk(node.body)
+        if isinstance(node, ast.Compare):
+            return compare(node)
+        if isinstance(node, ast.Name):
+            return [{node.id: True}]
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not) and isinstance(node.operand, ast.Name):
+            return [{node.operand.id: False}]
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+            branches = [{}]
+            for child in node.values:
+                child_branches = walk(child)
+                if not child_branches:
+                    return []
+                merged: list[dict[str, object]] = []
+                for a in branches:
+                    for b in child_branches:
+                        overlap = set(a).intersection(b)
+                        if any(a[k] != b[k] for k in overlap):
+                            continue
+                        merged.append({**a, **b})
+                branches = merged
+            return branches
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            out: list[dict[str, object]] = []
+            for child in node.values:
+                out.extend(walk(child))
+            return out
+        return []
+
+    return walk(tree)
+
+
+def _condition_literals(expression: str) -> dict[str, object]:
+    """Backward-compatible first branch of the generic condition constraint solver."""
+    branches = _condition_branches(expression)
+    return branches[0] if branches else {}
+
+
+def _edge_candidate(
+    row: dict,
+    edge_group: dict,
+    variables: list[dict],
+    profile: dict | None,
+    rules: dict | None,
+    event_fields: set[str],
+    assignments: dict[str, object] | None = None,
+) -> dict:
+    """Build an edge-case candidate deterministically from its condition.
+
+    The condition is the source of truth. Explicit edge overrides are applied first,
+    then deterministic constraints from the condition are applied to non-formula
+    fields, formulas are recalculated, and the final condition is checked by the
+    caller. Edge-only fields are materialized only when the edge definition itself
+    declares them; normal fields from another sparse event are never invented.
+    """
+    candidate = dict(row)
+    variable_by_name = {str(v.get("name")): v for v in variables if isinstance(v, dict) and v.get("name")}
+    edge_by_name = {str(v.get("name")): v for v in edge_group.get("variables", []) if v.get("name")}
+    refs = _condition_refs(edge_group.get("condition", ""))
+    formula_names = {str(v.get("name")) for v in variables if v.get("formula")}
+
+    # A condition can only be represented by this record if every referenced field is
+    # already present or explicitly declared by the edge definition. This prevents a
+    # sparse event from accidentally borrowing fields from an unrelated event.
+    for name in refs:
+        if name in candidate:
+            continue
+        definition = edge_by_name.get(name)
+        if definition is None:
+            # A normal variable absent from this sparse event is not materialized.
+            continue
+        effective = dict(variable_by_name.get(name, definition))
+        for key in ("gen", "params", "formula", "dtype", "nullable"):
+            if key in definition and definition[key] not in (None, ""):
+                effective[key] = definition[key]
+        generator = _GENERATORS.get(effective.get("gen"))
+        if generator and (effective.get("gen") != "formula"):
+            helper = dict(candidate)
+            helper["__current_field__"] = name
+            helper["__country_profile__"] = profile
+            value = generator(effective, helper)
+            candidate[name] = _apply_generation_constraint(
+                variable_by_name.get(name, effective), value, candidate, rules
+            )
+
+    # Apply explicit edge overrides. They are allowed to introduce an edge-only field,
+    # but only for this record when the field is part of the event or condition.
+    for edge_var in edge_group.get("variables", []):
+        name = str(edge_var.get("name", ""))
+        if not name or (name not in event_fields and name not in refs and name not in candidate):
+            continue
+        base_var = variable_by_name.get(name, edge_var)
+        effective = dict(base_var)
+        for key in ("gen", "params", "formula", "dtype", "nullable"):
+            if key in edge_var and edge_var[key] not in (None, ""):
+                effective[key] = edge_var[key]
+        generator = _GENERATORS.get(effective.get("gen"))
+        if generator and (effective.get("gen") != "formula"):
+            helper = dict(candidate)
+            helper["__current_field__"] = name
+            helper["__country_profile__"] = profile
+            value = generator(effective, helper)
+            candidate[name] = _apply_generation_constraint(base_var, value, candidate, rules)
+
+    # Apply condition constraints after generation. For OR conditions, each branch is
+    # tried by the caller; here the first branch is sufficient for candidate creation.
+    assignments = assignments if assignments is not None else _condition_literals(edge_group.get("condition", ""))
+    for name, value in assignments.items():
+        if name not in candidate:
+            # Never add an undeclared field merely because it appears in text.
+            continue
+        # Formula outputs remain authoritative; their inputs must determine them.
+        if name in formula_names:
+            continue
+        candidate[name] = value
+
+    # Recalculate formulas in declaration/dependency order. This is intentionally done
+    # after edge overrides so derived values stay mathematically consistent.
+    formula_vars = [v for v in variables if v.get("formula") and v.get("name") in candidate]
+    for _ in range(len(formula_vars) + 1):
+        changed = False
+        for var in formula_vars:
+            deps = _formula_dependencies(str(var.get("formula", "")))
+            if deps and not all(candidate.get(d) is not None for d in deps):
+                continue
+            value = _formula(var, candidate)
+            if value is not None and candidate.get(var["name"]) != value:
+                candidate[var["name"]] = value
+                changed = True
+        if not changed:
+            break
+    return candidate
+
+
+def _edge_case_candidate_for_aggregation(
+    row: dict,
+    edge_group: dict,
+    variables: list[dict],
+    profile: dict | None,
+    rules: dict | None,
+    assignments: dict[str, object] | None = None,
+) -> dict:
+    """Apply the same generic condition solver used by transactional records."""
+    return _edge_candidate(
+        row,
+        edge_group,
+        variables,
+        profile,
+        rules,
+        event_fields=set(v.get("name") for v in variables if v.get("name")),
+        assignments=assignments,
+    )
+
+
+def _transactional_records(
+    compiled,
+    journey_count: int,
+    event_counts_out: dict[str, dict[str, int]] | None = None,
+    profile: dict | None = None,
+    rules: dict | None = None,
+    edge_case_variables: list[dict] | None = None,
+    edge_case_percentage: float = 0.0,
+) -> list[dict]:
+    """Generate transactional records with record-level edge-case semantics.
+
+    ``journey_count`` remains the requested number of conceptual entities, while
+    the API materializes only the latest response window for performance.  The
+    edge-case percentage is applied to the *materialized event records* because
+    ``isEdgeCaseData`` belongs inside ``events[].records[]``.  Every true flag is
+    independently proven against that actual record; normal records are never
+    promoted to edge cases merely because they happen to match a condition.
     """
     events = compiled.events
     variables = list(compiled.variables)
@@ -738,17 +898,14 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
         events = (SimpleNamespace(event_type="BUSINESS_EVENT", sequence=1, fields=(), min_occurrences=1, max_occurrences=10),)
 
     response_entity_count = min(journey_count, MAX_RESPONSE_ENTITIES)
-    edge_groups = _edge_case_groups(edge_case_variables)
-    edge_names = list(edge_groups)
+    response_start_index = max(0, journey_count - response_entity_count)
     generated: list[dict] = []
     used_entity_keys: set[str] = set()
-    entity_batches: list[tuple[dict, list[dict]]] = []
 
-    for _entity_index in range(response_entity_count):
+    for entity_index in range(response_entity_count):
         entity_context = _generate_selected_record(
             variables, set(compiled.entity_fields), profile=profile, rules=rules
         )
-
         if entity_key and entity_key in entity_context:
             attempts = 0
             while str(entity_context[entity_key]) in used_entity_keys and attempts < 10:
@@ -766,14 +923,12 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
             event_counts_out.setdefault(entity_value, {})
         base_ts = _parse_dt(entity_context.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
         elapsed_seconds = 0
-        entity_rows: list[dict] = []
 
         for event in events:
             occurrence_count = random.randint(event.min_occurrences, event.max_occurrences)
             if event_counts_out is not None:
                 event_counts_out[entity_value][event.event_type] = occurrence_count
             start_occurrence = max(0, occurrence_count - MAX_EVENT_RECORDS)
-
             for occurrence in range(start_occurrence, occurrence_count):
                 elapsed_seconds += random.randint(5, 300)
                 event_ts = base_ts + timedelta(seconds=elapsed_seconds)
@@ -784,118 +939,94 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                     profile=profile,
                     rules=rules,
                 )
-                row["journey_id"] = journey_id
-                row["transaction_id"] = f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}"
-                row["event_type"] = event.event_type
-                row["event_sequence"] = event.sequence
-                row["event_occurrence"] = occurrence + 1
-                row["event_timestamp"] = event_ts.isoformat()
-                row["isEdgeCaseData"] = False
-                entity_rows.append(row)
+                row.update({
+                    "journey_id": journey_id,
+                    "transaction_id": f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}",
+                    "event_type": event.event_type,
+                    "event_sequence": event.sequence,
+                    "event_occurrence": occurrence + 1,
+                    "event_timestamp": event_ts.isoformat(),
+                    "isEdgeCaseData": False,
+                })
+                generated.append(row)
 
-        entity_batches.append((entity_context, entity_rows))
-        generated.extend(entity_rows)
-
+    edge_groups = _edge_case_groups(edge_case_variables)
     if not edge_groups or edge_case_percentage <= 0 or not generated:
         return generated
 
-    target_edge_records = _edge_case_count(len(generated), edge_case_percentage)
-    if target_edge_records <= 0:
+    target = _edge_case_count(len(generated), edge_case_percentage)
+    if target <= 0:
         return generated
 
-    def condition_refs(expression: str) -> set[str]:
-        if not expression:
-            return set()
-        try:
-            tree = ast.parse(expression, mode="eval")
-            return {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        except Exception:
-            return set()
-
-    row_to_entity: dict[int, tuple[dict, list[dict]]] = {}
-    for entity_context, rows in entity_batches:
-        for row in rows:
-            row_to_entity[id(row)] = (entity_context, rows)
-
-    def build_context(entity_context: dict, entity_rows: list[dict], candidate: dict) -> dict:
-        context = dict(entity_context)
-        for row in entity_rows:
-            for key, value in row.items():
-                if key not in {
-                    "journey_id", "transaction_id", "event_type", "event_sequence",
-                    "event_occurrence", "event_timestamp", "isEdgeCaseData"
-                } and value is not None:
-                    context[key] = value
-        for key, value in candidate.items():
-            if key != "isEdgeCaseData" and value is not None:
-                context[key] = value
-        return context
-
-    def try_candidate(row: dict, group: dict) -> bool:
-        entity_context, entity_rows = row_to_entity[id(row)]
-        refs = condition_refs(group.get("condition", ""))
-
-        # A record-level edge case must be attached to a record that can actually
-        # carry the fields required by its condition. Cross-event conditions may use
-        # journey context, so only fields that are absent from the complete context
-        # need to be present in the candidate itself.
-        # Apply overrides first.  An edge-case condition may intentionally reference
-        # an edge-only field (for example auto_topup_enabled), so checking the base
-        # context before applying the edge definition incorrectly rejects valid cases.
-        active_fields = set(row.keys()) | set(compiled.entity_fields) | refs
-        candidate = _apply_edge_case_overrides(
-            dict(row), group, variables, profile, rules, active_fields=active_fields
-        )
-        context = build_context(entity_context, entity_rows, candidate)
-        missing_refs = {ref for ref in refs if ref not in context}
-        if missing_refs:
-            return False
-        if not _safe_edge_condition(group.get("condition", ""), context):
-            return False
-
-        row.clear()
-        row.update(candidate)
-        row["isEdgeCaseData"] = True
-        return True
-
-    # Prefer records whose own event contains the condition fields. This prevents a
-    # condition such as recharge_status == "FAILED_EXPIRED_CARD" from being tested
-    # against an unrelated LOW_BALANCE event simply because both share a journey.
-    unused_rows = list(generated)
-    success_count = 0
-    for slot in range(target_edge_records):
-        group = edge_groups[edge_names[slot % len(edge_names)]]
-        refs = condition_refs(group.get("condition", ""))
-
-        preferred = [
-            row for row in unused_rows
-            if refs and refs.issubset(set(row.keys()) | set(compiled.entity_fields))
-        ]
-        # If the condition is cross-event, fall back to all rows in the journey; the
-        # complete context check above determines whether it is genuinely satisfiable.
-        candidates = preferred + [row for row in unused_rows if row not in preferred]
-
-        found = False
-        for row in candidates:
-            if try_candidate(row, group):
-                unused_rows.remove(row)
-                success_count += 1
-                found = True
+    # Find real candidates. A candidate is eligible only when the condition actually
+    # evaluates to true after deterministic condition constraints and formula repair.
+    # We never mark a record true merely because it was selected by percentage.
+    group_items = list(edge_groups.items())
+    eligible: list[tuple[int, str, dict]] = []
+    for idx, row in enumerate(generated):
+        event_def = compiled.event_by_type.get(str(row.get("event_type")))
+        event_fields = set(event_def.fields) if event_def else set()
+        for group_name, group in group_items:
+            configured_event = str(group.get("event_type") or "").strip().upper().replace(" ", "_")
+            if configured_event and configured_event != str(row.get("event_type") or "").strip().upper().replace(" ", "_"):
+                continue
+            refs = _condition_refs(group.get("condition", ""))
+            # If a condition references fields that are neither present in the row nor
+            # explicitly supplied by this edge definition, this event cannot represent it.
+            edge_names = {str(v.get("name")) for v in group.get("variables", []) if v.get("name")}
+            if any(name not in row and name not in edge_names for name in refs):
+                continue
+            branches = _condition_branches(group.get("condition", "")) or [{}]
+            for assignments in branches:
+                candidate = _edge_candidate(
+                    row, group, variables, profile, rules, event_fields, assignments=assignments
+                )
+                if _safe_edge_condition(group.get("condition", ""), candidate):
+                    eligible.append((idx, group_name, candidate))
+                    break
+            if eligible and eligible[-1][0] == idx:
                 break
 
-        if not found:
-            raise ValueError(
-                f"Unable to generate transactional edge-case record satisfying "
-                f"'{group.get('condition', '')}'. No materialized event record could "
-                f"satisfy the condition after applying its edge-case overrides."
-            )
-
-    if success_count != target_edge_records:
+    if len(eligible) < target:
+        descriptions = "; ".join(
+            f"{name}: {group.get('condition', '')}" for name, group in group_items
+        )
         raise ValueError(
-            f"Generated {success_count} transactional edge-case records, "
-            f"but {target_edge_records} were required by edgeCasePercentage={edge_case_percentage}"
+            f"Unable to generate {target} transactional edge-case record(s) from "
+            f"{len(generated)} materialized event records. No bypass was applied. "
+            f"Eligible conditions found for {len(eligible)} record(s). Definitions: {descriptions}"
         )
 
+    # Spread selected edge records through the materialized response rather than
+    # clustering all edge cases in one event/entity.
+    chosen_positions = {
+        eligible[min(len(eligible) - 1, int(i * len(eligible) / target))][0]
+        for i in range(target)
+    }
+    # Guarantee exactly target unique positions even with integer rounding.
+    if len(chosen_positions) < target:
+        for idx, _group_name, _candidate in eligible:
+            chosen_positions.add(idx)
+            if len(chosen_positions) == target:
+                break
+
+    chosen_lookup = {idx: (group_name, candidate) for idx, group_name, candidate in eligible if idx in chosen_positions}
+    for idx, (group_name, candidate) in chosen_lookup.items():
+        group = edge_groups[group_name]
+        if not _safe_edge_condition(group.get("condition", ""), candidate):
+            raise ValueError(
+                f"Edge-case invariant failed for condition '{group.get('condition', '')}' "
+                f"on event '{generated[idx].get('event_type')}'."
+            )
+        candidate["isEdgeCaseData"] = True
+        generated[idx] = candidate
+
+    # Exactly the requested number of materialized records are true.
+    true_count = sum(1 for row in generated if row.get("isEdgeCaseData") is True)
+    if true_count != target:
+        raise RuntimeError(
+            f"Transactional edge-case assignment invariant failed: expected {target}, got {true_count}"
+        )
     return generated
 
 
@@ -947,18 +1078,21 @@ class DataGeneratorAgent:
                 if index < edge_count and edge_names:
                     group = edge_groups[edge_names[index % len(edge_names)]]
                     matched = False
+                    branches = _condition_branches(group.get("condition", "")) or [{}]
                     for _ in range(_MAX_EDGE_CASE_ATTEMPTS):
-                        candidate = _apply_edge_case_overrides(
-                            dict(rec), group, variables, profile, state.rules,
-                            active_fields=set(FIELD_ORDER),
-                        )
-                        if _safe_edge_condition(group.get("condition", ""), candidate):
-                            rec = candidate
-                            rec["isEdgeCaseData"] = True
-                            matched = True
+                        for assignments in branches:
+                            candidate = _edge_case_candidate_for_aggregation(
+                                dict(rec), group, variables, profile, state.rules, assignments
+                            )
+                            if _safe_edge_condition(group.get("condition", ""), candidate):
+                                rec = candidate
+                                rec["isEdgeCaseData"] = True
+                                matched = True
+                                break
+                        if matched:
                             break
                         # Regenerate the normal base so random-dependent conditions
-                        # get another opportunity; deterministic overrides still win.
+                        # get another opportunity; deterministic constraints still win.
                         rec = _generate_record(variables, profile=profile, rules=state.rules)
                     if not matched:
                         raise ValueError(
