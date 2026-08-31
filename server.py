@@ -254,6 +254,7 @@ def import_scenario_csv(
     useCase: str | None = Form(None),
     label: str = Form(""),
     entityKey: str | None = Form(None),
+    edgeCasePercentage: float | None = Form(None),
 ):
     """CSV alternative to /scenario/propose.
 
@@ -269,7 +270,7 @@ def import_scenario_csv(
         raise HTTPException(400, detail={"error": f"CSV must be UTF-8 encoded: {exc}"}) from exc
 
     try:
-        variables, field_order, events = parse_definition_csv(
+        variables, field_order, events, edge_case_variables, csv_metadata = parse_definition_csv(
             csv_text, type_of_data=typeOfData
         )
     except ValueError as exc:
@@ -287,6 +288,26 @@ def import_scenario_csv(
             })
     else:
         entityKey = None
+
+    # CSV can define edgeCasePercentage; an explicit form value overrides it.
+    import math
+    edge_case_percentage = float(csv_metadata.get("edge_case_percentage", 0.0) or 0.0)
+    if edgeCasePercentage is not None:
+        edge_case_percentage = edgeCasePercentage
+    if not math.isfinite(edge_case_percentage) or not 0.0 <= edge_case_percentage <= 1.0:
+        raise HTTPException(400, detail={
+            "error": "edgeCasePercentage must be between 0 and 1",
+            "value": edge_case_percentage,
+        })
+    if not edge_case_variables:
+        edge_case_percentage = 0.0
+    else:
+        valid_names = {v["name"] for v in variables}
+        for item in edge_case_variables:
+            if item.get("name") not in valid_names:
+                raise HTTPException(400, detail={"error": f"Edge-case variable '{item.get('name')}' is not a normal CSV variable"})
+            if not str(item.get("condition", "")).strip():
+                raise HTTPException(400, detail={"error": f"Edge-case variable '{item.get('name')}' requires condition"})
 
     draft_id = new_draft_id()
     draft = {
@@ -307,8 +328,8 @@ def import_scenario_csv(
         "type_of_data": typeOfData,
         "entity_key": entityKey,
         "events": events,
-        "edge_case_variables": [],
-        "edge_case_percentage": 0.0,
+        "edge_case_variables": edge_case_variables,
+        "edge_case_percentage": edge_case_percentage,
     }
     save_draft(draft_id, draft)
     return ProposeResponse(
@@ -322,7 +343,7 @@ def import_scenario_csv(
         field_order=field_order,
         typeOfData=typeOfData,
         events=events,
-        edgeCaseVariables=[],
+        edgeCaseVariables=edge_case_variables,
     )
 
 
