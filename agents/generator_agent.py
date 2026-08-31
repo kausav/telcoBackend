@@ -664,13 +664,13 @@ def _journey_id() -> str:
 
 
 def _transactional_records(compiled, journey_count: int, event_counts_out: dict[str, dict[str, int]] | None = None, profile: dict | None = None, rules: dict | None = None, edge_case_variables: list[dict] | None = None, edge_case_percentage: float = 0.0) -> list[dict]:
-    """Fast transactional generation.
+    """Generate the materialized transactional response window.
 
-    Important optimization: the requested count represents entities, but the API only
-    returns the latest 10 entities and at most 10 records for each event/entity. We
-    therefore generate full data only for the response window instead of materializing
-    every historical transaction. Occurrence counts are still generated per event so
-    the response can expose an honest totalCount.
+    ``edgeCasePercentage`` is applied to the *actual event records returned by the
+    generator*, not to journeys.  Only records that actually satisfy an edge-case
+    condition are marked ``isEdgeCaseData=True``.  This keeps the public flag at the
+    record level and prevents one journey with many events from inflating the edge-case
+    percentage.
     """
     events = compiled.events
     variables = list(compiled.variables)
@@ -679,29 +679,24 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
         from types import SimpleNamespace
         events = (SimpleNamespace(event_type="BUSINESS_EVENT", sequence=1, fields=(), min_occurrences=1, max_occurrences=10),)
 
-    # Entity generation is deliberately outside the event loop: subscriber_id,
-    # customer_id, account_id, etc. are generated once and reused across all events.
-    # We only need the latest response window, so create at most 10 full entity states.
     response_entity_count = min(journey_count, MAX_RESPONSE_ENTITIES)
     edge_groups = _edge_case_groups(edge_case_variables)
-    conceptual_edge_count = _edge_case_count(journey_count, edge_case_percentage) if edge_groups else 0
-    conceptual_edge_indices = _edge_case_indices(journey_count, conceptual_edge_count)
-    response_start_index = max(0, journey_count - response_entity_count)
     edge_names = list(edge_groups)
     generated: list[dict] = []
     used_entity_keys: set[str] = set()
 
-    # The source generator creates records in order. The last entity is the latest one.
-    # Generate the response window in natural order so the last generated entity is last.
+    # Materialize only the response window for performance. Edge-case selection is
+    # deliberately done after all returned records exist, because the percentage and
+    # isEdgeCaseData flag are record-level requirements.
+    entity_batches: list[tuple[dict, list[dict]]] = []
     for entity_index in range(response_entity_count):
-        # Static variables not owned by an event form the entity context.
-        entity_context = _generate_selected_record(variables, set(compiled.entity_fields), profile=profile, rules=rules)
+        entity_context = _generate_selected_record(
+            variables, set(compiled.entity_fields), profile=profile, rules=rules
+        )
 
-        # Ensure the grouping key is unique where a generator can collide.
         if entity_key and entity_key in entity_context:
             attempts = 0
             while str(entity_context[entity_key]) in used_entity_keys and attempts < 10:
-                # Regenerate just the key and any fields directly depending on it.
                 key_var = compiled.variable_by_name.get(entity_key)
                 if key_var:
                     generator = _GENERATORS.get(key_var.get("gen"))
@@ -710,37 +705,23 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                 attempts += 1
             used_entity_keys.add(str(entity_context[entity_key]))
 
-        # entity_index is the zero-based index in the full conceptual dataset.
-        # Only the latest response window is materialized, but edge selection is made
-        # against the full dataset so edgeCasePercentage is never recalculated from
-        # the truncated response size.
-        conceptual_index = response_start_index + entity_index
-        is_edge_entity = conceptual_index in conceptual_edge_indices and bool(edge_names)
-        edge_rank = sorted(conceptual_edge_indices).index(conceptual_index) if is_edge_entity else -1
-        edge_group = edge_groups[edge_names[edge_rank % len(edge_names)]] if is_edge_entity else None
-        # Apply edge overrides to stable entity fields before event generation.
-        if edge_group:
-            entity_context = _apply_edge_case_overrides(entity_context, edge_group, variables, profile, rules, active_fields=set(compiled.entity_fields))
-
         journey_id = _journey_id()
         entity_value = str(entity_context.get(entity_key, "")) if entity_key else journey_id
         if event_counts_out is not None:
             event_counts_out.setdefault(entity_value, {})
         base_ts = _parse_dt(entity_context.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
         elapsed_seconds = 0
-
         entity_rows: list[dict] = []
+
         for event in events:
             occurrence_count = random.randint(event.min_occurrences, event.max_occurrences)
             if event_counts_out is not None:
                 event_counts_out[entity_value][event.event_type] = occurrence_count
-            # We do not materialize historical occurrences. Only the latest 10 are needed.
             start_occurrence = max(0, occurrence_count - MAX_EVENT_RECORDS)
 
             for occurrence in range(start_occurrence, occurrence_count):
                 elapsed_seconds += random.randint(5, 300)
                 event_ts = base_ts + timedelta(seconds=elapsed_seconds)
-
                 row = _generate_selected_record(
                     variables,
                     set(event.fields),
@@ -748,54 +729,136 @@ def _transactional_records(compiled, journey_count: int, event_counts_out: dict[
                     profile=profile,
                     rules=rules,
                 )
-
                 row["journey_id"] = journey_id
                 row["transaction_id"] = f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}"
                 row["event_type"] = event.event_type
                 row["event_sequence"] = event.sequence
                 row["event_occurrence"] = occurrence + 1
                 row["event_timestamp"] = event_ts.isoformat()
-
-                # Apply only event-relevant edge overrides. The full condition is
-                # evaluated later against the complete entity/journey context.
-                if edge_group:
-                    row = _apply_edge_case_overrides(
-                        row, edge_group, variables, profile, rules,
-                        active_fields=set(event.fields) | set(compiled.entity_fields),
-                    )
+                row["isEdgeCaseData"] = False
                 entity_rows.append(row)
 
-        if edge_group and entity_rows:
-            # For transactional scenarios the percentage is defined at the entity
-            # level. Evaluate the edge condition against the complete journey context
-            # (stable entity fields + fields emitted by all relevant events), rather
-            # than against one sparse event row. This prevents valid edge journeys from
-            # being labelled false simply because the condition references a field that
-            # belongs to another event.
-            condition_context = dict(entity_context)
-            for row in entity_rows:
-                for key, value in row.items():
-                    if key not in {"journey_id", "transaction_id", "event_type",
-                                   "event_sequence", "event_occurrence", "event_timestamp",
-                                   "isEdgeCaseData"} and value is not None:
-                        condition_context[key] = value
-            edge_valid = _safe_edge_condition(edge_group.get("condition", ""), condition_context)
-            if not edge_valid:
-                # This entity was selected as an edge-case unit, so silently
-                # labelling it false would violate edgeCasePercentage. Fail rather
-                # than return data that claims a requested edge case was generated
-                # when its condition was not actually satisfied.
-                raise ValueError(
-                    f"Unable to satisfy transactional edge-case condition "
-                    f"'{edge_group.get('condition', '')}' for entity '{entity_value}'"
-                )
-            for row in entity_rows:
-                row["isEdgeCaseData"] = True
-        else:
-            for row in entity_rows:
-                row["isEdgeCaseData"] = False
-
+        entity_batches.append((entity_context, entity_rows))
         generated.extend(entity_rows)
+
+    # No edge definitions or a zero percentage means ordinary transactional data.
+    if not edge_groups or edge_case_percentage <= 0 or not generated:
+        return generated
+
+    target_edge_records = _edge_case_count(len(generated), edge_case_percentage)
+    if target_edge_records <= 0:
+        return generated
+
+    # Build a stable lookup so conditions can use entity-level fields plus the fields
+    # available in the candidate event/journey. The flag is set only on the candidate
+    # record that actually satisfies the selected edge-case condition.
+    row_to_entity: dict[int, tuple[dict, list[dict]]] = {}
+    for entity_context, rows in entity_batches:
+        for row in rows:
+            row_to_entity[id(row)] = (entity_context, rows)
+
+    candidate_rows = list(generated)
+    # Deterministic spacing avoids clustering edge cases while still preserving the
+    # requested count exactly.
+    candidate_order: list[dict] = []
+    step = len(candidate_rows) / target_edge_records
+    for i in range(target_edge_records):
+        idx = min(len(candidate_rows) - 1, int((i + 0.5) * step))
+        candidate_order.append(candidate_rows[idx])
+
+    # Ensure distinct candidates if rounding produced duplicates.
+    seen_ids: set[int] = set()
+    candidate_order = [r for r in candidate_order if not (id(r) in seen_ids or seen_ids.add(id(r)))]
+    if len(candidate_order) < target_edge_records:
+        for row in candidate_rows:
+            if id(row) not in seen_ids:
+                candidate_order.append(row)
+                seen_ids.add(id(row))
+            if len(candidate_order) == target_edge_records:
+                break
+
+    success_count = 0
+    used_edge_ids: set[int] = set()
+    for target_index, target_row in enumerate(candidate_order):
+        if id(target_row) in used_edge_ids:
+            continue
+        group = edge_groups[edge_names[target_index % len(edge_names)]]
+        entity_context, entity_rows = row_to_entity[id(target_row)]
+
+        # First apply overrides only to fields relevant to this event or stable entity
+        # context. This prevents unrelated event fields from leaking into the record.
+        candidate = _apply_edge_case_overrides(
+            dict(target_row),
+            group,
+            variables,
+            profile,
+            rules,
+            active_fields=set(target_row.keys()) | set(compiled.entity_fields),
+        )
+
+        # Build a complete context for cross-event conditions, while keeping the actual
+        # output flag attached only to the candidate record.
+        condition_context = dict(entity_context)
+        for row in entity_rows:
+            for key, value in row.items():
+                if key not in {
+                    "journey_id", "transaction_id", "event_type", "event_sequence",
+                    "event_occurrence", "event_timestamp", "isEdgeCaseData"
+                } and value is not None:
+                    condition_context[key] = value
+        for key, value in candidate.items():
+            if key not in {"isEdgeCaseData"} and value is not None:
+                condition_context[key] = value
+
+        if _safe_edge_condition(group.get("condition", ""), condition_context):
+            target_row.clear()
+            target_row.update(candidate)
+            target_row["isEdgeCaseData"] = True
+            used_edge_ids.add(id(target_row))
+            success_count += 1
+        else:
+            # Try additional records for this edge-case slot rather than falsely
+            # labelling a record whose condition is not satisfied.
+            found = False
+            for alternative in candidate_rows:
+                if id(alternative) in seen_ids or id(alternative) in used_edge_ids:
+                    continue
+                alt_entity_context, alt_entity_rows = row_to_entity[id(alternative)]
+                alt_candidate = _apply_edge_case_overrides(
+                    dict(alternative), group, variables, profile, rules,
+                    active_fields=set(alternative.keys()) | set(compiled.entity_fields),
+                )
+                alt_context = dict(alt_entity_context)
+                for row in alt_entity_rows:
+                    for key, value in row.items():
+                        if key not in {
+                            "journey_id", "transaction_id", "event_type", "event_sequence",
+                            "event_occurrence", "event_timestamp", "isEdgeCaseData"
+                        } and value is not None:
+                            alt_context[key] = value
+                for key, value in alt_candidate.items():
+                    if key != "isEdgeCaseData" and value is not None:
+                        alt_context[key] = value
+                if _safe_edge_condition(group.get("condition", ""), alt_context):
+                    alternative.clear()
+                    alternative.update(alt_candidate)
+                    alternative["isEdgeCaseData"] = True
+                    seen_ids.add(id(alternative))
+                    used_edge_ids.add(id(alternative))
+                    found = True
+                    success_count += 1
+                    break
+            if not found:
+                raise ValueError(
+                    f"Unable to generate transactional edge-case record satisfying "
+                    f"'{group.get('condition', '')}'"
+                )
+
+    if success_count != target_edge_records:
+        raise ValueError(
+            f"Generated {success_count} transactional edge-case records, "
+            f"but {target_edge_records} were required by edgeCasePercentage={edge_case_percentage}"
+        )
 
     return generated
 

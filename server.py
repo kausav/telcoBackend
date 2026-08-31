@@ -622,11 +622,10 @@ def generate_dynamic(req: GenerateRequest):
         entity_records: list[dict] = []
         for entity_value, entity_rows in latest_entity_items:
             # Transactional edgeCasePercentage is defined at the entity/journey
-            # grain. Expose the flag once on the entity, not once per event row;
-            # otherwise one edge journey with many events would appear to exceed
-            # the requested percentage when consumers count event rows.
-            entity_is_edge = any(row.get("isEdgeCaseData") is True for row in entity_rows)
-            entity_output = {entity_key: entity_value, "isEdgeCaseData": entity_is_edge}
+            # grain, but the public flag belongs to the individual event record.
+            # Do not expose isEdgeCaseData at the entity level. The generator has
+            # already assigned the journey-consistent flag to each event row.
+            entity_output = {entity_key: entity_value}
 
             # Include useful identity fields alongside the grouping key.
             first = entity_rows[-1]
@@ -654,13 +653,9 @@ def generate_dynamic(req: GenerateRequest):
                 if not rows:
                     continue
                 actual_count = state.transactional_event_counts.get(str(entity_value), {}).get(event_type, len(rows))
-                # The edge-case flag belongs to the entity for transactional
-                # scenarios. Keep event records otherwise unchanged.
-                clean_rows = []
-                for event_row in rows[-10:]:
-                    clean_row = dict(event_row)
-                    clean_row.pop("isEdgeCaseData", None)
-                    clean_rows.append(clean_row)
+                # isEdgeCaseData intentionally lives inside each event record.
+                # Preserve it here; do not move it to the entity wrapper.
+                clean_rows = [dict(event_row) for event_row in rows[-10:]]
                 events_for_entity.append({
                     "event_type": event_type,
                     "totalCount": actual_count,
