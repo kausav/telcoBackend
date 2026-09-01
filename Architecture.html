@@ -111,38 +111,30 @@
         <li>Business rules and validation logic are derived by an LLM from a plain-English scenario description
             (auditable, not hardcoded).</li>
         <li>Bulk record generation itself is fast and deterministic (no LLM latency/cost per record).</li>
-        <li>New scenarios can be invented on demand by a human + LLM collaboration, without writing new generator code.
+        <li>New scenarios can be created on demand through human–LLM collaboration, without writing new generator code.
         </li>
     </ul>
 
     <h2>2. Architecture Diagram</h2>
     <div class="mermaid">
-        flowchart TB
-        U[Client] --> CLI["main.py CLI<br/>(--scenario --count)"]
-        U --> API["server.py FastAPI"]
-
-        CLI --> RP["run_pipeline()"]
-        API --> RP
-        API --> SD0["Agent 0: Scenario Designer<br/>(API only)"]
-
-        RP --> ORCH["Agent 1: Orchestrator"]
-        ORCH --> RULES["Agent 2: Rules Agent"]
-        RULES --> GEN["Agent 3: Data Generator"]
-        GEN --> QA["Agent 4: QA and Validation Agent"]
-
-        SD0 --> STORE[("SQLite WAL<br/>dynamic_scenarios.db")]
-        QA --> STORE
-
-        ORCH --> GEMINI[["Gemini<br/>gemini-3.6-flash"]]
-        RULES --> GEMINI
-        QA --> GEMINI
-        SD0 --> GEMINI
-
-        QA --> OUT[("Final Records +<br/>Validation Report")]
-    </div>
+flowchart TB
+    U["Client: CLI or HTTP API"] --> CLI["main.py / server.py<br/>Accept scenario inputs"]
+    CLI --> RP["run_pipeline()<br/>Create and pass WorkflowState"]
+    RP --> ORCH["Orchestrator<br/>Check scenario coherence before generation"]
+    ORCH --> RULES["Rules Agent<br/>Derive constraints and generation rules"]
+    RULES --> GEN["Data Generator<br/>Create deterministic records"]
+    GEN --> QA["QA Agent<br/>Validate formulas, fields, semantics and edge cases"]
+    QA --> OUT["Final records + validation report"]
+    ORCH --> GEMINI[["Gemini LLM<br/>Used for semantic reasoning"]]
+    RULES --> GEMINI
+    QA --> GEMINI
+    CLI --> STORE[("SQLite<br/>drafts / confirmed / feedback")]
+    QA --> STORE
+</div>
+<p><b>What happens:</b> A request enters through the CLI or FastAPI layer and is converted into a shared <code>WorkflowState</code>. The orchestrator checks that the scenario is coherent before expensive generation begins. The Rules Agent turns the scenario into executable constraints, the Data Generator creates records using deterministic Python generators, and QA validates the result. Gemini is used only where semantic reasoning is useful; the core record generation remains deterministic.</p>
 
     <h2>3. Agentic Architecture Deep Dive</h2>
-    <p><b>The 4 Pipeline Agents + 1 On-Demand Agent</b></p>
+    <p><b>The Four Pipeline Agents + One On-Demand Agent</b></p>
     <ul>
         <li>Orchestrator Agent</li>
         <li>Rules Agent</li>
@@ -158,33 +150,34 @@
     </ul>
 
     <div class="mermaid">
-        flowchart LR
-        A1["1. Orchestrator<br/>(LLM, temp 0.1)"] --> A2["2. Rules Agent<br/>(LLM, temp 0.1)"]
-        A2 --> A3["3. Data Generator<br/>(no LLM)"]
-        A3 --> A4["4. QA & Validation<br/>(algorithmic + LLM, temp 0.1)"]
-    </div>
+flowchart LR
+    A1["Orchestrator<br/>LLM sanity check"] --> A2["Rules Agent<br/>Derive executable rules"]
+    A2 --> A3["Data Generator<br/>Pure Python generation"]
+    A3 --> A4["QA Agent<br/>Deterministic + semantic validation"]
+</div>
+<p><b>Why this order:</b> Each stage consumes the decisions made by the previous stage. This prevents the generator from inventing its own interpretation of the scenario and gives QA the rules and schema needed to check whether generated values are actually valid.</p>
 
     <h3>Data Generator internal flow</h3>
     <div class="mermaid">
-        flowchart TB
-        V["Variable catalog<br/>(static config/variables*.py OR<br/>dynamic SQLite-confirmed scenario)"] --> OV["Apply
-        scenario overrides"]
-        OV --> LOOP["_generate_record()<br/>walks variables IN ORDER"]
-        LOOP --> DISP["_GENERATORS dispatch table<br/>(uniform, lognormal, beta,<br/>weighted_choice, formula,<br/>timestamp
-        helpers, LB-02 helpers...)"]
-        DISP --> REC["record dict<br/>(later fields can read<br/>earlier fields already written)"]
-        REC --> OUT["raw_records[]"]
-    </div>
+flowchart TB
+    V["Confirmed or configured variable catalog"] --> O["Apply scenario overrides<br/>Use confirmed user values"]
+    O --> L["Walk variables in declared order"]
+    L --> D["Generator dispatch table<br/>uniform / lognormal / beta / choices / formula / timestamps"]
+    D --> R["Build record incrementally"]
+    R --> F["Formula fields read prior values<br/>and preserve dependencies"]
+    F --> OUT["Validated candidate record"]
+</div>
+<p><b>What the generator does:</b> It reads the effective variable schema, applies scenario-specific overrides, and generates variables in dependency order. Formula fields can use values already produced in the same record. This keeps calculations consistent instead of generating dependent values independently.</p>
 
     <h3>3.1 Orchestrator Agent</h3>
     <p><b>Role:</b> Gatekeeper — validates the scenario request before any generation work happens. Cheap sanity check,
         not a full workflow/state manager.</p>
-    <p><b>Inputs:</b> scenario id, requested record count.<br /><b>Outputs:</b> pass/fail decision + execution notes;
+    <p><b>Inputs:</b> scenario id, requested record count.<br /><b>Outputs:</b> Pass/fail decision and execution notes.
         halts the pipeline immediately on failure.</p>
     <ul>
         <li>Checks scenario exists (static config/scenarios.py + SQLite dynamic store)</li>
         <li>Asks Gemini (temperature 0.1) to sanity-check the scenario and produce execution notes</li>
-        <li>Appends to <code>state.errors</code> and stops the pipeline on rejection</li>
+        <li>Appends errors to <code>state.errors</code> and stops the pipeline on rejection</li>
     </ul>
 
     <h3>3.2 Rules Agent</h3>
@@ -199,7 +192,7 @@
     </ul>
 
     <h3>3.3 Data Generator Agent</h3>
-    <p><b>Role:</b> The actual generation engine — <b>zero LLM calls per record</b>.</p>
+    <p><b>Role:</b> The actual generation engine — <b>makes zero LLM calls per record</b>.</p>
     <p><b>Inputs:</b> variable catalog (static or dynamic) + scenario overrides.<br /><b>Outputs:</b>
         <code>raw_records[]</code>.</p>
     <ul>
@@ -234,20 +227,23 @@
             <code>subscriber_id</code>)</li>
         <li>Force-includes 3 mandatory cross-scenario fields</li>
         <li>Retries once if too few variables are returned (temperature 0.3)</li>
-        <li>Persists confirmed scenarios into the SQLite store shared across all Cloud Run / uvicorn worker processes
+        <li>Persists confirmed scenarios into the SQLite store shared across all Cloud Run / Uvicorn worker processes
         </li>
     </ul>
 
     <div class="mermaid">
-        flowchart TB
-        U["User submits<br/>industry/domain/scenario"] --> P["/scenario/propose<br/>LLM invents variable catalog<br/>(temp 0.3)"]
-        P --> D["Draft saved<br/>(SQLite drafts table)"]
-        D --> C["/scenario/confirm<br/>user add/edit/delete + feedback"]
-        C --> S["Confirmed scenario<br/>(SQLite confirmed table)"]
-        S --> G["/generate or /scenario/generate<br/>runs the 4-agent pipeline"]
-        C -.->|feedback text| F["SQLite feedback table"]
-        F -.->|replayed into future prompts| P
-    </div>
+flowchart TB
+    U["User scenario input"] --> P["POST /scenario/propose<br/>Create variable and edge-case draft"]
+    P --> D["Draft stored in SQLite"]
+    D --> C["POST /scenario/confirm<br/>Add / edit / delete variables and edge cases"]
+    C --> V["Validate effective schema and edge conditions"]
+    V --> S["Confirmed scenario stored"]
+    S --> G["POST /scenario/generate"]
+    G --> PIPE["Generation + validation pipeline"]
+    C -.-> FB["Feedback stored in SQLite"]
+    FB -.-> P
+</div>
+<p><b>Scenario lifecycle:</b> <code>/scenario/propose</code> creates a draft schema. Confirmation is the point where user edits become authoritative, so the effective variable schema and edge-case definitions are validated before storage. Generation then consumes the confirmed scenario instead of silently using an older draft.</p>
 
     <h2>4. Validation Approach (actual — no separate "Progressive Validation Gates")</h2>
     <p>The current codebase does <b>not</b> implement separate named validation gate components. Validation is folded
@@ -273,7 +269,7 @@
             <td>Required-field presence beyond simple null checks</td>
         </tr>
         <tr>
-            <td>Null field default-fill (0 / "" / False)</td>
+            <td>Null-field defaulting (0 / "" / False)</td>
             <td>General business-rule consistency vs. Rules Agent output</td>
         </tr>
     </table>
@@ -292,20 +288,22 @@
 ├── errors               (any agent can append; halts the pipeline)
 └── field_order          (populated by Data Generator Agent)</pre>
     <p><b>Persistence model (actual):</b> SQLite (WAL mode) — <code>data/dynamic_scenarios.db</code> (drafts / confirmed
-        / feedback tables). No Firestore / BigQuery / Cloud Storage integration exists. WorkflowState itself is not
+        / feedback tables). There is no Firestore, BigQuery, or Cloud Storage integration. WorkflowState itself is not
         persisted between runs.</p>
 
     <h2>7. Agent Routing Logic and Error Recovery (actual)</h2>
     <div class="mermaid">
-        flowchart TB
-        START["run_pipeline()"] --> O["Orchestrator"]
-        O -->|state.errors set| STOP["Pipeline halts<br/>(for-loop break in main.py)"]
-        O -->|ok| R["Rules Agent"]
-        R --> G["Data Generator Agent"]
-        G --> Q["QA Agent"]
-        Q -->|chunk LLM call throws| PASS["Log error,<br/>pass chunk through unmodified"]
-        Q -->|success| FINAL["final_records +<br/>validation_report returned"]
-    </div>
+flowchart TB
+    START["Pipeline starts"] --> O["Orchestrator<br/>Reject incoherent scenario early"]
+    O -->|reject| STOP["Return structured error"]
+    O -->|accept| R["Rules Agent<br/>Build constraints"]
+    R --> G["Generator<br/>Generate records"]
+    G --> E["Edge-case solver<br/>Construct records when random data is insufficient"]
+    E --> Q["QA Agent<br/>Re-evaluate complete records"]
+    Q -->|valid| F["Return final records"]
+    Q -->|invalid| ERR["Return validation error<br/>without falsely marking the record valid"]
+</div>
+<p><b>Error handling:</b> Failures are stopped at the stage that can explain them. Edge-case generation is not a variable-specific bypass: the solver constructs candidates from the declared condition, then the complete condition is evaluated again. QA is the final authority for whether an edge-case flag is truthful.</p>
     <ul>
         <li>Orchestrator rejection → pipeline stops immediately, no downstream agents run</li>
         <li>QA per-chunk LLM failure → chunk is logged as an error and passed through as-is, not retried or routed back
@@ -315,13 +313,14 @@
 
     <h2>8. Deployment Topology (actual — GCP)</h2>
     <div class="mermaid">
-        flowchart LR
-        GH["GitHub push"] --> CI[".github/workflows/gcp-deploy.yml"]
-        CI -->|build & push| AR["Artifact Registry<br/>(telco-backend repo)"]
-        CI -->|deploy| CR["Cloud Run service<br/>(listens on $PORT)"]
-        SM["Secret Manager<br/>GEMINI_API_KEY"] -.injected at deploy.-> CR
-        CR --> USERS["API consumers"]
-    </div>
+flowchart LR
+    GH["GitHub push"] --> CI["CI workflow<br/>Build and test"]
+    CI --> AR["Artifact Registry<br/>Store container image"]
+    AR --> CR["Cloud Run<br/>Run FastAPI service"]
+    SM["Secret Manager<br/>Gemini API key"] --> CR
+    CR --> API["API consumers"]
+</div>
+<p><b>Deployment action:</b> A source change is built into a container image, stored in Artifact Registry, and deployed to Cloud Run. The Gemini credential is injected through Secret Manager rather than committed to source code. API consumers then call the deployed FastAPI service.</p>
     <ul>
         <li>Container listens on <code>$PORT</code> (Cloud Run convention, default 8080)</li>
         <li>Gemini key injected from Secret Manager at deploy time — never baked into the image or committed</li>
@@ -329,7 +328,7 @@
             dynamic-scenario store does not persist reliably across revisions/scale-out there</li>
     </ul>
 
-    <h2>9. Final Architecture Principles (actual, revised from aspirational doc)</h2>
+    <h2>9. Final Architecture Principles (actual, current implementation)</h2>
     <ul>
         <li>Direct client input flow: CLI or API request feeds straight into <code>run_pipeline()</code> — no separate
             Domain Knowledge Layer</li>
@@ -343,108 +342,21 @@
 
     <h2>10. Final End-to-End Flow (actual)</h2>
     <div class="mermaid">
-        flowchart TB
-        A["Client (CLI or API)"] --> B["run_pipeline(scenario, count)"]
-        B --> C["Orchestrator Agent<br/>(LLM sanity check)"]
-        C -->|reject| Z["Halt, return errors"]
-        C -->|accept| D["Rules Agent<br/>(LLM derives rules)"]
-        D --> E["Data Generator Agent<br/>(pure Python, dispatch table)"]
-        E --> F["QA Agent<br/>(algorithmic fix + LLM chunk audit)"]
-        F --> G["final_records + validation_report"]
-        G --> H["CLI: logged summary<br/>API: JSON response; frontend can export the response to CSV"]
-    </div>
+flowchart TB
+    C["Client request"] --> O["Orchestrator<br/>Check scenario"]
+    O -->|reject| Z["Stop with error"]
+    O -->|accept| R["Rules Agent<br/>Derive rules"]
+    R --> G["Data Generator<br/>Generate records"]
+    G --> Q["QA Agent<br/>Deterministic checks + LLM audit"]
+    Q --> F["Final records + validation report"]
+    F --> H["API JSON response"]
+</div>
+<p><b>End-to-end result:</b> The client receives generated data only after the scenario has passed orchestration, rules have been derived, records have been generated, and QA has evaluated them. The frontend can then display the JSON response or export it to CSV.</p>
 
-    <h2>11. Future Work — Gaps vs. the Aspirational Design</h2>
-    <table class="gap-table">
-        <tr>
-            <th>#</th>
-            <th>Aspirational concept</th>
-            <th>Status today</th>
-        </tr>
-        <tr>
-            <td>1</td>
-            <td>Dedicated Edge Case Agent</td>
-            <td>Not implemented. Edge cases are only whatever the Scenario Designer happens to encode.</td>
-        </tr>
-        <tr>
-            <td>2</td>
-            <td>LangGraph-based orchestration</td>
-            <td>Not implemented. Plain sequential Python loop in main.py.</td>
-        </tr>
-        <tr>
-            <td>3</td>
-            <td>Firestore / BigQuery / Cloud Storage</td>
-            <td>Not implemented. SQLite (WAL) is the only persistence layer.</td>
-        </tr>
-        <tr>
-            <td>4</td>
-            <td>Cloud Run Jobs / Dataflow generation engine</td>
-            <td>Not implemented. Generation runs synchronously in the API/CLI process.</td>
-        </tr>
-        <tr>
-            <td>5</td>
-            <td>Progressive Validation Gates as separate stages with retry loop</td>
-            <td>Not implemented as separate components; folded into Rules + QA agents.</td>
-        </tr>
-        <tr>
-            <td>6</td>
-            <td>Forward/reverse traceability</td>
-            <td>Not implemented. No artifact versioning or lineage tracking.</td>
-        </tr>
-        <tr>
-            <td>7</td>
-            <td>Random seed capture / generation manifest</td>
-            <td>Not implemented. Runs are not reproducible today.</td>
-        </tr>
-        <tr>
-            <td>8</td>
-            <td>Root-cause-classified error routing</td>
-            <td>Not implemented. QA failures are logged and passed through, not routed back.</td>
-        </tr>
-    </table>
 
-    <h2>12. LLM Usage Summary</h2>
-    <table>
-        <tr>
-            <th>Agent</th>
-            <th>Model call</th>
-            <th>Temp</th>
-            <th>Purpose</th>
-        </tr>
-        <tr>
-            <td>Orchestrator</td>
-            <td>generate_json</td>
-            <td>0.1</td>
-            <td>Validate scenario request</td>
-        </tr>
-        <tr>
-            <td>Rules</td>
-            <td>generate_json</td>
-            <td>0.1</td>
-            <td>Derive business/cross-field rules</td>
-        </tr>
-        <tr>
-            <td>Data Generator</td>
-            <td>(none)</td>
-            <td>—</td>
-            <td>Pure algorithmic generation</td>
-        </tr>
-        <tr>
-            <td>QA</td>
-            <td>generate_json × N chunks</td>
-            <td>0.1</td>
-            <td>Semantic validation of generated batches</td>
-        </tr>
-        <tr>
-            <td>Scenario Designer</td>
-            <td>generate_json (+1 retry)</td>
-            <td>0.3</td>
-            <td>Invent new scenario variable catalog</td>
-        </tr>
-    </table>
-    <p>All calls go through one client — <code>core/llm_client.py</code>, model <code>gemini-3.6-flash</code>.</p>
+    <h2>11. API Reference (server.py)</h2>
+<div class="note api-order-note"><b>API order:</b> <code>POST /scenario/propose</code> → <code>POST /scenario/import-csv</code> → <code>POST /scenario/confirm</code> → <code>POST /scenario/generate</code>. There is no backend <code>/scenario/download-csv</code>; CSV export is handled by the frontend.</div>
 
-    <h2>13. API Reference (server.py)</h2>
     <p>All request/response fields below are taken directly from the Pydantic models in <code>server.py</code>.
         "Required" means the field has no default (must be supplied); everything else is optional and falls back to its
         default (often <code>null</code> / empty list) if omitted or sent as
@@ -920,22 +832,30 @@
     </script>
 
 
-    <h2>5. Frontend Data Export</h2>
+    <h2>12. Edge-Case Data Model and Validation</h2>
+<p>Edge cases are first-class scenario definitions and are handled generically across industries and data types.</p>
+<table><tr><th>Field</th><th>Purpose</th></tr><tr><td><code>edgeCaseVariables</code></td><td>Variables and constraints defining an edge condition; it can be empty when no edge case is configured.</td></tr><tr><td><code>edgeCasePercentage</code></td><td>Requested fraction of generated records that should satisfy configured edge conditions. Valid range is <code>0</code> through <code>1</code>; when no edge-case variables exist, the effective value is <code>0</code>.</td></tr><tr><td><code>isEdgeCaseData</code></td><td>True only when the final generated record actually satisfies a configured edge condition.</td></tr></table>
+<ul><li><b>Generic constraint solving:</b> handles comparisons, field-to-field relationships, numeric coercion, boolean semantics, and compound logical expressions.</li><li><b>Confirmation:</b> validates the effective schema and edge conditions before a scenario is confirmed.</li><li><b>Generation:</b> computes the target edge-case count from total count and percentage and constructs candidates when random records do not naturally satisfy the condition.</li><li><b>Truthful classification:</b> the flag is derived from evaluating final values, not from merely selecting a record as an edge-case candidate.</li><li><b>Formula consistency:</b> dependent values are recalculated after edge-case assignments.</li><li><b>Transactional and aggregational:</b> the same generic edge-case principles apply to both data types.</li></ul>
+
+
+<h2>13. Frontend Data Export</h2>
 <p>The backend no longer exposes a CSV download API and does not persist generated datasets
 under a <code>generated_data</code> directory. The <code>/scenario/generate</code> response remains
 the source of the generated data, and the frontend is responsible for converting the
 received records into CSV when the user chooses to download them.</p>
 
 <div class="mermaid">
-    flowchart LR
-    G["POST /scenario/generate"] --> R["Generated response"]
-    R --> T{"typeOfData"}
-    T -->|"transactional"| TR["Flatten events[].records[]"]
-    T -->|"aggregational"| AR["Use records[]"]
-    TR --> CSV["Frontend CSV export"]
-    AR --> CSV
-    CSV --> F["proposed_scenario_id.csv"]
+flowchart LR
+    G["POST /scenario/generate"] --> R["Generated JSON response"]
+    R --> T{"Data type"}
+    T -->|transactional| TR["records[]<br/>entity -> events[] -> records[]"]
+    T -->|aggregational| AG["records[]<br/>row objects"]
+    TR --> X["Frontend flattening<br/>One event record = one CSV row"]
+    AG --> X
+    X --> E["Dynamic column union + CSV escaping"]
+    E --> F["Frontend download<br/>proposed_scenario_id_records.csv"]
 </div>
+<p><b>Frontend export:</b> Transactional responses contain entity-level data and nested event records, so the frontend expands each actual event record into one CSV row and merges entity/event metadata. Aggregational responses already contain row objects. In both cases columns are derived dynamically and values are CSV-escaped before download. No backend download endpoint is required.</p>
 
 <h3>Frontend CSV export contract</h3>
 <ul>
@@ -956,15 +876,21 @@ received records into CSV when the user chooses to download them.</p>
     separate batch/streaming redesign of the generator and QA pipeline.
 </div>
 
-<h3>Current scenario API lifecycle</h3>
+<h3>Current Scenario API Lifecycle</h3>
 <div class="mermaid">
-    flowchart TB
-    P["POST /scenario/propose"] --> C["POST /scenario/confirm"]
-    I["POST /scenario/import-csv"] --> C
-    C --> G["POST /scenario/generate"]
-    G --> R["Generated JSON response"]
-    R --> F["Frontend CSV conversion"]
+flowchart TB
+    P["POST /scenario/propose"] --> D["Draft<br/>variables + edge cases + edgeCasePercentage"]
+    I["POST /scenario/import-csv"] --> D
+    D --> C["POST /scenario/confirm"]
+    C --> V["Effective-schema validation<br/>edge conditions + percentage 0..1"]
+    V --> S["Confirmed scenario"]
+    S --> G["POST /scenario/generate"]
+    G --> EC["Generate normal + targeted edge-case records"]
+    EC --> QA["Validate edge condition against actual values"]
+    QA --> R["Generated JSON response"]
+    R --> FE["Frontend display / CSV export"]
 </div>
+<p><b>Why edge-case validation is part of the lifecycle:</b> Edge cases enter through proposal or CSV import, can be edited during confirmation, and are checked against the effective schema before generation. During generation the requested percentage determines how many records are targeted, while the condition itself determines whether a record qualifies. QA then checks the actual generated values rather than trusting the boolean flag alone.</p>
 
 </body>
 
