@@ -394,6 +394,112 @@ def _repair_edge_record(
     return rec, False
 
 
+
+def _make_non_edge_record(
+    rec: dict,
+    edge_groups: dict[str, dict],
+    variables: list[dict],
+    profile: dict | None = None,
+    rules: dict | None = None,
+    transactional: bool = False,
+) -> tuple[dict, bool]:
+    """Dynamically repair a normal record that accidentally matches an edge condition.
+
+    This is deliberately schema/condition driven.  It does not know any industry or
+    field names.  We search for a minimally changed value assignment that makes every
+    applicable edge condition false, while respecting declared categorical domains and
+    recalculating formula fields.  This is used after ordinary QA repairs because those
+    repairs can legitimately change a value and accidentally enter an edge state.
+    """
+    candidate = dict(rec)
+    applicable = [g for g in _applicable_edge_groups(rec, edge_groups, transactional) if g.get("condition")]
+    if not applicable:
+        return candidate, True
+
+    by_name = {str(v.get("name")): v for v in variables if isinstance(v, dict) and v.get("name")}
+    formula_names = {str(v.get("name")) for v in variables if v.get("formula")}
+
+    def alternatives(name: str, value: Any) -> list[Any]:
+        var = by_name.get(name, {})
+        params = var.get("params") if isinstance(var.get("params"), dict) else {}
+        choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+        out: list[Any] = []
+        def add(x):
+            if x is None and value is not None:
+                return
+            if all(str(x) != str(y) for y in out):
+                out.append(x)
+        for c in choices:
+            if str(c).strip().lower() != str(value).strip().lower():
+                add(c)
+        if isinstance(value, bool):
+            add(not value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            n = float(value)
+            add(int(n - 1) if isinstance(value, int) else n - 1.0)
+            add(int(n + 1) if isinstance(value, int) else n + 1.0)
+            params_min, params_max = params.get("min"), params.get("max")
+            try:
+                if params_min is not None and float(params_min) != n: add(int(float(params_min)) if isinstance(value, int) else float(params_min))
+            except Exception: pass
+            try:
+                if params_max is not None and float(params_max) != n: add(int(float(params_max)) if isinstance(value, int) else float(params_max))
+            except Exception: pass
+            add(0 if isinstance(value, int) else 0.0)
+        elif isinstance(value, str):
+            add("")
+            add("OTHER")
+        return out[:8]
+
+    def condition_refs(expr: str) -> list[str]:
+        try:
+            tree = ast.parse(str(expr), mode="eval")
+            return list(dict.fromkeys(n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id in by_name))
+        except Exception:
+            return []
+
+    # Build small domains only for fields actually used by edge conditions.  The
+    # Cartesian search is bounded so QA remains fast even with many schema fields.
+    domains: dict[str, list[Any]] = {}
+    refs: list[str] = []
+    for group in applicable:
+        for name in condition_refs(group.get("condition", "")):
+            if name not in refs and name not in formula_names and name in rec:
+                refs.append(name)
+    for name in refs:
+        domains[name] = alternatives(name, rec.get(name))
+
+    # Try one-field changes first, then small combinations.  Most accidental matches
+    # are caused by a single QA repair, so this keeps the common path cheap.
+    from itertools import product
+    trials: list[dict[str, Any]] = [{}]
+    for name in refs:
+        vals = domains.get(name, [])
+        if not vals:
+            continue
+        trials.extend({name: v} for v in vals)
+    if len(refs) <= 5:
+        value_lists = [domains.get(n, [])[:5] for n in refs]
+        if all(value_lists):
+            for combo in product(*value_lists):
+                trials.append(dict(zip(refs, combo)))
+                if len(trials) >= 250:
+                    break
+
+    for changes in trials[:250]:
+        test = dict(candidate)
+        test.update(changes)
+        test = _generator_recalculate_formulas(test, variables)
+        if not any(
+            _safe_edge_condition(g.get("condition", ""), test)
+            for g in applicable
+            if g.get("condition")
+        ):
+            test["isEdgeCaseData"] = False
+            return test, True
+
+    return candidate, False
+
 def _applicable_edge_groups(rec: dict, edge_groups: dict[str, dict], transactional: bool) -> list[dict]:
     """Return edge definitions applicable to the actual record/event.
 
@@ -486,10 +592,18 @@ class QAAgent:
                 for group in _applicable_edge_groups(rec, edge_groups, transactional)
                 if group.get("condition")
             ):
-                raise ValueError(
-                    "Generated record isEdgeCaseData=false but its actual values satisfy "
-                    "a configured edge-case condition"
+                rec, normal_ok = _make_non_edge_record(
+                    rec, edge_groups, variables, profile=profile, rules=state.rules, transactional=transactional
                 )
+                if not normal_ok or any(
+                    _safe_edge_condition(group.get("condition", ""), rec)
+                    for group in _applicable_edge_groups(rec, edge_groups, transactional)
+                    if group.get("condition")
+                ):
+                    raise ValueError(
+                        "Generated normal record satisfies a configured edge-case condition "
+                        "and no schema-valid non-edge value could be derived dynamically"
+                    )
 
             if transactional:
                 # Metadata is structural and should never be delegated to the LLM.
@@ -591,6 +705,27 @@ class QAAgent:
                     raise ValueError(
                         "Generated edge-case record failed deterministic validation: "
                         "isEdgeCaseData=true but no configured edge-case condition is satisfied"
+                    )
+
+            # A later schema/default fill can also change a previously-normal record
+            # into an edge state. Reconcile once more after ALL deterministic repairs.
+            # Never allow a false label to coexist with a true edge condition.
+            if rec.get("isEdgeCaseData") is not True and any(
+                _safe_edge_condition(group.get("condition", ""), rec)
+                for group in _applicable_edge_groups(rec, edge_groups, transactional)
+                if group.get("condition")
+            ):
+                rec, normal_ok = _make_non_edge_record(
+                    rec, edge_groups, variables, profile=profile, rules=state.rules, transactional=transactional
+                )
+                if not normal_ok or any(
+                    _safe_edge_condition(group.get("condition", ""), rec)
+                    for group in _applicable_edge_groups(rec, edge_groups, transactional)
+                    if group.get("condition")
+                ):
+                    raise ValueError(
+                        "Generated normal record satisfies a configured edge-case condition "
+                        "after final QA reconciliation and no schema-valid non-edge value could be derived dynamically"
                     )
 
             algo_fixed += len(issues)
