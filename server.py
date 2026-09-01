@@ -292,6 +292,7 @@ def _persist_generated_artifact(*, scenario_id: str, draft_id: str,
         raise
 
 
+@app.post("/scenario/propose", response_model=ProposeResponse)
 def propose_scenario(req: ProposeRequest):
     """API 1 — ask the designer agent to invent a new scenario + variable catalog."""
     # scenarioId is just the user's preferred label at this stage; it's not reserved here
@@ -779,39 +780,6 @@ def confirm_scenario_route(req: ConfirmRequest):
     )
 
 
-@app.post("/scenario/download-csv")
-def download_generated_csv(req: DownloadCsvRequest):
-    """Stream the exact CSV artifact previously produced by /scenario/generate."""
-    resolved = resolve_scenario_id_from_draft(req.draftId)
-    if resolved is None:
-        raise HTTPException(404, detail={"error": f"Unknown or unconfirmed draftId '{req.draftId}'"})
-    if resolved != req.scenarioId:
-        raise HTTPException(400, detail={
-            "error": f"draftId '{req.draftId}' does not match scenarioId '{req.scenarioId}'",
-            "draft_scenario_id": resolved,
-        })
-    if not scenario_exists(req.scenarioId):
-        raise HTTPException(404, detail={"error": f"Unknown scenario '{req.scenarioId}'"})
-    path = _generated_artifact_path(req.scenarioId, req.draftId)
-    if not path.exists():
-        raise HTTPException(404, detail={
-            "error": "No generated records found for this scenarioId/draftId. Run /scenario/generate first with the same scenarioId and draftId."
-        })
-    if path.stat().st_size == 0:
-        raise HTTPException(500, detail={"error": "Generated CSV artifact is empty"})
-    meta = resolve_scenario_meta(req.scenarioId) or {}
-    proposed_scenario_id = str(
-        meta.get("proposed_scenario_id") or meta.get("requested_scenario_id") or req.scenarioId
-    ).strip() or req.scenarioId
-    safe_filename = Path(proposed_scenario_id).name.replace('"', "_").replace('\\\\', "_")
-    return FileResponse(
-        path=path,
-        media_type="text/csv; charset=utf-8",
-        filename=f"{safe_filename}.csv",
-        headers={"Cache-Control": "no-store"},
-    )
-
-
 @app.post("/scenario/generate", response_model=GenerateResponse)
 def generate_dynamic(req: GenerateRequest):
     """API 4 — confirm a draft/scenario into records via the 4-agent pipeline."""
@@ -954,3 +922,37 @@ def generate_dynamic(req: GenerateRequest):
         errors=state.errors,
         edgeCasePercentage=float(meta.get("edge_case_percentage", 0.0) or 0.0),
     )
+
+@app.post("/scenario/download-csv")
+def download_generated_csv(req: DownloadCsvRequest):
+    """Stream the exact CSV artifact previously produced by /scenario/generate."""
+    resolved = resolve_scenario_id_from_draft(req.draftId)
+    if resolved is None:
+        raise HTTPException(404, detail={"error": f"Unknown or unconfirmed draftId '{req.draftId}'"})
+    if resolved != req.scenarioId:
+        raise HTTPException(400, detail={
+            "error": f"draftId '{req.draftId}' does not match scenarioId '{req.scenarioId}'",
+            "draft_scenario_id": resolved,
+        })
+    if not scenario_exists(req.scenarioId):
+        raise HTTPException(404, detail={"error": f"Unknown scenario '{req.scenarioId}'"})
+    path = _generated_artifact_path(req.scenarioId, req.draftId)
+    if not path.exists():
+        raise HTTPException(404, detail={
+            "error": "No generated records found for this scenarioId/draftId. Run /scenario/generate first with the same scenarioId and draftId."
+        })
+    if path.stat().st_size == 0:
+        raise HTTPException(500, detail={"error": "Generated CSV artifact is empty"})
+    meta = resolve_scenario_meta(req.scenarioId) or {}
+    proposed_scenario_id = str(
+        meta.get("proposed_scenario_id") or meta.get("requested_scenario_id") or req.scenarioId
+    ).strip() or req.scenarioId
+    safe_filename = Path(proposed_scenario_id).name.replace('"', "_").replace('\\\\', "_")
+    return FileResponse(
+        path=path,
+        media_type="text/csv; charset=utf-8",
+        filename=f"{safe_filename}.csv",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
