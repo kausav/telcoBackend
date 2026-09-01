@@ -1,6 +1,10 @@
-record_type,name,dtype,description,gen,params,depends_on,nullable,formula,event_type,sequence,fields,min_occurrences,max_occurrences,edge_case_name,edge_case_description,condition,edge_case_percentage,value
+﻿record_type,name,dtype,description,gen,params,depends_on,nullable,formula,event_type,sequence,fields,min_occurrences,max_occurrences,edge_case_name,edge_case_description,condition,edge_case_percentage,value
 variable,subscriber_id,string,Unique subscriber identifier,prefixed_int,"{""prefix"":""SUB-"",""digits"":8}",,false,,,,,,,,,,,
-variable,balance,float,Current balance,uniform,"{""min"":0,""max"":500}",,false,,,,,,,,,,,
+variable,balance,float,Current account balance,uniform,"{""min"":0,""max"":500}",,false,,,,,,,,,,,
 variable,plan_type,categorical,Subscription type,weighted_choice,"{""choices"":[""prepaid"",""postpaid""],""weights"":[0.7,0.3]}",,false,,,,,,,,,,,
-edge_case_variable,balance,float,Zero balance edge override,constant,"{""value"":0}",,false,,,,,,,Zero-Balance,Balance reaches zero,balance == 0,,
-metadata,,,,,,,,,,,,,,,,,0.02,
+variable,account_status,categorical,Account status,weighted_choice,"{""choices"":[""ACTIVE"",""SUSPENDED"",""CLOSED""],""weights"":[0.8,0.15,0.05]}",,false,,,,,,,,,,,
+variable,monthly_spend,float,Monthly spend,uniform,"{""min"":0,""max"":1000}",,false,,,,,,,,,,,
+edge_case_variable,balance,float,Zero account balance,constant,"{""value"":0}",,false,,,,,,,ZERO_BALANCE_ACCOUNT,Account balance reaches zero,balance == 0,,
+edge_case_variable,account_status,categorical,Suspended account with zero balance,constant,"{""value"":""SUSPENDED""}",,false,,,,,,,ZERO_BALANCE_SUSPENDED,Account is suspended with zero balance,"balance == 0 and account_status == ""SUSPENDED""",,
+edge_case_variable,monthly_spend,float,Very high monthly spend,constant,"{""value"":1000}",,false,,,,,,,HIGH_SPEND_OUTLIER,Monthly spend reaches the upper boundary,monthly_spend >= 1000,,
+metadata,edgeCasePercentage,,,,,,,,,,,,,,,,0.04,0.04

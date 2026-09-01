@@ -1,12 +1,10 @@
 from __future__ import annotations
 import logging
-import csv
 import json
 import math
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -77,11 +75,6 @@ class GenerateRequest(BaseModel):
     scenario: str | None = Field(None, examples=["LB-01"])
     draftId: str | None = Field(None, description="Confirmed draft id; disambiguates when scenario ids collide across users")
     count: int = Field(20, ge=1, le=5000)
-
-
-class DownloadCsvRequest(BaseModel):
-    scenarioId: str = Field(..., description="Confirmed scenario id whose generated records should be downloaded")
-    draftId: str = Field(..., description="Confirmed draft id associated with the scenario")
 
 
 class GenerateResponse(BaseModel):
@@ -186,110 +179,6 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-# Generated-data artifacts are persisted as CSV on disk. The generator already
-# produces records in memory for the existing API response; importantly, we do not
-# create a second full JSON representation or load the artifact into RAM on download.
-_GENERATED_DATA_DIR = Path(__file__).resolve().parent / "generated_data"
-_GENERATED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _generated_artifact_path(scenario_id: str, draft_id: str) -> Path:
-    import hashlib
-    key = f"{scenario_id}\\0{draft_id}".encode("utf-8")
-    return _GENERATED_DATA_DIR / f"{hashlib.sha256(key).hexdigest()}.csv"
-
-
-def _legacy_generated_json_path(scenario_id: str, draft_id: str) -> Path:
-    import hashlib
-    key = f"{scenario_id}\\0{draft_id}".encode("utf-8")
-    return _GENERATED_DATA_DIR / f"{hashlib.sha256(key).hexdigest()}.json"
-
-
-def _iter_flattened_rows(records, type_of_data: str):
-    """Yield CSV rows lazily; never build a second full row list."""
-    if type_of_data != "transactional":
-        for record in records:
-            if isinstance(record, dict):
-                yield record
-        return
-    for entity in records:
-        if not isinstance(entity, dict):
-            continue
-        if "events" not in entity:
-            yield entity
-            continue
-        entity_fields = {k: v for k, v in entity.items() if k != "events"}
-        events = entity.get("events") or []
-        if not isinstance(events, list):
-            continue
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            event_records = event.get("records") or []
-            if not isinstance(event_records, list):
-                continue
-            for record in event_records:
-                row = dict(entity_fields)
-                row["event_type"] = event.get("event_type")
-                row["event_totalCount"] = event.get("totalCount")
-                if isinstance(record, dict):
-                    row.update(record)
-                else:
-                    row["record"] = record
-                yield row
-
-
-def _csv_fieldnames(records: list[dict], type_of_data: str) -> list[str]:
-    """Discover columns without constructing a second records/rows list."""
-    seen: set[str] = set()
-    fieldnames: list[str] = []
-    for row in _iter_flattened_rows(records, type_of_data):
-        for key in row:
-            key = str(key)
-            if key not in seen:
-                seen.add(key)
-                fieldnames.append(key)
-    return fieldnames
-
-
-def _csv_scalar(value):
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list, tuple)):
-        return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
-    return str(value)
-
-
-def _persist_generated_artifact(*, scenario_id: str, draft_id: str,
-                                type_of_data: str, records: list[dict]) -> None:
-    """Persist generated records directly to one CSV artifact atomically."""
-    if not draft_id:
-        return
-    if not isinstance(records, list) or not records:
-        raise ValueError("Generation completed without any records to export")
-    fieldnames = _csv_fieldnames(records, type_of_data)
-    if not fieldnames:
-        raise ValueError("Generated dataset contains no exportable records")
-    path = _generated_artifact_path(scenario_id, draft_id)
-    tmp = path.with_suffix(".csv.tmp")
-    try:
-        with tmp.open("w", encoding="utf-8-sig", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            for row in _iter_flattened_rows(records, type_of_data):
-                writer.writerow({str(k): _csv_scalar(v) for k, v in row.items()})
-        tmp.replace(path)
-        legacy = _legacy_generated_json_path(scenario_id, draft_id)
-        if legacy.exists():
-            legacy.unlink()
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
 
 
 @app.post("/scenario/propose", response_model=ProposeResponse)
@@ -818,18 +707,6 @@ def generate_dynamic(req: GenerateRequest):
     meta = resolve_scenario_meta(scenario_id) or {}
     final_records = state.final_records
 
-    # Persist the exact full generated dataset for CSV download.  This happens
-    # before transactional response shaping, because /generate intentionally
-    # returns only the latest 10 entities while the download should contain all
-    # records generated for this request.
-    if req.draftId:
-        _persist_generated_artifact(
-            scenario_id=scenario_id,
-            draft_id=req.draftId,
-            type_of_data=state.type_of_data,
-            records=final_records,
-        )
-
     # Transactional responses are grouped by the scenario-defined entity key.
     # Only the latest 10 entities are returned. Within each entity, each event
     # contains its own totalCount and latest 10 records.
@@ -922,37 +799,3 @@ def generate_dynamic(req: GenerateRequest):
         errors=state.errors,
         edgeCasePercentage=float(meta.get("edge_case_percentage", 0.0) or 0.0),
     )
-
-@app.post("/scenario/download-csv")
-def download_generated_csv(req: DownloadCsvRequest):
-    """Stream the exact CSV artifact previously produced by /scenario/generate."""
-    resolved = resolve_scenario_id_from_draft(req.draftId)
-    if resolved is None:
-        raise HTTPException(404, detail={"error": f"Unknown or unconfirmed draftId '{req.draftId}'"})
-    if resolved != req.scenarioId:
-        raise HTTPException(400, detail={
-            "error": f"draftId '{req.draftId}' does not match scenarioId '{req.scenarioId}'",
-            "draft_scenario_id": resolved,
-        })
-    if not scenario_exists(req.scenarioId):
-        raise HTTPException(404, detail={"error": f"Unknown scenario '{req.scenarioId}'"})
-    path = _generated_artifact_path(req.scenarioId, req.draftId)
-    if not path.exists():
-        raise HTTPException(404, detail={
-            "error": "No generated records found for this scenarioId/draftId. Run /scenario/generate first with the same scenarioId and draftId."
-        })
-    if path.stat().st_size == 0:
-        raise HTTPException(500, detail={"error": "Generated CSV artifact is empty"})
-    meta = resolve_scenario_meta(req.scenarioId) or {}
-    proposed_scenario_id = str(
-        meta.get("proposed_scenario_id") or meta.get("requested_scenario_id") or req.scenarioId
-    ).strip() or req.scenarioId
-    safe_filename = Path(proposed_scenario_id).name.replace('"', "_").replace('\\\\', "_")
-    return FileResponse(
-        path=path,
-        media_type="text/csv; charset=utf-8",
-        filename=f"{safe_filename}.csv",
-        headers={"Cache-Control": "no-store"},
-    )
-
-

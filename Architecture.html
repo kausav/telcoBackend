@@ -920,74 +920,51 @@
     </script>
 
 
-    <h2>5. Generated Data CSV Download</h2>
-<p>The generated dataset is persisted as a <b>single CSV artifact on disk</b> for each
-<code>scenarioId + draftId</code> pair. The system no longer creates a JSON copy of the
-full generated dataset. This avoids the additional memory spike caused by JSON
-serialization and avoids loading a large JSON document into memory during download.</p>
+    <h2>5. Frontend Data Export</h2>
+<p>The backend no longer exposes a CSV download API and does not persist generated datasets
+under a <code>generated_data</code> directory. The <code>/scenario/generate</code> response remains
+the source of the generated data, and the frontend is responsible for converting the
+received records into CSV when the user chooses to download them.</p>
 
 <div class="mermaid">
     flowchart LR
-    G["POST /scenario/generate"] --> R["Generated records"]
-    R --> W["CSV artifact writer"]
-    W --> A[("generated_data/<br/>scenarioId + draftId")]
-    A --> D["POST /scenario/download-csv"]
-    D --> S["FileResponse / OS-level streaming"]
-    S --> F["proposed_scenario_id.csv"]
+    G["POST /scenario/generate"] --> R["Generated response"]
+    R --> T{"typeOfData"}
+    T -->|"transactional"| TR["Flatten events[].records[]"]
+    T -->|"aggregational"| AR["Use records[]"]
+    TR --> CSV["Frontend CSV export"]
+    AR --> CSV
+    CSV --> F["proposed_scenario_id.csv"]
 </div>
 
-<h3>Download API contract</h3>
-<pre>{
-  "scenarioId": "confirmed-scenario-id",
-  "draftId": "confirmed-draft-id"
-}</pre>
-<p><code>POST /scenario/download-csv</code> requires both identifiers. The service
-verifies that the draft belongs to the supplied scenario, locates the CSV artifact
-created by the most recent successful generation for that pair, and streams that
-file without parsing the complete dataset into Python memory.</p>
-
-<h3>CSV artifact architecture</h3>
+<h3>Frontend CSV export contract</h3>
 <ul>
-    <li><b>One artifact per generation key:</b> <code>scenarioId + draftId</code>.</li>
-    <li><b>No generated JSON artifact:</b> the previous full-dataset JSON representation has been removed.</li>
-    <li><b>Atomic write:</b> generation writes to a temporary CSV and replaces the final artifact only after the write succeeds.</li>
-    <li><b>Dynamic columns:</b> the column union is derived from the generated records; no industry-specific column list is hard-coded.</li>
-    <li><b>Transactional:</b> one CSV row represents one generated event record. The canonical flat representation is exported directly; nested event payloads are also supported for compatibility.</li>
-    <li><b>Aggregational:</b> generated records are exported directly.</li>
-    <li><b>Nested values:</b> dictionaries/lists are serialized as compact JSON strings inside a CSV cell.</li>
-    <li><b>Edge cases:</b> <code>isEdgeCaseData</code> is preserved exactly on the generated record.</li>
-    <li><b>Download:</b> the API uses a file response instead of <code>read_text()</code>, <code>json.loads()</code>, or an in-memory <code>BytesIO</code> containing the complete CSV.</li>
-    <li><b>Filename:</b> the user-facing filename is derived from <code>proposed_scenario_id</code>, so the downloaded file is <code>proposed_scenario_id.csv</code>, even when the confirmed/internal <code>scenario_id</code> differs.</li>
+    <li><b>No backend download endpoint:</b> CSV conversion is intentionally handled by the frontend.</li>
+    <li><b>No generated-data artifact:</b> the backend does not create a JSON or CSV copy of the complete dataset on disk.</li>
+    <li><b>Transactional:</b> the frontend can flatten each <code>events[].records[]</code> entry into one CSV row and retain <code>event_type</code> and other event metadata.</li>
+    <li><b>Aggregational:</b> the frontend can export the generated <code>records</code> directly.</li>
+    <li><b>Dynamic columns:</b> the frontend should derive columns from the actual generated records rather than using industry-specific hard-coded columns.</li>
+    <li><b>Edge cases:</b> <code>isEdgeCaseData</code> remains part of the generated record and should be exported unchanged.</li>
+    <li><b>Filename:</b> use <code>proposed_scenario_id.csv</code> when the frontend has the proposed scenario identifier from the scenario metadata.</li>
 </ul>
 
 <div class="note">
-    <b>Memory behavior:</b> the current API response contract still requires
-    <code>/scenario/generate</code> to retain its generated records for the existing
-    response structure. The CSV change removes the second full JSON/CSV in-memory
-    copies and makes persistence/download streaming-friendly. A future fully
-    constant-memory generator would require changing the internal agent/QA pipeline
-    to process batches end-to-end; that is deliberately not done here because the
-    existing <code>/scenario/generate</code> response contract must remain unchanged.
+    <b>Memory behavior:</b> removing backend CSV persistence avoids creating a second full
+    dataset representation on the server. The existing <code>/scenario/generate</code> API
+    response contract is unchanged. The generator still retains the records required to
+    construct that response; making generation itself constant-memory would require a
+    separate batch/streaming redesign of the generator and QA pipeline.
 </div>
 
-<h3>Lifecycle</h3>
+<h3>Current scenario API lifecycle</h3>
 <div class="mermaid">
     flowchart TB
-    G["Generate dataset"] --> V["Validate / QA"]
-    V --> C["Final generated records"]
-    C --> F["Discover CSV columns"]
-    F --> W["Write CSV incrementally"]
-    W --> A["Atomic CSV artifact"]
-    A --> D["POST /scenario/download-csv"]
-    D --> X["Stream file to client"]
+    P["POST /scenario/propose"] --> C["POST /scenario/confirm"]
+    I["POST /scenario/import-csv"] --> C
+    C --> G["POST /scenario/generate"]
+    G --> R["Generated JSON response"]
+    R --> F["Frontend CSV conversion"]
 </div>
-
-<h3>Artifact lifecycle and cleanup</h3>
-<p>When a new generation succeeds for the same <code>scenarioId + draftId</code>,
-the CSV artifact is atomically replaced. Legacy JSON artifacts from the previous
-implementation are removed for that same generation key. The download endpoint
-never regenerates data, so the downloaded file is the exact persisted dataset from
-the successful generation.</p>
 
 </body>
 
