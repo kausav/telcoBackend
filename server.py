@@ -206,10 +206,14 @@ def _persist_generated_artifact(
 ) -> None:
     if not draft_id:
         return
+    if not isinstance(records, list) or not records:
+        raise ValueError("Generation completed without any records to export")
+
     payload = {
         "scenario_id": scenario_id,
         "draft_id": draft_id,
         "typeOfData": type_of_data,
+        "record_count": len(records),
         "records": records,
     }
     path = _generated_artifact_path(scenario_id, draft_id)
@@ -237,12 +241,21 @@ def _flatten_generated_records(records: list[dict], type_of_data: str) -> list[d
     for entity in records:
         if not isinstance(entity, dict):
             continue
-        entity_fields = {
-            k: v for k, v in entity.items() if k != "events"
-        }
+
+        # The pipeline stores transactional data internally as flat event-record
+        # dictionaries.  This is the canonical generated-record representation.
+        # Do not assume the API response's nested `events[].records[]` shape here.
+        # Supporting the flat form is what makes CSV download work reliably.
+        if "events" not in entity:
+            rows.append(dict(entity))
+            continue
+
+        # Backward-compatible support for a nested transactional payload.
+        entity_fields = {k: v for k, v in entity.items() if k != "events"}
         events = entity.get("events") or []
         if not isinstance(events, list):
             continue
+
         for event in events:
             if not isinstance(event, dict):
                 continue
@@ -254,8 +267,6 @@ def _flatten_generated_records(records: list[dict], type_of_data: str) -> list[d
             for record in event_records:
                 row = dict(entity_fields)
                 row["event_type"] = event_type
-                # totalCount is metadata, not part of the individual event record.
-                # Keep it under a distinct CSV column so no generated field is lost.
                 row["event_totalCount"] = event_total
                 if isinstance(record, dict):
                     row.update(record)
@@ -739,6 +750,7 @@ def confirm_scenario_route(req: ConfirmRequest):
         "industry": draft.get("industry_type", "generic"),
         "country": draft.get("country"),
         "requested_scenario_id": requested_scenario_id,
+        "proposed_scenario_id": requested_scenario_id or scenario_id,
         "type_of_data": type_of_data,
         "events": events,
         "entity_key": draft.get("entity_key"),
@@ -798,13 +810,29 @@ def download_generated_csv(req: DownloadCsvRequest):
         records = payload.get("records", [])
         if not isinstance(records, list):
             raise ValueError("Stored generated records are invalid")
+        if not records:
+            raise ValueError("Stored generated dataset is empty")
         rows = _flatten_generated_records(records, type_of_data)
+        if not rows:
+            raise ValueError("Stored generated dataset contains no exportable records")
         data = _write_csv(rows)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         logger.exception("Failed to prepare CSV download for scenario=%s draft=%s", req.scenarioId, req.draftId)
         raise HTTPException(500, detail={"error": f"Unable to prepare CSV download: {exc}"}) from exc
 
-    filename = f"{req.scenarioId}_generated.csv"
+    # The download filename must use the proposed scenario id, not the
+    # confirmed/internal scenario id.  A draft can be confirmed under a
+    # different scenario_id when the originally proposed id collides, while
+    # the user-facing proposed_scenario_id remains the id they originally
+    # supplied to /scenario/propose.
+    meta = resolve_scenario_meta(req.scenarioId) or {}
+    proposed_scenario_id = (
+        meta.get("proposed_scenario_id")
+        or meta.get("requested_scenario_id")
+        or req.scenarioId
+    )
+    proposed_scenario_id = str(proposed_scenario_id).strip() or req.scenarioId
+    filename = f"{proposed_scenario_id}.csv"
     return StreamingResponse(
         data,
         media_type="text/csv; charset=utf-8",
