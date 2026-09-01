@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Literal
 
-from main import run_pipeline
+from core.pipeline_service import run_generation_pipeline
 from agents.scenario_designer_agent import ScenarioDesignerAgent
 from core.csv_scenario import parse_definition_csv, parse_variables_csv
 from core.dynamic_scenarios import (
@@ -169,11 +169,6 @@ class ConfirmResponse(BaseModel):
     events: list[dict] = Field(default_factory=list)
     edgeCaseVariables: list[dict] = Field(default_factory=list)
     edgeCasePercentage: float = Field(0.0, ge=0.0, le=1.0)
-
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
 
 
 @app.get("/health")
@@ -690,7 +685,7 @@ def generate_dynamic(req: GenerateRequest):
         raise HTTPException(400, detail={"error": f"Unknown scenario '{scenario_id}'"})
     scenario_context = resolve_scenario_context(scenario_id)
     try:
-        state = run_pipeline(
+        state = run_generation_pipeline(
             scenario=scenario_id,
             count=req.count,
             industry=scenario_context.get("industry", "generic"),

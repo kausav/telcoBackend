@@ -118,29 +118,28 @@
     <h2>2. Architecture Diagram</h2>
     <div class="mermaid">
 flowchart TB
-    U["Client: CLI or HTTP API"] --> CLI["main.py / server.py<br/>Accept scenario inputs"]
-    CLI --> RP["run_pipeline()<br/>Create and pass WorkflowState"]
-    RP --> ORCH["Orchestrator<br/>Check scenario coherence before generation"]
-    ORCH --> RULES["Rules Agent<br/>Derive constraints and generation rules"]
+    U["Client: HTTP API"] --> API["server.py<br/>Accept and validate HTTP requests"]
+    API --> RP["run_generation_pipeline()<br/>Create and pass WorkflowState"]
+    RP --> VALIDATE["Pipeline validation<br/>Check scenario coherence before generation"]
+    VALIDATE --> RULES["Rules Agent<br/>Derive constraints and generation rules"]
     RULES --> GEN["Data Generator<br/>Create deterministic records"]
     GEN --> QA["QA Agent<br/>Validate formulas, fields, semantics and edge cases"]
     QA --> OUT["Final records + validation report"]
-    ORCH --> GEMINI[["Gemini LLM<br/>Used for semantic reasoning"]]
+    VALIDATE --> GEMINI[["Gemini LLM<br/>Used for semantic reasoning"]]
     RULES --> GEMINI
     QA --> GEMINI
-    CLI --> STORE[("SQLite<br/>drafts / confirmed / feedback")]
+    API --> STORE[("SQLite<br/>drafts / confirmed / feedback")]
     QA --> STORE
 </div>
-<p><b>What happens:</b> A request enters through the CLI or FastAPI layer and is converted into a shared <code>WorkflowState</code>. The orchestrator checks that the scenario is coherent before expensive generation begins. The Rules Agent turns the scenario into executable constraints, the Data Generator creates records using deterministic Python generators, and QA validates the result. Gemini is used only where semantic reasoning is useful; the core record generation remains deterministic.</p>
+<p><b>What happens:</b> A request enters through the FastAPI layer and is converted into a shared <code>WorkflowState</code>. The pipeline validation service checks that the scenario is coherent before expensive generation begins. The Rules Agent turns the scenario into executable constraints, the Data Generator creates records using deterministic Python generators, and QA validates the result. Gemini is used only where semantic reasoning is useful; the core record generation remains deterministic.</p>
 
     <h2>3. Agentic Architecture Deep Dive</h2>
-    <p><b>The Four Pipeline Agents + One On-Demand Agent</b></p>
+    <p><b>Four Agents Total (Three Runtime Pipeline Agents + One On-Demand Scenario Designer)</b></p>
     <ul>
-        <li>Orchestrator Agent</li>
         <li>Rules Agent</li>
         <li>Data Generator Agent</li>
         <li>QA &amp; Validation Agent</li>
-        <li>Agent 0 (on-demand, not in the main pipeline): Scenario Designer Agent</li>
+        <li>Scenario Designer Agent (on-demand; used by scenario proposal/confirmation flow, not by the generation pipeline)</li>
     </ul>
     <p><b>Not counted as agents</b> (components/layers, not agents):</p>
     <ul>
@@ -151,7 +150,7 @@ flowchart TB
 
     <div class="mermaid">
 flowchart LR
-    A1["Orchestrator<br/>LLM sanity check"] --> A2["Rules Agent<br/>Derive executable rules"]
+    A1["Pipeline validation service<br/>LLM scenario sanity check"] --> A2["Rules Agent<br/>Derive executable rules"]
     A2 --> A3["Data Generator<br/>Pure Python generation"]
     A3 --> A4["QA Agent<br/>Deterministic + semantic validation"]
 </div>
@@ -169,11 +168,9 @@ flowchart TB
 </div>
 <p><b>What the generator does:</b> It reads the effective variable schema, applies scenario-specific overrides, and generates variables in dependency order. Formula fields can use values already produced in the same record. This keeps calculations consistent instead of generating dependent values independently.</p>
 
-    <h3>3.1 Orchestrator Agent</h3>
-    <p><b>Role:</b> Gatekeeper — validates the scenario request before any generation work happens. Cheap sanity check,
-        not a full workflow/state manager.</p>
-    <p><b>Inputs:</b> scenario id, requested record count.<br /><b>Outputs:</b> Pass/fail decision and execution notes.
-        halts the pipeline immediately on failure.</p>
+    <h3>3.1 Pipeline Validation Service</h3>
+    <p><b>Role:</b> Gatekeeper service — validates the scenario request before generation work happens. This is deterministic application orchestration plus one semantic LLM validation call; it is not an agent and does not consume an agent slot.</p>
+    <p><b>Inputs:</b> confirmed scenario context, industry, country, data type, and requested record count.<br /><b>Outputs:</b> Pass/fail decision and execution notes. The pipeline halts immediately on failure.</p>
     <ul>
         <li>Checks scenario exists (static config/scenarios.py + SQLite dynamic store)</li>
         <li>Asks Gemini (temperature 0.1) to sanity-check the scenario and produce execution notes</li>
@@ -216,7 +213,7 @@ flowchart TB
             run</li>
     </ul>
 
-    <h3>3.5 Agent 0 — Scenario Designer Agent (on-demand, not in main pipeline)</h3>
+    <h3>3.5 Scenario Designer Agent (on-demand)</h3>
     <p><b>Role:</b> Invents a brand-new scenario's full variable catalog from a plain-English business description, via
         <code>/scenario/propose</code> + <code>/scenario/confirm</code>.</p>
     <p><b>Inputs:</b> industryType, domain, businessScenario, optional businessResponse/expectedOutcome, plus feedback
@@ -294,7 +291,7 @@ flowchart TB
     <h2>7. Agent Routing Logic and Error Recovery (actual)</h2>
     <div class="mermaid">
 flowchart TB
-    START["Pipeline starts"] --> O["Orchestrator<br/>Reject incoherent scenario early"]
+    START["Pipeline starts"] --> O["Pipeline validation service<br/>Reject incoherent scenario early"]
     O -->|reject| STOP["Return structured error"]
     O -->|accept| R["Rules Agent<br/>Build constraints"]
     R --> G["Generator<br/>Generate records"]
@@ -305,7 +302,7 @@ flowchart TB
 </div>
 <p><b>Error handling:</b> Failures are stopped at the stage that can explain them. Edge-case generation is not a variable-specific bypass: the solver constructs candidates from the declared condition, then the complete condition is evaluated again. QA is the final authority for whether an edge-case flag is truthful.</p>
     <ul>
-        <li>Orchestrator rejection → pipeline stops immediately, no downstream agents run</li>
+        <li>Pipeline validation rejection → generation stages do not run</li>
         <li>QA per-chunk LLM failure → chunk is logged as an error and passed through as-is, not retried or routed back
         </li>
         <li>No root-cause-classified routing back to Rules/Data Generator Agent on QA failure exists today</li>
@@ -330,7 +327,7 @@ flowchart LR
 
     <h2>9. Final Architecture Principles (actual, current implementation)</h2>
     <ul>
-        <li>Direct client input flow: CLI or API request feeds straight into <code>run_pipeline()</code> — no separate
+        <li>Direct client input flow: HTTP API request feeds into <code>run_generation_pipeline()</code> — no separate
             Domain Knowledge Layer</li>
         <li>Generation does not wait on QA approval — generation and validation are sequential stages, not a gated loop
         </li>
@@ -343,7 +340,7 @@ flowchart LR
     <h2>10. Final End-to-End Flow (actual)</h2>
     <div class="mermaid">
 flowchart TB
-    C["Client request"] --> O["Orchestrator<br/>Check scenario"]
+    C["Client request"] --> O["Pipeline validation service<br/>Check scenario"]
     O -->|reject| Z["Stop with error"]
     O -->|accept| R["Rules Agent<br/>Derive rules"]
     R --> G["Data Generator<br/>Generate records"]
@@ -351,7 +348,7 @@ flowchart TB
     Q --> F["Final records + validation report"]
     F --> H["API JSON response"]
 </div>
-<p><b>End-to-end result:</b> The client receives generated data only after the scenario has passed orchestration, rules have been derived, records have been generated, and QA has evaluated them. The frontend can then display the JSON response or export it to CSV.</p>
+<p><b>End-to-end result:</b> The client receives generated data only after the scenario has passed pipeline validation, rules have been derived, records have been generated, and QA has evaluated them. The frontend can then display the JSON response or export it to CSV.</p>
 
 
     <h2>11. API Reference (server.py)</h2>
@@ -362,7 +359,7 @@ flowchart TB
         default (often <code>null</code> / empty list) if omitted or sent as
         blank/<code>"string"</code>/<code>null</code> placeholder text.</p>
 
-    <h3>GET /</h3>
+    
     <p><b>Purpose:</b> Liveness check.</p>
     <table>
         <tr>
@@ -716,7 +713,7 @@ flowchart TB
     </table>
 
     <h3>POST /scenario/generate — API 4</h3>
-    <p><b>Purpose:</b> Run the 4-agent pipeline (Orchestrator → Rules → Generator → QA) for a confirmed scenario and
+    <p><b>Purpose:</b> Run the generation pipeline (Rules → Generator → QA) after pipeline-level scenario validation for a confirmed scenario and
         return generated records.</p>
     <p><b>Request body</b> (<code>GenerateRequest</code>):</p>
     <table>
