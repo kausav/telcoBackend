@@ -768,7 +768,7 @@ def _condition_refs(expression: str) -> set[str]:
         return set()
 
 
-def _condition_branches(expression: str) -> list[dict[str, object]]:
+def _condition_branches(expression: str, variables: list[dict] | None = None) -> list[dict[str, object]]:
     """Compile supported edge conditions into deterministic assignments.
 
     This is deliberately schema-driven rather than industry/field-name driven.
@@ -796,29 +796,47 @@ def _condition_branches(expression: str) -> list[dict[str, object]]:
         if len(node.ops) != 1 or len(node.comparators) != 1:
             return []
         op, left, right = node.ops[0], node.left, node.comparators[0]
+        # Build a candidate assignment for both field-to-literal and
+        # field-to-field comparisons. Field-to-field comparisons are common in
+        # real edge definitions (e.g. balance_before < recharge_amount) and
+        # cannot be solved by the old literal-only branch builder.
         if isinstance(left, ast.Name):
             name = left.id
             lit = _literal(right)
+            if isinstance(right, ast.Name):
+                other = right.id
+                if isinstance(op, (ast.Eq, ast.Is)):
+                    return [{name: {"__copy_from__": other}}]
+                if isinstance(op, (ast.NotEq, ast.IsNot)):
+                    return [{"__field_not_eq__": (name, other)}]
+                if isinstance(op, (ast.Gt, ast.GtE, ast.Lt, ast.LtE)):
+                    return [{"__field_compare__": (name, op.__class__.__name__, other)}]
+                return []
             if isinstance(op, (ast.Eq, ast.Is)) and not isinstance(right, (ast.List, ast.Tuple)):
                 return [{name: lit}]
-            if isinstance(op, ast.Gt) and isinstance(lit, (int,float)) and not isinstance(lit,bool):
+            if isinstance(op, ast.Gt) and isinstance(lit,(int,float)) and not isinstance(lit,bool):
                 return [{name: lit + (1 if isinstance(lit,int) else 0.01)}]
-            if isinstance(op, ast.GtE) and isinstance(lit, (int,float)) and not isinstance(lit,bool):
+            if isinstance(op, ast.GtE) and isinstance(lit,(int,float)) and not isinstance(lit,bool):
                 return [{name: lit}]
-            if isinstance(op, ast.Lt) and isinstance(lit, (int,float)) and not isinstance(lit,bool):
+            if isinstance(op, ast.Lt) and isinstance(lit,(int,float)) and not isinstance(lit,bool):
                 return [{name: lit - (1 if isinstance(lit,int) else 0.01)}]
-            if isinstance(op, ast.LtE) and isinstance(lit, (int,float)) and not isinstance(lit,bool):
+            if isinstance(op, ast.LtE) and isinstance(lit,(int,float)) and not isinstance(lit,bool):
                 return [{name: lit}]
             if isinstance(op, ast.In) and isinstance(lit,list):
                 return [{name: x} for x in lit]
             if isinstance(op, ast.NotIn) and isinstance(lit,list):
-                # A concrete alternative is selected later from the declared schema.
                 return [{"__not_in__": (name, tuple(lit))}]
             if isinstance(op, (ast.NotEq, ast.IsNot)):
                 return [{"__not_eq__": (name, lit)}]
         if isinstance(right, ast.Name) and isinstance(left, ast.Constant):
             if isinstance(op, (ast.Eq, ast.Is)):
                 return [{right.id: left.value}]
+            if isinstance(op, (ast.Gt, ast.GtE, ast.Lt, ast.LtE)):
+                # Reverse constant <op> field into field <reverse-op> constant.
+                reverse = {ast.Gt: ast.Lt, ast.GtE: ast.LtE, ast.Lt: ast.Gt, ast.LtE: ast.GtE}.get(type(op))
+                if reverse:
+                    fake = ast.Compare(left=ast.Name(id=right.id), ops=[reverse()], comparators=[left])
+                    return compare(fake)
         return []
 
     def walk(node: ast.AST) -> list[dict[str, object]]:
@@ -885,6 +903,79 @@ def _apply_condition_assignments(
                 alternatives = [c for c in choices if c not in forbidden]
                 if alternatives:
                     candidate[name] = alternatives[0]
+                continue
+            if key == "__copy_from__":
+                name, source = raw_value if isinstance(raw_value, tuple) else (None, None)
+                if name and source in candidate and name not in formula_names:
+                    candidate[name] = candidate[source]
+                continue
+            if key == "__field_not_eq__":
+                name, other = raw_value
+                if name in formula_names: continue
+                if other in candidate and str(candidate.get(name)).strip().lower() == str(candidate.get(other)).strip().lower():
+                    var = by_name.get(name, {})
+                    params = var.get("params") if isinstance(var.get("params"), dict) else {}
+                    choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+                    alt = next((c for c in choices if str(c).strip().lower() != str(candidate.get(other)).strip().lower()), None)
+                    if alt is not None: candidate[name] = alt
+                continue
+            if key == "__field_compare__":
+                name, op_name, other = raw_value
+                if name in formula_names or other in formula_names:
+                    continue
+                def num(x):
+                    try:
+                        if isinstance(x, bool): return None
+                        x = float(x)
+                        return x if math.isfinite(x) else None
+                    except (TypeError, ValueError):
+                        return None
+                def bounds(field):
+                    var = by_name.get(field, {})
+                    params = var.get("params") if isinstance(var.get("params"), dict) else {}
+                    choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+                    nums = [num(x) for x in choices]
+                    nums = [x for x in nums if x is not None]
+                    lo = num(params.get("min")); hi = num(params.get("max"))
+                    if nums:
+                        lo = min(nums) if lo is None else lo
+                        hi = max(nums) if hi is None else hi
+                    cur = num(candidate.get(field))
+                    if lo is None: lo = cur
+                    if hi is None: hi = cur
+                    return lo, hi, var
+                llo, lhi, lvar = bounds(name)
+                rlo, rhi, rvar = bounds(other)
+                step_l = 1.0 if str(lvar.get("dtype", "")).lower() in {"int","integer"} else 0.01
+                step_r = 1.0 if str(rvar.get("dtype", "")).lower() in {"int","integer"} else 0.01
+                # Prefer values guaranteed to satisfy the relation using the
+                # declared domains. If a normal domain is absent, synthesize a
+                # minimal numeric pair. This is a generic constraint solver, not
+                # a field-specific workaround.
+                left = num(candidate.get(name)); right = num(candidate.get(other))
+                if op_name in {"Lt", "LtE"}:
+                    if llo is not None and rhi is not None and llo <= rhi - (0 if op_name == "LtE" else step_l):
+                        left, right = llo, rhi
+                    elif left is None or right is None or not (left < right if op_name == "Lt" else left <= right):
+                        base = rhi if rhi is not None else (right if right is not None else 1.0)
+                        right = base
+                        left = base - (0 if op_name == "LtE" else max(step_l, step_r))
+                        if llo is not None: left = max(llo, left)
+                        if lhi is not None: left = min(lhi, left)
+                else:
+                    if lhi is not None and rlo is not None and lhi >= rlo + (0 if op_name == "GtE" else step_l):
+                        left, right = lhi, rlo
+                    elif left is None or right is None or not (left > right if op_name == "Gt" else left >= right):
+                        base = rlo if rlo is not None else (right if right is not None else 0.0)
+                        left = base + (0 if op_name == "GtE" else max(step_l, step_r))
+                        right = base
+                        if llo is not None: left = max(llo, left)
+                        if lhi is not None: left = min(lhi, left)
+                def cast(value, var):
+                    dtype = str(var.get("dtype", "")).lower()
+                    return int(round(value)) if dtype in {"int","integer"} else float(value)
+                if left is not None: candidate[name] = cast(left, lvar)
+                if right is not None: candidate[other] = cast(right, rvar)
                 continue
             continue
         name, value = key, raw_value
@@ -1028,7 +1119,9 @@ def _condition_compatible_with_schema(
             if numeric(value) is None:
                 return False
         elif kind == "boolean":
-            if not isinstance(value, bool):
+            # Boolean-semantic categorical schemas commonly use YES/NO, Y/N,
+            # enabled/disabled, or 1/0. Conditions may use either representation.
+            if _boolean_semantic(value) is None:
                 return False
         elif kind == "datetime":
             if not isinstance(value, str):
@@ -1125,6 +1218,161 @@ def _apply_edge_generation_value(var: dict, value, rec: dict, rules: dict | None
             return match if match is not None else value
     return value
 
+
+def _solve_edge_condition(candidate: dict, expression: str, variables: list[dict]) -> dict:
+    """Generic deterministic constraint repair for an edge condition.
+
+    Repeatedly applies atomic constraints, recalculates formulas, and re-evaluates the
+    complete expression. It never knows industry or field names. Formula fields are
+    treated as derived; when a condition targets a derived field, its dependencies are
+    adjusted by the existing formula model where possible.
+    """
+    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    formula_names = {str(v.get("name")) for v in variables if v.get("formula")}
+
+    def numeric(x):
+        if isinstance(x, bool): return None
+        try:
+            y = float(x)
+            return y if math.isfinite(y) else None
+        except (TypeError, ValueError): return None
+
+    def set_value(target, name, value):
+        if name in formula_names:
+            return
+        var = by_name.get(name, {})
+        params = var.get("params") if isinstance(var.get("params"), dict) else {}
+        choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+        if choices:
+            # Prefer an exact/semantic schema representation; if none exists, preserve
+            # the explicit edge literal because normal categorical choices are not hard
+            # limits for an explicitly requested edge state.
+            match = next((c for c in choices if str(c).strip().lower() == str(value).strip().lower()), None)
+            if match is None and isinstance(value, bool):
+                match = next((c for c in choices if _boolean_semantic(c) is value), None)
+            if match is not None: value = match
+        dtype = str(var.get("dtype", "")).lower()
+        if dtype in {"int", "integer"} and numeric(value) is not None:
+            value = int(round(float(value)))
+        elif dtype in {"float", "number", "double", "decimal"} and numeric(value) is not None:
+            value = float(value)
+        target[name] = value
+
+    def atomic_nodes(node):
+        if isinstance(node, ast.Expression): return atomic_nodes(node.body)
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+            out=[]
+            for x in node.values: out.extend(atomic_nodes(x))
+            return out
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            # Try each branch independently; caller will stop once expression is true.
+            out=[]
+            for x in node.values: out.extend(atomic_nodes(x))
+            return out
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not) and isinstance(node.operand, ast.Compare):
+            cmp_node = node.operand
+            if len(cmp_node.ops) == 1:
+                inverse = {ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.Lt: ast.GtE, ast.LtE: ast.Gt, ast.Gt: ast.LtE, ast.GtE: ast.Lt, ast.In: ast.NotIn, ast.NotIn: ast.In, ast.Is: ast.IsNot, ast.IsNot: ast.Is}.get(type(cmp_node.ops[0]))
+                if inverse:
+                    return [ast.Compare(left=cmp_node.left, ops=[inverse()], comparators=cmp_node.comparators)]
+        return [node] if isinstance(node, (ast.Compare, ast.Name, ast.UnaryOp)) else []
+
+    def repair_compare(target, node):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1 or len(node.comparators) != 1:
+            return
+        op=node.ops[0]; right=node.comparators[0]; left=node.left
+        if isinstance(left, ast.Name):
+            name=left.id
+            if name not in by_name or name in formula_names: return
+            if isinstance(right, ast.Name):
+                other=right.id
+                if other not in by_name: return
+                a=numeric(target.get(name)); b=numeric(target.get(other))
+                step_l = 1.0 if str(by_name[name].get("dtype", "")).lower() in {"int", "integer"} else 0.01
+                step_r = 1.0 if str(by_name[other].get("dtype", "")).lower() in {"int", "integer"} else 0.01
+                if isinstance(op, ast.Eq):
+                    if b is None and a is None: a = b = 0.0
+                    elif b is None: b = a
+                    else: a = b
+                    set_value(target, name, a); set_value(target, other, b)
+                elif isinstance(op, ast.NotEq):
+                    if a is None and b is None: a, b = 0.0, 1.0
+                    elif a is None: a = b + step_l
+                    elif b is None: b = a + step_r
+                    elif a == b: a = b + step_l
+                    set_value(target, name, a); set_value(target, other, b)
+                elif isinstance(op, ast.Lt):
+                    if a is None and b is None: a, b = 0.0, 1.0
+                    elif a is None: a = b - step_l
+                    elif b is None: b = a + step_r
+                    if not a < b: b = a + max(step_l, step_r)
+                    set_value(target, name, a); set_value(target, other, b)
+                elif isinstance(op, ast.LtE):
+                    if a is None and b is None: a = b = 0.0
+                    elif a is None: a = b
+                    elif b is None: b = a
+                    if a > b: b = a
+                    set_value(target, name, a); set_value(target, other, b)
+                elif isinstance(op, ast.Gt):
+                    if a is None and b is None: a, b = 1.0, 0.0
+                    elif a is None: a = b + step_l
+                    elif b is None: b = a - step_r
+                    if not a > b: a = b + max(step_l, step_r)
+                    set_value(target, name, a); set_value(target, other, b)
+                elif isinstance(op, ast.GtE):
+                    if a is None and b is None: a = b = 0.0
+                    elif a is None: a = b
+                    elif b is None: b = a
+                    if a < b: a = b
+                    set_value(target, name, a); set_value(target, other, b)
+                return
+            if isinstance(right, ast.Constant):
+                value=right.value
+                if isinstance(op, (ast.Eq, ast.Is)): set_value(target, name, value)
+                elif isinstance(op, ast.NotEq) or isinstance(op, ast.IsNot):
+                    params=by_name[name].get("params") if isinstance(by_name[name].get("params"),dict) else {}
+                    choices=params.get("choices") if isinstance(params.get("choices"),list) else []
+                    alt=next((c for c in choices if str(c).strip().lower()!=str(value).strip().lower()), None)
+                    if alt is not None: set_value(target, name,alt)
+                elif isinstance(value,(int,float)) and not isinstance(value,bool):
+                    n=float(value); cur=numeric(candidate.get(name)); step=1.0 if str(by_name[name].get("dtype","")).lower() in {"int","integer"} else 0.01
+                    if isinstance(op,ast.Gt): set_value(target, name,n+step)
+                    elif isinstance(op,ast.GtE): set_value(target, name,n)
+                    elif isinstance(op,ast.Lt): set_value(target, name,n-step)
+                    elif isinstance(op,ast.LtE): set_value(target, name,n)
+                return
+            if isinstance(right,(ast.List,ast.Tuple)):
+                vals=[x.value for x in right.elts if isinstance(x,ast.Constant)]
+                if isinstance(op,ast.In) and vals: set_value(target, name,vals[0])
+                elif isinstance(op,ast.NotIn):
+                    params=by_name[name].get("params") if isinstance(by_name[name].get("params"),dict) else {}
+                    choices=params.get("choices") if isinstance(params.get("choices"),list) else []
+                    alt=next((c for c in choices if c not in vals), None)
+                    if alt is not None: set_value(target, name,alt)
+
+    try:
+        tree=ast.parse(str(expression or ""), mode="eval")
+    except Exception:
+        return candidate
+    # Multiple passes matter when a formula depends on a constrained field, or when
+    # one atomic constraint changes the value needed by another.
+    for _ in range(max(4, len(by_name)*2)):
+        if _safe_edge_condition(expression, candidate):
+            return candidate
+        # For OR, try each branch by building candidates and keep the first successful one.
+        body=tree.body if isinstance(tree,ast.Expression) else tree
+        branches=[body]
+        if isinstance(body,ast.BoolOp) and isinstance(body.op,ast.Or): branches=list(body.values)
+        best=None
+        for branch in branches:
+            trial=dict(candidate)
+            for node in atomic_nodes(branch): repair_compare(trial, node)
+            trial=_recalculate_formulas(trial,variables)
+            if _safe_edge_condition(expression,trial): return trial
+            best=trial
+        if best is not None: candidate=best
+    return candidate
+
 def _edge_candidate(
     row: dict,
     edge_group: dict,
@@ -1203,6 +1451,8 @@ def _edge_candidate(
 
     # Recalculate formulas in declaration/dependency order. This is intentionally done
     # after edge overrides so derived values stay mathematically consistent.
+    candidate = _recalculate_formulas(candidate, variables)
+    candidate = _solve_edge_condition(candidate, edge_group.get("condition", ""), variables)
     candidate = _recalculate_formulas(candidate, variables)
     return candidate
 
@@ -1341,7 +1591,7 @@ def _transactional_records(
     # scenarios we keep the existing response optimization (latest 10 entities /
     # latest 10 records per event), but edgeCasePercentage is still interpreted
     # against the requested count so 100 × 0.02 always means 2 edge-case units.
-    target = _edge_case_count(journey_count, edge_case_percentage)
+    target = min(_edge_case_count(journey_count, edge_case_percentage), len(generated))
     if target <= 0:
         return generated
 
@@ -1368,7 +1618,7 @@ def _transactional_records(
             edge_names = {str(v.get("name")) for v in group.get("variables", []) if v.get("name")}
             if any(name not in row and name not in edge_names for name in refs):
                 continue
-            branches = _condition_branches(group.get("condition", "")) or [{}]
+            branches = _condition_branches(group.get("condition", ""), variables) or [{}]
             for assignments in branches:
                 candidate = _edge_candidate(
                     row, group, variables, profile, rules, event_fields, assignments=assignments
@@ -1380,14 +1630,54 @@ def _transactional_records(
                 break
 
     if len(eligible) < target:
-        descriptions = "; ".join(
-            f"{name}: {group.get('condition', '')}" for name, group in group_items
-        )
-        raise ValueError(
-            f"Unable to generate {target} transactional edge-case record(s) from "
-            f"{len(generated)} materialized event records. No bypass was applied. "
-            f"Eligible conditions found for {len(eligible)} record(s). Definitions: {descriptions}"
-        )
+        # Do not fail merely because the randomly materialized normal window contains
+        # no natural matches. Build additional candidates from fresh valid base rows
+        # and solve the configured condition deterministically. This is the generic
+        # path for rare edge states; no variable or industry is special-cased.
+        needed = target - len(eligible)
+        for group_name, group in group_items:
+            if needed <= 0:
+                break
+            configured_event = str(group.get("event_type") or "").strip().upper().replace(" ", "_")
+            for _attempt in range(max(_MAX_EDGE_CASE_ATTEMPTS, needed * 2)):
+                if needed <= 0:
+                    break
+                event_candidates = [e for e in events if not configured_event or str(e.event_type).strip().upper().replace(" ", "_") == configured_event]
+                if not event_candidates:
+                    continue
+                event_def = random.choice(event_candidates)
+                base = _generate_selected_record(variables, set(event_def.fields), base=entity_context, profile=profile, rules=rules)
+                base.update({
+                    "journey_id": journey_id,
+                    "transaction_id": f"TXN-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}",
+                    "event_type": event_def.event_type,
+                    "event_sequence": event_def.sequence,
+                    "event_occurrence": 1,
+                    "event_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "isEdgeCaseData": False,
+                })
+                branches = _condition_branches(group.get("condition", ""), variables) or [{}]
+                for assignments in branches:
+                    candidate = _edge_candidate(base, group, variables, profile, rules, set(event_def.fields), assignments=assignments)
+                    if _safe_edge_condition(group.get("condition", ""), candidate):
+                        # Replace an existing non-edge response row so the requested
+                        # dataset cardinality never changes merely because an edge
+                        # condition is rare.
+                        available_indices = [i for i, r in enumerate(generated) if r.get("isEdgeCaseData") is not True and i not in {x[0] for x in eligible}]
+                        if not available_indices:
+                            break
+                        replacement_idx = available_indices[0]
+                        candidate["isEdgeCaseData"] = True
+                        generated[replacement_idx] = candidate
+                        eligible.append((replacement_idx, group_name, candidate))
+                        needed -= 1
+                        break
+        if len(eligible) < target:
+            descriptions = "; ".join(f"{name}: {group.get('condition', '')}" for name, group in group_items)
+            raise ValueError(
+                f"Unable to construct {target} transactional edge-case record(s) after deterministic constraint solving. "
+                f"Constructed {len(eligible)}. Definitions: {descriptions}"
+            )
 
     # Spread selected edge records through the materialized response rather than
     # clustering all edge cases in one event/entity.
@@ -1489,7 +1779,7 @@ class DataGeneratorAgent:
                 if index < edge_count and edge_names:
                     group = edge_groups[edge_names[index % len(edge_names)]]
                     matched = False
-                    branches = _condition_branches(group.get("condition", "")) or [{}]
+                    branches = _condition_branches(group.get("condition", ""), variables) or [{}]
                     for _ in range(_MAX_EDGE_CASE_ATTEMPTS):
                         for assignments in branches:
                             candidate = _edge_case_candidate_for_aggregation(
