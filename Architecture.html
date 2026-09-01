@@ -104,8 +104,9 @@
 
 
     <h2>1. Purpose</h2>
-    <p>This service generates synthetic data for configurable business scenarios across industries and data grains
-        (transactional or aggregational). It uses a multi-agent pipeline (LLM + deterministic code) so that:</p>
+    <p>This service generates synthetic telecom "low-balance / top-up" event data for testing, analytics, and ML
+        training pipelines. Instead of a fixed template, it uses a multi-agent pipeline (LLM + deterministic code) so
+        that:</p>
     <ul>
         <li>Business rules and validation logic are derived by an LLM from a plain-English scenario description
             (auditable, not hardcoded).</li>
@@ -120,24 +121,24 @@
         U[Client] --> CLI["main.py CLI\n(--scenario --count)"]
         U --> API["server.py FastAPI"]
 
-        API --> SD0["Agent 0: Scenario Designer\npropose / import-csv / confirm"]
-        SD0 --> STORE[("SQLite WAL\ndynamic_scenarios.db")]
         CLI --> RP["run_pipeline()"]
         API --> RP
+        API --> SD0["Agent 0: Scenario Designer\n(API only)"]
+
         RP --> ORCH["Agent 1: Orchestrator"]
         ORCH --> RULES["Agent 2: Rules Agent"]
         RULES --> GEN["Agent 3: Data Generator"]
         GEN --> QA["Agent 4: QA and Validation Agent"]
-        QA --> OUT[("Final generated records +\nvalidation report")]
-        OUT --> RESP["/scenario/generate\nJSON response"]
-        OUT --> ART["generated_data\nJSON artifact"]
-        ART --> DL["POST /scenario/download-csv"]
-        DL --> CSV["proposed_scenario_id.csv"]
+
+        SD0 --> STORE[("SQLite WAL\ndynamic_scenarios.db")]
+        QA --> STORE
 
         ORCH --> GEMINI[["Gemini\ngemini-3.6-flash"]]
         RULES --> GEMINI
         QA --> GEMINI
         SD0 --> GEMINI
+
+        QA --> OUT[("Final Records +\nValidation Report")]
     </div>
 
     <h2>3. Agentic Architecture Deep Dive</h2>
@@ -171,8 +172,7 @@
         OV --> LOOP["_generate_record()\nwalks variables IN ORDER"]
         LOOP --> DISP["_GENERATORS dispatch table\n(uniform, lognormal, beta,\nweighted_choice, formula,\ntimestamp
         helpers, LB-02 helpers...)"]
-        DISP --> EDGE["Edge-case constraint handling\nwhen configured"]
-        EDGE --> REC["record dict\n(later fields can read\nearlier fields already written)"]
+        DISP --> REC["record dict\n(later fields can read\nearlier fields already written)"]
         REC --> OUT["raw_records[]"]
     </div>
 
@@ -244,11 +244,7 @@
         P --> D["Draft saved\n(SQLite drafts table)"]
         D --> C["/scenario/confirm\nuser add/edit/delete + feedback"]
         C --> S["Confirmed scenario\n(SQLite confirmed table)"]
-        S --> G["POST /scenario/generate\nscenario and/or draftId"]
-        G --> PIPE["4-agent pipeline"]
-        PIPE --> ART["generated_data\nexact generated dataset"]
-        ART --> DL["POST /scenario/download-csv\nscenarioId + draftId"]
-        DL --> CSV["proposed_scenario_id.csv"]
+        S --> G["/generate or /scenario/generate\nruns the 4-agent pipeline"]
         C -.->|feedback text| F["SQLite feedback table"]
         F -.->|replayed into future prompts| P
     </div>
@@ -296,8 +292,8 @@
 ├── errors               (any agent can append; halts the pipeline)
 └── field_order          (populated by Data Generator Agent)</pre>
     <p><b>Persistence model (actual):</b> SQLite (WAL mode) — <code>data/dynamic_scenarios.db</code> (drafts / confirmed
-        / feedback tables). Generated datasets for CSV download are persisted separately under <code>generated_data/</code>
-        as JSON artifacts keyed by <code>scenarioId + draftId</code>. WorkflowState itself is not persisted between runs.</p>
+        / feedback tables). No Firestore / BigQuery / Cloud Storage integration exists. WorkflowState itself is not
+        persisted between runs.</p>
 
     <h2>7. Agent Routing Logic and Error Recovery (actual)</h2>
     <div class="mermaid">
@@ -342,7 +338,7 @@
         <li>Deterministic generation, hybrid validation</li>
         <li>No contract objects / versioning — WorkflowState is the only hand-off object, valid for one run</li>
         <li>No forward/reverse traceability implementation exists today</li>
-        <li>Reproducibility is partial — no random seed capture or generation manifest is persisted; the latest generated dataset is persisted for CSV download</li>
+        <li>Reproducibility is partial — no random seed capture or generation manifest is persisted</li>
     </ul>
 
     <h2>10. Final End-to-End Flow (actual)</h2>
@@ -355,9 +351,7 @@
         D --> E["Data Generator Agent\n(pure Python, dispatch table)"]
         E --> F["QA Agent\n(algorithmic fix + LLM chunk audit)"]
         F --> G["final_records + validation_report"]
-        G --> H["CLI: logged summary\nAPI: JSON response"]
-        G --> I["POST /scenario/download-csv\nreads persisted artifact"]
-        I --> J["proposed_scenario_id.csv"]
+        G --> H["CLI: logged summary\nAPI: JSON response; CSV download uses persisted CSV artifact"]
     </div>
 
     <h2>11. Future Work — Gaps vs. the Aspirational Design</h2>
@@ -617,14 +611,9 @@
             <td>list[object]</td>
             <td>Transactional event definitions (empty for aggregational)</td>
         </tr>
-        <tr>
-            <td>edgeCaseVariables</td>
-            <td>list[object]</td>
-            <td>Optional edge-case definitions; empty when no edge cases are proposed</td>
-        </tr>
     </table>
 
-    <h3>POST /scenario/import-csv — API 1B</h3>
+    <h3>POST /scenario/import-csv</h3>
     <p><b>Purpose:</b> Alternative to API 1 — load an industry-supplied CSV variable catalog directly instead of having
         the LLM invent one. Produces a draft in the same shape as <code>/scenario/propose</code>, so it still goes
         through <code>/scenario/confirm</code>. Multipart form data, not JSON.</p>
@@ -812,35 +801,11 @@
             <td>list[object]</td>
             <td>Final event definitions after eventAdd/eventEdit/eventDelete</td>
         </tr>
-        <tr>
-            <td>edgeCaseVariables</td>
-            <td>list[object]</td>
-            <td>Final edge-case definitions after edgeCaseAdd/edgeCaseEdit/edgeCaseDelete</td>
-        </tr>
-        <tr>
-            <td>edgeCasePercentage</td>
-            <td>float [0,1]</td>
-            <td>Fraction of generated records/entities requested as edge-case data; 0 when no edge cases are configured</td>
-        </tr>
     </table>
 
-    <h3>POST /scenario/download-csv — API 4</h3>
-    <p><b>Purpose:</b> Download the exact dataset produced by a previous successful <code>/scenario/generate</code> call.
-        This endpoint never runs the generation pipeline again.</p>
-    <p><b>Request body</b> (<code>DownloadCsvRequest</code>):</p>
-    <table>
-        <tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
-        <tr><td>scenarioId</td><td>string</td><td>Yes</td><td>Confirmed scenario id; must match the scenario resolved from <code>draftId</code></td></tr>
-        <tr><td>draftId</td><td>string</td><td>Yes</td><td>Confirmed draft handle associated with the generated artifact</td></tr>
-    </table>
-    <p><b>Response:</b> <code>text/csv</code> attachment. The filename is <code>proposed_scenario_id.csv</code>, using the
-        original scenario id supplied at proposal time, even if confirmation reassigned the internal <code>scenario_id</code>.
-        Transactional data is exported one row per event record; aggregational data is exported one row per generated record.</p>
-
-    <h3>POST /scenario/generate — API 3</h3>
+    <h3>POST /scenario/generate — API 4</h3>
     <p><b>Purpose:</b> Run the 4-agent pipeline (Orchestrator → Rules → Generator → QA) for a confirmed scenario and
-        return generated records. When <code>draftId</code> is supplied, the exact full generated dataset is also
-        persisted for CSV download.</p>
+        return generated records.</p>
     <p><b>Request body</b> (<code>GenerateRequest</code>):</p>
     <table>
         <tr>
@@ -955,48 +920,75 @@
     </script>
 
 
-    <h2>14. Generated Data CSV Download</h2>
-    <p>The generated dataset can be downloaded through a dedicated POST API. The download endpoint does
-        <b>not</b> run the generation pipeline again. A successful <code>/scenario/generate</code> request persists
-        the exact generated records for the supplied <code>scenarioId + draftId</code> pair. The download API reads
-        that persisted artifact and serializes it dynamically to CSV.</p>
+    <h2>5. Generated Data CSV Download</h2>
+<p>The generated dataset is persisted as a <b>single CSV artifact on disk</b> for each
+<code>scenarioId + draftId</code> pair. The system no longer creates a JSON copy of the
+full generated dataset. This avoids the additional memory spike caused by JSON
+serialization and avoids loading a large JSON document into memory during download.</p>
 
-    <div class="mermaid">
-        flowchart LR
-        G["POST /scenario/generate"] --> R["Generated records"]
-        R --> P[("Generated-data artifact
-scenarioId + draftId")]
-        P --> D["POST /scenario/download-csv"]
-        D --> F["Dynamic CSV
-file download"]
-    </div>
+<div class="mermaid">
+    flowchart LR
+    G["POST /scenario/generate"] --> R["Generated records"]
+    R --> W["CSV artifact writer"]
+    W --> A[("generated_data/<br/>scenarioId + draftId")]
+    A --> D["POST /scenario/download-csv"]
+    D --> S["FileResponse / OS-level streaming"]
+    S --> F["proposed_scenario_id.csv"]
+</div>
 
-    <h3>Download API contract</h3>
-    <pre>{
-  "scenarioId": "LB-01",
+<h3>Download API contract</h3>
+<pre>{
+  "scenarioId": "confirmed-scenario-id",
   "draftId": "confirmed-draft-id"
 }</pre>
-    <p><code>POST /scenario/download-csv</code> requires both identifiers. The service first verifies that the
-        draft belongs to the supplied confirmed scenario, then reads the artifact created by the most recent successful
-        generation for that pair. The download filename is always the stored <code>proposed_scenario_id</code> followed by
-        <code>.csv</code>; this is intentionally different from the possibly reassigned internal <code>scenario_id</code>.</p>
+<p><code>POST /scenario/download-csv</code> requires both identifiers. The service
+verifies that the draft belongs to the supplied scenario, locates the CSV artifact
+created by the most recent successful generation for that pair, and streams that
+file without parsing the complete dataset into Python memory.</p>
 
-    <h3>CSV serialization</h3>
-    <ul>
-        <li><b>Aggregational:</b> generated records are exported directly with a dynamic union of all record fields.</li>
-        <li><b>Transactional:</b> the canonical internal flat event-record representation is exported one row per event record.</li>
-        <li>No industry-specific column list is hard-coded.</li>
-        <li>Nested objects/arrays are serialized as JSON strings.</li>
-        <li>Boolean values are emitted as <code>true</code>/<code>false</code>.</li>
-        <li><code>isEdgeCaseData</code> is preserved in the exported record.</li>
-        <li>An empty generated dataset is treated as an error rather than returning a misleading empty CSV.</li>
-    </ul>
-    <div class="note">
-        The CSV download is a serialization of the generated dataset; it does not regenerate records and therefore
-        cannot produce a different dataset from the one returned by <code>/scenario/generate</code>. The current artifact
-        store is local filesystem storage; on ephemeral/multi-instance Cloud Run deployments it should be replaced by a
-        shared durable object store if cross-instance persistence is required.
-    </div>
+<h3>CSV artifact architecture</h3>
+<ul>
+    <li><b>One artifact per generation key:</b> <code>scenarioId + draftId</code>.</li>
+    <li><b>No generated JSON artifact:</b> the previous full-dataset JSON representation has been removed.</li>
+    <li><b>Atomic write:</b> generation writes to a temporary CSV and replaces the final artifact only after the write succeeds.</li>
+    <li><b>Dynamic columns:</b> the column union is derived from the generated records; no industry-specific column list is hard-coded.</li>
+    <li><b>Transactional:</b> one CSV row represents one generated event record. The canonical flat representation is exported directly; nested event payloads are also supported for compatibility.</li>
+    <li><b>Aggregational:</b> generated records are exported directly.</li>
+    <li><b>Nested values:</b> dictionaries/lists are serialized as compact JSON strings inside a CSV cell.</li>
+    <li><b>Edge cases:</b> <code>isEdgeCaseData</code> is preserved exactly on the generated record.</li>
+    <li><b>Download:</b> the API uses a file response instead of <code>read_text()</code>, <code>json.loads()</code>, or an in-memory <code>BytesIO</code> containing the complete CSV.</li>
+    <li><b>Filename:</b> the user-facing filename is derived from <code>proposed_scenario_id</code>, so the downloaded file is <code>proposed_scenario_id.csv</code>, even when the confirmed/internal <code>scenario_id</code> differs.</li>
+</ul>
+
+<div class="note">
+    <b>Memory behavior:</b> the current API response contract still requires
+    <code>/scenario/generate</code> to retain its generated records for the existing
+    response structure. The CSV change removes the second full JSON/CSV in-memory
+    copies and makes persistence/download streaming-friendly. A future fully
+    constant-memory generator would require changing the internal agent/QA pipeline
+    to process batches end-to-end; that is deliberately not done here because the
+    existing <code>/scenario/generate</code> response contract must remain unchanged.
+</div>
+
+<h3>Lifecycle</h3>
+<div class="mermaid">
+    flowchart TB
+    G["Generate dataset"] --> V["Validate / QA"]
+    V --> C["Final generated records"]
+    C --> F["Discover CSV columns"]
+    F --> W["Write CSV incrementally"]
+    W --> A["Atomic CSV artifact"]
+    A --> D["POST /scenario/download-csv"]
+    D --> X["Stream file to client"]
+</div>
+
+<h3>Artifact lifecycle and cleanup</h3>
+<p>When a new generation succeeds for the same <code>scenarioId + draftId</code>,
+the CSV artifact is atomically replaced. Legacy JSON artifacts from the previous
+implementation are removed for that same generation key. The download endpoint
+never regenerates data, so the downloaded file is the exact persisted dataset from
+the successful generation.</p>
+
 </body>
 
 </html>

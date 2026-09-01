@@ -1,13 +1,12 @@
 from __future__ import annotations
 import logging
 import csv
-import io
 import json
 import math
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -189,114 +188,110 @@ def health():
     return {"status": "ok"}
 
 
-# Generated-data artifacts are persisted on disk so the download endpoint returns
-# the exact records produced by /scenario/generate, without regenerating them.
+# Generated-data artifacts are persisted as CSV on disk. The generator already
+# produces records in memory for the existing API response; importantly, we do not
+# create a second full JSON representation or load the artifact into RAM on download.
 _GENERATED_DATA_DIR = Path(__file__).resolve().parent / "generated_data"
 _GENERATED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _generated_artifact_path(scenario_id: str, draft_id: str) -> Path:
     import hashlib
-    key = f"{scenario_id}\0{draft_id}".encode("utf-8")
+    key = f"{scenario_id}\\0{draft_id}".encode("utf-8")
+    return _GENERATED_DATA_DIR / f"{hashlib.sha256(key).hexdigest()}.csv"
+
+
+def _legacy_generated_json_path(scenario_id: str, draft_id: str) -> Path:
+    import hashlib
+    key = f"{scenario_id}\\0{draft_id}".encode("utf-8")
     return _GENERATED_DATA_DIR / f"{hashlib.sha256(key).hexdigest()}.json"
 
 
-def _persist_generated_artifact(
-    *, scenario_id: str, draft_id: str, type_of_data: str, records: list[dict],
-) -> None:
-    if not draft_id:
-        return
-    if not isinstance(records, list) or not records:
-        raise ValueError("Generation completed without any records to export")
-
-    payload = {
-        "scenario_id": scenario_id,
-        "draft_id": draft_id,
-        "typeOfData": type_of_data,
-        "record_count": len(records),
-        "records": records,
-    }
-    path = _generated_artifact_path(scenario_id, draft_id)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
-    tmp.replace(path)
-
-
-def _csv_scalar(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list, tuple)):
-        return json.dumps(value, ensure_ascii=False, default=str)
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
-
-
-def _flatten_generated_records(records: list[dict], type_of_data: str) -> list[dict]:
-    """Convert either generated grain into one CSV row per generated record."""
+def _iter_flattened_rows(records, type_of_data: str):
+    """Yield CSV rows lazily; never build a second full row list."""
     if type_of_data != "transactional":
-        return [dict(record) for record in records]
-
-    rows: list[dict] = []
+        for record in records:
+            if isinstance(record, dict):
+                yield record
+        return
     for entity in records:
         if not isinstance(entity, dict):
             continue
-
-        # The pipeline stores transactional data internally as flat event-record
-        # dictionaries.  This is the canonical generated-record representation.
-        # Do not assume the API response's nested `events[].records[]` shape here.
-        # Supporting the flat form is what makes CSV download work reliably.
         if "events" not in entity:
-            rows.append(dict(entity))
+            yield entity
             continue
-
-        # Backward-compatible support for a nested transactional payload.
         entity_fields = {k: v for k, v in entity.items() if k != "events"}
         events = entity.get("events") or []
         if not isinstance(events, list):
             continue
-
         for event in events:
             if not isinstance(event, dict):
                 continue
-            event_type = event.get("event_type")
-            event_total = event.get("totalCount")
             event_records = event.get("records") or []
             if not isinstance(event_records, list):
                 continue
             for record in event_records:
                 row = dict(entity_fields)
-                row["event_type"] = event_type
-                row["event_totalCount"] = event_total
+                row["event_type"] = event.get("event_type")
+                row["event_totalCount"] = event.get("totalCount")
                 if isinstance(record, dict):
                     row.update(record)
                 else:
                     row["record"] = record
-                rows.append(row)
-    return rows
+                yield row
 
 
-def _write_csv(rows: list[dict]) -> io.BytesIO:
-    # Dynamic union of all keys: no industry-specific column list.
-    fieldnames: list[str] = []
+def _csv_fieldnames(records: list[dict], type_of_data: str) -> list[str]:
+    """Discover columns without constructing a second records/rows list."""
     seen: set[str] = set()
-    for row in rows:
+    fieldnames: list[str] = []
+    for row in _iter_flattened_rows(records, type_of_data):
         for key in row:
             key = str(key)
             if key not in seen:
                 seen.add(key)
                 fieldnames.append(key)
-    text = io.StringIO(newline="")
-    writer = csv.DictWriter(text, fieldnames=fieldnames, extrasaction="ignore")
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({str(k): _csv_scalar(v) for k, v in row.items()})
-    data = io.BytesIO(text.getvalue().encode("utf-8-sig"))
-    data.seek(0)
-    return data
+    return fieldnames
 
 
-@app.post("/scenario/propose", response_model=ProposeResponse)
+def _csv_scalar(value):
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    return str(value)
+
+
+def _persist_generated_artifact(*, scenario_id: str, draft_id: str,
+                                type_of_data: str, records: list[dict]) -> None:
+    """Persist generated records directly to one CSV artifact atomically."""
+    if not draft_id:
+        return
+    if not isinstance(records, list) or not records:
+        raise ValueError("Generation completed without any records to export")
+    fieldnames = _csv_fieldnames(records, type_of_data)
+    if not fieldnames:
+        raise ValueError("Generated dataset contains no exportable records")
+    path = _generated_artifact_path(scenario_id, draft_id)
+    tmp = path.with_suffix(".csv.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in _iter_flattened_rows(records, type_of_data):
+                writer.writerow({str(k): _csv_scalar(v) for k, v in row.items()})
+        tmp.replace(path)
+        legacy = _legacy_generated_json_path(scenario_id, draft_id)
+        if legacy.exists():
+            legacy.unlink()
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def propose_scenario(req: ProposeRequest):
     """API 1 — ask the designer agent to invent a new scenario + variable catalog."""
     # scenarioId is just the user's preferred label at this stage; it's not reserved here
@@ -786,7 +781,7 @@ def confirm_scenario_route(req: ConfirmRequest):
 
 @app.post("/scenario/download-csv")
 def download_generated_csv(req: DownloadCsvRequest):
-    """Download the exact records previously generated for a confirmed scenario/draft."""
+    """Stream the exact CSV artifact previously produced by /scenario/generate."""
     resolved = resolve_scenario_id_from_draft(req.draftId)
     if resolved is None:
         raise HTTPException(404, detail={"error": f"Unknown or unconfirmed draftId '{req.draftId}'"})
@@ -797,46 +792,23 @@ def download_generated_csv(req: DownloadCsvRequest):
         })
     if not scenario_exists(req.scenarioId):
         raise HTTPException(404, detail={"error": f"Unknown scenario '{req.scenarioId}'"})
-
     path = _generated_artifact_path(req.scenarioId, req.draftId)
     if not path.exists():
         raise HTTPException(404, detail={
             "error": "No generated records found for this scenarioId/draftId. Run /scenario/generate first with the same scenarioId and draftId."
         })
-
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        type_of_data = payload.get("typeOfData", "aggregational")
-        records = payload.get("records", [])
-        if not isinstance(records, list):
-            raise ValueError("Stored generated records are invalid")
-        if not records:
-            raise ValueError("Stored generated dataset is empty")
-        rows = _flatten_generated_records(records, type_of_data)
-        if not rows:
-            raise ValueError("Stored generated dataset contains no exportable records")
-        data = _write_csv(rows)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        logger.exception("Failed to prepare CSV download for scenario=%s draft=%s", req.scenarioId, req.draftId)
-        raise HTTPException(500, detail={"error": f"Unable to prepare CSV download: {exc}"}) from exc
-
-    # The download filename must use the proposed scenario id, not the
-    # confirmed/internal scenario id.  A draft can be confirmed under a
-    # different scenario_id when the originally proposed id collides, while
-    # the user-facing proposed_scenario_id remains the id they originally
-    # supplied to /scenario/propose.
+    if path.stat().st_size == 0:
+        raise HTTPException(500, detail={"error": "Generated CSV artifact is empty"})
     meta = resolve_scenario_meta(req.scenarioId) or {}
-    proposed_scenario_id = (
-        meta.get("proposed_scenario_id")
-        or meta.get("requested_scenario_id")
-        or req.scenarioId
-    )
-    proposed_scenario_id = str(proposed_scenario_id).strip() or req.scenarioId
-    filename = f"{proposed_scenario_id}.csv"
-    return StreamingResponse(
-        data,
+    proposed_scenario_id = str(
+        meta.get("proposed_scenario_id") or meta.get("requested_scenario_id") or req.scenarioId
+    ).strip() or req.scenarioId
+    safe_filename = Path(proposed_scenario_id).name.replace('"', "_").replace('\\\\', "_")
+    return FileResponse(
+        path=path,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        filename=f"{safe_filename}.csv",
+        headers={"Cache-Control": "no-store"},
     )
 
 
