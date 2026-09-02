@@ -85,7 +85,7 @@ def _purge_expired_drafts(conn: sqlite3.Connection) -> None:
 
 
 def next_scenario_id() -> str:
-    """Next free LB-0N id, considering both static and confirmed dynamic scenarios."""
+    """Next free scenario id, considering existing configured and confirmed scenarios."""
     with _connect() as conn:
         rows = conn.execute("SELECT scenario_id FROM confirmed").fetchall()
     existing = list(SCENARIOS.keys()) + [r[0] for r in rows]
@@ -166,7 +166,8 @@ def resolve_scenario_meta(scenario_id: str) -> dict[str, Any] | None:
 
 
 def resolve_variables(scenario_id: str) -> tuple[list[dict[str, Any]], list[str]] | None:
-    """Return (variables, field_order) for a dynamic scenario, or None if it's a static one."""
+    """Return (variables, field_order) for a confirmed scenario, or None if no
+    confirmed scenario definition exists."""
     dyn = get_confirmed(scenario_id)
     return (dyn["variables"], dyn["field_order"]) if dyn else None
 

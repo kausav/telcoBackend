@@ -212,7 +212,7 @@ VARIABLES: list[dict] = [
     {
         "name": "customer_action",
         "dtype": "categorical",
-        # LB-01 Normal: customer always accepts
+        # Default catalog behavior: customer accepts
         "gen": "constant",
         "params": {"value": "ACCEPTED"},
     },
@@ -260,7 +260,7 @@ VARIABLES: list[dict] = [
     {
         "name": "recharge_amount",
         "dtype": "float",
-        # equals recommended_topup_amt for LB-01 Normal (successful acceptance)
+        # Default catalog behavior: recharge matches the recommended top-up amount
         "gen": "formula",
         "formula": "recommended_topup_amt",
         "depends_on": ["recommended_topup_amt"],
@@ -268,7 +268,7 @@ VARIABLES: list[dict] = [
     {
         "name": "transaction_status",
         "dtype": "categorical",
-        # LB-01 Normal: always SUCCESS
+        # Default catalog behavior: successful transaction
         "gen": "constant",
         "params": {"value": "SUCCESS"},
     },

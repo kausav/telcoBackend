@@ -1,7 +1,9 @@
 """
-Scenario catalog. Each scenario maps to a subset/override of VARIABLES.
-Static LB-01/02/03 entries removed — all scenarios are now created dynamically
-via /scenario/propose + /scenario/confirm (see core/dynamic_scenarios.py).
+Optional built-in scenario catalog.
+
+The current API creates scenarios dynamically through /scenario/propose and
+/scenario/confirm. The catalog remains available as a compatibility hook for
+preconfigured scenarios without being required by the dynamic pipeline.
 """
 
 SCENARIOS: dict[str, dict] = {}

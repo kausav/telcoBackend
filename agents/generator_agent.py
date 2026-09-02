@@ -1,7 +1,7 @@
 """
 Agent 3 — Data Generator Agent
 Generates records purely algorithmically using the generation rules in
-config/variables.py — no LLM call per record. Each generator type maps
+the confirmed scenario schema — no LLM call per record. Each generator type maps
 directly to the constraints, distributions, and formulas from the Excel BRD.
 """
 from __future__ import annotations
@@ -408,133 +408,9 @@ def _parse_dt(s: str) -> datetime:
         return datetime.now(timezone.utc)
 
 
-# ── LB-02 generator helpers ───────────────────────────────────────────────────
-
-# Deterministic circle-to-timezone mapping (DST-adjusted for summer)
-_CIRCLE_TZ: dict[str, str] = {
-    "US_EAST_NY":    "America/New_York",
-    "US_WEST_CA":    "America/Los_Angeles",
-    "US_CENTRAL_TX": "America/Chicago",
-    "US_SOUTH_FL":   "America/New_York",
-}
-_TZ_UTC_OFFSET: dict[str, int] = {
-    "America/New_York":    -4,
-    "America/Los_Angeles": -7,
-    "America/Chicago":     -5,
-}
-_QUIET_HOURS: set[int] = set(range(21, 24)) | set(range(0, 7))  # 21-23 and 0-6
+# ── Generator dispatch table ──────────────────────────────────────────────────
 
 
-def _circle_tz_lookup(params: dict, rec: dict) -> str:
-    return _CIRCLE_TZ.get(rec.get("telecom_circle_code", "US_EAST_NY"), "America/New_York")
-
-
-def _lb02_auto_recharge_enabled(params: dict, rec: dict) -> bool:
-    mandate = rec.get("auto_recharge_mandate_status")
-    if mandate in ("PROCESSING_IN_FLIGHT", "ACTIVE_IDLE"):
-        return True
-    return random.choices([False, True], weights=[0.85, 0.15], k=1)[0]
-
-
-def _lb02_suppression_reason(params: dict, rec: dict) -> str:
-    if rec.get("auto_recharge_mandate_status") == "PROCESSING_IN_FLIGHT":
-        return "AUTO_RECHARGE_ACTIVE"
-    choices = ["RECENT_RECHARGE_COOLDOWN", "PENDING_IN_FLIGHT_TXN",
-               "FREQUENCY_CAP_EXCEEDED", "AUTO_RECHARGE_ACTIVE", "QUIET_HOURS_RESTRICTION"]
-    return random.choices(choices, weights=[0.40, 0.20, 0.20, 0.10, 0.10], k=1)[0]
-
-
-def _lb02_local_hour(params: dict, rec: dict) -> int:
-    if rec.get("suppression_reason_code") == "QUIET_HOURS_RESTRICTION":
-        return random.choice(list(_QUIET_HOURS))
-    tz = rec.get("subscriber_local_tz", "America/New_York")
-    offset = _TZ_UTC_OFFSET.get(tz, -4)
-    try:
-        hour = (_parse_dt(rec.get("event_timestamp", "")).hour + offset) % 24
-        return hour if hour not in _QUIET_HOURS else random.randint(7, 20)
-    except Exception:
-        return random.randint(7, 20)
-
-
-def _lb02_hours_since_recharge(params: dict, rec: dict) -> float:
-    if rec.get("suppression_reason_code") == "RECENT_RECHARGE_COOLDOWN":
-        return round(random.uniform(0.25, 23.99), 2)
-    return round(random.uniform(24.01, 720.00), 2)
-
-
-def _lb02_last_recharge_ts(params: dict, rec: dict) -> str:
-    base = _parse_dt(rec.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
-    return (base - timedelta(hours=rec.get("hours_since_last_recharge", 24.0))).isoformat()
-
-
-def _lb02_pending_txn_id(params: dict, rec: dict):
-    if rec.get("suppression_reason_code") == "PENDING_IN_FLIGHT_TXN":
-        return f"TXN-PG-{random.randint(100_000_000, 999_999_999)}"
-    return None
-
-
-def _lb02_alerts_sent(params: dict, rec: dict) -> int:
-    return random.randint(1, 3) if rec.get("suppression_reason_code") == "FREQUENCY_CAP_EXCEEDED" else 0
-
-
-def _lb02_last_outbound_ts(params: dict, rec: dict):
-    if rec.get("alerts_sent_last_24h", 0) == 0:
-        return None
-    base = _parse_dt(rec.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
-    return (base - timedelta(hours=random.uniform(0.5, 23.5))).isoformat()
-
-
-def _lb02_decision_action(params: dict, rec: dict) -> str:
-    reason = rec.get("suppression_reason_code")
-    if reason == "QUIET_HOURS_RESTRICTION":
-        return "QUEUED_FOR_MORNING"
-    if reason in ("RECENT_RECHARGE_COOLDOWN", "AUTO_RECHARGE_ACTIVE"):
-        return "SUPPRESSED_SILENT"
-    return "DROPPED"
-
-
-def _lb02_journey_state(params: dict, rec: dict) -> str:
-    return "DEFERRED_PENDING" if rec.get("decision_engine_action") == "QUEUED_FOR_MORNING" \
-        else "CLOSED_SUPPRESSED"
-
-
-def _lb02_subsequent_ts(params: dict, rec: dict):
-    if rec.get("campaign_attribution_nature") == "UNCONVERTED":
-        return None
-    base = _parse_dt(rec.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
-    return (base + timedelta(hours=random.uniform(0.5, 48.0))).isoformat()
-
-
-def _lb02_subsequent_channel(params: dict, rec: dict):
-    if rec.get("subsequent_topup_timestamp") is None:
-        return None
-    if rec.get("campaign_attribution_nature") == "AUTO_RECURRING":
-        return "AUTO_DEBIT_ACH"
-    return random.choices(["MY_ACCOUNT_APP", "RETAILER_POS", "WEB_PORTAL"],
-                          weights=[0.60, 0.25, 0.15], k=1)[0]
-
-
-def _lb02_subsequent_payment(params: dict, rec: dict):
-    if rec.get("subsequent_topup_timestamp") is None:
-        return None
-    if rec.get("campaign_attribution_nature") == "AUTO_RECURRING":
-        return "DIRECT_DEBIT"
-    return random.choices(["CREDIT_CARD", "DEBIT_CARD", "DIGITAL_WALLET"],
-                          weights=[0.40, 0.35, 0.25], k=1)[0]
-
-
-def _lb02_subsequent_amount(params: dict, rec: dict):
-    if rec.get("subsequent_topup_timestamp") is None:
-        return None
-    return random.choices([10.00, 20.00, 50.00], weights=[0.30, 0.50, 0.20], k=1)[0]
-
-
-def _lb02_balance_after(params: dict, rec: dict):
-    amount = rec.get("subsequent_recharge_amount")
-    return None if amount is None else round(rec.get("balance_before", 0.0) + amount, 2)
-
-
-# ── Dispatch table ─────────────────────────────────────────────────────────────
 
 _GENERATORS = {
     "prefixed_int":   lambda v, rec: _prefixed_int(v["params"], rec),
@@ -555,23 +431,6 @@ _GENERATORS = {
     "prefixed_uuid":  lambda v, rec: _prefixed_uuid(v["params"], rec),
     "tx_id":          lambda v, rec: _tx_id(v["params"], rec),
     "formula":        lambda v, rec: _formula(v, rec),
-    # LB-02 specific
-    "circle_tz_lookup":           lambda v, rec: _circle_tz_lookup(v.get("params", {}), rec),
-    "lb02_auto_recharge_enabled": lambda v, rec: _lb02_auto_recharge_enabled(v.get("params", {}), rec),
-    "lb02_suppression_reason":    lambda v, rec: _lb02_suppression_reason(v.get("params", {}), rec),
-    "lb02_local_hour":            lambda v, rec: _lb02_local_hour(v.get("params", {}), rec),
-    "lb02_hours_since_recharge":  lambda v, rec: _lb02_hours_since_recharge(v.get("params", {}), rec),
-    "lb02_last_recharge_ts":      lambda v, rec: _lb02_last_recharge_ts(v.get("params", {}), rec),
-    "lb02_pending_txn_id":        lambda v, rec: _lb02_pending_txn_id(v.get("params", {}), rec),
-    "lb02_alerts_sent":           lambda v, rec: _lb02_alerts_sent(v.get("params", {}), rec),
-    "lb02_last_outbound_ts":      lambda v, rec: _lb02_last_outbound_ts(v.get("params", {}), rec),
-    "lb02_decision_action":       lambda v, rec: _lb02_decision_action(v.get("params", {}), rec),
-    "lb02_journey_state":         lambda v, rec: _lb02_journey_state(v.get("params", {}), rec),
-    "lb02_subsequent_ts":         lambda v, rec: _lb02_subsequent_ts(v.get("params", {}), rec),
-    "lb02_subsequent_channel":    lambda v, rec: _lb02_subsequent_channel(v.get("params", {}), rec),
-    "lb02_subsequent_payment":    lambda v, rec: _lb02_subsequent_payment(v.get("params", {}), rec),
-    "lb02_subsequent_amount":     lambda v, rec: _lb02_subsequent_amount(v.get("params", {}), rec),
-    "lb02_balance_after":         lambda v, rec: _lb02_balance_after(v.get("params", {}), rec),
 }
 
 
