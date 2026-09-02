@@ -1,23 +1,31 @@
 """
-Agent 2 — Rules Agent
-Uses Gemini to articulate business rules and validation invariants for the
-selected scenario. Downstream QA agent uses these rules to validate records.
+Agent 2 — Schema Agent
+Uses Gemini to articulate business rules, field constraints and formulas for the
+selected scenario, then deterministically validates the derived schema for
+missing variables, missing rules, and incomplete logic before edge-case
+handling or generation ever run.
+
+Internally implemented as a 2-node LangGraph subgraph: derive_schema ->
+validate_schema. A failed validation appends to state.errors, which the outer
+pipeline graph (core/pipeline.py) uses to halt before the Edge Case Agent runs.
 """
 from __future__ import annotations
+import ast
 import logging
 import json
 
+from langgraph.graph import StateGraph, END
+
 from config.industry_profiles import get_profile
-from config.variables import VARIABLES
 from core.dynamic_scenarios import resolve_scenario_meta, resolve_variables
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
-from core.runtime_cache import get_rules, set_rules
+from core.runtime_cache import get_schema, set_schema
 
 logger = logging.getLogger(__name__)
 
 _SYSTEM = """
-You are the Rules Agent for a synthetic data generation pipeline covering any
+You are the Schema Agent for a synthetic data generation pipeline covering any
 business industry (telecom, banking, retail, healthcare, etc.).
 Given a scenario, its variable definitions, and the target industry's and
 country's real-world conventions (currency, product/plan types, regulator,
@@ -36,32 +44,52 @@ Return a JSON object with:
 """
 
 
-class RulesAgent:
+class SchemaAgent:
     def __init__(self, llm: GeminiClient) -> None:
         self._llm = llm
+        # Per-call scratch value, populated by _derive_schema and read by _validate_schema.
+        # Safe because a fresh SchemaAgent is instantiated for each run_pipeline() call.
+        self._variables: list[dict] = []
+        self._graph = self._build_graph()
+
+    def _build_graph(self):
+        graph = StateGraph(WorkflowState)
+        graph.add_node("derive_schema", self._derive_schema)
+        graph.add_node("validate_schema", self._validate_schema)
+        graph.set_entry_point("derive_schema")
+        graph.add_edge("derive_schema", "validate_schema")
+        graph.add_edge("validate_schema", END)
+        return graph.compile()
 
     def run(self, state: WorkflowState) -> WorkflowState:
-        logger.info("[RulesAgent] Deriving rules for scenario=%s", state.scenario)
+        result = self._graph.invoke(state, config={"recursion_limit": 10})
+        return result if isinstance(result, WorkflowState) else WorkflowState.model_validate(result)
 
-        cache_key = (
+    def _cache_key(self, state: WorkflowState) -> tuple:
+        return (
             state.scenario, state.industry, (state.country or "GLOBAL").upper(), state.type_of_data,
             state.domain or "", state.business_scenario or "", state.business_response or "",
             state.expected_outcome or "", state.scenario_type or "", state.use_case or "",
             state.entity_key or "", str(state.scenario_context.get("events", [])),
         )
-        cached = get_rules(cache_key)
+
+    def _derive_schema(self, state: WorkflowState) -> WorkflowState:
+        logger.info("[SchemaAgent] Deriving schema for scenario=%s", state.scenario)
+
+        dyn = resolve_variables(state.scenario)
+        if dyn is None:
+            raise ValueError(f"Unknown scenario '{state.scenario}'")
+        VARS, _ = dyn
+        self._variables = VARS
+
+        cache_key = self._cache_key(state)
+        cached = get_schema(cache_key)
         if cached is not None:
             state.rules = cached
-            logger.info("[RulesAgent] Cache hit; skipping LLM rules generation.")
+            logger.info("[SchemaAgent] Cache hit; skipping LLM schema derivation.")
             return state
 
         sc = resolve_scenario_meta(state.scenario)
-        dyn = resolve_variables(state.scenario)
-        if dyn is not None:
-            VARS, _ = dyn
-        else:
-            VARS = VARIABLES
-
         field_summary = [
             {"name": v["name"], "dtype": v["dtype"], "gen": v["gen"],
              "depends_on": v.get("depends_on", [])}
@@ -138,9 +166,66 @@ class RulesAgent:
             generation_constraints[field] = gc
         rules["generation_constraints"] = generation_constraints
 
-        set_rules(cache_key, rules)
+        set_schema(cache_key, rules)
         state.rules = rules
-        logger.info("[RulesAgent] Rules generated. Business rules: %d cross-field: %d",
+        logger.info("[SchemaAgent] Schema generated. Business rules: %d cross-field: %d",
                     len(rules.get("business_rules", [])),
                     len(rules.get("cross_field_rules", [])))
+        return state
+
+    def _validate_schema(self, state: WorkflowState) -> WorkflowState:
+        """Schema validation layer: catch missing variables, missing rules, and
+        incomplete logic (formulas referencing undefined fields) before any
+        downstream agent trusts state.rules."""
+        variables = self._variables
+        var_names = {str(v.get("name")) for v in variables if v.get("name")}
+        rules = state.rules or {}
+        problems: list[str] = []
+
+        # Missing variable: a declared dependency that doesn't exist in the schema.
+        for v in variables:
+            for dep in v.get("depends_on", []) or []:
+                if str(dep) not in var_names:
+                    problems.append(f"variable '{v.get('name')}' depends_on missing variable '{dep}'")
+
+        # Missing rule: a variable declares a formula but has no formula_rules entry.
+        formula_fields = {
+            str(item.get("field")) for item in rules.get("formula_rules", []) or []
+            if isinstance(item, dict) and item.get("field")
+        }
+        for v in variables:
+            if v.get("formula") and str(v.get("name")) not in formula_fields:
+                problems.append(f"variable '{v.get('name')}' has a formula but no formula_rules entry")
+
+        # Incomplete logic: a formula expression that doesn't parse, or that
+        # references a variable outside the declared schema. Only variable-declared
+        # formulas are authoritative and strictly checked here; formula_rules entries
+        # the LLM added on its own (with no matching variable.formula) are supplementary
+        # and already degrade gracefully downstream (QA skips an unevaluable formula
+        # instead of failing the record), so they are not a hard gate.
+        authoritative_fields = {str(v.get("name")) for v in variables if v.get("formula")}
+        for item in rules.get("formula_rules", []) or []:
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field", ""))
+            if field not in authoritative_fields:
+                continue
+            expression = str(item.get("expression", ""))
+            try:
+                tree = ast.parse(expression, mode="eval")
+                refs = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+            except SyntaxError as exc:
+                problems.append(f"formula for '{field}' is not a valid expression: {exc}")
+                continue
+            unknown = sorted(
+                name for name in refs
+                if name not in var_names and name not in {"round", "min", "max", "abs", "sum"}
+            )
+            if unknown:
+                problems.append(f"formula for '{field}' references undefined variable(s): {unknown}")
+
+        if problems:
+            state.errors.append("Schema validation failed: " + "; ".join(problems))
+        else:
+            logger.info("[SchemaAgent] Schema validation passed for %d variables.", len(variables))
         return state

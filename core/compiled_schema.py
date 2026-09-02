@@ -65,11 +65,8 @@ def compile_scenario(scenario_id: str, force: bool = False) -> CompiledScenario:
 
         resolved = resolve_variables(scenario_id)
         if resolved is None:
-            from config.variables import VARIABLES, FIELD_ORDER
-            variables = VARIABLES
-            field_order = FIELD_ORDER
-        else:
-            variables, field_order = resolved
+            raise ValueError(f"Unknown scenario '{scenario_id}'")
+        variables, field_order = resolved
 
         entity_key = resolve_entity_key(scenario_id)
         events_raw = resolve_events(scenario_id)

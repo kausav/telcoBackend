@@ -64,3 +64,4 @@ class GeminiClient:
             contents=user_prompt,
         )
         return response.text.strip()
+    

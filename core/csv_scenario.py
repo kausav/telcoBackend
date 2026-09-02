@@ -7,7 +7,7 @@ sample/output records.
 Variable rows use these columns (header row required):
   name         (required) — field name, e.g. "subscriber_id"
   dtype        (required) — one of: string, int, float, categorical, datetime, bool
-  gen          (required) — a generator type known to agents/generator_agent.py
+  gen          (required) — a generator type known to agents/data_generation_agent.py
                              (see get_known_generator_types()), e.g. "uniform"
   params       (optional) — JSON object string, e.g. {"min": 0, "max": 100}
                              (default: {})
@@ -28,7 +28,7 @@ import io
 import json
 import re
 
-from agents.generator_agent import get_known_generator_types
+from agents.data_generation_agent import get_known_generator_types
 
 REQUIRED_COLUMNS = {"name", "dtype", "gen"}
 ALLOWED_DTYPES = {"string", "int", "float", "categorical", "datetime", "bool", "boolean"}
@@ -134,7 +134,8 @@ def parse_definition_csv(
       name,dtype,gen,params,description,depends_on,nullable,formula
 
     Transactional event rows use:
-      record_type,event_type,sequence,fields,min_occurrences,max_occurrences
+      record_type,event_type,sequence,fields,min_occurrences,max_occurrences,description
+    ``description`` is optional (defaults to an empty string) and is not required.
 
     Edge-case rows use the normal variable columns plus:
       edge_case_name,edge_case_description,condition
@@ -330,6 +331,7 @@ def parse_definition_csv(
             "event_type": event_type,
             "sequence": sequence,
             "fields": fields,
+            "description": row.get("description", "").strip(),
             "min_occurrences": row.get("min_occurrences", "1"),
             "max_occurrences": row.get("max_occurrences", "10"),
         })
@@ -367,6 +369,7 @@ def parse_definition_csv(
                 "event_type": event_type,
                 "sequence": event["sequence"],
                 "fields": event["fields"],
+                "description": event.get("description", ""),
                 "min_occurrences": min_occ,
                 "max_occurrences": max_occ,
             })

@@ -2,7 +2,7 @@
 Agent 0 — Scenario Designer Agent
 Given a plain-English business scenario description, asks Gemini to invent a
 new scenario (LB-04, LB-05, ...) and its full variable catalog, expressed in
-the same generator-type vocabulary that agents/generator_agent.py already
+the same generator-type vocabulary that agents/data_generation_agent.py already
 knows how to execute — so the result can be run through the existing
 4-agent pipeline with no new generator code.
 """
@@ -44,6 +44,95 @@ _MANDATORY_VARIABLES: list[dict] = [
         "nullable": False,
     },
 ]
+
+# ── Telecom-only client overrides ───────────────────────────────────────────────
+# Every branch below is gated on industry_key == "telecom" at the call site, so no
+# other industry's proposed scenarios are affected by any of these constants.
+_TELECOM_CLV_CHOICES = ["low", "medium", "high"]
+_TELECOM_CLV_WEIGHTS = [0.34, 0.43, 0.23]
+_TELECOM_SEGMENT_CHOICES = [
+    "Occasional Rechargers", "Habitual Rechargers", "Valued Customers",
+    "Heavy Data Users", "Frequent Data Exhausters", "Low Data Users",
+]
+_TELECOM_SEGMENT_WEIGHTS = [0.22, 0.18, 0.15, 0.20, 0.15, 0.10]
+_TELECOM_SERVICE_PROVIDERS = ["Jio", "BSNL"]
+_TELECOM_SERVICE_PROVIDER_WEIGHTS = [0.6, 0.4]
+_TELECOM_TRIGGER_CAUSE_SYNONYMS = ["trigger_type", "triggertype", "trigger", "event_trigger_type", "trigger_reason"]
+_TELECOM_TRIGGER_CAUSE_CHOICES = ["LOW_BALANCE_THRESHOLD", "VALIDITY_EXPIRY_WARNING", "ZERO_BALANCE"]
+_TELECOM_TRIGGER_CAUSE_WEIGHTS = [0.5, 0.3, 0.2]
+_TELECOM_RECHARGE_STATUS_SYNONYMS = ["recharge_status", "topup_status", "recharge_result", "recharge_outcome", "topup_result"]
+_TELECOM_RECHARGE_STATUS_CHOICES = ["SUCCESS", "FAILED", "PENDING", "GATEWAY_TIMEOUT"]
+_TELECOM_RECHARGE_STATUS_WEIGHTS = [0.70, 0.15, 0.10, 0.05]
+# loyalty_tier_customer is intentionally omitted for telecom — redundant with customer_lifetime_value.
+_TELECOM_DROPPED_MANDATORY_NAMES = {"loyalty_tier_customer"}
+# Replaces a raw churn_risk_score with the inputs needed to derive one downstream.
+_TELECOM_CHURN_HELPER_VARIABLES: list[dict] = [
+    {
+        "name": "historical_low_balance_frequency",
+        "dtype": "int",
+        "description": "Number of times the subscriber hit a low-balance trigger in the trailing 90 days.",
+        "gen": "lognormal_int",
+        "params": {"mu": 1.2, "sigma": 0.6, "min": 0, "max": 30},
+        "depends_on": [],
+        "nullable": False,
+    },
+    {
+        "name": "offer_acceptance_rate_historical",
+        "dtype": "float",
+        "description": "Historical fraction of recharge/top-up offers accepted by the subscriber.",
+        "gen": "uniform",
+        "params": {"min": 0.0, "max": 1.0},
+        "depends_on": [],
+        "nullable": False,
+    },
+    {
+        "name": "preferred_topup_channel",
+        "dtype": "categorical",
+        "description": "Channel the subscriber most frequently uses to top up/recharge.",
+        "gen": "weighted_choice",
+        "params": {"choices": ["MY_ACCOUNT_APP", "RETAILER_POS", "WEB_PORTAL", "USSD"], "weights": [0.45, 0.30, 0.15, 0.10]},
+        "depends_on": [],
+        "nullable": False,
+    },
+]
+_TELECOM_CHURN_NAME_MARKER = "churn"
+_KYC_NAME_MARKER = "kyc"
+_UPI_FIELD_NAME_MARKERS = ("payment", "pay_method", "channel")
+_UPI_VALUE_MARKER = "upi"
+_UPI_MASK_LABEL = "MASKED"
+
+
+def _telecom_mandatory_variables() -> list[dict]:
+    """Telecom client override of the generic mandatory fields: fixed CLV tiers,
+    fixed subscriber segments, a named service_provider, and churn-helper fields
+    instead of a raw churn score. loyalty_tier_customer is dropped — redundant with
+    customer_lifetime_value. Only used when industry_key == "telecom"."""
+    clv = dict(_MANDATORY_VARIABLES[0])
+    clv.update({
+        "dtype": "categorical",
+        "description": "Customer lifetime value tier.",
+        "gen": "weighted_choice",
+        "params": {"choices": list(_TELECOM_CLV_CHOICES), "weights": list(_TELECOM_CLV_WEIGHTS)},
+    })
+    segment = {
+        "name": "subscriber_segment",
+        "dtype": "categorical",
+        "description": "Subscriber usage/behavior segment.",
+        "gen": "weighted_choice",
+        "params": {"choices": list(_TELECOM_SEGMENT_CHOICES), "weights": list(_TELECOM_SEGMENT_WEIGHTS)},
+        "depends_on": [],
+        "nullable": False,
+    }
+    service_provider = {
+        "name": "service_provider",
+        "dtype": "categorical",
+        "description": "Telecom service provider operating the subscriber's connection.",
+        "gen": "weighted_choice",
+        "params": {"choices": list(_TELECOM_SERVICE_PROVIDERS), "weights": list(_TELECOM_SERVICE_PROVIDER_WEIGHTS)},
+        "depends_on": [],
+        "nullable": False,
+    }
+    return [clv, segment, service_provider] + [dict(v) for v in _TELECOM_CHURN_HELPER_VARIABLES]
 
 # Canonical field CONCEPTS. Each concept resolves to a different canonical name per
 # industry (e.g. "identifier" is subscriber_id for telecom but customer_id elsewhere),
@@ -157,6 +246,8 @@ def _build_base_variables(industry_key: str, profile: dict) -> list[dict]:
             "nullable": False,
         },
     ]
+    if industry_key == "telecom":
+        return base + _telecom_mandatory_variables()
     return base + [dict(m) for m in _MANDATORY_VARIABLES]
 
 
@@ -169,6 +260,11 @@ def _build_alias_map(industry_key: str) -> dict[str, str]:
         for syn in synonyms:
             if syn != canonical:
                 alias_map[syn] = canonical
+    if industry_key == "telecom":
+        # Telecom-only rename: any trigger/cause-like field becomes "trigger_cause".
+        # Gated here so no other industry's field naming is affected.
+        for syn in _TELECOM_TRIGGER_CAUSE_SYNONYMS:
+            alias_map.setdefault(syn, "trigger_cause")
     return alias_map
 
 
@@ -183,7 +279,7 @@ def _build_glossary_text(industry_key: str) -> str:
         lines.append(f"- {canonical:<26} — {description}{note}")
     return "\n".join(lines) + "\n"
 
-# Keep this in sync with the dispatch table in agents/generator_agent.py.
+# Keep this in sync with the dispatch table in agents/data_generation_agent.py.
 _GENERATOR_DOCS = """
 Allowed "gen" types and their required "params" (use ONLY these — nothing else):
 - prefixed_int      params: {prefix: str, digits: int}
@@ -247,7 +343,7 @@ one-size-fits-all telecom template.
 Return a JSON object with exactly these keys:
   - "data_type": "transactional" or "aggregational"
   - "entity_key": str — for transactional output, the primary business entity variable used to group events; MUST exactly match one variable name. For aggregational output return null
-  - "events": [ {"event_type": str, "sequence": int, "fields": [str]} ] — REQUIRED for transactional output; ordered business events; choose the number appropriate to the scenario. For aggregational output return []
+  - "events": [ {"event_type": str, "sequence": int, "fields": [str], "description": str} ] — REQUIRED for transactional output; ordered business events; choose the number appropriate to the scenario; "description" is a short plain-English explanation of what happens at that event. For aggregational output return []
   - "label": str               — short human-readable scenario title
   - "journey": str              — the domain/journey name
   - "description": str          — 1-3 sentence description combining businessScenario, businessResponse, expectedOutcome
@@ -307,6 +403,20 @@ class ScenarioDesignerAgent:
             f"{max(1, MIN_VARIABLES - len(base_variables))} to {MAX_VARIABLES - len(base_variables)} of them.\n"
         )
 
+        telecom_note = ""
+        if industry_key == "telecom":
+            telecom_note = (
+                "Telecom-specific requirements for this scenario:\n"
+                "- Do NOT invent any KYC/identity-verification field (no field name containing 'kyc').\n"
+                "- Any plan/rate-plan/data-plan field (e.g. rate_plan_code) MUST depend_on service_provider "
+                "and describe plans realistic for that specific provider (Jio, BSNL), not generic plans.\n"
+                "- Do NOT invent a churn_risk_score/churn_propensity_score field; churn is derived downstream "
+                "from the already auto-injected historical_low_balance_frequency, offer_acceptance_rate_historical "
+                "and preferred_topup_channel fields.\n"
+                "- If this scenario needs a trigger/cause field, name it exactly 'trigger_cause' with categorical "
+                f"choices exactly {_TELECOM_TRIGGER_CAUSE_CHOICES}.\n"
+            )
+
         prompt = (
             f"Scenario ID: {scenario_id or '(assign automatically)'}\n"
             f"Scenario type/outcome: {scenario_type or '(not provided — infer a sensible one)'}\n"
@@ -327,6 +437,7 @@ class ScenarioDesignerAgent:
             f"Identity/KYC notes: {profile['identity_notes']}\n"
             f"Typical transaction denominations in {profile['currency']}: {profile['typical_denominations']}\n\n"
             f"{glossary_text}\n"
+            f"{telecom_note}"
             f"{preinjected_note}\n"
             f"Feedback from prior attempts at this same domain/scenario (learn from these, "
             f"avoid repeating past mistakes):\n{feedback_block}\n\n"
@@ -342,8 +453,12 @@ class ScenarioDesignerAgent:
         if not llm_variables and not base_variables:
             raise ValueError("Gemini response contained no usable variables")
         llm_variables = self._normalize_field_names(llm_variables, industry_key)
+        if industry_key == "telecom":
+            llm_variables = self._apply_telecom_overrides(llm_variables)
         combined = base_variables + llm_variables
         result["variables"] = self._enforce_variable_bounds(combined, prompt, base_names, industry_key)
+        if industry_key == "telecom":
+            result["variables"] = self._apply_telecom_overrides(result["variables"])
         result["field_order"] = [v["name"] for v in result["variables"]]
         # Resolve entity_key only AFTER base variables are injected. The primary entity
         # identifier is normally one of those auto-injected fields (e.g. subscriber_id),
@@ -527,6 +642,7 @@ class ScenarioDesignerAgent:
                 "event_type": event_type,
                 "sequence": index,
                 "fields": fields,
+                "description": str(event.get("description") or "").strip(),
                 "min_occurrences": min_occurrences,
                 "max_occurrences": max_occurrences,
             })
@@ -535,6 +651,7 @@ class ScenarioDesignerAgent:
                 "event_type": "BUSINESS_EVENT",
                 "sequence": 1,
                 "fields": [],
+                "description": "",
                 "min_occurrences": 1,
                 "max_occurrences": 10,
             }]
@@ -569,6 +686,45 @@ class ScenarioDesignerAgent:
             v["depends_on"] = [rename_map.get(d, d) for d in v.get("depends_on", [])]
             result.append(v)
         return result
+
+    @staticmethod
+    def _apply_telecom_overrides(variables: list[dict]) -> list[dict]:
+        """Telecom-only client requirements: drop KYC fields and raw churn scores,
+        mask UPI in payment/channel choices, and force trigger_cause's fixed enum
+        when that field is present. Only ever called when industry_key == "telecom";
+        every other industry's variables pass through this file unmodified."""
+        out: list[dict] = []
+        for v in variables:
+            name = str(v.get("name", ""))
+            lname = name.lower()
+            if _KYC_NAME_MARKER in lname:
+                continue
+            if _TELECOM_CHURN_NAME_MARKER in lname:
+                continue
+            v = dict(v)
+            if name == "trigger_cause":
+                v["dtype"] = "categorical"
+                v["gen"] = "weighted_choice"
+                v["params"] = {
+                    "choices": list(_TELECOM_TRIGGER_CAUSE_CHOICES),
+                    "weights": list(_TELECOM_TRIGGER_CAUSE_WEIGHTS),
+                }
+            elif any(marker in lname for marker in _UPI_FIELD_NAME_MARKERS):
+                params = v.get("params")
+                if isinstance(params, dict) and isinstance(params.get("choices"), list):
+                    params = dict(params)
+                    params["choices"] = [
+                        _UPI_MASK_LABEL if _UPI_VALUE_MARKER in str(c).lower() else c
+                        for c in params["choices"]
+                    ]
+                    v["params"] = params
+            out.append(v)
+
+        # Dropping a field can leave a dangling depends_on reference; drop those too.
+        valid_names = {v["name"] for v in out}
+        for v in out:
+            v["depends_on"] = [d for d in v.get("depends_on", []) if d in valid_names]
+        return out
 
     def _enforce_variable_bounds(
         self, variables: list[dict], prompt: str, protected_names: set[str], industry_key: str = "generic"

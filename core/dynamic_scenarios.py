@@ -1,12 +1,11 @@
 """
-Shared store for LLM-proposed scenarios (LB-04, LB-05, ...).
+Shared store for LLM-proposed scenarios (LB-01, LB-02, ...).
 
-Static scenarios (LB-01/02/03) keep living in config/scenarios.py and
-config/variables*.py. Dynamic scenarios proposed via the /scenario/* API
-are persisted in a SQLite file (not plain process-memory dicts) so that
-they are visible across all uvicorn worker processes, not just the one
-that happened to handle the /scenario/propose or /scenario/confirm call.
-They are still wiped if the DB file is deleted / the volume is reset.
+Scenarios proposed via the /scenario/* API are persisted in a SQLite file
+(not plain process-memory dicts) so that they are visible across all uvicorn
+worker processes, not just the one that happened to handle the
+/scenario/propose or /scenario/confirm call. They are still wiped if the DB
+file is deleted / the volume is reset.
 """
 from __future__ import annotations
 import json
@@ -17,8 +16,6 @@ import time
 import uuid
 from contextlib import contextmanager
 from typing import Any
-
-from config.scenarios import SCENARIOS
 
 _DB_PATH = os.environ.get(
     "DYNAMIC_SCENARIOS_DB",
@@ -85,10 +82,10 @@ def _purge_expired_drafts(conn: sqlite3.Connection) -> None:
 
 
 def next_scenario_id() -> str:
-    """Next free scenario id, considering existing configured and confirmed scenarios."""
+    """Next free LB-0N id, considering all confirmed dynamic scenarios."""
     with _connect() as conn:
         rows = conn.execute("SELECT scenario_id FROM confirmed").fetchall()
-    existing = list(SCENARIOS.keys()) + [r[0] for r in rows]
+    existing = [r[0] for r in rows]
     nums = [int(m.group(1)) for k in existing if (m := re.match(r"LB-(\d+)$", k))]
     return f"LB-{(max(nums) + 1) if nums else 1:02d}"
 
@@ -151,23 +148,18 @@ def get_confirmed(scenario_id: str) -> dict[str, Any] | None:
 
 
 def scenario_exists(scenario_id: str) -> bool:
-    if scenario_id in SCENARIOS:
-        return True
     with _connect() as conn:
         row = conn.execute("SELECT 1 FROM confirmed WHERE scenario_id = ?", (scenario_id,)).fetchone()
     return row is not None
 
 
 def resolve_scenario_meta(scenario_id: str) -> dict[str, Any] | None:
-    if scenario_id in SCENARIOS:
-        return SCENARIOS[scenario_id]
     dyn = get_confirmed(scenario_id)
     return dyn["meta"] if dyn else None
 
 
 def resolve_variables(scenario_id: str) -> tuple[list[dict[str, Any]], list[str]] | None:
-    """Return (variables, field_order) for a confirmed scenario, or None if no
-    confirmed scenario definition exists."""
+    """Return (variables, field_order) for a confirmed scenario, or None if unknown."""
     dyn = get_confirmed(scenario_id)
     return (dyn["variables"], dyn["field_order"]) if dyn else None
 
@@ -221,11 +213,9 @@ def resolve_events(scenario_id: str) -> list[dict[str, Any]]:
     return events if isinstance(events, list) else []
 
 def list_scenarios() -> list[dict[str, Any]]:
-    out = [{"id": k, **v} for k, v in SCENARIOS.items()]
     with _connect() as conn:
         rows = conn.execute("SELECT scenario_id, meta FROM confirmed").fetchall()
-    out += [{"id": r[0], **json.loads(r[1])} for r in rows]
-    return out
+    return [{"id": r[0], **json.loads(r[1])} for r in rows]
 
 
 def _feedback_key(domain: str, business_scenario: str) -> str:

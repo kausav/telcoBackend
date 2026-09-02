@@ -9,33 +9,33 @@ from threading import RLock
 from typing import Any
 
 _LOCK = RLock()
-_RULES: dict[tuple, dict[str, Any]] = {}
-_PIPELINE_VALIDATION: dict[tuple, dict[str, Any]] = {}
+_SCHEMA: dict[tuple, dict[str, Any]] = {}
+_ORCHESTRATOR: dict[tuple, dict[str, Any]] = {}
 
 
-def get_rules(key: tuple):
+def get_schema(key: tuple):
     with _LOCK:
-        return _RULES.get(key)
+        return _SCHEMA.get(key)
 
 
-def set_rules(key: tuple, value: dict[str, Any]) -> None:
+def set_schema(key: tuple, value: dict[str, Any]) -> None:
     with _LOCK:
-        _RULES[key] = value
+        _SCHEMA[key] = value
 
 
-def get_pipeline_validation(key: tuple):
+def get_orchestrator(key: tuple):
     with _LOCK:
-        return _PIPELINE_VALIDATION.get(key)
+        return _ORCHESTRATOR.get(key)
 
 
-def set_pipeline_validation(key: tuple, value: dict[str, Any]) -> None:
+def set_orchestrator(key: tuple, value: dict[str, Any]) -> None:
     with _LOCK:
-        _PIPELINE_VALIDATION[key] = value
+        _ORCHESTRATOR[key] = value
 
 
 def clear_scenario(scenario_id: str) -> None:
     with _LOCK:
-        for cache in (_RULES, _PIPELINE_VALIDATION):
+        for cache in (_SCHEMA, _ORCHESTRATOR):
             for key in list(cache):
                 if key and key[0] == scenario_id:
                     cache.pop(key, None)

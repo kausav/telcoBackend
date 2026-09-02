@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Literal
 
-from core.pipeline_service import run_generation_pipeline
+from core.pipeline import run_pipeline
 from agents.scenario_designer_agent import ScenarioDesignerAgent
 from core.csv_scenario import parse_definition_csv, parse_variables_csv
 from core.dynamic_scenarios import (
@@ -29,17 +29,16 @@ from core.dynamic_scenarios import (
 )
 from core.llm_client import GeminiClient
 from core.compiled_schema import invalidate_scenario
-from agents.generator_agent import _condition_compatible_with_schema
+from agents.data_generation_agent import _condition_compatible_with_schema
 from core.runtime_cache import clear_scenario
 
 
 def _get_field_order(scenario: str) -> list[str]:
-    """Return the field order for any scenario without importing at module level."""
+    """Return the persisted field order for a confirmed scenario."""
     dyn = resolve_variables(scenario)
-    if dyn is not None:
-        return dyn[1]
-    from config.variables import FIELD_ORDER
-    return FIELD_ORDER
+    if dyn is None:
+        raise HTTPException(400, detail={"error": f"Unknown scenario '{scenario}'"})
+    return dyn[1]
 
 
 def _is_placeholder(value) -> bool:
@@ -171,14 +170,21 @@ class ConfirmResponse(BaseModel):
     edgeCasePercentage: float = Field(0.0, ge=0.0, le=1.0)
 
 
+@app.get("/")
+def root():
+    """Liveness check."""
+    return {"status": "ok"}
+
+
 @app.get("/health")
 def health():
+    """Health check."""
     return {"status": "ok"}
 
 
 @app.post("/scenario/propose", response_model=ProposeResponse)
 def propose_scenario(req: ProposeRequest):
-    """API 1 — ask the designer agent to invent a new scenario + variable catalog."""
+    """API 1a — ask the designer agent to invent a new scenario + variable catalog."""
     # scenarioId is just the user's preferred label at this stage; it's not reserved here
     # because two different users can propose the same one concurrently. draftId (minted
     # below) is the only unique handle — /scenario/confirm resolves any scenarioId clash.
@@ -255,7 +261,7 @@ def import_scenario_csv(
     entityKey: str | None = Form(None),
     edgeCasePercentage: float | None = Form(None),
 ):
-    """CSV alternative to /scenario/propose.
+    """API 1b — CSV alternative to /scenario/propose.
 
     The uploaded CSV is a *scenario definition*, not sample/output data. It tells
     the backend which variables the user wants and, for transactional scenarios,
@@ -289,7 +295,6 @@ def import_scenario_csv(
         entityKey = None
 
     # CSV can define edgeCasePercentage; an explicit form value overrides it.
-    import math
     edge_case_percentage = float(csv_metadata.get("edge_case_percentage", 0.0) or 0.0)
     if edgeCasePercentage is not None:
         edge_case_percentage = edgeCasePercentage
@@ -594,7 +599,6 @@ def confirm_scenario_route(req: ConfirmRequest):
         edge_case_percentage = float(edge_case_percentage or 0.0)
     except (TypeError, ValueError) as exc:
         raise HTTPException(400, detail={"error": "edgeCasePercentage must be a finite float between 0 and 1"}) from exc
-    import math
     if not math.isfinite(edge_case_percentage) or not 0.0 <= edge_case_percentage <= 1.0:
         raise HTTPException(400, detail={"error": "edgeCasePercentage must be between 0 and 1", "value": edge_case_percentage})
 
@@ -665,8 +669,8 @@ def confirm_scenario_route(req: ConfirmRequest):
 
 
 @app.post("/scenario/generate", response_model=GenerateResponse)
-def generate_dynamic(req: GenerateRequest):
-    """API 4 — confirm a draft/scenario into records via the 4-agent pipeline."""
+def generate_scenario(req: GenerateRequest):
+    """API 3 — confirm a draft/scenario into records via the 4-agent pipeline."""
     scenario_id = req.scenario
     if req.draftId:
         # draftId is the unambiguous handle when two users' scenarioId choices collided.
@@ -685,7 +689,7 @@ def generate_dynamic(req: GenerateRequest):
         raise HTTPException(400, detail={"error": f"Unknown scenario '{scenario_id}'"})
     scenario_context = resolve_scenario_context(scenario_id)
     try:
-        state = run_generation_pipeline(
+        state = run_pipeline(
             scenario=scenario_id,
             count=req.count,
             industry=scenario_context.get("industry", "generic"),
