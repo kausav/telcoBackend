@@ -110,6 +110,7 @@ class GenerateRequest(BaseModel):
 
 
 class GenerateResponse(BaseModel):
+    success: bool = Field(True, description="True when the API request completed successfully")
     scenario_id: str
     typeOfData: Literal["transactional", "aggregational"]
     events: list[dict] = Field(default_factory=list)
@@ -142,6 +143,7 @@ class ProposeRequest(BaseModel):
 
 
 class ProposeResponse(BaseModel):
+    success: bool = Field(True, description="True when the API request completed successfully")
     draft_id: str
     scenario_id: str
     scenario_id_available: bool = Field(True, description="False if this scenarioId is already confirmed under a different draft — /scenario/confirm will mint a new id in that case")
@@ -189,6 +191,7 @@ class ConfirmRequest(BaseModel):
 
 
 class ConfirmResponse(BaseModel):
+    success: bool = Field(True, description="True when the API request completed successfully")
     scenario_id: str
     requested_scenario_id: str | None = Field(None, description="The scenarioId originally requested at propose time, for comparison")
     scenario_id_reassigned: bool = Field(False, description="True if scenario_id differs from requested_scenario_id because the requested id was already confirmed under a different draft")
@@ -207,7 +210,7 @@ class ConfirmResponse(BaseModel):
 @app.get("/")
 def root():
     """Liveness check."""
-    return {"status": "ok"}
+    return {"success": True, "status": "ok"}
 
 
 @app.get("/health")
@@ -264,6 +267,7 @@ def propose_scenario(req: ProposeRequest):
             req.scenarioId, draft_id,
         )
     return ProposeResponse(
+        success=True,
         draft_id=draft_id,
         scenario_id=req.scenarioId,
         scenario_id_available=scenario_id_available,
@@ -371,6 +375,7 @@ def import_scenario_csv(
     }
     save_draft(draft_id, draft)
     return ProposeResponse(
+        success=True,
         draft_id=draft_id,
         scenario_id=scenarioId,
         scenario_id_available=not scenario_exists(scenarioId),
@@ -695,6 +700,7 @@ def confirm_scenario_route(req: ConfirmRequest):
     pop_draft(req.draft_id)
 
     return ConfirmResponse(
+        success=True,
         scenario_id=scenario_id,
         requested_scenario_id=requested_scenario_id,
         scenario_id_reassigned=requested_scenario_id is not None and scenario_id != requested_scenario_id,
@@ -829,6 +835,7 @@ def generate_scenario(req: GenerateRequest):
         event_data = []
 
     return GenerateResponse(
+        success=True,
         scenario_id=scenario_id,
         typeOfData=state.type_of_data,
         entityKey=entity_key,
