@@ -471,7 +471,9 @@ class ScenarioDesignerAgent:
             result.get("entity_key"), result["variables"], industry_key, type_of_data
         )
         result["events"] = self._normalize_events(result.get("events", []), result["variables"], type_of_data, industry_key)
-        edge_vars = self._normalize_edge_case_variables(result.get("edge_case_variables", []), result["variables"], industry_key)
+        edge_vars = self._normalize_edge_case_variables(
+            result.get("edge_case_variables", []), result["variables"], industry_key, profile=profile
+        )
 
         # If the LLM omitted usable edge cases (or returned invalid conditions), build
         # deterministic boundary cases from the actual scenario variables. This is a
@@ -500,8 +502,22 @@ class ScenarioDesignerAgent:
         return result
 
 
-    def _normalize_edge_case_variables(self, edge_vars: list, variables: list[dict], industry_key: str) -> list[dict]:
-        """Normalize edge-case definitions without silently throwing away valid cases."""
+    def _normalize_edge_case_variables(
+        self,
+        edge_vars: list,
+        variables: list[dict],
+        industry_key: str,
+        profile: dict | None = None,
+    ) -> list[dict]:
+        """Normalize and preflight edge cases before they reach /scenario/confirm.
+
+        The LLM can produce syntactically valid but operationally impossible edge
+        conditions (for example a percentage threshold plus a zero balance when the
+        effective generator cannot materialize both values).  Such definitions are
+        removed here, while valid definitions are retained.  The check deliberately
+        reuses the same generic deterministic edge solver as data generation, so
+        proposal-time validation and generation-time behavior stay aligned.
+        """
         alias_map = _build_alias_map(industry_key)
         valid_names = {str(v.get("name")) for v in variables if isinstance(v, dict) and v.get("name")}
         out = []
@@ -545,6 +561,121 @@ class ScenarioDesignerAgent:
                 }:
                     continue
             out.append(v)
+
+        # Materialize deterministic overrides for simple condition assignments.
+        # This is the key guard against LLM-generated conditions such as
+        # ``data_depletion_pct >= 100 and balance_before == 0`` when the ordinary
+        # generators cannot naturally emit those values.  The edge condition itself
+        # remains the source of truth; these constant overrides merely make the
+        # requested state executable and are applied only to edge records.
+        if out:
+            try:
+                from agents.data_generation_agent import _condition_branches
+
+                by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+                formula_names = {str(v.get("name")) for v in variables if v.get("formula")}
+                groups: dict[str, dict] = {}
+                for item in out:
+                    group_name = str(item.get("edge_case_name") or "Scenario Edge Case").strip()
+                    group = groups.setdefault(group_name, {
+                        "condition": str(item.get("condition") or "").strip(),
+                        "variables": [],
+                    })
+                    group["variables"].append(item)
+                    if item.get("condition") and not group.get("condition"):
+                        group["condition"] = str(item["condition"]).strip()
+
+                for group in groups.values():
+                    branches = _condition_branches(group.get("condition", ""), variables) or []
+                    if not branches:
+                        continue
+                    # The first satisfiable branch is sufficient for OR expressions.
+                    assignments = branches[0]
+                    existing = {str(v.get("name")): v for v in group["variables"] if v.get("name")}
+                    for name, value in assignments.items():
+                        if str(name).startswith("__") or name in formula_names or name not in by_name:
+                            continue
+                        base = by_name[name]
+                        target = existing.get(name)
+                        if target is None:
+                            target = dict(base)
+                            target["edge_case_name"] = next(
+                                k for k, g in groups.items() if g is group
+                            )
+                            target["edge_case_description"] = ""
+                            target["condition"] = group.get("condition", "")
+                            group["variables"].append(target)
+                            existing[name] = target
+                        target["gen"] = "constant"
+                        target["params"] = {"value": value}
+                        target["dtype"] = base.get("dtype", target.get("dtype", "string"))
+
+                out = [item for group in groups.values() for item in group["variables"]]
+            except Exception as exc:
+                logger.warning("[ScenarioDesigner] Edge-condition override normalization skipped: %s", exc)
+
+        # Preflight complete edge groups using the same deterministic solver used by
+        # generation.  This is intentionally best-effort: if a group cannot be
+        # constructed from the declared schema, omit that group instead of allowing
+        # an unusable edge definition to reach /scenario/confirm and later break
+        # /scenario/generate.
+        if out:
+            try:
+                from agents.data_generation_agent import (
+                    _condition_branches,
+                    _edge_case_candidate_for_aggregation,
+                    _generate_record,
+                    _safe_edge_condition,
+                )
+
+                groups: dict[str, dict] = {}
+                for item in out:
+                    group_name = str(item.get("edge_case_name") or "Scenario Edge Case").strip()
+                    group = groups.setdefault(group_name, {
+                        "condition": str(item.get("condition") or "").strip(),
+                        "variables": [],
+                    })
+                    group["variables"].append(item)
+                    if item.get("condition") and not group.get("condition"):
+                        group["condition"] = str(item["condition"]).strip()
+
+                valid_groups: set[str] = set()
+                for group_name, group in groups.items():
+                    condition = group.get("condition", "")
+                    branches = _condition_branches(condition, variables) or []
+                    if not branches:
+                        continue
+                    constructible = False
+                    for _ in range(5):
+                        try:
+                            base = _generate_record(variables, profile=profile, rules=None)
+                        except Exception:
+                            base = {}
+                        for assignments in branches:
+                            try:
+                                candidate = _edge_case_candidate_for_aggregation(
+                                    dict(base), group, variables, profile, None, assignments=assignments
+                                )
+                                if _safe_edge_condition(condition, candidate):
+                                    constructible = True
+                                    break
+                            except Exception:
+                                continue
+                        if constructible:
+                            break
+                    if constructible:
+                        valid_groups.add(group_name)
+
+                out = [
+                    item for item in out
+                    if str(item.get("edge_case_name") or "Scenario Edge Case").strip() in valid_groups
+                ]
+            except Exception as exc:
+                # Never make proposal fail solely because the optional preflight
+                # helper is unavailable. Syntax/schema validation above remains the
+                # hard gate.
+                logger.warning("[ScenarioDesigner] Edge-case constructability preflight skipped: %s", exc)
+
         return out[:50]
 
     @staticmethod

@@ -1542,7 +1542,19 @@ def _transactional_records(
                 if not event_candidates:
                     continue
                 event_def = random.choice(event_candidates)
-                base = _generate_selected_record(variables, set(event_def.fields), base=entity_context, profile=profile, rules=rules)
+                try:
+                    base = _generate_selected_record(
+                        variables, set(event_def.fields), base=entity_context,
+                        profile=profile, rules=rules
+                    )
+                except Exception as exc:
+                    if record_errors_out is not None:
+                        record_errors_out.append({
+                            "record_index": len(generated),
+                            "error": str(exc),
+                            "record": {"journey_id": journey_id, "event_type": event_def.event_type},
+                        })
+                    continue
                 base.update({
                     "journey_id": journey_id,
                     "transaction_id": f"TXN-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}",
@@ -1569,11 +1581,26 @@ def _transactional_records(
                         needed -= 1
                         break
         if len(eligible) < target:
+            missing = target - len(eligible)
             descriptions = "; ".join(f"{name}: {group.get('condition', '')}" for name, group in group_items)
-            raise ValueError(
-                f"Unable to construct {target} transactional edge-case record(s) after deterministic constraint solving. "
-                f"Constructed {len(eligible)}. Definitions: {descriptions}"
-            )
+            # Edge-case construction is record-level work. A rare/impossible edge
+            # definition must not abort the entire /scenario/generate request.
+            # Keep all successfully generated records and report each unconstructed
+            # edge-case unit through record_errors.
+            for offset in range(missing):
+                if record_errors_out is not None:
+                    record_errors_out.append({
+                        "record_index": len(generated) + offset,
+                        "error": (
+                            "Unable to construct transactional edge-case record after "
+                            "deterministic constraint solving. "
+                            f"Constructed {len(eligible)} of {target}. Definitions: {descriptions}"
+                        ),
+                        "record": {},
+                    })
+            target = len(eligible)
+            if target <= 0:
+                return generated
 
     # Spread selected edge records through the materialized response rather than
     # clustering all edge cases in one event/entity.
@@ -1592,19 +1619,31 @@ def _transactional_records(
     for idx, (group_name, candidate) in chosen_lookup.items():
         group = edge_groups[group_name]
         if not _safe_edge_condition(group.get("condition", ""), candidate):
-            raise ValueError(
-                f"Edge-case invariant failed for condition '{group.get('condition', '')}' "
-                f"on event '{generated[idx].get('event_type')}'."
-            )
+            if record_errors_out is not None:
+                record_errors_out.append({
+                    "record_index": idx,
+                    "error": (
+                        f"Edge-case invariant failed for condition '{group.get('condition', '')}' "
+                        f"on event '{generated[idx].get('event_type')}'."
+                    ),
+                    "record": dict(generated[idx]),
+                })
+            continue
         candidate["isEdgeCaseData"] = True
         generated[idx] = candidate
 
-    # Exactly the requested number of materialized records are true.
+    # The generator is best-effort: any mismatch is reported as a record-level
+    # error rather than aborting the whole request.
     true_count = sum(1 for row in generated if row.get("isEdgeCaseData") is True)
-    if true_count != target:
-        raise RuntimeError(
-            f"Transactional edge-case assignment invariant failed: expected {target}, got {true_count}"
-        )
+    if true_count != target and record_errors_out is not None:
+        record_errors_out.append({
+            "record_index": -1,
+            "error": (
+                f"Transactional edge-case assignment produced {true_count} valid edge-case "
+                f"record(s) out of {target} requested."
+            ),
+            "record": {},
+        })
     return generated
 
 

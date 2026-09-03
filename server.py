@@ -482,8 +482,17 @@ def confirm_scenario_route(req: ConfirmRequest):
     }
     for name in req.edgeCaseDelete:
         if not _is_placeholder(name):
-            target = str(name)
-            edge_by_key = {k: v for k, v in edge_by_key.items() if k[1] != target}
+            target = str(name).strip()
+            target_key = target.casefold()
+            # Accept either the edge-case group name (preferred by the UI) or
+            # an individual edge-case variable name. Matching is case-insensitive
+            # so UI/display casing cannot leave a deleted group behind. Deleting an
+            # edge case always removes the complete group.
+            edge_by_key = {
+                k: v for k, v in edge_by_key.items()
+                if str(k[0]).strip().casefold() != target_key
+                and str(k[1]).strip().casefold() != target_key
+            }
     for e in req.edgeCaseEdit:
         if _is_placeholder(e.name):
             continue
