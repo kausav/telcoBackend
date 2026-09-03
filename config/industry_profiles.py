@@ -17,7 +17,6 @@ Every agent that needs industry/country grounding calls get_profile() rather
 than hardcoding "telecom" anywhere.
 """
 from __future__ import annotations
-import os
 
 # Country is intentionally optional. Missing country means GLOBAL/non-country-specific data.
 DEFAULT_INDUSTRY = "generic"

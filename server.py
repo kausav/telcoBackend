@@ -1,17 +1,17 @@
 from __future__ import annotations
 import logging
-import json
 import math
-from pathlib import Path
+import uuid
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from typing import Literal
 
 from core.pipeline import run_pipeline
 from agents.scenario_designer_agent import ScenarioDesignerAgent
-from core.csv_scenario import parse_definition_csv, parse_variables_csv
+from core.csv_scenario import parse_definition_csv
 from core.dynamic_scenarios import (
     add_feedback,
     confirm_scenario,
@@ -59,8 +59,41 @@ def _clean_dict(d: dict) -> dict:
         cleaned[k] = v
     return cleaned
 
+from core.error_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+    unhandled_exception_handler,
+)
+from core.errors import ErrorResponse
+
 logger = logging.getLogger(__name__)
-app = FastAPI(title="Telco Agentic SDG", version="2.0.0")
+app = FastAPI(
+    title="Telco Agentic SDG",
+    version="2.0.0",
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
+    },
+)
+
+app.add_exception_handler(HTTPException, http_exception_handler)
+app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
+app.add_exception_handler(Exception, unhandled_exception_handler)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """Assign one correlation id to every request and return it to the client."""
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 app.add_middleware(
     CORSMiddleware,
