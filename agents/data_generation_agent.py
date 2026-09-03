@@ -2110,6 +2110,140 @@ def _applicable_edge_groups(rec: dict, edge_groups: dict[str, dict], transaction
     return out
 
 
+def _apply_telecom_client_contract(records: list[dict], scenario_id: str, industry: str) -> list[dict]:
+    """Deterministically enforce audited Telecom LB-06/LB-07 business semantics.
+
+    This is intentionally isolated from the generic generator/QA machinery. It only
+    runs for the two audited Telecom scenarios and therefore cannot change generation
+    behavior for other industries/scenarios. The schema remains the source of field
+    definitions; this helper only reconciles values across the lifecycle events.
+    """
+    if str(industry or "").strip().lower() != "telecom":
+        return records
+    sid = str(scenario_id or "").strip().upper()
+    if sid not in {"LB-06", "LB-07"}:
+        return records
+
+    by_journey: dict[str, list[dict]] = {}
+    for row in records:
+        by_journey.setdefault(str(row.get("journey_id", "")), []).append(row)
+
+    def num(v, default=0.0):
+        try:
+            x = float(v)
+            return x if math.isfinite(x) else default
+        except (TypeError, ValueError):
+            return default
+
+    for rows in by_journey.values():
+        rows.sort(key=lambda r: (int(r.get("event_sequence", 0) or 0), int(r.get("event_occurrence", 0) or 0), str(r.get("event_timestamp", ""))))
+        first = rows[0] if rows else {}
+        balance = max(0.0, num(first.get("balance_before"), num(first.get("balance_after"), 0.0)))
+        amount = max(10.0, num(first.get("recharge_amount"), 100.0))
+        failed_txn = None
+
+        if sid == "LB-06":
+            failure_reasons = ["INSUFFICIENT_FUNDS", "GATEWAY_TIMEOUT", "NETWORK_FAILURE", "BANK_DECLINE", "AUTHENTICATION_FAILURE", "PAYMENT_INSTRUMENT_UNAVAILABLE"]
+            reason = failure_reasons[sum(ord(c) for c in str(first.get("journey_id", ""))) % len(failure_reasons)]
+            retry_total = sum(1 for r in rows if str(r.get("event_type", "")).upper() == "TOPUP_RETRY")
+            retry_number = 0
+            failure_rows = [r for r in rows if str(r.get("event_type", "")).upper() == "TOPUP_FAILURE"]
+            for row in rows:
+                et = str(row.get("event_type", "")).upper()
+                row["balance_before"] = round(balance, 2)
+                row["recharge_amount"] = round(amount, 2)
+                if et == "LOW_BALANCE_DETECTED":
+                    row["balance_after"] = round(balance, 2)
+                elif et in {"TOPUP_ATTEMPT", "TOPUP_FAILURE"}:
+                    row["recharge_status"] = "FAILED"
+                    row["failure_reason"] = reason
+                    row["balance_after"] = round(balance, 2)
+                    if et == "TOPUP_FAILURE":
+                        failed_txn = row.get("transaction_id")
+                elif et == "RECOVERY_GUIDANCE":
+                    row["recovery_action"] = "USE_ALTERNATE_PAYMENT_METHOD" if reason in {"GATEWAY_TIMEOUT", "BANK_DECLINE", "PAYMENT_INSTRUMENT_UNAVAILABLE"} else "RETRY_SAME_METHOD"
+                    row["recovery_status"] = "RECOVERY_PENDING"
+                    row["balance_after"] = round(balance, 2)
+                elif et == "TOPUP_RETRY":
+                    retry_number += 1
+                    row["recharge_status"] = "SUCCESS" if retry_number == retry_total else "FAILED"
+                    row["failure_reason"] = None if retry_number == retry_total else reason
+                    row["parent_transaction_id"] = failed_txn or row.get("parent_transaction_id") or "PARENT_TXN"
+                    row["retry_count"] = retry_number
+                    row["balance_after"] = round(balance, 2)
+                elif et == "TOPUP_SUCCESS":
+                    row["recharge_status"] = "SUCCESS"
+                    row["recovery_status"] = "RECOVERED_ALTERNATE_METHOD" if reason in {"GATEWAY_TIMEOUT", "BANK_DECLINE", "PAYMENT_INSTRUMENT_UNAVAILABLE"} else "RECOVERED_SAME_METHOD"
+                    row["parent_transaction_id"] = failed_txn or row.get("parent_transaction_id") or "PARENT_TXN"
+                    row["retry_count"] = max(1, retry_total)
+                    success_balance = round(balance + amount, 2)
+                    row["balance_after"] = success_balance
+                    row["final_journey_status"] = "RECOVERED"
+                    try:
+                        row["recovery_timestamp"] = row.get("event_timestamp")
+                    except Exception:
+                        pass
+
+        else:  # LB-07: preserve the exceptional state before reconciliation.
+            expected = round(balance + amount, 2)
+            observed = round(balance, 2)
+            for row in rows:
+                et = str(row.get("event_type", "")).upper()
+                row["balance_before"] = round(balance, 2)
+                row["recharge_amount"] = round(amount, 2)
+                row["transaction_status"] = "SUCCESS"
+                row["payment_gateway"] = row.get("payment_gateway") or "Gateway_A"
+                if et in {"TOPUP_INITIATED", "PAYMENT_AUTHORIZED", "PAYMENT_SETTLED"}:
+                    row["balance_after"] = round(balance, 2)
+                    if et == "PAYMENT_SETTLED":
+                        row["settlement_status"] = "SETTLED"
+                elif et == "BALANCE_UPDATE_FAILED":
+                    row["balance_after"] = observed
+                    row["expected_balance"] = expected
+                    row["observed_balance"] = observed
+                    row["balance_update_status"] = "FAILED"
+                    row["balance_variance"] = round(observed - expected, 2)
+                    row["exception_detected_flag"] = True
+                    reasons = ["LEDGER_SYNCHRONIZATION_DELAY", "CORE_SYSTEM_UPDATE_DELAY", "CACHE_REFRESH_ISSUE", "EVENT_PROCESSING_LAG", "RECONCILIATION_MISMATCH", "BACKEND_TIMEOUT_AFTER_SUCCESSFUL_PROCESSING"]
+                    row["exception_reason"] = reasons[sum(ord(c) for c in str(first.get("journey_id", ""))) % len(reasons)]
+                elif et == "DISCREPANCY_DETECTED":
+                    row["balance_after"] = observed
+                    row["expected_balance"] = expected
+                    row["observed_balance"] = observed
+                    row["balance_variance"] = round(observed - expected, 2)
+                    row["exception_detected_flag"] = True
+                elif et == "VERIFICATION_REQUESTED":
+                    row["balance_after"] = observed
+                    row["verification_status"] = "VERIFIED"
+                    row["verification_attempt_count"] = 1
+                elif et == "TRANSACTION_LOOKUP":
+                    row["balance_after"] = observed
+                    row["settlement_status"] = "SETTLED"
+                    row["verification_status"] = "VERIFIED"
+                elif et == "RECONCILIATION_STARTED":
+                    row["balance_after"] = observed
+                    row["reconciliation_status"] = "RESOLVED"
+                    row["resolution_type"] = "BALANCE_CORRECTION"
+                elif et in {"STATUS_CONFIRMED", "CUSTOMER_NOTIFIED"}:
+                    row["balance_after"] = expected
+                    row["verification_status"] = "VERIFIED"
+                    row["settlement_status"] = "SETTLED"
+                    row["reconciliation_status"] = "RESOLVED"
+                    row["final_status"] = "RESOLVED"
+                elif et == "BALANCE_CORRECTED":
+                    row["expected_balance"] = expected
+                    row["final_balance"] = expected
+                    row["balance_after"] = expected
+                    row["resolution_type"] = "BALANCE_CORRECTION"
+                elif et == "CASE_RESOLVED":
+                    row["final_balance"] = expected
+                    row["balance_after"] = expected
+                    row["final_status"] = "RESOLVED"
+                    row["resolution_type"] = "BALANCE_CORRECTION"
+
+    return records
+
+
 # ── Agent ──────────────────────────────────────────────────────────────────────
 
 class DataGenerationAgent:
@@ -2255,6 +2389,7 @@ class DataGenerationAgent:
             logger.info("[DataGeneration] Generated %d aggregational records with %d fields each; edge cases=%d.",
                         len(records), len(variables), edge_count)
 
+        records = _apply_telecom_client_contract(records, state.scenario, state.industry)
         state.raw_records = records
         return state
 

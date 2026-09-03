@@ -1,893 +1,2246 @@
 <!DOCTYPE html>
+
 <html lang="en">
 
+
+
 <head>
+
     <meta charset="UTF-8" />
+
     <title>Ingenii Backend — Agentic Architecture</title>
+
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.8/dist/mermaid.min.js"></script>
+
     <style>
         body {
-            font-family: "Segoe UI", Arial, sans-serif;
-            max-width: 960px;
-            margin: 40px auto;
-            padding: 0 20px;
-            color: #1a1a1a;
-            line-height: 1.55;
+
+            font-family:
+                "Segoe UI",
+                Arial,
+                sans-serif;
+
+            max-width:
+                960px;
+
+            margin:
+                40px auto;
+
+            padding:
+                0 20px;
+
+            color:
+                #1a1a1a;
+
+            line-height:
+                1.55;
+
         }
+
+
 
         h1 {
-            font-size: 28px;
-            border-bottom: 3px solid #2b6cb0;
-            padding-bottom: 10px;
+
+            font-size:
+                28px;
+
+            border-bottom:
+                3px solid #2b6cb0;
+
+            padding-bottom:
+                10px;
+
         }
+
+
 
         h2 {
-            font-size: 21px;
-            margin-top: 48px;
-            color: #2b6cb0;
-            border-bottom: 1px solid #ddd;
-            padding-bottom: 6px;
+
+            font-size:
+                21px;
+
+            margin-top:
+                48px;
+
+            color:
+                #2b6cb0;
+
+            border-bottom:
+                1px solid #ddd;
+
+            padding-bottom:
+                6px;
+
         }
+
+
 
         h3 {
-            font-size: 17px;
-            margin-top: 28px;
-            color: #1a4971;
+
+            font-size:
+                17px;
+
+            margin-top:
+                28px;
+
+            color:
+                #1a4971;
+
         }
+
+
 
         .subtitle {
-            color: #555;
-            font-style: italic;
-            margin-top: -6px;
+
+            color:
+                #555;
+
+            font-style:
+                italic;
+
+            margin-top:
+                -6px;
+
         }
+
+
 
         .mermaid {
-            margin: 20px 0;
-            text-align: center;
+
+            margin:
+                20px 0;
+
+            text-align:
+                center;
+
         }
+
+
 
         table {
-            border-collapse: collapse;
-            width: 100%;
-            margin: 16px 0;
+
+            border-collapse:
+                collapse;
+
+            width:
+                100%;
+
+            margin:
+                16px 0;
+
         }
+
+
 
         th,
+
         td {
-            border: 1px solid #ccc;
-            padding: 8px 10px;
-            text-align: left;
-            vertical-align: top;
-            font-size: 14px;
+
+            border:
+                1px solid #ccc;
+
+            padding:
+                8px 10px;
+
+            text-align:
+                left;
+
+            vertical-align:
+                top;
+
+            font-size:
+                14px;
+
         }
+
+
 
         th {
-            background: #f0f4f8;
+
+            background:
+                #f0f4f8;
+
         }
+
+
 
         code {
-            background: #f5f5f5;
-            padding: 1px 5px;
-            border-radius: 3px;
-            font-size: 13px;
+
+            background:
+                #f5f5f5;
+
+            padding:
+                1px 5px;
+
+            border-radius:
+                3px;
+
+            font-size:
+                13px;
+
         }
+
+
 
         pre {
-            background: #f5f5f5;
-            padding: 12px;
-            border-radius: 6px;
-            overflow-x: auto;
-            font-size: 13px;
+
+            background:
+                #f5f5f5;
+
+            padding:
+                12px;
+
+            border-radius:
+                6px;
+
+            overflow-x:
+                auto;
+
+            font-size:
+                13px;
+
         }
+
+
 
         ul {
-            margin-top: 6px;
+
+            margin-top:
+                6px;
+
         }
+
+
 
         .note {
-            background: #fff8e1;
-            border-left: 4px solid #f5c518;
-            padding: 10px 14px;
-            margin: 14px 0;
+
+            background:
+                #fff8e1;
+
+            border-left:
+                4px solid #f5c518;
+
+            padding:
+                10px 14px;
+
+            margin:
+                14px 0;
+
         }
+
+
 
         .gap-table td:first-child {
-            font-weight: bold;
-            white-space: nowrap;
+
+            font-weight:
+                bold;
+
+            white-space:
+                nowrap;
+
         }
     </style>
+
 </head>
 
+
+
 <body>
+
+
 
     <h1>Ingenii Backend — Agentic Architecture Overview</h1>
 
 
+
+
+
     <h2>1. Purpose</h2>
+
     <p>This service generates synthetic telecom "low-balance / top-up" event data for testing, analytics, and ML
+
         training pipelines. Instead of a fixed template, it uses a multi-agent pipeline (LLM + deterministic code) so
+
         that:</p>
+
     <ul>
+
         <li>Business rules and validation logic are derived by an LLM from a plain-English scenario description
+
             (auditable, not hardcoded).</li>
+
         <li>Bulk record generation itself is fast and deterministic (no LLM latency/cost per record).</li>
+
         <li>New scenarios can be created on demand through human–LLM collaboration, without writing new generator code.
+
         </li>
+
     </ul>
+
+
 
     <h2>2. Architecture Diagram</h2>
+
     <div class="mermaid">
-flowchart TB
-    U["Client: HTTP API"] --> API["server.py<br/>Accept and validate HTTP requests"]
-    API --> RP["run_generation_pipeline()<br/>Create and pass WorkflowState"]
-    RP --> VALIDATE["Pipeline validation<br/>Check scenario coherence before generation"]
-    VALIDATE --> RULES["Rules Agent<br/>Derive constraints and generation rules"]
-    RULES --> GEN["Data Generator<br/>Create deterministic records"]
-    GEN --> QA["QA Agent<br/>Validate formulas, fields, semantics and edge cases"]
-    QA --> OUT["Final records + validation report"]
-    VALIDATE --> GEMINI[["Gemini LLM<br/>Used for semantic reasoning"]]
-    RULES --> GEMINI
-    QA --> GEMINI
-    API --> STORE[("SQLite<br/>drafts / confirmed / feedback")]
-    QA --> STORE
-</div>
-<p><b>What happens:</b> A request enters through the FastAPI layer and is converted into a shared <code>WorkflowState</code>. The pipeline validation service checks that the scenario is coherent before expensive generation begins. The Rules Agent turns the scenario into executable constraints, the Data Generator creates records using deterministic Python generators, and QA validates the result. Gemini is used only where semantic reasoning is useful; the core record generation remains deterministic.</p>
+
+        flowchart TB
+
+        U["Client: HTTP API"] --> SD["Scenario Designer Agent<br />/scenario/propose + /scenario/confirm<br />Generates
+        the variable catalog"]
+
+        SD --> CLI["server.py<br />/scenario/generate"]
+
+        CLI --> RP["run_pipeline() (core/pipeline.py)<br />LangGraph StateGraph over WorkflowState"]
+
+        RP --> ORCH["Orchestrator<br />Gatekeeper: runs AFTER variables exist,<br />checks the variable data"]
+
+        ORCH --> SCHEMA["Schema Agent<br />Derive rules/constraints, then validate the schema"]
+
+        SCHEMA --> EDGE["Edge Case Agent<br />Detect and validate edge-case definitions"]
+
+        EDGE --> GEN["Data Generation Agent<br />Generate records, then QA-validate them"]
+
+        GEN --> OUT["Final records + validation report"]
+
+        SD --> GEMINI[["Gemini LLM<br />Used for semantic reasoning"]]
+
+        ORCH --> GEMINI
+
+        SCHEMA --> GEMINI
+
+        GEN --> GEMINI
+
+        SD --> STORE[("SQLite<br />drafts / confirmed / feedback")]
+
+        GEN --> STORE
+
+    </div>
+
+    <p><b>What happens:</b>
+        The Scenario Designer Agent generates the variable catalog first, in its own earlier request
+        (<code>/scenario/propose</code>
+        then
+        <code>/scenario/confirm</code>).
+        Only once that variable data is confirmed and persisted does a
+        <code>/scenario/generate</code>
+        request enter the FastAPI layer and get converted into a shared
+        <code>WorkflowState</code>.
+        <code>run_pipeline()</code> compiles a <b>LangGraph <code>StateGraph</code></b> with one node per agent; a
+        conditional edge after each node checks <code>state.errors</code> and routes straight to <code>END</code> the
+        moment any agent rejects the request, instead of running the remaining stages.
+        The Orchestrator is a gatekeeper that runs <b>after</b> the variable data already exists and checks it, rather
+        than inventing it. The Schema Agent turns the scenario into executable constraints and validates its own schema,
+        the Edge Case Agent validates edge-case definitions, and the Data Generation Agent creates records and then
+        validates them internally.
+        Gemini is used only where semantic reasoning is useful; the core record generation remains deterministic.
+    </p>
+
+
 
     <h2>3. Agentic Architecture Deep Dive</h2>
-    <p><b>Four Agents Total (Three Runtime Pipeline Agents + One On-Demand Scenario Designer)</b></p>
-    <ul>
-        <li>Rules Agent</li>
-        <li>Data Generator Agent</li>
-        <li>QA &amp; Validation Agent</li>
-        <li>Scenario Designer Agent (on-demand; used by scenario proposal/confirmation flow, not by the generation pipeline)</li>
-    </ul>
-    <p><b>Not counted as agents</b> (components/layers, not agents):</p>
-    <ul>
-        <li>WorkflowState (Pydantic object threaded through the pipeline)</li>
-        <li>SQLite dynamic-scenario store (drafts / confirmed / feedback tables)</li>
-        <li>GeminiClient wrapper (core/llm_client.py)</li>
-    </ul>
 
-    <div class="mermaid">
-flowchart LR
-    A1["Pipeline validation service<br/>LLM scenario sanity check"] --> A2["Rules Agent<br/>Derive executable rules"]
-    A2 --> A3["Data Generator<br/>Pure Python generation"]
-    A3 --> A4["QA Agent<br/>Deterministic + semantic validation"]
-</div>
-<p><b>Why this order:</b> Each stage consumes the decisions made by the previous stage. This prevents the generator from inventing its own interpretation of the scenario and gives QA the rules and schema needed to check whether generated values are actually valid.</p>
+    <p><b>Exactly Five Agents</b></p>
 
-    <h3>Data Generator internal flow</h3>
-    <div class="mermaid">
-flowchart TB
-    V["Confirmed or configured variable catalog"] --> O["Apply scenario overrides<br/>Use confirmed user values"]
-    O --> L["Walk variables in declared order"]
-    L --> D["Generator dispatch table<br/>uniform / lognormal / beta / choices / formula / timestamps"]
-    D --> R["Build record incrementally"]
-    R --> F["Formula fields read prior values<br/>and preserve dependencies"]
-    F --> OUT["Validated candidate record"]
-</div>
-<p><b>What the generator does:</b> It reads the effective variable schema, applies data-driven scenario overrides, and generates variables in dependency order. Formula fields can use values already produced in the same record. Generator behavior is selected from a generic dispatch table; there are no scenario-ID-specific generator functions such as LB-01/LB-02 handlers. Scenario and industry behavior comes from the confirmed schema, rules, formulas, profiles, and edge-case definitions rather than hard-coded scenario implementations.</p>
-
-    <h3>3.1 Pipeline Validation Service</h3>
-    <p><b>Role:</b> Gatekeeper service — validates the scenario request before generation work happens. This is deterministic application orchestration plus one semantic LLM validation call; it is not an agent and does not consume an agent slot.</p>
-    <p><b>Inputs:</b> confirmed scenario context, industry, country, data type, and requested record count.<br /><b>Outputs:</b> Pass/fail decision and execution notes. The pipeline halts immediately on failure.</p>
     <ul>
-        <li>Checks scenario exists (static config/scenarios.py + SQLite dynamic store)</li>
-        <li>Asks Gemini (temperature 0.1) to sanity-check the scenario and produce execution notes</li>
-        <li>Appends errors to <code>state.errors</code> and stops the pipeline on rejection</li>
-    </ul>
 
-    <h3>3.2 Rules Agent</h3>
-    <p><b>Role:</b> Derives the business rules and field constraints that generated records must satisfy — becomes the
-        shared contract used later by QA.</p>
-    <p><b>Inputs:</b> scenario metadata + variable definitions.<br /><b>Outputs:</b> <code>business_rules[]</code>,
-        <code>field_constraints{}</code>, <code>cross_field_rules[]</code> (temperature 0.1).</p>
-    <ul>
-        <li>Summarizes every variable for the LLM</li>
-        <li>Produces a complete rules document covering all variables</li>
-        <li>Stores rules in shared state (<code>state.rules</code>) for the QA Agent to consume</li>
-    </ul>
-
-    <h3>3.3 Data Generator Agent</h3>
-    <p><b>Role:</b> The actual generation engine — <b>makes zero LLM calls per record</b>.</p>
-    <p><b>Inputs:</b> variable catalog (static or dynamic) + scenario overrides.<br /><b>Outputs:</b>
-        <code>raw_records[]</code>.</p>
-    <ul>
-        <li>Resolves each variable via a dispatch table (uniform, lognormal, beta, weighted_choice, formula, timestamp
-            helpers, etc.)</li>
-        <li>Generates fields in dependency order so later fields can read earlier ones already written (e.g.
-            <code>account_id</code> mirrors <code>subscriber_id</code>)</li>
-        <li>Sandboxes formula-type fields via <code>eval()</code> with <code>__builtins__</code> disabled</li>
-    </ul>
-
-    <h3>3.4 QA &amp; Validation Agent</h3>
-    <p><b>Role:</b> Two-layer validation — deterministic checks first, then LLM semantic audit.</p>
-    <p><b>Inputs:</b> <code>raw_records[]</code>, business rules from the Rules Agent.<br /><b>Outputs:</b>
-        <code>final_records[]</code>, <code>validation_report{}</code>.</p>
-    <ul>
-        <li>Recomputes <code>balance_after</code>, trims to official field order, default-fills any null field (0 / "" /
-            False)</li>
-        <li>Sends records in chunks of 50 to Gemini (temperature 0.1) for semantic review</li>
-        <li>Recovers any record the LLM drops (default-filled and re-added) so output count matches the request</li>
-        <li>Passes a chunk through unmodified (and logs an error) if its LLM call fails, rather than crashing the whole
-            run</li>
-    </ul>
-
-    <h3>3.5 Scenario Designer Agent (on-demand)</h3>
-    <p><b>Role:</b> Invents a brand-new scenario's full variable catalog from a plain-English business description, via
-        <code>/scenario/propose</code> + <code>/scenario/confirm</code>.</p>
-    <p><b>Inputs:</b> industryType, domain, businessScenario, optional businessResponse/expectedOutcome, plus feedback
-        history.<br /><b>Outputs:</b> 15–35 variable catalog in the same generator vocabulary the Data Generator Agent
-        already understands.</p>
-    <ul>
-        <li>Normalizes field name synonyms to a canonical glossary (e.g. <code>customer_id</code> →
-            <code>subscriber_id</code>)</li>
-        <li>Force-includes 3 mandatory cross-scenario fields</li>
-        <li>Retries once if too few variables are returned (temperature 0.3)</li>
-        <li>Persists confirmed scenarios into the SQLite store shared across all Cloud Run / Uvicorn worker processes
+        <li>Scenario Designer Agent — generates the variable catalog (runs first, on its own, via
+            <code>/scenario/propose</code>
+            +
+            <code>/scenario/confirm</code>)
         </li>
+
+        <li>Orchestrator Agent — gatekeeper; runs after the variable data exists and checks it</li>
+
+        <li>Schema Agent</li>
+
+        <li>Edge Case Agent</li>
+
+        <li>Data Generation Agent (generation + an internal QA/validation layer)</li>
+
+    </ul>
+
+    <p><b>Not counted as agents</b>
+        (components/layers, not agents):</p>
+
+    <ul>
+
+        <li>WorkflowState (Pydantic object threaded through the pipeline)</li>
+
+        <li>LangGraph <code>StateGraph</code> (core/pipeline.py) — the graph/orchestration engine that runs the agents
+            and routes on <code>state.errors</code>; it does not itself make decisions</li>
+
+        <li>SQLite dynamic-scenario store (drafts / confirmed / feedback tables)</li>
+
+        <li>GeminiClient wrapper (core/llm_client.py)</li>
+
+    </ul>
+
+
+
+    <div class="mermaid">
+
+        flowchart LR
+
+        A0["Scenario Designer<br />Generates variable catalog"] --> A1["Orchestrator<br />Gatekeeper: checks that data"]
+
+        A1 --> A2["Schema Agent<br />Derive + validate
+        executable rules"]
+
+        A2 --> A3["Edge Case Agent<br />Detect + validate edge cases"]
+
+        A3 --> A4["Data Generation Agent<br />Generate, then QA-validate"]
+
+    </div>
+
+    <p><b>Why this order:</b>
+        The Scenario Designer Agent produces the variable data in an earlier, separate request. The Orchestrator only
+        then gatekeeps that already-produced data before any expensive work happens. Each subsequent stage consumes the
+        decisions made by the previous stage, which prevents the generator from inventing its own interpretation of the
+        scenario and gives the Data Generation Agent's QA layer the rules/edge-case context it needs to check whether
+        generated values are actually valid. The arrows within <code>run_pipeline()</code> are LangGraph conditional
+        edges, not a plain Python loop: each one re-checks
+        <code>state.errors</code>
+        before advancing.
+    </p>
+
+
+
+    <h3>Data Generation Agent internal flow</h3>
+
+    <div class="mermaid">
+
+        flowchart TB
+
+        V["Confirmed variable catalog"] --> O["Apply scenario overrides<br />Use confirmed user values"]
+
+        O --> L["Walk variables in declared order"]
+
+        L --> D["Generator dispatch table<br />uniform / lognormal / beta / choices / formula / timestamps"]
+
+        D --> R["Build record incrementally"]
+
+        R --> F["Formula fields read prior values<br />and preserve dependencies"]
+
+        F --> QV["Internal qa_validate node<br />Deterministic checks + optional LLM audit"]
+
+        QV --> OUT["Final validated record"]
+
+    </div>
+
+    <p><b>What the generator does:</b>
+        It reads the effective variable schema, applies scenario-specific overrides, and generates variables in
+        dependency
+        order. Formula fields can use values already produced in the same record. This keeps calculations consistent
+        instead
+        of generating dependent
+        values independently. The same agent then validates its own output before returning
+        <code>state.final_records</code>.
+    </p>
+
+
+
+    <h3>3.1 Scenario Designer Agent</h3>
+
+    <p><b>Role:</b>
+        Generates the variable catalog. Runs first, standalone, before any other agent — it is the source of the
+        variable data every other agent operates on.</p>
+
+    <p><b>Inputs:</b>
+        industryType, domain, businessScenario, optional businessResponse/expectedOutcome, plus feedback
+
+        history.<br /><b>Outputs:</b>
+        15–35 variable catalog in the same generator vocabulary the Data Generation Agent
+
+        already understands.</p>
+
+    <ul>
+
+        <li>Normalizes field name synonyms to a canonical glossary (e.g.
+            <code>customer_id</code>
+            →
+
+            <code>subscriber_id</code>)
+        </li>
+
+        <li>Force-includes 2 mandatory cross-scenario fields</li>
+
+        <li>Retries once if too few variables are returned (temperature 0.3)</li>
+
+        <li>Persists confirmed scenarios into the SQLite store shared across all Cloud Run / Uvicorn worker processes
+
+        </li>
+
     </ul>
 
     <div class="mermaid">
-flowchart TB
-    U["User scenario input"] --> P["POST /scenario/propose<br/>Create variable and edge-case draft"]
-    P --> D["Draft stored in SQLite"]
-    D --> C["POST /scenario/confirm<br/>Add / edit / delete variables and edge cases"]
-    C --> V["Validate effective schema and edge conditions"]
-    V --> S["Confirmed scenario stored"]
-    S --> G["POST /scenario/generate"]
-    G --> PIPE["Generation + validation pipeline"]
-    C -.-> FB["Feedback stored in SQLite"]
-    FB -.-> P
-</div>
-<p><b>Scenario lifecycle:</b> <code>/scenario/propose</code> creates a draft schema. Confirmation is the point where user edits become authoritative, so the effective variable schema and edge-case definitions are validated before storage. Generation then consumes the confirmed scenario instead of silently using an older draft.</p>
+
+        flowchart TB
+
+        U["User scenario input"] --> P["POST /scenario/propose<br />Create variable and edge-case draft"]
+
+        P --> D["Draft stored in SQLite"]
+
+        D --> C["POST /scenario/confirm<br />Add / edit / delete variables and edge cases"]
+
+        C --> V["Validate effective schema and edge conditions"]
+
+        V --> S["Confirmed scenario stored"]
+
+        S --> G["POST /scenario/generate"]
+
+        G --> PIPE["Orchestrator → Schema → Edge Case → Data Generation"]
+
+        C -.-> FB["Feedback stored in SQLite"]
+
+        FB -.-> P
+
+    </div>
+
+    <p><b>Scenario lifecycle:</b>
+        <code>/scenario/propose</code>
+        creates a draft schema. Confirmation is the point where user edits become authoritative, so the effective
+        variable
+        schema and edge-case definitions are validated before storage. Generation then consumes the confirmed scenario
+        instead of silently using an older
+        draft.
+    </p>
+
+
+
+    <h3>3.2 Orchestrator Agent</h3>
+
+    <p><b>Role:</b>
+        Gatekeeper — runs <b>after</b> the Scenario Designer Agent's variable data already exists and is confirmed.
+        Checks that variable data (and the scenario it belongs to) is present and coherent before any of the heavier
+        downstream agents run. Cheap sanity check, not a full workflow/state manager. Internally implemented as its own
+        3-node LangGraph subgraph, so it can short-circuit to <code>END</code> as soon as a decision is reached instead
+        of running every check unconditionally.</p>
+
+    <div class="mermaid">
+
+        flowchart LR
+
+        CE["check_existence<br />(scenario + variable data)"] -->|reject: halt| END1((END))
+
+        CE -->|exists: continue| CC["check_cache"]
+
+        CC -->|cache hit| END2((END))
+
+        CC -->|cache miss| V["validate (Gemini)"]
+
+        V --> END3((END))
+
+    </div>
+
+    <p><b>Inputs:</b>
+        scenario id, requested record count, the confirmed variable catalog.<br /><b>Outputs:</b>
+        Pass/fail decision and execution notes.
+
+        halts the pipeline immediately on failure.</p>
+
+    <ul>
+
+        <li>
+            <code>check_existence</code>
+            — confirms the scenario exists AND that the Scenario Designer Agent actually produced usable variable data
+            (SQLite dynamic store — all scenarios are proposed/confirmed via the API, none are statically configured);
+            rejection routes straight to <code>END</code>
+        </li>
+
+        <li>
+            <code>check_cache</code>
+            — reuses a prior validation decision for the same scenario/industry/country/type combination, skipping the
+            LLM
+            call entirely on a hit
+        </li>
+
+        <li>
+            <code>validate</code>
+            — only reached on a cache miss; asks Gemini (temperature 0.1) to gatekeep the variable data produced by the
+            Scenario Designer Agent against real-world industry/country conventions, then caches the result
+        </li>
+
+        <li>Any rejection appends to
+            <code>state.errors</code>,
+            which stops the outer pipeline graph on the next conditional edge
+        </li>
+
+    </ul>
+
+
+
+    <h3>3.3 Schema Agent</h3>
+
+    <p><b>Role:</b>
+        Derives the business rules and field constraints that generated records must satisfy, then deterministically
+        validates its own output for missing variables, missing rules, and incomplete logic — becomes the
+
+        shared contract used later by the Data Generation Agent's QA layer.</p>
+
+    <p><b>Inputs:</b>
+        scenario metadata + variable definitions.<br /><b>Outputs:</b>
+        <code>business_rules[]</code>,
+
+        <code>field_constraints{}</code>,
+        <code>cross_field_rules[]</code>
+        (temperature 0.1).
+    </p>
+
+    <div class="mermaid">
+
+        flowchart LR
+
+        DS["derive_schema (Gemini)"] --> VS["validate_schema<br />missing variables / missing rules / incomplete logic"]
+
+    </div>
+
+    <ul>
+
+        <li>Summarizes every variable for the LLM</li>
+
+        <li>Produces a complete rules document covering all variables</li>
+
+        <li>Validation layer catches: a <code>depends_on</code> referencing an undefined variable (missing variable), a
+            variable-declared formula with no matching <code>formula_rules</code> entry (missing rule), and an
+            unparseable or undefined-reference formula expression (incomplete logic)</li>
+
+        <li>Stores rules in shared state (<code>state.rules</code>)
+            for the Edge Case Agent and Data Generation Agent's QA layer to consume</li>
+
+    </ul>
+
+
+
+    <h3>3.4 Edge Case Agent</h3>
+
+    <p><b>Role:</b>
+        Detects the edge-case definitions carried on the confirmed scenario and validates them before generation starts,
+        so a bad edge-case definition never reaches the hot generation path.</p>
+
+    <p><b>Inputs:</b>
+        <code>state.edge_case_variables</code>,
+        <code>state.edge_case_percentage</code>,
+        the schema from the Schema Agent.<br /><b>Outputs:</b>
+        pass/fail decision; appends to
+        <code>state.errors</code>
+        on failure.
+    </p>
+
+    <div class="mermaid">
+
+        flowchart LR
+
+        DE["detect_edge_cases"] -->|none configured| END1((END))
+
+        DE -->|edge cases found| VE["validate_edge_cases"]
+
+    </div>
+
+    <ul>
+
+        <li><b>Invalid combinations / impossible scenarios</b>
+            — each edge condition is checked against the effective variable schema (
+            <code>_condition_compatible_with_schema</code>); an unsatisfiable condition halts the pipeline before any
+            records are generated
+        </li>
+
+        <li><b>Incorrect allocations</b>
+            —
+            <code>edgeCasePercentage</code>
+            must be within [0, 1]; a percentage that floors to 0 edge-case units for a small requested count is logged,
+            not treated as an error
+        </li>
+
+    </ul>
+
+
+
+    <h3>3.5 Data Generation Agent</h3>
+
+    <p><b>Role:</b>
+        The actual generation engine — <b>makes zero LLM calls per record</b> — followed by its own internal
+        QA/validation layer.</p>
+
+    <p><b>Inputs:</b>
+        variable catalog (confirmed scenario) + scenario overrides.<br /><b>Outputs:</b>
+
+        <code>final_records[]</code>,
+        <code>validation_report{}</code>.
+    </p>
+
+    <div class="mermaid">
+
+        flowchart LR
+
+        GN["generate<br />Pure Python, no LLM per record"] --> QVL["qa_validate<br />Deterministic + optional LLM
+        audit"]
+
+    </div>
+
+    <ul>
+
+        <li>Resolves each variable via a dispatch table (uniform, lognormal, beta, weighted_choice, formula, timestamp
+
+            helpers, etc.)</li>
+
+        <li>Generates fields in dependency order so later fields can read earlier ones already written (e.g.
+
+            <code>account_id</code>
+            mirrors <code>subscriber_id</code>)
+        </li>
+
+        <li>Sandboxes formula-type fields via
+            <code>eval()</code>
+            with <code>__builtins__</code>
+            disabled
+        </li>
+
+        <li>
+            <code>qa_validate</code>
+            recomputes formula fields, trims to official field order, default-fills any null field (0 / "" / False)
+        </li>
+
+        <li>Sends records in chunks of 50 to Gemini (temperature 0.1) for semantic review when
+            <code>QA_LLM_MODE</code>
+            is enabled
+        </li>
+
+        <li>Passes a chunk through unmodified (and logs an error) if its LLM call fails, rather than crashing the whole
+
+            run</li>
+
+    </ul>
+
+
+
 
     <h2>4. Validation Approach (actual — no separate "Progressive Validation Gates")</h2>
-    <p>The current codebase does <b>not</b> implement separate named validation gate components. Validation is folded
-        into two places:</p>
+
+    <p>The current codebase does
+        <b>not</b>
+        implement separate named validation gate components. Validation is folded
+
+        into two places:
+    </p>
+
     <ul>
-        <li><b>Design-time validation</b> → Rules Agent (derives constraints before generation)</li>
-        <li><b>Post-generation validation</b> → QA Agent (algorithmic checks + LLM semantic audit, in chunks of 50)</li>
+
+        <li><b>Design-time validation</b>
+            → Schema Agent (derives + validates constraints before generation) and Edge Case Agent (validates edge-case
+            definitions before generation)</li>
+
+        <li><b>Post-generation validation</b>
+            → Data Generation Agent's internal QA layer (algorithmic checks + optional LLM semantic audit, in chunks of
+            50)</li>
+
     </ul>
-    <!-- <div class="note">There is no explicit "Schema Validation Gate" / "Edge Case Validation Gate" / "Final Dataset QA & Validation Gate" separation, and no automatic re-loop back to an earlier agent on failure.</div> -->
+
+    <!-- <div class="note">There is no explicit "Schema Validation Gate" / "Edge Case Validation Gate" / "Final Dataset QA & Validation Gate" separation, and no automatic re-loop back to an earlier agent on failure.</div>
+-->
+
+
 
     <h2>5. Deterministic + AI Validation (actual split)</h2>
+
     <table>
+
         <tr>
-            <th>Deterministic (QA Agent, algorithmic layer, free)</th>
-            <th>AI / LLM (QA Agent, semantic layer, chunks of 50, temp 0.1)</th>
+
+            <th>Deterministic (Data Generation Agent's qa_validate node, algorithmic layer, free)</th>
+
+            <th>AI / LLM (Data Generation Agent's qa_validate node, semantic layer, chunks of 50, temp 0.1)</th>
+
         </tr>
+
         <tr>
+
             <td>balance_after == balance_before + recharge_amount (recomputed)</td>
+
             <td>Timestamp ordering plausibility</td>
+
         </tr>
+
         <tr>
+
             <td>Trim record to declared field_order</td>
+
             <td>Required-field presence beyond simple null checks</td>
+
         </tr>
+
         <tr>
+
             <td>Null-field defaulting (0 / "" / False)</td>
-            <td>General business-rule consistency vs. Rules Agent output</td>
+
+            <td>General business-rule consistency vs. Schema Agent output</td>
+
         </tr>
+
     </table>
 
+
+
     <h2>6. Orchestration State Management</h2>
-    <p>Instead of a Firestore-backed <code>GenerationState</code>, the real implementation uses a single in-memory
-        Pydantic model (<code>core/state.py</code>) passed by reference through each agent call:</p>
+
+    <p>Instead of a Firestore-backed
+        <code>GenerationState</code>,
+        the real implementation uses a single in-memory
+
+        Pydantic model (<code>core/state.py</code>)
+        passed by reference through each agent call:
+    </p>
+
     <pre>WorkflowState
+
 ├── scenario            (e.g. "LB-01")
+
 ├── count                (records requested)
+
 ├── batch_size           (QA chunk size, default 50)
-├── rules                (populated by Rules Agent)
-├── raw_records          (populated by Data Generator Agent)
-├── final_records        (populated by QA Agent)
-├── validation_report    (populated by QA Agent)
+
+├── rules                (populated by Schema Agent)
+
+├── raw_records          (populated by Data Generation Agent's generate node)
+
+├── final_records        (populated by Data Generation Agent's qa_validate node)
+
+├── validation_report    (populated by Data Generation Agent's qa_validate node)
+
 ├── errors               (any agent can append; halts the pipeline)
-└── field_order          (populated by Data Generator Agent)</pre>
-    <p><b>Persistence model (actual):</b> SQLite (WAL mode) — <code>data/dynamic_scenarios.db</code> (drafts / confirmed
+
+└── field_order          (populated by Data Generation Agent's generate node)</pre>
+
+    <p><b>Persistence model (actual):</b>
+        SQLite (WAL mode) — <code>data/dynamic_scenarios.db</code>
+        (drafts / confirmed
+
         / feedback tables). There is no Firestore, BigQuery, or Cloud Storage integration. WorkflowState itself is not
+
         persisted between runs.</p>
 
+
+
     <h2>7. Agent Routing Logic and Error Recovery (actual)</h2>
+
     <div class="mermaid">
-flowchart TB
-    START["Pipeline starts"] --> O["Pipeline validation service<br/>Reject incoherent scenario early"]
-    O -->|reject| STOP["Return structured error"]
-    O -->|accept| R["Rules Agent<br/>Build constraints"]
-    R --> G["Generator<br/>Generate records"]
-    G --> E["Edge-case solver<br/>Construct records when random data is insufficient"]
-    E --> Q["QA Agent<br/>Re-evaluate complete records"]
-    Q -->|valid| F["Return final records"]
-    Q -->|invalid| ERR["Return validation error<br/>without falsely marking the record valid"]
-</div>
-<p><b>Error handling:</b> Failures are stopped at the stage that can explain them. Edge-case generation is not a variable-specific bypass: the solver constructs candidates from the declared condition, then the complete condition is evaluated again. QA is the final authority for whether an edge-case flag is truthful.</p>
+
+        flowchart TB
+
+        START["Variables already generated<br />(Scenario Designer Agent)"] --> O["Orchestrator<br />Gatekeeper: reject
+        incoherent variable data early"]
+
+        O -->|reject| STOP["Return structured error"]
+
+        O -->|accept| R["Schema Agent<br />Build + validate constraints"]
+
+        R --> EC["Edge Case Agent<br />Validate edge-case definitions"]
+
+        EC --> G["Data Generation Agent: generate<br />Generate records"]
+
+        G --> E["Edge-case solver<br />Construct records when random data is insufficient"]
+
+        E --> Q["Data Generation Agent: qa_validate<br />Re-evaluate complete records"]
+
+        Q -->|valid| F["Return final records"]
+
+        Q -->|invalid| ERR["Return validation error<br />without falsely marking the record valid"]
+
+    </div>
+
+    <p><b>Error handling:</b>
+        Failures are stopped at the stage that can explain them. Edge-case generation is not a variable-specific bypass:
+        the
+        solver constructs candidates from the declared condition, then the complete condition is evaluated again. The
+        qa_validate node is the
+        final authority for whether
+        an edge-case flag is truthful.</p>
+
     <ul>
-        <li>Pipeline validation rejection → generation stages do not run</li>
-        <li>QA per-chunk LLM failure → chunk is logged as an error and passed through as-is, not retried or routed back
+
+        <li>Orchestrator rejection → pipeline stops immediately, no downstream agents run</li>
+
+        <li>qa_validate per-chunk LLM failure → chunk is logged as an error and passed through as-is, not retried or
+            routed back
+
         </li>
-        <li>No root-cause-classified routing back to Rules/Data Generator Agent on QA failure exists today</li>
+
+        <li>No root-cause-classified routing back to Schema/Data Generation Agent on qa_validate failure exists today
+        </li>
+
     </ul>
+
+
 
     <h2>8. Deployment Topology (actual — GCP)</h2>
+
     <div class="mermaid">
-flowchart LR
-    GH["GitHub push"] --> CI["CI workflow<br/>Build and test"]
-    CI --> AR["Artifact Registry<br/>Store container image"]
-    AR --> CR["Cloud Run<br/>Run FastAPI service"]
-    SM["Secret Manager<br/>Gemini API key"] --> CR
-    CR --> API["API consumers"]
-</div>
-<p><b>Deployment action:</b> A source change is built into a container image, stored in Artifact Registry, and deployed to Cloud Run. The Gemini credential is injected through Secret Manager rather than committed to source code. API consumers then call the deployed FastAPI service.</p>
+
+        flowchart LR
+
+        GH["GitHub push"] --> CI["CI workflow<br />Build and test"]
+
+        CI --> AR["Artifact Registry<br />Store container image"]
+
+        AR --> CR["Cloud Run<br />Run FastAPI service"]
+
+        SM["Secret Manager<br />Gemini API key"] --> CR
+
+        CR --> API["API consumers"]
+
+    </div>
+
+    <p><b>Deployment action:</b>
+        A source change is built into a container image, stored in Artifact Registry, and deployed to Cloud Run. The
+        Gemini
+        credential is injected through Secret Manager rather than committed to source code. API consumers then call the
+        deployed FastAPI service.</p>
+
     <ul>
-        <li>Container listens on <code>$PORT</code> (Cloud Run convention, default 8080)</li>
+
+        <li>Container listens on
+            <code>$PORT</code>
+            (Cloud Run convention, default 8080)
+        </li>
+
         <li>Gemini key injected from Secret Manager at deploy time — never baked into the image or committed</li>
-        <li><b>Known limitation:</b> Cloud Run's filesystem is ephemeral and not shared across instances — the SQLite
+
+        <li><b>Known limitation:</b>
+            Cloud Run's filesystem is ephemeral and not shared across instances — the SQLite
+
             dynamic-scenario store does not persist reliably across revisions/scale-out there</li>
+
     </ul>
+
+
 
     <h2>9. Final Architecture Principles (actual, current implementation)</h2>
+
     <ul>
-        <li>Direct client input flow: HTTP API request feeds into <code>run_generation_pipeline()</code> — no separate
-            Domain Knowledge Layer</li>
-        <li>Generation does not wait on QA approval — generation and validation are sequential stages, not a gated loop
+
+        <li>Direct client input flow: API request feeds straight into
+            <code>run_pipeline()</code>
+            — no separate
+
+            Domain Knowledge Layer
         </li>
+
+        <li>Generation does not wait on QA approval — generation and validation are sequential stages, not a gated loop
+
+        </li>
+
         <li>Deterministic generation, hybrid validation</li>
+
         <li>No contract objects / versioning — WorkflowState is the only hand-off object, valid for one run</li>
+
         <li>No forward/reverse traceability implementation exists today</li>
+
         <li>Reproducibility is partial — no random seed capture or generation manifest is persisted</li>
+
     </ul>
 
+
+
     <h2>10. Final End-to-End Flow (actual)</h2>
+
     <div class="mermaid">
-flowchart TB
-    C["Client request"] --> O["Pipeline validation service<br/>Check scenario"]
-    O -->|reject| Z["Stop with error"]
-    O -->|accept| R["Rules Agent<br/>Derive rules"]
-    R --> G["Data Generator<br/>Generate records"]
-    G --> Q["QA Agent<br/>Deterministic checks + LLM audit"]
-    Q --> F["Final records + validation report"]
-    F --> H["API JSON response"]
-</div>
-<p><b>End-to-end result:</b> The client receives generated data only after the scenario has passed pipeline validation, rules have been derived, records have been generated, and QA has evaluated them. The frontend can then display the JSON response or export it to CSV.</p>
+
+        flowchart TB
+
+        SD["Scenario Designer Agent<br />Generates variable catalog (earlier request)"] --> C["Client request:
+        /scenario/generate"]
+
+        C --> O["Orchestrator<br />Gatekeeper: check variable data"]
+
+        O -->|reject| Z["Stop with error"]
+
+        O -->|accept| R["Schema Agent<br />Derive + validate rules"]
+
+        R --> EC["Edge Case Agent<br />Validate edge-case definitions"]
+
+        EC --> G["Data Generation Agent: generate<br />Generate records"]
+
+        G --> Q["Data Generation Agent: qa_validate<br />Deterministic checks + LLM audit"]
+
+        Q --> F["Final records + validation report"]
+
+        F --> H["API JSON response"]
+
+    </div>
+
+    <p><b>End-to-end result:</b>
+        The client receives generated data only after the scenario has passed orchestration, rules have been derived,
+        records have been generated, and QA has evaluated them. The frontend can then display the JSON response or
+        export it
+        to CSV.</p>
+
+
+
 
 
     <h2>11. API Reference (server.py)</h2>
-<div class="note api-order-note"><b>API order:</b> <code>POST /scenario/propose</code> → <code>POST /scenario/import-csv</code> → <code>POST /scenario/confirm</code> → <code>POST /scenario/generate</code>. There is no backend <code>/scenario/download-csv</code>; CSV export is handled by the frontend.</div>
 
-    <p>All request/response fields below are taken directly from the Pydantic models in <code>server.py</code>.
+    <div class="note api-order-note"><b>API order:</b>
+        <code>POST /scenario/propose</code>
+        → <code>POST /scenario/import-csv</code>
+        → <code>POST /scenario/confirm</code>
+        → <code>POST /scenario/generate</code>.
+    </div>
+
+
+
+    <p>All request/response fields below are taken directly from the Pydantic models in
+        <code>server.py</code>.
+
         "Required" means the field has no default (must be supplied); everything else is optional and falls back to its
-        default (often <code>null</code> / empty list) if omitted or sent as
-        blank/<code>"string"</code>/<code>null</code> placeholder text.</p>
 
-    
-    <p><b>Purpose:</b> Liveness check.</p>
+        default (often <code>null</code>
+        / empty list) if omitted or sent as
+
+        blank/<code>"string"</code>/<code>null</code>
+        placeholder text.
+    </p>
+
+
+
+    <h3>GET /</h3>
+
+    <p><b>Purpose:</b>
+        Liveness check.</p>
+
     <table>
+
         <tr>
+
             <th>Response field</th>
+
             <th>Type</th>
+
             <th>Description</th>
+
         </tr>
+
         <tr>
+
             <td>status</td>
+
             <td>string</td>
-            <td>Always <code>"ok"</code></td>
+
+            <td>Always
+                <code>"ok"</code>
+            </td>
+
         </tr>
+
     </table>
+
+
 
     <h3>GET /health</h3>
-    <p><b>Purpose:</b> Health check (identical shape to <code>/</code>).</p>
+
+    <p><b>Purpose:</b>
+        Health check (identical shape to <code>/</code>).</p>
+
     <table>
+
         <tr>
+
             <th>Response field</th>
+
             <th>Type</th>
+
             <th>Description</th>
+
         </tr>
+
         <tr>
+
             <td>status</td>
+
             <td>string</td>
-            <td>Always <code>"ok"</code></td>
+
+            <td>Always
+                <code>"ok"</code>
+            </td>
+
         </tr>
+
     </table>
+
+
 
     <h3>POST /scenario/propose — API 1</h3>
-    <p><b>Purpose:</b> Ask the Scenario Designer agent (LLM) to invent a brand-new scenario's variable catalog from a
+
+    <p><b>Purpose:</b>
+        Ask the Scenario Designer agent (LLM) to invent a brand-new scenario's variable catalog from a
+
         plain-English business description. Produces a draft that must be reviewed/finalized via
-        <code>/scenario/confirm</code>.</p>
-    <p><b>Request body</b> (<code>ProposeRequest</code>):</p>
+
+        <code>/scenario/confirm</code>.
+    </p>
+
+    <p><b>Request body</b>
+        (<code>ProposeRequest</code>):</p>
+
     <table>
+
         <tr>
+
             <th>Field</th>
+
             <th>Type</th>
+
             <th>Required</th>
+
             <th>Description</th>
+
         </tr>
+
         <tr>
+
             <td>scenarioId</td>
+
             <td>string</td>
+
             <td>Yes</td>
-            <td>Preferred scenario id label, e.g. <code>LB-04</code> (not reserved yet — collisions resolved at confirm
-                time)</td>
+
+            <td>Preferred scenario id label, e.g.
+                <code>LB-04</code>
+                (not reserved yet — collisions resolved at confirm
+
+                time)
+            </td>
+
         </tr>
+
         <tr>
+
             <td>scenarioType</td>
+
             <td>string</td>
+
             <td>Yes</td>
-            <td>e.g. <code>Normal</code>, <code>No Response</code>, <code>Customer Declines</code></td>
+
+            <td>e.g.
+                <code>Normal</code>,
+                <code>No Response</code>,
+                <code>Customer Declines</code>
+            </td>
+
         </tr>
+
         <tr>
+
             <td>industryType</td>
+
             <td>string</td>
+
             <td>Yes</td>
-            <td>e.g. <code>Telecom</code></td>
+
+            <td>e.g.
+                <code>Telecom</code>
+            </td>
+
         </tr>
+
         <tr>
+
             <td>domain</td>
+
             <td>string</td>
+
             <td>Yes</td>
-            <td>e.g. <code>Low Balance &amp; Top-up</code></td>
+
+            <td>e.g.
+                <code>Low Balance
+&amp; Top-up</code>
+            </td>
+
         </tr>
+
         <tr>
+
             <td>businessScenario</td>
+
             <td>string</td>
+
             <td>Yes</td>
+
             <td>Plain-English description of the trigger scenario</td>
+
         </tr>
+
         <tr>
+
             <td>businessResponse</td>
+
             <td>string</td>
+
             <td>No</td>
-            <td>Expected business reaction to the scenario (default <code>null</code>)</td>
+
+            <td>Expected business reaction to the scenario (default
+                <code>null</code>)
+            </td>
+
         </tr>
+
         <tr>
+
             <td>expectedOutcome</td>
+
             <td>string</td>
+
             <td>No</td>
-            <td>Expected end state (default <code>null</code>)</td>
+
+            <td>Expected end state (default
+                <code>null</code>)
+            </td>
+
         </tr>
+
         <tr>
+
             <td>country</td>
+
             <td>string</td>
+
             <td>No</td>
-            <td>ISO 3166-1 alpha-2 code; omit for generic/global conventions (default <code>null</code>)</td>
+
+            <td>ISO 3166-1 alpha-2 code; omit for generic/global conventions (default
+                <code>null</code>)
+            </td>
+
         </tr>
+
         <tr>
+
             <td>useCase</td>
+
             <td>string</td>
+
             <td>No</td>
-            <td>Sharper context than domain alone (default <code>null</code>)</td>
+
+            <td>Sharper context than domain alone (default
+                <code>null</code>)
+            </td>
+
         </tr>
+
         <tr>
+
             <td>typeOfData</td>
-            <td><code>"transactional"</code> | <code>"aggregational"</code></td>
+
+            <td><code>"transactional"</code>
+                | <code>"aggregational"</code></td>
+
             <td>Yes</td>
+
             <td>Output data grain</td>
+
         </tr>
+
     </table>
-    <p><b>Response body</b> (<code>ProposeResponse</code>):</p>
+
+    <p><b>Response body</b>
+        (<code>ProposeResponse</code>):</p>
+
     <table>
+
         <tr>
+
             <th>Field</th>
+
             <th>Type</th>
+
             <th>Description</th>
+
         </tr>
+
         <tr>
+
             <td>draft_id</td>
+
             <td>string</td>
-            <td>Unique handle for this draft; pass to <code>/scenario/confirm</code></td>
+
+            <td>Unique handle for this draft; pass to
+                <code>/scenario/confirm</code>
+            </td>
+
         </tr>
+
         <tr>
+
             <td>scenario_id</td>
+
             <td>string</td>
-            <td>Echo of requested <code>scenarioId</code></td>
+
+            <td>Echo of requested
+                <code>scenarioId</code>
+            </td>
+
         </tr>
+
         <tr>
+
             <td>scenario_id_available</td>
+
             <td>bool</td>
-            <td><code>false</code> if that scenarioId is already confirmed under a different draft</td>
+
+            <td><code>false</code>
+                if that scenarioId is already confirmed under a different draft</td>
+
         </tr>
+
         <tr>
+
             <td>label</td>
+
             <td>string</td>
+
             <td>Human-readable scenario label</td>
+
         </tr>
+
         <tr>
+
             <td>journey</td>
+
             <td>string</td>
+
             <td>Journey/domain name</td>
+
         </tr>
+
         <tr>
+
             <td>description</td>
+
             <td>string</td>
+
             <td>Generated scenario description</td>
+
         </tr>
+
         <tr>
+
             <td>variables</td>
+
             <td>list[object]</td>
+
             <td>Proposed variable catalog (15–35 vars)</td>
+
         </tr>
+
         <tr>
+
             <td>field_order</td>
+
             <td>list[string]</td>
+
             <td>Ordered variable names</td>
+
         </tr>
+
         <tr>
+
             <td>typeOfData</td>
-            <td><code>"transactional"</code> | <code>"aggregational"</code></td>
+
+            <td><code>"transactional"</code>
+                | <code>"aggregational"</code></td>
+
             <td>Echo of request</td>
+
         </tr>
+
         <tr>
+
             <td>events</td>
+
             <td>list[object]</td>
+
             <td>Transactional event definitions (empty for aggregational)</td>
+
         </tr>
+
     </table>
+
+
 
     <h3>POST /scenario/import-csv</h3>
-    <p><b>Purpose:</b> Alternative to API 1 — load an industry-supplied CSV variable catalog directly instead of having
-        the LLM invent one. Produces a draft in the same shape as <code>/scenario/propose</code>, so it still goes
-        through <code>/scenario/confirm</code>. Multipart form data, not JSON.</p>
-    <p><b>Request body</b> (multipart form fields):</p>
+
+    <p><b>Purpose:</b>
+        Alternative to API 1 — load an industry-supplied CSV variable catalog directly instead of having
+
+        the LLM invent one. Produces a draft in the same shape as
+        <code>/scenario/propose</code>,
+        so it still goes
+
+        through <code>/scenario/confirm</code>.
+        Multipart form data, not JSON.
+    </p>
+
+    <p><b>Request body</b>
+        (multipart form fields):</p>
+
     <table>
+
         <tr>
+
             <th>Field</th>
+
             <th>Type</th>
+
             <th>Required</th>
+
             <th>Description</th>
+
         </tr>
+
         <tr>
+
             <td>file</td>
+
             <td>file (CSV)</td>
+
             <td>Yes</td>
+
             <td>Columns: name, dtype, gen, params, description, depends_on, nullable, formula</td>
+
         </tr>
+
         <tr>
+
             <td>scenarioId</td>
+
             <td>string</td>
+
             <td>Yes</td>
+
             <td>Preferred scenario id label</td>
+
         </tr>
+
         <tr>
+
             <td>domain</td>
+
             <td>string</td>
+
             <td>Yes</td>
+
             <td>Domain name</td>
+
         </tr>
+
         <tr>
+
             <td>industryType</td>
+
             <td>string</td>
+
             <td>No</td>
-            <td>Default <code>"generic"</code></td>
+
+            <td>Default
+                <code>"generic"</code>
+            </td>
+
         </tr>
+
         <tr>
+
             <td>country</td>
+
             <td>string</td>
+
             <td>No</td>
-            <td>Default <code>null</code></td>
+
+            <td>Default
+                <code>null</code>
+            </td>
+
         </tr>
+
         <tr>
+
             <td>businessScenario</td>
+
             <td>string</td>
+
             <td>No</td>
-            <td>Default <code>""</code></td>
+
+            <td>Default
+                <code>""</code>
+            </td>
+
         </tr>
+
         <tr>
+
             <td>scenarioType</td>
+
             <td>string</td>
+
             <td>No</td>
-            <td>Default <code>""</code></td>
+
+            <td>Default
+                <code>""</code>
+            </td>
+
         </tr>
+
         <tr>
+
             <td>label</td>
+
             <td>string</td>
+
             <td>No</td>
-            <td>Default <code>""</code> (falls back to scenarioId)</td>
+
+            <td>Default
+                <code>""</code>
+                (falls back to scenarioId)
+            </td>
+
         </tr>
+
     </table>
-    <p><b>Response body:</b> same shape as <code>ProposeResponse</code> above (<code>typeOfData</code> is always
-        <code>"aggregational"</code> for CSV imports).</p>
+
+    <p><b>Response body:</b>
+        same shape as <code>ProposeResponse</code>
+        above (<code>typeOfData</code>
+        is always
+
+        <code>"aggregational"</code>
+        for CSV imports).
+    </p>
+
+
 
     <h3>POST /scenario/confirm — API 2</h3>
-    <p><b>Purpose:</b> Apply user add/edit/delete changes (and optional feedback) to a draft, then finalize it into a
+
+    <p><b>Purpose:</b>
+        Apply user add/edit/delete changes (and optional feedback) to a draft, then finalize it into a
+
         usable scenario stored in SQLite.</p>
-    <p><b>Request body</b> (<code>ConfirmRequest</code>):</p>
+
+    <p><b>Request body</b>
+        (<code>ConfirmRequest</code>):</p>
+
     <table>
+
         <tr>
+
             <th>Field</th>
+
             <th>Type</th>
+
             <th>Required</th>
+
             <th>Description</th>
+
         </tr>
+
         <tr>
+
             <td>draft_id</td>
+
             <td>string</td>
+
             <td>Yes</td>
+
             <td>Draft handle returned by propose/import-csv</td>
+
         </tr>
+
         <tr>
+
             <td>add</td>
+
             <td>list[object]</td>
+
             <td>No</td>
-            <td>New variable definitions to add (default empty list); each needs a <code>name</code> key</td>
+
+            <td>New variable definitions to add (default empty list); each needs a
+                <code>name</code>
+                key
+            </td>
+
         </tr>
+
         <tr>
+
             <td>edit</td>
-            <td>list[<code>{name, changes}</code>]</td>
+
+            <td>list[<code>{name,
+changes}</code>]</td>
+
             <td>No</td>
+
             <td>Existing variables to edit by name (default empty list)</td>
+
         </tr>
+
         <tr>
+
             <td>delete</td>
+
             <td>list[string]</td>
+
             <td>No</td>
+
             <td>Variable names to delete (default empty list)</td>
+
         </tr>
+
         <tr>
+
             <td>eventAdd</td>
+
             <td>list[object]</td>
+
             <td>No</td>
+
             <td>Transactional events to add — transactional scenarios only (default empty list)</td>
+
         </tr>
+
         <tr>
+
             <td>eventEdit</td>
-            <td>list[<code>{event_type, changes}</code>]</td>
+
+            <td>list[<code>{event_type,
+changes}</code>]</td>
+
             <td>No</td>
+
             <td>Transactional events to edit by event_type (default empty list)</td>
+
         </tr>
+
         <tr>
+
             <td>eventDelete</td>
+
             <td>list[string]</td>
+
             <td>No</td>
+
             <td>Transactional event_type values to delete (default empty list)</td>
+
         </tr>
+
         <tr>
+
             <td>feedback</td>
+
             <td>string</td>
+
             <td>No</td>
-            <td>Free-text feedback saved for future proposals (default <code>null</code>)</td>
+
+            <td>Free-text feedback saved for future proposals (default
+                <code>null</code>)
+            </td>
+
         </tr>
+
     </table>
-    <p class="note">Blank/<code>"string"</code>/<code>null</code> placeholder values in any of the above (except
-        <code>draft_id</code>) are treated as "no value" and skipped rather than applied literally.</p>
-    <p><b>Response body</b> (<code>ConfirmResponse</code>):</p>
+
+    <p class="note">Blank/<code>"string"</code>/<code>null</code>
+        placeholder values in any of the above (except
+
+        <code>draft_id</code>)
+        are treated as "no value" and skipped rather than applied literally.
+    </p>
+
+    <p><b>Response body</b>
+        (<code>ConfirmResponse</code>):</p>
+
     <table>
+
         <tr>
+
             <th>Field</th>
+
             <th>Type</th>
+
             <th>Description</th>
+
         </tr>
+
         <tr>
+
             <td>scenario_id</td>
+
             <td>string</td>
+
             <td>Final confirmed scenario id (may differ from requested if reassigned)</td>
+
         </tr>
+
         <tr>
+
             <td>requested_scenario_id</td>
+
             <td>string</td>
+
             <td>The scenarioId originally requested at propose time</td>
+
         </tr>
+
         <tr>
+
             <td>scenario_id_reassigned</td>
+
             <td>bool</td>
-            <td><code>true</code> if scenario_id was reassigned due to a collision</td>
+
+            <td><code>true</code>
+                if scenario_id was reassigned due to a collision</td>
+
         </tr>
+
         <tr>
+
             <td>draft_id</td>
+
             <td>string</td>
+
             <td>Echo of request draft_id</td>
+
         </tr>
+
         <tr>
+
             <td>label</td>
+
             <td>string</td>
+
             <td>Final scenario label</td>
+
         </tr>
+
         <tr>
+
             <td>journey</td>
+
             <td>string</td>
+
             <td>Journey/domain name</td>
+
         </tr>
+
         <tr>
+
             <td>description</td>
+
             <td>string</td>
+
             <td>Final scenario description</td>
+
         </tr>
+
         <tr>
+
             <td>variables</td>
+
             <td>list[object]</td>
+
             <td>Final variable catalog after add/edit/delete</td>
+
         </tr>
+
         <tr>
+
             <td>field_order</td>
+
             <td>list[string]</td>
+
             <td>Ordered variable names</td>
+
         </tr>
+
         <tr>
+
             <td>typeOfData</td>
-            <td><code>"transactional"</code> | <code>"aggregational"</code></td>
+
+            <td><code>"transactional"</code>
+                | <code>"aggregational"</code></td>
+
             <td>Data grain</td>
+
         </tr>
+
         <tr>
+
             <td>events</td>
+
             <td>list[object]</td>
+
             <td>Final event definitions after eventAdd/eventEdit/eventDelete</td>
+
         </tr>
+
     </table>
+
+
 
     <h3>POST /scenario/generate — API 4</h3>
-    <p><b>Purpose:</b> Run the generation pipeline (Rules → Generator → QA) after pipeline-level scenario validation for a confirmed scenario and
+
+    <p><b>Purpose:</b>
+        Run the pipeline (Orchestrator → Schema → Edge Case → Data Generation) for a confirmed scenario and
+
         return generated records.</p>
-    <p><b>Request body</b> (<code>GenerateRequest</code>):</p>
+
+    <p><b>Request body</b>
+        (<code>GenerateRequest</code>):</p>
+
     <table>
+
         <tr>
+
             <th>Field</th>
+
             <th>Type</th>
+
             <th>Required</th>
+
             <th>Description</th>
+
         </tr>
+
         <tr>
+
             <td>scenario</td>
+
             <td>string</td>
+
             <td>No*</td>
-            <td>Confirmed scenario id, e.g. <code>LB-01</code> (default <code>null</code>)</td>
+
+            <td>Confirmed scenario id, e.g.
+                <code>LB-01</code>
+                (default <code>null</code>)
+            </td>
+
         </tr>
+
         <tr>
+
             <td>draftId</td>
+
             <td>string</td>
+
             <td>No*</td>
-            <td>Confirmed draft id; disambiguates when scenarioId collided across users (default <code>null</code>)</td>
+
+            <td>Confirmed draft id; disambiguates when scenarioId collided across users (default
+                <code>null</code>)
+            </td>
+
         </tr>
+
         <tr>
+
             <td>count</td>
+
             <td>integer</td>
+
             <td>No</td>
+
             <td>Number of records to generate, 1–5000 (default 20)</td>
+
         </tr>
-    </table>
-    <p class="note">*Either <code>scenario</code> or <code>draftId</code> must be supplied (enforced at runtime, not by
-        the schema) — a 400 is returned if both are missing.</p>
-    <p><b>Response body</b> (<code>GenerateResponse</code>):</p>
-    <table>
-        <tr>
-            <th>Field</th>
-            <th>Type</th>
-            <th>Description</th>
-        </tr>
-        <tr>
-            <td>scenario_id</td>
-            <td>string</td>
-            <td>Resolved scenario id used for generation</td>
-        </tr>
-        <tr>
-            <td>typeOfData</td>
-            <td><code>"transactional"</code> | <code>"aggregational"</code></td>
-            <td>Data grain</td>
-        </tr>
-        <tr>
-            <td>events</td>
-            <td>list[object]</td>
-            <td>Scenario's event definitions</td>
-        </tr>
-        <tr>
-            <td>requested_scenario_id</td>
-            <td>string</td>
-            <td>Originally requested scenarioId at propose time, if different from scenario_id</td>
-        </tr>
-        <tr>
-            <td>draft_id</td>
-            <td>string</td>
-            <td>Echo of request draftId, if supplied</td>
-        </tr>
-        <tr>
-            <td>scenario_label</td>
-            <td>string</td>
-            <td>Human-readable scenario label</td>
-        </tr>
-        <tr>
-            <td>fields</td>
-            <td>list[string]</td>
-            <td>Ordered field names</td>
-        </tr>
-        <tr>
-            <td>total_records</td>
-            <td>integer</td>
-            <td>Total number of generated records</td>
-        </tr>
-        <tr>
-            <td>validation_report</td>
-            <td>object</td>
-            <td>QA agent's validation summary</td>
-        </tr>
-        <tr>
-            <td>records</td>
-            <td>list[object]</td>
-            <td>Generated data — flat records for aggregational, entities grouped by <code>entityKey</code> (each with
-                nested <code>events</code>) for transactional, latest 10 entities/events only</td>
-        </tr>
-        <tr>
-            <td>entityKey</td>
-            <td>string</td>
-            <td>Field used to group transactional records by business entity (<code>null</code> for aggregational)</td>
-        </tr>
-        <tr>
-            <td>totalCount</td>
-            <td>integer</td>
-            <td>Total unique entities (transactional) or records (aggregational)</td>
-        </tr>
-        <tr>
-            <td>eventData</td>
-            <td>list[object]</td>
-            <td>Deprecated/always empty; kept for backward compatibility</td>
-        </tr>
-        <tr>
-            <td>errors</td>
-            <td>list[string]</td>
-            <td>Any pipeline errors/warnings encountered</td>
-        </tr>
+
     </table>
 
+    <p class="note">*Either
+        <code>scenario</code>
+        or <code>draftId</code>
+        must be supplied (enforced at runtime, not by
+
+        the schema) — a 400 is returned if both are missing.
+    </p>
+
+    <p><b>Response body</b>
+        (<code>GenerateResponse</code>):</p>
+
+    <table>
+
+        <tr>
+
+            <th>Field</th>
+
+            <th>Type</th>
+
+            <th>Description</th>
+
+        </tr>
+
+        <tr>
+
+            <td>scenario_id</td>
+
+            <td>string</td>
+
+            <td>Resolved scenario id used for generation</td>
+
+        </tr>
+
+        <tr>
+
+            <td>typeOfData</td>
+
+            <td><code>"transactional"</code>
+                | <code>"aggregational"</code></td>
+
+            <td>Data grain</td>
+
+        </tr>
+
+        <tr>
+
+            <td>events</td>
+
+            <td>list[object]</td>
+
+            <td>Scenario's event definitions</td>
+
+        </tr>
+
+        <tr>
+
+            <td>requested_scenario_id</td>
+
+            <td>string</td>
+
+            <td>Originally requested scenarioId at propose time, if different from scenario_id</td>
+
+        </tr>
+
+        <tr>
+
+            <td>draft_id</td>
+
+            <td>string</td>
+
+            <td>Echo of request draftId, if supplied</td>
+
+        </tr>
+
+        <tr>
+
+            <td>scenario_label</td>
+
+            <td>string</td>
+
+            <td>Human-readable scenario label</td>
+
+        </tr>
+
+        <tr>
+
+            <td>fields</td>
+
+            <td>list[string]</td>
+
+            <td>Ordered field names</td>
+
+        </tr>
+
+        <tr>
+
+            <td>total_records</td>
+
+            <td>integer</td>
+
+            <td>Total number of generated records</td>
+
+        </tr>
+
+        <tr>
+
+            <td>validation_report</td>
+
+            <td>object</td>
+
+            <td>Data Generation Agent's qa_validate summary</td>
+
+        </tr>
+
+        <tr>
+
+            <td>records</td>
+
+            <td>list[object]</td>
+
+            <td>Generated data — flat records for aggregational, entities grouped by
+                <code>entityKey</code>
+                (each with
+
+                nested <code>events</code>)
+                for transactional, latest 10 entities/events only
+            </td>
+
+        </tr>
+
+        <tr>
+
+            <td>entityKey</td>
+
+            <td>string</td>
+
+            <td>Field used to group transactional records by business entity (<code>null</code>
+                for aggregational)</td>
+
+        </tr>
+
+        <tr>
+
+            <td>totalCount</td>
+
+            <td>integer</td>
+
+            <td>Total unique entities (transactional) or records (aggregational)</td>
+
+        </tr>
+
+        <tr>
+
+            <td>eventData</td>
+
+            <td>list[object]</td>
+
+            <td>Deprecated/always empty; kept for backward compatibility</td>
+
+        </tr>
+
+        <tr>
+
+            <td>errors</td>
+
+            <td>list[string]</td>
+
+            <td>Any pipeline errors/warnings encountered</td>
+
+        </tr>
+
+    </table>
+
+
+
     <script>
-        mermaid.initialize({ startOnLoad: true, theme: "default", flowchart: { htmlLabels: true, curve: "basis" } });
+
+        mermaid.initialize({
+            startOnLoad:
+                true,
+            theme:
+                "default",
+            flowchart: {
+                htmlLabels:
+                    true,
+                curve:
+                    "basis"
+            }
+        });
+
     </script>
 
 
+
+
+
     <h2>12. Edge-Case Data Model and Validation</h2>
-<p>Edge cases are first-class scenario definitions and are handled generically across industries and data types.</p>
-<table><tr><th>Field</th><th>Purpose</th></tr><tr><td><code>edgeCaseVariables</code></td><td>Variables and constraints defining an edge condition; it can be empty when no edge case is configured.</td></tr><tr><td><code>edgeCasePercentage</code></td><td>Requested fraction of generated records that should satisfy configured edge conditions. Valid range is <code>0</code> through <code>1</code>; when no edge-case variables exist, the effective value is <code>0</code>.</td></tr><tr><td><code>isEdgeCaseData</code></td><td>True only when the final generated record actually satisfies a configured edge condition.</td></tr></table>
-<ul><li><b>Generic constraint solving:</b> handles comparisons, field-to-field relationships, numeric coercion, boolean semantics, and compound logical expressions.</li><li><b>Confirmation:</b> validates the effective schema and edge conditions before a scenario is confirmed.</li><li><b>Generation:</b> computes the target edge-case count from total count and percentage and constructs candidates when random records do not naturally satisfy the condition.</li><li><b>Truthful classification:</b> the flag is derived from evaluating final values, not from merely selecting a record as an edge-case candidate.</li><li><b>Formula consistency:</b> dependent values are recalculated after edge-case assignments.</li><li><b>Transactional and aggregational:</b> the same generic edge-case principles apply to both data types.</li></ul>
+
+    <p>Edge cases are first-class scenario definitions and are handled generically across industries and data types.</p>
+
+    <table>
+        <tr>
+            <th>Field</th>
+            <th>Purpose</th>
+        </tr>
+        <tr>
+            <td><code>edgeCaseVariables</code></td>
+            <td>Variables
+                and constraints defining an edge condition; it can be empty when no edge case is configured.</td>
+        </tr>
+        <tr>
+            <td><code>edgeCasePercentage</code></td>
+            <td>Requested
+                fraction of generated records that should satisfy configured edge conditions. Valid range is
+                <code>0</code>
+                through <code>1</code>;
+                when no edge-case variables exist, the effective value is
+                <code>0</code>.
+            </td>
+        </tr>
+        <tr>
+            <td><code>isEdgeCaseData</code></td>
+            <td>True
+                only when the final generated record actually satisfies a configured edge condition.</td>
+        </tr>
+    </table>
+
+    <ul>
+        <li><b>Generic
+                constraint solving:</b> handles comparisons, field-to-field relationships, numeric coercion, boolean
+            semantics,
+            and compound
+            logical expressions.</li>
+        <li><b>Confirmation:</b>
+            validates the effective schema and edge conditions before a scenario is confirmed.</li>
+        <li><b>Generation:</b>
+            computes the target edge-case count from total count and percentage and constructs candidates when random
+            records
+            do not naturally satisfy the condition.</li>
+        <li><b>Truthful
+                classification:</b> the flag is derived from evaluating final values, not from merely selecting a record
+            as an
+            edge-case candidate.</li>
+        <li><b>Formula
+                consistency:</b> dependent values are recalculated after edge-case assignments.</li>
+        <li><b>Transactional
+                and aggregational:</b> the same generic edge-case principles apply to both data types.</li>
+    </ul>
 
 
-<h2>13. Frontend Data Export</h2>
-<p>The backend no longer exposes a CSV download API and does not persist generated datasets
-under a <code>generated_data</code> directory. The <code>/scenario/generate</code> response remains
-the source of the generated data, and the frontend is responsible for converting the
-received records into CSV when the user chooses to download them.</p>
 
-<div class="mermaid">
-flowchart LR
-    G["POST /scenario/generate"] --> R["Generated JSON response"]
-    R --> T{"Data type"}
-    T -->|transactional| TR["records[]<br/>entity -> events[] -> records[]"]
-    T -->|aggregational| AG["records[]<br/>row objects"]
-    TR --> X["Frontend flattening<br/>One event record = one CSV row"]
-    AG --> X
-    X --> E["Dynamic column union + CSV escaping"]
-    E --> F["Frontend download<br/>proposed_scenario_id_records.csv"]
-</div>
-<p><b>Frontend export:</b> Transactional responses contain entity-level data and nested event records, so the frontend expands each actual event record into one CSV row and merges entity/event metadata. Aggregational responses already contain row objects. In both cases columns are derived dynamically and values are CSV-escaped before download. No backend download endpoint is required.</p>
 
-<h3>Frontend CSV export contract</h3>
-<ul>
-    <li><b>No backend download endpoint:</b> CSV conversion is intentionally handled by the frontend.</li>
-    <li><b>No generated-data artifact:</b> the backend does not create a JSON or CSV copy of the complete dataset on disk.</li>
-    <li><b>Transactional:</b> the frontend can flatten each <code>events[].records[]</code> entry into one CSV row and retain <code>event_type</code> and other event metadata.</li>
-    <li><b>Aggregational:</b> the frontend can export the generated <code>records</code> directly.</li>
-    <li><b>Dynamic columns:</b> the frontend should derive columns from the actual generated records rather than using industry-specific hard-coded columns.</li>
-    <li><b>Edge cases:</b> <code>isEdgeCaseData</code> remains part of the generated record and should be exported unchanged.</li>
-    <li><b>Filename:</b> use <code>proposed_scenario_id.csv</code> when the frontend has the proposed scenario identifier from the scenario metadata.</li>
-</ul>
 
-<div class="note">
-    <b>Memory behavior:</b> removing backend CSV persistence avoids creating a second full
-    dataset representation on the server. The existing <code>/scenario/generate</code> API
-    response contract is unchanged. The generator still retains the records required to
-    construct that response; making generation itself constant-memory would require a
-    separate batch/streaming redesign of the generator and QA pipeline.
-</div>
+    <h2>13. Frontend Data Export</h2>
 
-<h3>Current Scenario API Lifecycle</h3>
-<div class="mermaid">
-flowchart TB
-    P["POST /scenario/propose"] --> D["Draft<br/>variables + edge cases + edgeCasePercentage"]
-    I["POST /scenario/import-csv"] --> D
-    D --> C["POST /scenario/confirm"]
-    C --> V["Effective-schema validation<br/>edge conditions + percentage 0..1"]
-    V --> S["Confirmed scenario"]
-    S --> G["POST /scenario/generate"]
-    G --> EC["Generate normal + targeted edge-case records"]
-    EC --> QA["Validate edge condition against actual values"]
-    QA --> R["Generated JSON response"]
-    R --> FE["Frontend display / CSV export"]
-</div>
-<p><b>Why edge-case validation is part of the lifecycle:</b> Edge cases enter through proposal or CSV import, can be edited during confirmation, and are checked against the effective schema before generation. During generation the requested percentage determines how many records are targeted, while the condition itself determines whether a record qualifies. QA then checks the actual generated values rather than trusting the boolean flag alone.</p>
+    <p>The backend no longer exposes a CSV download API and does not persist generated datasets
+
+        under a <code>generated_data</code>
+        directory. The <code>/scenario/generate</code>
+        response remains
+
+        the source of the generated data, and the frontend is responsible for converting the
+
+        received records into CSV when the user chooses to download them.</p>
+
+
+
+    <div class="mermaid">
+
+        flowchart LR
+
+        G["POST /scenario/generate"] --> R["Generated JSON response"]
+
+        R --> T{"Data type"}
+
+        T -->|transactional| TR["records[]<br />entity -> events[] -> records[]"]
+
+        T -->|aggregational| AG["records[]<br />row objects"]
+
+        TR --> X["Frontend flattening<br />One event record = one CSV row"]
+
+        AG --> X
+
+        X --> E["Dynamic column union + CSV escaping"]
+
+        E --> F["Frontend download<br />proposed_scenario_id_records.csv"]
+
+    </div>
+
+    <p><b>Frontend export:</b>
+        Transactional responses contain entity-level data and nested event records, so the frontend expands each actual
+        event record into one CSV row and merges entity/event metadata. Aggregational responses already contain row
+        objects.
+        In both cases columns are derived
+        dynamically and values are CSV-escaped before download. No backend download endpoint is required.</p>
+
+
+
+    <h3>Frontend CSV export contract</h3>
+
+    <ul>
+
+        <li><b>No backend download endpoint:</b>
+            CSV conversion is intentionally handled by the frontend.</li>
+
+        <li><b>No generated-data artifact:</b>
+            the backend does not create a JSON or CSV copy of the complete dataset on disk.</li>
+
+        <li><b>Transactional:</b>
+            the frontend can flatten each <code>events[].records[]</code>
+            entry into one CSV row and retain <code>event_type</code>
+            and other event metadata.</li>
+
+        <li><b>Aggregational:</b>
+            the frontend can export the generated <code>records</code>
+            directly.</li>
+
+        <li><b>Dynamic columns:</b>
+            the frontend should derive columns from the actual generated records rather than using industry-specific
+            hard-coded columns.</li>
+
+        <li><b>Edge cases:</b>
+            <code>isEdgeCaseData</code>
+            remains part of the generated record and should be exported unchanged.
+        </li>
+
+        <li><b>Filename:</b>
+            use <code>proposed_scenario_id.csv</code>
+            when the frontend has the proposed scenario identifier from the scenario metadata.</li>
+
+    </ul>
+
+
+
+    <div class="note">
+
+        <b>Memory behavior:</b>
+        removing backend CSV persistence avoids creating a second full
+
+        dataset representation on the server. The existing
+        <code>/scenario/generate</code>
+        API
+
+        response contract is unchanged. The generator still retains the records required to
+
+        construct that response; making generation itself constant-memory would require a
+
+        separate batch/streaming redesign of the generator and QA pipeline.
+
+    </div>
+
+
+
+    <h3>Current Scenario API Lifecycle</h3>
+
+    <div class="mermaid">
+
+        flowchart TB
+
+        P["POST /scenario/propose"] --> D["Draft<br />variables + edge cases + edgeCasePercentage"]
+
+        I["POST /scenario/import-csv"] --> D
+
+        D --> C["POST /scenario/confirm"]
+
+        C --> V["Effective-schema validation<br />edge conditions + percentage 0–1"]
+
+        V --> S["Confirmed scenario"]
+
+        S --> G["POST /scenario/generate"]
+
+        G --> EC["Generate normal + targeted edge-case records"]
+
+        EC --> QA["Validate edge condition against actual values"]
+
+        QA --> R["Generated JSON response"]
+
+        R --> FE["Frontend display / CSV export"]
+
+    </div>
+
+    <p><b>Why edge-case validation is
+            part of the lifecycle:</b> Edge cases enter through proposal or CSV import, can be edited during
+        confirmation, and
+        are checked
+        against the effective schema before generation. During generation the requested percentage determines how many
+        records are targeted, while the condition itself determines whether a record qualifies. QA then checks the
+        actual
+        generated values rather than trusting
+        the boolean flag alone.</p>
+
+
 
 </body>
 

@@ -8,7 +8,6 @@ knows how to execute — so the result can be run through the existing
 """
 from __future__ import annotations
 import logging
-from functools import lru_cache
 import ast
 import math
 
@@ -56,7 +55,7 @@ _TELECOM_SEGMENT_CHOICES = [
     "Heavy Data Users", "Frequent Data Exhausters", "Low Data Users",
 ]
 _TELECOM_SEGMENT_WEIGHTS = [0.22, 0.18, 0.15, 0.20, 0.15, 0.10]
-_TELECOM_SERVICE_PROVIDERS = ["Jio", "BSNL"]
+_TELECOM_SERVICE_PROVIDERS = ["Provider_A", "Provider_B"]
 _TELECOM_SERVICE_PROVIDER_WEIGHTS = [0.6, 0.4]
 _TELECOM_TRIGGER_CAUSE_SYNONYMS = ["trigger_type", "triggertype", "trigger", "event_trigger_type", "trigger_reason"]
 _TELECOM_TRIGGER_CAUSE_CHOICES = ["LOW_BALANCE_THRESHOLD", "VALIDITY_EXPIRY_WARNING", "ZERO_BALANCE"]
@@ -102,10 +101,111 @@ _UPI_FIELD_NAME_MARKERS = ("payment", "pay_method", "channel")
 _UPI_VALUE_MARKER = "upi"
 _UPI_MASK_LABEL = "MASKED"
 
+# Telecom-wide mandatory client contract. These fields are injected for EVERY
+# Telecom proposal, independent of scenario id. Scenario-specific requirements
+# below are layered on top only for the requested LB-06/LB-07 journeys.
+_TELECOM_CORE_MANDATORY = [
+    {
+        "name": "subscriber_msisdn", "dtype": "string",
+        "description": "Subscriber mobile number in E.164 format.",
+        "gen": "e164_phone", "params": {"country_codes": ["+91"]},
+        "depends_on": [], "nullable": False,
+    },
+    {
+        "name": "account_id", "dtype": "string",
+        "description": "Billing account identifier tied to subscriber_id.",
+        "gen": "id_mirror", "params": {"prefix": "ACC-", "source_field": "subscriber_id", "source_prefix": "SUB-"},
+        "depends_on": ["subscriber_id"], "nullable": False,
+    },
+    {
+        "name": "balance_after", "dtype": "float",
+        "description": "Subscriber account balance after the relevant transaction/event.",
+        "gen": "uniform", "params": {"min": 0.0, "max": 5000.0},
+        "depends_on": [], "nullable": False,
+    },
+    {
+        "name": "payment_gateway", "dtype": "categorical",
+        "description": "Synthetic payment gateway name; never expose a real provider name.",
+        "gen": "weighted_choice", "params": {"choices": ["Gateway_A", "Gateway_B", "Gateway_C"], "weights": [0.50, 0.30, 0.20]},
+        "depends_on": [], "nullable": False,
+    },
+]
+
+_LB06_VARIABLES = [
+    {"name":"balance_before","dtype":"float","description":"Subscriber balance immediately before the recharge/recovery transaction.","gen":"uniform","params":{"min":0.0,"max":100.0},"depends_on":[],"nullable":False},
+    {"name":"recharge_amount","dtype":"float","description":"Recharge/top-up amount.","gen":"uniform","params":{"min":10.0,"max":500.0},"depends_on":[],"nullable":False},
+    {"name":"payment_method","dtype":"categorical","description":"Synthetic payment method used for recharge/retry.","gen":"weighted_choice","params":{"choices":["Virtual_Payment","CARD_SYNTHETIC","BANK_SYNTHETIC","WALLET_SYNTHETIC"],"weights":[0.40,0.25,0.20,0.15]},"depends_on":[],"nullable":False},
+    {"name":"failure_reason","dtype":"categorical","description":"Reason for failed recharge attempt.","gen":"weighted_choice","params":{"choices":["INSUFFICIENT_FUNDS","GATEWAY_TIMEOUT","NETWORK_FAILURE","BANK_DECLINE","AUTHENTICATION_FAILURE","PAYMENT_INSTRUMENT_UNAVAILABLE"],"weights":[0.30,0.15,0.15,0.15,0.10,0.15]},"depends_on":[],"nullable":False},
+    {"name":"recovery_action","dtype":"categorical","description":"Recovery action actually taken after a failed recharge.","gen":"weighted_choice","params":{"choices":["RETRY_SAME_METHOD","USE_ALTERNATE_PAYMENT_METHOD","REAUTHENTICATE","CONTACT_SUPPORT"],"weights":[0.35,0.35,0.15,0.15]},"depends_on":[],"nullable":False},
+    {"name":"recovery_status","dtype":"categorical","description":"Outcome of the recovery action.","gen":"weighted_choice","params":{"choices":["RECOVERY_PENDING","RECOVERED_SAME_METHOD","RECOVERED_ALTERNATE_METHOD","ESCALATED","ABANDONED"],"weights":[0.10,0.35,0.35,0.10,0.10]},"depends_on":[],"nullable":False},
+    {"name":"recovery_channel","dtype":"categorical","description":"Channel used for recovery guidance/action.","gen":"weighted_choice","params":{"choices":["APP","SMS","WEB","USSD","CONTACT_CENTER"],"weights":[0.35,0.20,0.15,0.15,0.15]},"depends_on":[],"nullable":False},
+    {"name":"recovery_timestamp","dtype":"datetime","description":"Timestamp at which recovery action occurred.","gen":"ts_offset","params":{"source_field":"event_timestamp","min_seconds":60,"max_seconds":3600},"depends_on":["event_timestamp"],"nullable":False},
+    {"name":"parent_transaction_id","dtype":"string","description":"Transaction id of the failed recharge that this retry/recovery belongs to.","gen":"constant","params":{"value":"PARENT_TXN"},"depends_on":[],"nullable":False},
+    {"name":"retry_count","dtype":"int","description":"Number of recharge retry attempts in this journey.","gen":"uniform","params":{"min":0,"max":4},"depends_on":[],"nullable":False},
+    {"name":"final_journey_status","dtype":"categorical","description":"Final outcome of the recovery journey.","gen":"weighted_choice","params":{"choices":["RECOVERED","UNRESOLVED_FAILURE","ABANDONED","ESCALATED"],"weights":[0.60,0.20,0.10,0.10]},"depends_on":[],"nullable":False},
+]
+_LB06_EVENTS = [
+    ("LOW_BALANCE_DETECTED",1,["subscriber_id","account_id","subscriber_msisdn","balance_after","trigger_cause"]),
+    ("TOPUP_ATTEMPT",2,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","payment_gateway","recharge_amount","recharge_status","failure_reason","payment_method"]),
+    ("TOPUP_FAILURE",3,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","payment_gateway","recharge_amount","recharge_status","failure_reason","payment_method"]),
+    ("RECOVERY_GUIDANCE",4,["subscriber_id","account_id","subscriber_msisdn","balance_after","recovery_channel","recovery_action"]),
+    ("TOPUP_RETRY",5,["subscriber_id","account_id","subscriber_msisdn","balance_after","payment_gateway","recharge_amount","recharge_status","parent_transaction_id","retry_count"]),
+    ("TOPUP_SUCCESS",6,["subscriber_id","account_id","subscriber_msisdn","balance_after","payment_gateway","recharge_amount","recharge_status","recovery_status","recovery_timestamp","parent_transaction_id","final_journey_status"]),
+]
+
+_LB07_VARIABLES = [
+    {"name":"balance_before","dtype":"float","description":"Subscriber balance before the top-up.","gen":"uniform","params":{"min":0.0,"max":100.0},"depends_on":[],"nullable":False},
+    {"name":"recharge_amount","dtype":"float","description":"Top-up amount.","gen":"uniform","params":{"min":10.0,"max":500.0},"depends_on":[],"nullable":False},
+    {"name":"transaction_status","dtype":"categorical","description":"Payment transaction status.","gen":"constant","params":{"value":"SUCCESS"},"depends_on":[],"nullable":False},
+    {"name":"expected_balance","dtype":"float","description":"Expected balance after successful top-up.","gen":"uniform","params":{"min":1.0,"max":5000.0},"depends_on":[],"nullable":False},
+    {"name":"observed_balance","dtype":"float","description":"Observed balance immediately after the successful payment before reconciliation.","gen":"uniform","params":{"min":0.0,"max":4999.0},"depends_on":[],"nullable":False},
+    {"name":"balance_update_status","dtype":"categorical","description":"Whether the balance update succeeded at first attempt.","gen":"weighted_choice","params":{"choices":["UPDATED","FAILED","DELAYED"],"weights":[0.10,0.75,0.15]},"depends_on":[],"nullable":False},
+    {"name":"balance_variance","dtype":"float","description":"Observed balance minus expected balance during the discrepancy.","gen":"uniform","params":{"min":-500.0,"max":0.0},"depends_on":[],"nullable":False},
+    {"name":"exception_reason","dtype":"categorical","description":"Reason for successful payment with missing/delayed balance update.","gen":"weighted_choice","params":{"choices":["LEDGER_SYNCHRONIZATION_DELAY","CORE_SYSTEM_UPDATE_DELAY","CACHE_REFRESH_ISSUE","EVENT_PROCESSING_LAG","RECONCILIATION_MISMATCH","BACKEND_TIMEOUT_AFTER_SUCCESSFUL_PROCESSING"],"weights":[0.20,0.20,0.15,0.15,0.15,0.15]},"depends_on":[],"nullable":False},
+    {"name":"exception_detected_flag","dtype":"boolean","description":"Whether a balance discrepancy was detected.","gen":"constant","params":{"value":True},"depends_on":[],"nullable":False},
+    {"name":"verification_status","dtype":"categorical","description":"Verification status after discrepancy detection.","gen":"weighted_choice","params":{"choices":["PENDING","VERIFIED","FAILED"],"weights":[0.10,0.80,0.10]},"depends_on":[],"nullable":False},
+    {"name":"verification_attempt_count","dtype":"int","description":"Number of verification attempts.","gen":"uniform","params":{"min":1,"max":3},"depends_on":[],"nullable":False},
+    {"name":"settlement_status","dtype":"categorical","description":"Payment settlement status.","gen":"weighted_choice","params":{"choices":["SETTLED","PENDING","REVERSED"],"weights":[0.85,0.10,0.05]},"depends_on":[],"nullable":False},
+    {"name":"reconciliation_status","dtype":"categorical","description":"Balance reconciliation outcome.","gen":"weighted_choice","params":{"choices":["RESOLVED","PENDING","MANUAL_REVIEW"],"weights":[0.75,0.10,0.15]},"depends_on":[],"nullable":False},
+    {"name":"final_status","dtype":"categorical","description":"Final status communicated after reconciliation.","gen":"weighted_choice","params":{"choices":["RESOLVED","PENDING","MANUALLY_RESOLVED","NOT_RESOLVED"],"weights":[0.75,0.10,0.10,0.05]},"depends_on":[],"nullable":False},
+    {"name":"final_balance","dtype":"float","description":"Final reconciled balance after correction or status clarification.","gen":"uniform","params":{"min":1.0,"max":5000.0},"depends_on":[],"nullable":False},
+    {"name":"resolution_type","dtype":"categorical","description":"How the discrepancy was resolved.","gen":"weighted_choice","params":{"choices":["AUTO_RECONCILIATION","MANUAL_REVIEW","BALANCE_CORRECTION","STATUS_CLARIFICATION"],"weights":[0.45,0.20,0.25,0.10]},"depends_on":[],"nullable":False},
+]
+_LB07_EVENTS = [
+    ("TOPUP_INITIATED",1,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","payment_gateway","recharge_amount","transaction_status"]),
+    ("PAYMENT_AUTHORIZED",2,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","payment_gateway","recharge_amount","transaction_status"]),
+    ("PAYMENT_SETTLED",3,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","payment_gateway","recharge_amount","transaction_status","settlement_status"]),
+    ("BALANCE_UPDATE_FAILED",4,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","expected_balance","observed_balance","balance_update_status","balance_variance","exception_reason","transaction_status"]),
+    ("DISCREPANCY_DETECTED",5,["subscriber_id","account_id","subscriber_msisdn","balance_after","expected_balance","observed_balance","balance_variance","exception_detected_flag"]),
+    ("VERIFICATION_REQUESTED",6,["subscriber_id","account_id","subscriber_msisdn","balance_after","verification_status","verification_attempt_count"]),
+    ("TRANSACTION_LOOKUP",7,["subscriber_id","account_id","subscriber_msisdn","balance_after","payment_gateway","settlement_status","verification_status"]),
+    ("RECONCILIATION_STARTED",8,["subscriber_id","account_id","subscriber_msisdn","balance_after","reconciliation_status","resolution_type"]),
+    ("STATUS_CONFIRMED",9,["subscriber_id","account_id","subscriber_msisdn","balance_after","verification_status","settlement_status","reconciliation_status","final_status"]),
+    ("CUSTOMER_NOTIFIED",10,["subscriber_id","account_id","subscriber_msisdn","balance_after","final_status"]),
+    ("BALANCE_CORRECTED",11,["subscriber_id","account_id","subscriber_msisdn","balance_after","expected_balance","final_balance","resolution_type"]),
+    ("CASE_RESOLVED",12,["subscriber_id","account_id","subscriber_msisdn","balance_after","final_balance","final_status","resolution_type"]),
+]
+
+def _telecom_requirement_contract(scenario_id: str, type_of_data: str) -> tuple[list[dict], list[dict]]:
+    """Return deterministic client-contract additions for the two audited Telecom journeys."""
+    sid = str(scenario_id or "").strip().upper()
+    if type_of_data != "transactional":
+        return [], []
+    if sid == "LB-06":
+        defs, events = _LB06_VARIABLES, _LB06_EVENTS
+    elif sid == "LB-07":
+        defs, events = _LB07_VARIABLES, _LB07_EVENTS
+    else:
+        return [], []
+    return [dict(v) for v in defs], [
+        {"event_type": et, "sequence": seq, "fields": list(fields), "description": "Client-required scenario lifecycle event.", "min_occurrences": (1 if et not in {"TOPUP_ATTEMPT", "TOPUP_FAILURE", "TOPUP_RETRY"} else 1), "max_occurrences": (3 if et in {"TOPUP_ATTEMPT", "TOPUP_FAILURE", "TOPUP_RETRY"} else 1)}
+        for et, seq, fields in events
+    ]
+
 
 def _telecom_mandatory_variables() -> list[dict]:
     """Telecom client override of the generic mandatory fields: fixed CLV tiers,
-    fixed subscriber segments, a named service_provider, and churn-helper fields
+    fixed subscriber segments, a synthetic service_provider, and churn-helper fields
     instead of a raw churn score. loyalty_tier_customer is dropped — redundant with
     customer_lifetime_value. Only used when industry_key == "telecom"."""
     clv = dict(_MANDATORY_VARIABLES[0])
@@ -127,7 +227,7 @@ def _telecom_mandatory_variables() -> list[dict]:
     service_provider = {
         "name": "service_provider",
         "dtype": "categorical",
-        "description": "Telecom service provider operating the subscriber's connection.",
+        "description": "Synthetic telecom service provider operating the subscriber connection.",
         "gen": "weighted_choice",
         "params": {"choices": list(_TELECOM_SERVICE_PROVIDERS), "weights": list(_TELECOM_SERVICE_PROVIDER_WEIGHTS)},
         "depends_on": [],
@@ -248,11 +348,14 @@ def _build_base_variables(industry_key: str, profile: dict) -> list[dict]:
         },
     ]
     if industry_key == "telecom":
-        return base + _telecom_mandatory_variables()
+        core = [dict(v) for v in _TELECOM_CORE_MANDATORY if v["name"] not in {x["name"] for x in base}]
+        for item in core:
+            if item.get("name") == "subscriber_msisdn":
+                item["params"] = {"country_codes": [profile["phone_country_code"]]}
+        return base + _telecom_mandatory_variables() + core
     return base + [dict(m) for m in _MANDATORY_VARIABLES]
 
 
-@lru_cache(maxsize=None)
 def _build_alias_map(industry_key: str) -> dict[str, str]:
     """Synonym -> canonical name mapping for this industry (e.g. telecom canonicalizes
     to subscriber_id, banking/retail/etc. canonicalize to customer_id)."""
@@ -270,7 +373,6 @@ def _build_alias_map(industry_key: str) -> dict[str, str]:
     return alias_map
 
 
-@lru_cache(maxsize=None)
 def _build_glossary_text(industry_key: str) -> str:
     lines = [
         "Canonical field names for this industry — if a variable represents one of these "
@@ -412,7 +514,7 @@ class ScenarioDesignerAgent:
                 "Telecom-specific requirements for this scenario:\n"
                 "- Do NOT invent any KYC/identity-verification field (no field name containing 'kyc').\n"
                 "- Any plan/rate-plan/data-plan field (e.g. rate_plan_code) MUST depend_on service_provider "
-                "and describe plans realistic for that specific provider (Jio, BSNL), not generic plans.\n"
+                "and describe plans realistic for that specific synthetic provider (Provider_A, Provider_B), not generic plans.\n"
                 "- Do NOT invent a churn_risk_score/churn_propensity_score field; churn is derived downstream "
                 "from the already auto-injected historical_low_balance_frequency, offer_acceptance_rate_historical "
                 "and preferred_topup_channel fields.\n"
@@ -423,6 +525,11 @@ class ScenarioDesignerAgent:
                 "- If this scenario needs a trigger/cause field, name it exactly 'trigger_cause' with categorical "
                 f"choices exactly {_TELECOM_TRIGGER_CAUSE_CHOICES}.\n"
             )
+
+        if industry_key == "telecom" and str(scenario_id or "").strip().upper() == "LB-06":
+            telecom_note += "\nLB-06 client acceptance requirements: model Low Balance -> Top-up Attempt -> Failure -> Recovery Guidance -> Retry/Alternative -> Successful Recovery. Include an actual successful TOPUP_SUCCESS or equivalent event, balance_after movement, explicit parent-child linkage via parent_transaction_id, retry_count reconciliation, final_journey_status, multiple realistic failure reasons, abandonment, support escalation, payment-method switching, delayed recovery, and consecutive retry failures followed by eventual success. Do not claim recovery without a successful event and balance movement. Keep failure_reason semantically consistent with recharge_status. Use chronologically consistent timestamps.\n"
+        elif industry_key == "telecom" and str(scenario_id or "").strip().upper() == "LB-07":
+            telecom_note += "\nLB-07 client acceptance requirements: model Low Balance -> Top-Up Initiated -> Payment Authorized -> Payment Settled -> Balance Update Failed -> Discrepancy Detected -> Verification Requested -> Transaction Lookup -> Reconciliation Started -> Status Confirmed -> Customer Notified -> Balance Corrected -> Case Resolved. Explicitly represent Transaction Success=TRUE with Balance Updated=FALSE, expected/observed balance, variance, exception reason, verification, settlement, reconciliation, final status and final balance. Do not equate GATEWAY_TIMEOUT with successful payment unless subsequent settlement verification establishes success.\n"
 
         prompt = (
             f"Scenario ID: {scenario_id or '(assign automatically)'}\n"
@@ -466,6 +573,18 @@ class ScenarioDesignerAgent:
         result["variables"] = self._enforce_variable_bounds(combined, prompt, base_names, industry_key)
         if industry_key == "telecom":
             result["variables"] = self._apply_telecom_overrides(result["variables"])
+        # Deterministic client contract for the two audited Telecom scenarios.
+        # The LLM remains responsible for additional scenario detail, but these
+        # required fields/events cannot be omitted or renamed.
+        if industry_key == "telecom":
+            required_vars, required_events = _telecom_requirement_contract(scenario_id, type_of_data)
+            existing_names = {str(v.get("name")) for v in result["variables"]}
+            for required in required_vars:
+                if required["name"] not in existing_names:
+                    result["variables"].append(required)
+                    existing_names.add(required["name"])
+            if required_events:
+                result["events"] = required_events
         result["field_order"] = [v["name"] for v in result["variables"]]
         # Resolve entity_key only AFTER base variables are injected. The primary entity
         # identifier is normally one of those auto-injected fields (e.g. subscriber_id),
