@@ -14,13 +14,15 @@ import math
 from config.industry_profiles import get_profile, match_industry_key
 from core.llm_client import GeminiClient
 from core.dynamic_scenarios import get_feedback_history
+from core.runtime_cache import get_schema, set_schema
 
 logger = logging.getLogger(__name__)
 
 MIN_VARIABLES = 15
 MAX_VARIABLES = 35
-# If the LLM returns fewer than this, we retry asking it to expand toward MAX_VARIABLES.
-_EXPAND_TARGET = 35
+# Proposals target the maximum catalog size. Telecom can reach this target locally
+# from its reusable schema catalog, avoiding an extra LLM round trip.
+_EXPAND_TARGET = MAX_VARIABLES
 
 # These 2 fields must appear in every scenario (static or dynamic) for cross-scenario
 # customer profiling/analytics. Injected automatically if the LLM omits them.
@@ -129,6 +131,42 @@ _TELECOM_CORE_MANDATORY = [
         "gen": "weighted_choice", "params": {"choices": ["Gateway_A", "Gateway_B", "Gateway_C"], "weights": [0.50, 0.30, 0.20]},
         "depends_on": [], "nullable": False,
     },
+]
+
+# Reusable Telecom proposal catalog. These definitions are immutable templates used
+# only to fill the requested 35-field catalog when Gemini returns fewer fields.
+# Keeping them in the process cache avoids a second Gemini round-trip while preserving
+# the 35-variable target. Scenario-specific fields from Gemini always take precedence.
+_TELECOM_CACHED_PROPOSAL_CATALOG = [
+    {"name":"subscriber_segment","dtype":"categorical","description":"Subscriber usage/behavior segment.","gen":"weighted_choice","params":{"choices":list(_TELECOM_SEGMENT_CHOICES),"weights":list(_TELECOM_SEGMENT_WEIGHTS)},"depends_on":[],"nullable":False},
+    {"name":"service_provider","dtype":"categorical","description":"Synthetic telecom service provider.","gen":"weighted_choice","params":{"choices":list(_TELECOM_SERVICE_PROVIDERS),"weights":list(_TELECOM_SERVICE_PROVIDER_WEIGHTS)},"depends_on":[],"nullable":False},
+    {"name":"rate_plan_code","dtype":"categorical","description":"Synthetic rate plan associated with the service provider.","gen":"weighted_choice","params":{"choices":["PLAN_A","PLAN_B","PLAN_C","PLAN_D"],"weights":[0.35,0.30,0.20,0.15]},"depends_on":["service_provider"],"nullable":False},
+    {"name":"trigger_cause","dtype":"categorical","description":"Cause that triggered the telecom journey.","gen":"weighted_choice","params":{"choices":list(_TELECOM_TRIGGER_CAUSE_CHOICES),"weights":list(_TELECOM_TRIGGER_CAUSE_WEIGHTS)},"depends_on":[],"nullable":False},
+    {"name":"recharge_status","dtype":"categorical","description":"Recharge/top-up outcome.","gen":"weighted_choice","params":{"choices":list(_TELECOM_RECHARGE_STATUS_CHOICES),"weights":list(_TELECOM_RECHARGE_STATUS_WEIGHTS)},"depends_on":[],"nullable":False},
+    {"name":"balance_before","dtype":"float","description":"Subscriber balance before a relevant transaction.","gen":"uniform","params":{"min":0.0,"max":1000.0},"depends_on":[],"nullable":False},
+    {"name":"recharge_amount","dtype":"float","description":"Recharge/top-up amount.","gen":"uniform","params":{"min":10.0,"max":500.0},"depends_on":[],"nullable":False},
+    {"name":"payment_method","dtype":"categorical","description":"Synthetic payment method.","gen":"weighted_choice","params":{"choices":["Virtual_Payment","CARD_SYNTHETIC","BANK_SYNTHETIC","WALLET_SYNTHETIC"],"weights":[0.40,0.25,0.20,0.15]},"depends_on":[],"nullable":False},
+    {"name":"failure_reason","dtype":"categorical","description":"Recharge/payment failure reason.","gen":"weighted_choice","params":{"choices":["INSUFFICIENT_FUNDS","GATEWAY_TIMEOUT","NETWORK_FAILURE","BANK_DECLINE","AUTHENTICATION_FAILURE","PAYMENT_INSTRUMENT_UNAVAILABLE"],"weights":[0.30,0.15,0.15,0.15,0.10,0.15]},"depends_on":[],"nullable":False},
+    {"name":"recovery_action","dtype":"categorical","description":"Recovery action after a failed recharge.","gen":"weighted_choice","params":{"choices":["RETRY_SAME_METHOD","USE_ALTERNATE_PAYMENT_METHOD","REAUTHENTICATE","CONTACT_SUPPORT"],"weights":[0.35,0.35,0.15,0.15]},"depends_on":[],"nullable":False},
+    {"name":"recovery_status","dtype":"categorical","description":"Recovery outcome.","gen":"weighted_choice","params":{"choices":["RECOVERY_PENDING","RECOVERED_SAME_METHOD","RECOVERED_ALTERNATE_METHOD","ESCALATED","ABANDONED"],"weights":[0.10,0.35,0.35,0.10,0.10]},"depends_on":[],"nullable":False},
+    {"name":"recovery_channel","dtype":"categorical","description":"Recovery guidance/action channel.","gen":"weighted_choice","params":{"choices":["APP","SMS","WEB","USSD","CONTACT_CENTER"],"weights":[0.35,0.20,0.15,0.15,0.15]},"depends_on":[],"nullable":False},
+    {"name":"transaction_status","dtype":"categorical","description":"Transaction processing status.","gen":"weighted_choice","params":{"choices":["SUCCESS","FAILED","PENDING"],"weights":[0.75,0.15,0.10]},"depends_on":[],"nullable":False},
+    {"name":"settlement_status","dtype":"categorical","description":"Payment settlement status.","gen":"weighted_choice","params":{"choices":["SETTLED","PENDING","REVERSED"],"weights":[0.85,0.10,0.05]},"depends_on":[],"nullable":False},
+    {"name":"retry_count","dtype":"int","description":"Number of recharge retries in the journey.","gen":"uniform","params":{"min":0,"max":4},"depends_on":[],"nullable":False},
+    {"name":"recovery_timestamp","dtype":"datetime","description":"Timestamp of a recovery action.","gen":"ts_offset","params":{"source_field":"event_timestamp","min_seconds":60,"max_seconds":3600},"depends_on":["event_timestamp"],"nullable":False},
+    {"name":"final_journey_status","dtype":"categorical","description":"Final telecom journey outcome.","gen":"weighted_choice","params":{"choices":["RECOVERED","UNRESOLVED_FAILURE","ABANDONED","ESCALATED"],"weights":[0.60,0.20,0.10,0.10]},"depends_on":[],"nullable":False},
+    {"name":"expected_balance","dtype":"float","description":"Expected balance after a successful top-up.","gen":"formula","params":{},"depends_on":["balance_before","recharge_amount"],"nullable":False,"formula":"balance_before + recharge_amount"},
+    {"name":"observed_balance","dtype":"float","description":"Observed account balance during an exception.","gen":"uniform","params":{"min":0.0,"max":5000.0},"depends_on":[],"nullable":False},
+    {"name":"balance_update_status","dtype":"categorical","description":"Whether the balance update completed.","gen":"weighted_choice","params":{"choices":["UPDATED","FAILED","DELAYED"],"weights":[0.75,0.15,0.10]},"depends_on":[],"nullable":False},
+    {"name":"balance_variance","dtype":"float","description":"Difference between expected and observed balance.","gen":"formula","params":{},"depends_on":["expected_balance","observed_balance"],"nullable":False,"formula":"expected_balance - observed_balance"},
+    {"name":"exception_detected_flag","dtype":"boolean","description":"Whether a balance/payment exception was detected.","gen":"weighted_choice","params":{"choices":[True,False],"weights":[0.15,0.85]},"depends_on":[],"nullable":False},
+    {"name":"verification_status","dtype":"categorical","description":"Transaction verification result.","gen":"weighted_choice","params":{"choices":["REQUESTED","VERIFIED","FAILED","PENDING"],"weights":[0.10,0.75,0.05,0.10]},"depends_on":[],"nullable":False},
+    {"name":"verification_attempt_count","dtype":"int","description":"Number of verification attempts.","gen":"uniform","params":{"min":1,"max":3},"depends_on":[],"nullable":False},
+    {"name":"reconciliation_status","dtype":"categorical","description":"Balance reconciliation outcome.","gen":"weighted_choice","params":{"choices":["RESOLVED","PENDING","MANUAL_REVIEW"],"weights":[0.75,0.10,0.15]},"depends_on":[],"nullable":False},
+    {"name":"final_status","dtype":"categorical","description":"Final transaction/customer status.","gen":"weighted_choice","params":{"choices":["RESOLVED","PENDING","MANUALLY_RESOLVED","NOT_RESOLVED"],"weights":[0.75,0.10,0.10,0.05]},"depends_on":[],"nullable":False},
+    {"name":"final_balance","dtype":"float","description":"Final reconciled subscriber balance.","gen":"uniform","params":{"min":1.0,"max":5000.0},"depends_on":[],"nullable":False},
+    {"name":"resolution_type","dtype":"categorical","description":"How an exception was resolved.","gen":"weighted_choice","params":{"choices":["AUTO_RECONCILIATION","MANUAL_REVIEW","BALANCE_CORRECTION","STATUS_CLARIFICATION"],"weights":[0.45,0.20,0.25,0.10]},"depends_on":[],"nullable":False},
+    {"name":"parent_transaction_id","dtype":"string","description":"Parent failed transaction identifier for a retry.","gen":"constant","params":{"value":"PARENT_TXN"},"depends_on":[],"nullable":False},
 ]
 
 _LB06_VARIABLES = [
@@ -498,14 +536,22 @@ class ScenarioDesignerAgent:
         profile = get_profile(industry_type, country)
         industry_key = match_industry_key(industry_type)
         glossary_text = _build_glossary_text(industry_key)
-        base_variables = _build_base_variables(industry_key, profile)
+        base_cache_key = ("proposal_base", industry_key, str(profile.get("country_code") or country or profile.get("country_name") or "default"))
+        # Base fields are immutable schema templates; cache them because they are reused
+        # on every proposal. A miss simply builds them once.
+        base_variables = get_schema(base_cache_key)
+        if base_variables is None:
+            base_variables = _build_base_variables(industry_key, profile)
+            set_schema(base_cache_key, base_variables)
+        base_variables = [dict(v) for v in base_variables]
         base_names = {v["name"] for v in base_variables}
         preinjected_note = (
             f"These {len(base_variables)} fields are auto-injected and ALREADY generated — "
             f"do NOT include them in your \"variables\" list, just reference their exact names "
             f"in depends_on if a scenario-specific field needs one of them: {sorted(base_names)}\n"
-            f"Return ONLY the ADDITIONAL scenario-specific variables needed — aim for "
-            f"{max(1, MIN_VARIABLES - len(base_variables))} to {MAX_VARIABLES - len(base_variables)} of them.\n"
+            f"Return scenario-specific variables only. Prefer highly relevant variables over filler. "
+            f"The backend will deterministically complete the final catalog to {MAX_VARIABLES} fields "
+            f"from the reusable industry schema catalog when necessary.\n"
         )
 
         telecom_note = ""
@@ -524,6 +570,11 @@ class ScenarioDesignerAgent:
                 "- Do NOT create loyalty_tier_customer; it is not part of the Telecom schema.\n"
                 "- If this scenario needs a trigger/cause field, name it exactly 'trigger_cause' with categorical "
                 f"choices exactly {_TELECOM_TRIGGER_CAUSE_CHOICES}.\n"
+                "- Choose variables based on the requested journey and business outcome; do not generate a "
+                "fixed scenario template. For any missing non-mandatory fields, the backend may select from "
+                "its reusable Telecom schema catalog after this response.\n"
+                "- Return only schema definitions (names, types, generators, parameters, dependencies), never "
+                "static customer/transaction records or pre-filled sample data.\n"
             )
 
         if industry_key == "telecom" and str(scenario_id or "").strip().upper() == "LB-06":
@@ -585,6 +636,38 @@ class ScenarioDesignerAgent:
                     existing_names.add(required["name"])
             if required_events:
                 result["events"] = required_events
+            # Required client fields are protected; trim only non-required fields if the
+            # combined proposal exceeds the hard 35-variable ceiling.
+            if len(result["variables"]) > MAX_VARIABLES:
+                protected_required = {v["name"] for v in required_vars}
+                kept = []
+                for v in result["variables"]:
+                    if len(kept) < MAX_VARIABLES or v["name"] in protected_required:
+                        kept.append(v)
+                # If protected fields pushed the list over the ceiling, retain all protected
+                # fields and the earliest non-protected fields until the ceiling is reached.
+                if len(kept) > MAX_VARIABLES:
+                    protected_items = [v for v in kept if v["name"] in protected_required]
+                    other_items = [v for v in kept if v["name"] not in protected_required]
+                    result["variables"] = protected_items + other_items[:max(0, MAX_VARIABLES-len(protected_items))]
+                else:
+                    result["variables"] = kept
+            # Required LB-06/LB-07 fields are added after the first bounds pass.
+            # Fill any remaining Telecom slots from cached schema metadata so the final
+            # proposal still targets the requested maximum of 35 fields.
+            if len(result["variables"]) < MAX_VARIABLES:
+                existing_names = {v["name"] for v in result["variables"]}
+                catalog_key = ("telecom_proposal_catalog",)
+                catalog = get_schema(catalog_key)
+                if catalog is None:
+                    catalog = [dict(v) for v in _TELECOM_CACHED_PROPOSAL_CATALOG]
+                    set_schema(catalog_key, catalog)
+                for candidate in catalog:
+                    if len(result["variables"]) >= MAX_VARIABLES:
+                        break
+                    if candidate["name"] not in existing_names:
+                        result["variables"].append(dict(candidate))
+                        existing_names.add(candidate["name"])
         result["field_order"] = [v["name"] for v in result["variables"]]
         # Resolve entity_key only AFTER base variables are injected. The primary entity
         # identifier is normally one of those auto-injected fields (e.g. subscriber_id),
@@ -1034,6 +1117,48 @@ class ScenarioDesignerAgent:
                     continue
                 kept_reversed.append(v)
             variables = list(reversed(kept_reversed))
+
+        if len(variables) < _EXPAND_TARGET and industry_key == "telecom":
+            # Telecom deliberately does not make a second Gemini call just to reach 35.
+            # Gemini chooses the scenario-specific fields; Python fills only the remaining
+            # slots from reusable schema metadata. No customer/transaction records are cached.
+            existing = {v["name"] for v in variables}
+            catalog_key = ("telecom_proposal_catalog",)
+            catalog = get_schema(catalog_key)
+            if catalog is None:
+                catalog = [dict(v) for v in _TELECOM_CACHED_PROPOSAL_CATALOG]
+                set_schema(catalog_key, catalog)
+            for candidate in catalog:
+                if len(variables) >= MAX_VARIABLES:
+                    break
+                if candidate["name"] not in existing:
+                    variables.append(dict(candidate))
+                    existing.add(candidate["name"])
+            return variables
+
+        if len(variables) < _EXPAND_TARGET:
+            logger.info("[ScenarioDesigner] Only %d variables produced; requesting one bounded expansion (target %d)",
+                        len(variables), _EXPAND_TARGET)
+            scenario_specific = [v for v in variables if v["name"] not in protected_names]
+            expand_prompt = (
+                prompt + "\n\n"
+                f"Your previous attempt produced {len(scenario_specific)} scenario-specific variables. "
+                f"Add NEW, distinct, relevant variables so the scenario-specific total approaches "
+                f"{MAX_VARIABLES - len(protected_names)}. Do not repeat protected fields. "
+                "Return the full scenario-specific variables list under the variables key, in dependency order."
+            )
+            try:
+                retry = self._llm.generate_json(_SYSTEM, expand_prompt, temperature=0.3)
+                retried_vars = [v for v in retry.get("variables", []) if isinstance(v, dict) and v.get("name")]
+                retried_vars = [v for v in retried_vars if v["name"] not in protected_names]
+                retried_vars = self._normalize_field_names(retried_vars, industry_key)
+                if len(retried_vars) > len(scenario_specific):
+                    protected = [v for v in variables if v["name"] in protected_names]
+                    variables = (protected + retried_vars)[:MAX_VARIABLES]
+            except Exception as exc:
+                logger.warning("[ScenarioDesigner] Expansion retry failed: %s", exc)
+
+        return variables
 
         if len(variables) < _EXPAND_TARGET:
             logger.info("[ScenarioDesigner] Only %d variables produced, requesting more (target ~%d)",
