@@ -91,6 +91,7 @@ class GenerateResponse(BaseModel):
     totalCount: int = Field(0, description="Total number of unique entities in the response dataset")
     eventData: list[dict] = Field(default_factory=list, description="Deprecated compatibility field; transactional data is grouped under records by entityKey")
     errors: list[str]
+    record_errors: list[dict] = Field(default_factory=list, description="Errors for individual records that could not be generated or validated; successful records are still returned")
     edgeCasePercentage: float = Field(0.0, ge=0.0, le=1.0)
 
 
@@ -701,7 +702,11 @@ def generate_scenario(req: GenerateRequest):
         # Deterministic scenario-definition/data-contract failures are client/config
         # errors, not server crashes. Surface the exact reason as HTTP 400.
         raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-    if state.errors and not state.final_records:
+    # Scenario/pipeline errors still fail when no record-level work succeeded.
+    # Individual record failures are returned as record_errors and must never turn
+    # the whole /scenario/generate request into an HTTP 500, even when every
+    # requested record failed.
+    if state.errors and not state.final_records and not state.record_errors:
         raise HTTPException(500, detail={"errors": state.errors})
     meta = resolve_scenario_meta(scenario_id) or {}
     final_records = state.final_records
@@ -796,5 +801,6 @@ def generate_scenario(req: GenerateRequest):
         records=response_records,
         eventData=event_data,
         errors=state.errors,
+        record_errors=state.record_errors,
         edgeCasePercentage=float(meta.get("edge_case_percentage", 0.0) or 0.0),
     )

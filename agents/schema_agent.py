@@ -133,15 +133,22 @@ class SchemaAgent:
         # as machine-readable rules so validation/generation cannot lose a formula
         # because the LLM omitted it from its response.
         formula_rules = list(rules.get("formula_rules", []) or [])
-        existing_formula_fields = {
-            str(item.get("field")) for item in formula_rules
-            if isinstance(item, dict) and item.get("field")
+        # Variable definitions are authoritative. If Gemini supplied a formula_rule
+        # for the same field, replace it with the explicit variable formula rather
+        # than allowing a malformed/alternate LLM expression to win.
+        authoritative_formulas = {
+            str(var.get("name")): str(var.get("formula"))
+            for var in VARS
+            if var.get("name") and var.get("formula")
         }
-        for var in VARS:
-            field = str(var.get("name", ""))
-            expression = var.get("formula")
-            if field and expression and field not in existing_formula_fields:
-                formula_rules.append({"field": field, "expression": str(expression)})
+        formula_rules = [
+            item for item in formula_rules
+            if not (isinstance(item, dict) and str(item.get("field", "")) in authoritative_formulas)
+        ]
+        formula_rules.extend(
+            {"field": field, "expression": expression}
+            for field, expression in authoritative_formulas.items()
+        )
         rules["formula_rules"] = formula_rules
 
         # Ensure the generation constraints contain the explicit scenario choices

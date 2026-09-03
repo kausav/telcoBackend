@@ -534,11 +534,12 @@ def _generate_record(variables: list[dict], profile: dict | None = None, rules: 
         gen_type = var["gen"]
         generator = _GENERATORS.get(gen_type)
         effective_var = var
-        rule_formula = _formula_from_rules(var["name"], rules)
-        if rule_formula and var.get("gen") != "formula":
+        # Explicit variable formulas are authoritative; rules are only a fallback.
+        rule_formula = var.get("formula") or _formula_from_rules(var["name"], rules)
+        if rule_formula:
             effective_var = dict(var)
             effective_var["gen"] = "formula"
-            effective_var["formula"] = rule_formula
+            effective_var["formula"] = str(rule_formula)
         generator = _GENERATORS.get(effective_var.get("gen"))
         if generator:
             helper_rec = dict(rec)
@@ -584,11 +585,12 @@ def _generate_selected_record(
         if name not in required or name in rec:
             continue
         effective_var = var
-        rule_formula = _formula_from_rules(name, rules)
-        if rule_formula and var.get("gen") != "formula":
+        # Explicit variable formulas are authoritative; rules are only a fallback.
+        rule_formula = var.get("formula") or _formula_from_rules(name, rules)
+        if rule_formula:
             effective_var = dict(var)
             effective_var["gen"] = "formula"
-            effective_var["formula"] = rule_formula
+            effective_var["formula"] = str(rule_formula)
         generator = _GENERATORS.get(effective_var.get("gen"))
         if generator:
             helper_rec = dict(rec)
@@ -1356,6 +1358,7 @@ def _transactional_records(
     rules: dict | None = None,
     edge_case_variables: list[dict] | None = None,
     edge_case_percentage: float = 0.0,
+    record_errors_out: list[dict] | None = None,
 ) -> list[dict]:
     """Generate transactional records with record-level edge-case semantics.
 
@@ -1382,9 +1385,20 @@ def _transactional_records(
     used_entity_keys: set[str] = set()
 
     for entity_index in range(response_entity_count):
-        entity_context = _generate_selected_record(
-            variables, set(compiled.entity_fields), profile=profile, rules=rules
-        )
+        try:
+            entity_context = _generate_selected_record(
+                variables, set(compiled.entity_fields), profile=profile, rules=rules
+            )
+        except Exception as exc:
+            error = {
+                "record_index": len(generated),
+                "error": str(exc),
+                "record": {"entity_index": entity_index},
+            }
+            if record_errors_out is not None:
+                record_errors_out.append(error)
+            logger.warning("[DataGeneration] Skipping transactional entity %d: %s", entity_index, exc)
+            continue
         if entity_key and entity_key in entity_context:
             attempts = 0
             while str(entity_context[entity_key]) in used_entity_keys and attempts < 10:
@@ -1412,23 +1426,29 @@ def _transactional_records(
                 elapsed_seconds += random.randint(5, 300)
                 event_ts = base_ts + timedelta(seconds=elapsed_seconds)
                 row = None
+                generation_exception = None
                 for _attempt in range(_MAX_EDGE_CASE_ATTEMPTS if edge_enabled else 1):
-                    candidate_row = _generate_selected_record(
-                        variables,
-                        set(event.fields),
-                        base=entity_context,
-                        profile=profile,
-                        rules=rules,
-                    )
-                    candidate_row.update({
-                        "journey_id": journey_id,
-                        "transaction_id": f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}",
-                        "event_type": event.event_type,
-                        "event_sequence": event.sequence,
-                        "event_occurrence": occurrence + 1,
-                        "event_timestamp": event_ts.isoformat(),
-                        "isEdgeCaseData": False,
-                    })
+                    try:
+                        candidate_row = _generate_selected_record(
+                            variables,
+                            set(event.fields),
+                            base=entity_context,
+                            profile=profile,
+                            rules=rules,
+                        )
+                        candidate_row.update({
+                            "journey_id": journey_id,
+                            "transaction_id": f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}",
+                            "event_type": event.event_type,
+                            "event_sequence": event.sequence,
+                            "event_occurrence": occurrence + 1,
+                            "event_timestamp": event_ts.isoformat(),
+                            "isEdgeCaseData": False,
+                        })
+                    except Exception as exc:
+                        generation_exception = exc
+                        row = None
+                        break
                     # Edge classification is deterministic: if a normal generated
                     # record already satisfies an edge condition, it cannot be labelled
                     # false. Regenerate it instead. This prevents two identical records
@@ -1439,11 +1459,25 @@ def _transactional_records(
                     row = candidate_row
                     break
                 if row is None:
-                    raise ValueError(
-                        "Unable to generate a normal transactional record that does not "
-                        "satisfy any configured edge-case condition. The edge-case definitions "
-                        "leave no valid normal-domain value for this event."
-                    )
+                    error = {
+                        "record_index": len(generated),
+                        "error": (
+                            str(generation_exception) if generation_exception is not None else
+                            "Unable to generate a normal transactional record that does not "
+                            "satisfy any configured edge-case condition. The edge-case definitions "
+                            "leave no valid normal-domain value for this event."
+                        ),
+                        "record": {
+                            "journey_id": journey_id,
+                            "event_type": event.event_type,
+                            "event_sequence": event.sequence,
+                            "event_occurrence": occurrence + 1,
+                        },
+                    }
+                    if record_errors_out is not None:
+                        record_errors_out.append(error)
+                    logger.warning("[DataGeneration] Skipping transactional record: %s", error["error"])
+                    continue
                 generated.append(row)
 
     if not edge_groups or edge_case_percentage <= 0 or not generated:
@@ -2082,7 +2116,13 @@ class DataGenerationAgent:
             entity_key = compiled.entity_key
             state.transactional_event_counts = {}
             profile = get_profile(state.industry, state.country)
-            records = _transactional_records(compiled, state.count, state.transactional_event_counts, profile=profile, rules=state.rules, edge_case_variables=state.edge_case_variables, edge_case_percentage=state.edge_case_percentage)
+            records = _transactional_records(
+                compiled, state.count, state.transactional_event_counts,
+                profile=profile, rules=state.rules,
+                edge_case_variables=state.edge_case_variables,
+                edge_case_percentage=state.edge_case_percentage,
+                record_errors_out=state.record_errors,
+            )
             state.field_order = [
                 "journey_id", "transaction_id", "event_type", "event_sequence",
                 "event_occurrence", "event_timestamp",
@@ -2099,52 +2139,77 @@ class DataGenerationAgent:
             edge_names = list(edge_groups)
             records = []
             for index in range(state.count):
-                rec = _generate_record(variables, profile=profile, rules=state.rules)
-                if index < edge_count and edge_names:
-                    group = edge_groups[edge_names[index % len(edge_names)]]
-                    matched = False
-                    branches = _condition_branches(group.get("condition", ""), variables) or [{}]
-                    for _ in range(_MAX_EDGE_CASE_ATTEMPTS):
-                        for assignments in branches:
-                            candidate = _edge_case_candidate_for_aggregation(
-                                dict(rec), group, variables, profile, state.rules, assignments
-                            )
-                            if _safe_edge_condition(group.get("condition", ""), candidate):
-                                rec = candidate
-                                rec["isEdgeCaseData"] = True
-                                matched = True
+                rec = {}
+                try:
+                    rec = _generate_record(variables, profile=profile, rules=state.rules)
+                    if index < edge_count and edge_names:
+                        group = edge_groups[edge_names[index % len(edge_names)]]
+                        matched = False
+                        branches = _condition_branches(group.get("condition", ""), variables) or [{}]
+                        for _ in range(_MAX_EDGE_CASE_ATTEMPTS):
+                            for assignments in branches:
+                                candidate = _edge_case_candidate_for_aggregation(
+                                    dict(rec), group, variables, profile, state.rules, assignments
+                                )
+                                if _safe_edge_condition(group.get("condition", ""), candidate):
+                                    rec = candidate
+                                    rec["isEdgeCaseData"] = True
+                                    matched = True
+                                    break
+                            if matched:
                                 break
-                        if matched:
-                            break
-                        # Regenerate the normal base so random-dependent conditions
-                        # get another opportunity; deterministic constraints still win.
-                        rec = _generate_record(variables, profile=profile, rules=state.rules)
-                    if not matched:
-                        raise ValueError(
-                            f"Unable to generate an aggregational edge-case record satisfying "
-                            f"'{group.get('condition', '')}' after {_MAX_EDGE_CASE_ATTEMPTS} attempts"
-                        )
-                else:
-                    # A record whose actual values satisfy a configured edge condition
-                    # cannot be labelled false. Regenerate normal records until they are
-                    # outside every edge condition. This makes the flag a deterministic
-                    # property of the record, so identical condition-relevant data can
-                    # never receive contradictory true/false labels.
-                    if edge_groups and state.edge_case_percentage > 0:
-                        normal_ok = False
-                        for _attempt in range(_MAX_EDGE_CASE_ATTEMPTS):
-                            if not _matches_any_edge_condition(rec, edge_groups):
-                                normal_ok = True
-                                break
+                            # Regenerate the normal base so random-dependent conditions
+                            # get another opportunity; deterministic constraints still win.
                             rec = _generate_record(variables, profile=profile, rules=state.rules)
-                        if not normal_ok:
-                            raise ValueError(
-                                "Unable to generate a normal aggregational record that does not "
-                                "satisfy any configured edge-case condition. The edge-case "
-                                "definitions leave no valid normal-domain value."
-                            )
-                    rec["isEdgeCaseData"] = False
-                records.append(rec)
+                        if not matched:
+                            error = {
+                                "record_index": index,
+                                "error": (
+                                    f"Unable to generate an aggregational edge-case record satisfying "
+                                    f"'{group.get('condition', '')}' after {_MAX_EDGE_CASE_ATTEMPTS} attempts"
+                                ),
+                                "record": dict(rec) if isinstance(rec, dict) else {},
+                            }
+                            state.record_errors.append(error)
+                            logger.warning("[DataGeneration] Skipping aggregational record %d: %s", index, error["error"])
+                            continue
+                    else:
+                        # A record whose actual values satisfy a configured edge condition
+                        # cannot be labelled false. Regenerate normal records until they are
+                        # outside every edge condition. This makes the flag a deterministic
+                        # property of the record, so identical condition-relevant data can
+                        # never receive contradictory true/false labels.
+                        if edge_groups and state.edge_case_percentage > 0:
+                            normal_ok = False
+                            for _attempt in range(_MAX_EDGE_CASE_ATTEMPTS):
+                                if not _matches_any_edge_condition(rec, edge_groups):
+                                    normal_ok = True
+                                    break
+                                rec = _generate_record(variables, profile=profile, rules=state.rules)
+                            if not normal_ok:
+                                error = {
+                                "record_index": index,
+                                "error": (
+                                    "Unable to generate a normal aggregational record that does not "
+                                    "satisfy any configured edge-case condition. The edge-case "
+                                    "definitions leave no valid normal-domain value."
+                                ),
+                                "record": dict(rec) if isinstance(rec, dict) else {},
+                            }
+                            state.record_errors.append(error)
+                            logger.warning("[DataGeneration] Skipping aggregational record %d: %s", index, error["error"])
+                            continue
+                        rec["isEdgeCaseData"] = False
+                    records.append(rec)
+                except Exception as exc:
+                    error = {
+                        "record_index": index,
+                        "error": str(exc),
+                        "record": dict(rec) if isinstance(locals().get("rec"), dict) else {},
+                    }
+                    state.record_errors.append(error)
+                    logger.warning("[DataGeneration] Skipping aggregational record %d: %s", index, exc)
+                    continue
             if "isEdgeCaseData" not in state.field_order:
                 state.field_order = list(state.field_order) + ["isEdgeCaseData"]
             logger.info("[DataGeneration] Generated %d aggregational records with %d fields each; edge cases=%d.",
@@ -2181,198 +2246,209 @@ class DataGenerationAgent:
         journey_state: dict[str, tuple[int, datetime | None, str | None]] = {}
         journey_edge_context: dict[str, dict[str, Any]] = {}
 
-        for rec in records:
-            pre_event_def = event_defs.get(str(rec.get("event_type"))) if transactional else None
-            pre_event_fields = set(pre_event_def.get("fields", []) or []) if pre_event_def else set()
-            rec, pre_repaired_edge = _repair_edge_record(dict(rec), edge_groups, variables, profile=profile, rules=state.rules, event_fields=pre_event_fields)
-            rec, issues = _validate_record(
-                rec, variables, state.field_order, profile, transactional,
-                event_fields=pre_event_fields,
-                rules=state.rules,
-            )
-
-            if rec.get("isEdgeCaseData") is True:
-                rec, repaired_ok = _repair_edge_record(rec, edge_groups, variables, profile=profile, rules=state.rules, event_fields=pre_event_fields)
-                if not repaired_ok:
-                    raise ValueError(
-                        "Generated edge-case record failed deterministic validation: "
-                        "the configured edge-case condition cannot be satisfied by the validated record"
-                    )
-
-            # Edge-case labels are trusted only after the configured condition is checked.
-            # Aggregational rows are self-contained. Transactional rows are sparse, so their
-            # final edge status is validated later against the complete journey context.
-            if rec.get("isEdgeCaseData") is True:
-                matched = any(
-                    _safe_edge_condition(group.get("condition", ""), rec)
-                    for group in _applicable_edge_groups(rec, edge_groups, transactional)
-                    if group.get("condition")
+        for record_index, rec in enumerate(records):
+            try:
+                pre_event_def = event_defs.get(str(rec.get("event_type"))) if transactional else None
+                pre_event_fields = set(pre_event_def.get("fields", []) or []) if pre_event_def else set()
+                rec, pre_repaired_edge = _repair_edge_record(dict(rec), edge_groups, variables, profile=profile, rules=state.rules, event_fields=pre_event_fields)
+                rec, issues = _validate_record(
+                    rec, variables, state.field_order, profile, transactional,
+                    event_fields=pre_event_fields,
+                    rules=state.rules,
                 )
-                if not matched:
-                    # Never silently turn a generated edge case into a normal record.
-                    # If QA changed a value so the condition no longer holds, the
-                    # dataset is internally inconsistent and must fail visibly.
-                    raise ValueError(
-                        "Generated edge-case record failed deterministic validation: "
-                        "isEdgeCaseData=true but no configured edge-case condition is satisfied"
-                    )
 
-            # Classification is deterministic: a normal record must not satisfy an
-            # applicable edge condition. Otherwise identical condition-relevant data
-            # could legitimately receive both true and false labels. Generator-side
-            # normal-record exclusion is the primary guard; QA repeats the invariant
-            # after all repairs/fills so it cannot be broken here.
-            if rec.get("isEdgeCaseData") is not True and any(
-                _safe_edge_condition(group.get("condition", ""), rec)
-                for group in _applicable_edge_groups(rec, edge_groups, transactional)
-                if group.get("condition")
-            ):
-                rec, normal_ok = _make_non_edge_record(
-                    rec, edge_groups, variables, profile=profile, rules=state.rules, transactional=transactional
-                )
-                if not normal_ok or any(
+                if rec.get("isEdgeCaseData") is True:
+                    rec, repaired_ok = _repair_edge_record(rec, edge_groups, variables, profile=profile, rules=state.rules, event_fields=pre_event_fields)
+                    if not repaired_ok:
+                        raise ValueError(
+                            "Generated edge-case record failed deterministic validation: "
+                            "the configured edge-case condition cannot be satisfied by the validated record"
+                        )
+
+                # Edge-case labels are trusted only after the configured condition is checked.
+                # Aggregational rows are self-contained. Transactional rows are sparse, so their
+                # final edge status is validated later against the complete journey context.
+                if rec.get("isEdgeCaseData") is True:
+                    matched = any(
+                        _safe_edge_condition(group.get("condition", ""), rec)
+                        for group in _applicable_edge_groups(rec, edge_groups, transactional)
+                        if group.get("condition")
+                    )
+                    if not matched:
+                        # Never silently turn a generated edge case into a normal record.
+                        # If QA changed a value so the condition no longer holds, the
+                        # dataset is internally inconsistent and must fail visibly.
+                        raise ValueError(
+                            "Generated edge-case record failed deterministic validation: "
+                            "isEdgeCaseData=true but no configured edge-case condition is satisfied"
+                        )
+
+                # Classification is deterministic: a normal record must not satisfy an
+                # applicable edge condition. Otherwise identical condition-relevant data
+                # could legitimately receive both true and false labels. Generator-side
+                # normal-record exclusion is the primary guard; QA repeats the invariant
+                # after all repairs/fills so it cannot be broken here.
+                if rec.get("isEdgeCaseData") is not True and any(
                     _safe_edge_condition(group.get("condition", ""), rec)
                     for group in _applicable_edge_groups(rec, edge_groups, transactional)
                     if group.get("condition")
                 ):
-                    raise ValueError(
-                        "Generated normal record satisfies a configured edge-case condition "
-                        "and no schema-valid non-edge value could be derived dynamically"
+                    rec, normal_ok = _make_non_edge_record(
+                        rec, edge_groups, variables, profile=profile, rules=state.rules, transactional=transactional
                     )
+                    if not normal_ok or any(
+                        _safe_edge_condition(group.get("condition", ""), rec)
+                        for group in _applicable_edge_groups(rec, edge_groups, transactional)
+                        if group.get("condition")
+                    ):
+                        raise ValueError(
+                            "Generated normal record satisfies a configured edge-case condition "
+                            "and no schema-valid non-edge value could be derived dynamically"
+                        )
 
-            if transactional:
-                # Metadata is structural and should never be delegated to the LLM.
-                if not rec.get("journey_id"):
-                    rec["journey_id"] = f"JRN-{uuid.uuid4().hex[:12].upper()}"
-                    issues.append("journey_id generated")
-                if not rec.get("transaction_id") or str(rec.get("transaction_id")) in seen_transactions:
-                    rec["transaction_id"] = f"TXN-{uuid.uuid4().hex[:12].upper()}"
-                    issues.append("transaction_id generated/renewed for uniqueness")
-                seen_transactions.add(str(rec["transaction_id"]))
+                if transactional:
+                    # Metadata is structural and should never be delegated to the LLM.
+                    if not rec.get("journey_id"):
+                        rec["journey_id"] = f"JRN-{uuid.uuid4().hex[:12].upper()}"
+                        issues.append("journey_id generated")
+                    if not rec.get("transaction_id") or str(rec.get("transaction_id")) in seen_transactions:
+                        rec["transaction_id"] = f"TXN-{uuid.uuid4().hex[:12].upper()}"
+                        issues.append("transaction_id generated/renewed for uniqueness")
+                    seen_transactions.add(str(rec["transaction_id"]))
 
-                event_type = str(rec.get("event_type") or "BUSINESS_EVENT")
-                rec["event_type"] = event_type
-                seq = int(rec.get("event_sequence") or 1)
-                if event_defs:
-                    definition = event_defs.get(event_type)
-                    if definition:
-                        expected_seq = int(definition.get("sequence", seq))
-                        if seq != expected_seq:
-                            rec["event_sequence"] = expected_seq
-                            seq = expected_seq
-                            issues.append("event_sequence corrected from scenario definition")
-                rec["event_sequence"] = max(1, seq)
+                    event_type = str(rec.get("event_type") or "BUSINESS_EVENT")
+                    rec["event_type"] = event_type
+                    seq = int(rec.get("event_sequence") or 1)
+                    if event_defs:
+                        definition = event_defs.get(event_type)
+                        if definition:
+                            expected_seq = int(definition.get("sequence", seq))
+                            if seq != expected_seq:
+                                rec["event_sequence"] = expected_seq
+                                seq = expected_seq
+                                issues.append("event_sequence corrected from scenario definition")
+                    rec["event_sequence"] = max(1, seq)
 
-                ts = _qa_parse_dt(rec.get("event_timestamp"))
-                if ts is None:
-                    ts = datetime.now(timezone.utc)
-                    rec["event_timestamp"] = ts.isoformat()
-                    issues.append("event_timestamp generated")
+                    ts = _qa_parse_dt(rec.get("event_timestamp"))
+                    if ts is None:
+                        ts = datetime.now(timezone.utc)
+                        rec["event_timestamp"] = ts.isoformat()
+                        issues.append("event_timestamp generated")
 
-                journey = str(rec["journey_id"])
-                previous = journey_state.get(journey)
-                if previous:
-                    prev_seq, prev_ts, prev_entity = previous
-                    if rec["event_sequence"] < prev_seq:
-                        rec["event_sequence"] = prev_seq
-                        issues.append("event_sequence corrected to preserve journey ordering")
-                    if prev_ts and ts < prev_ts:
-                        rec["event_timestamp"] = prev_ts.isoformat()
-                        ts = prev_ts
-                        issues.append("event_timestamp corrected to preserve journey ordering")
-                    entity_name = resolve_entity_key(state.scenario)
-                    if entity_name and entity_name in rec and prev_entity and str(rec[entity_name]) != prev_entity:
-                        rec[entity_name] = prev_entity
-                        issues.append("entity key corrected for journey consistency")
-                entity_key = resolve_entity_key(state.scenario)
-                entity_value = str(rec.get(entity_key)) if entity_key and rec.get(entity_key) is not None else None
-                journey_state[journey] = (rec["event_sequence"], ts, entity_value)
-                if entity_value:
-                    seen_entities.add(entity_value)
+                    journey = str(rec["journey_id"])
+                    previous = journey_state.get(journey)
+                    if previous:
+                        prev_seq, prev_ts, prev_entity = previous
+                        if rec["event_sequence"] < prev_seq:
+                            rec["event_sequence"] = prev_seq
+                            issues.append("event_sequence corrected to preserve journey ordering")
+                        if prev_ts and ts < prev_ts:
+                            rec["event_timestamp"] = prev_ts.isoformat()
+                            ts = prev_ts
+                            issues.append("event_timestamp corrected to preserve journey ordering")
+                        entity_name = resolve_entity_key(state.scenario)
+                        if entity_name and entity_name in rec and prev_entity and str(rec[entity_name]) != prev_entity:
+                            rec[entity_name] = prev_entity
+                            issues.append("entity key corrected for journey consistency")
+                    entity_key = resolve_entity_key(state.scenario)
+                    entity_value = str(rec.get(entity_key)) if entity_key and rec.get(entity_key) is not None else None
+                    journey_state[journey] = (rec["event_sequence"], ts, entity_value)
+                    if entity_value:
+                        seen_entities.add(entity_value)
 
-            # Fill missing values only after validation. Formula fields are
-            # calculated first whenever their dependencies are available; never
-            # replace a calculable formula with an arbitrary dtype default.
-            active_fill_fields = set(event_defs.get(str(rec.get("event_type")), {}).get("fields", []) or []) if transactional else set(state.field_order)
-            for formula_field, formula_expr in formula_specs:
-                if formula_field not in active_fill_fields or rec.get(formula_field) is not None:
-                    continue
-                deps = _formula_dependencies(formula_expr)
-                if deps and all(rec.get(dep) is not None for dep in deps):
-                    calculated = _safe_formula(formula_expr, rec)
-                    if calculated is not None:
-                        rec[formula_field] = calculated
-                        issues.append(f"{formula_field} calculated from formula")
+                # Fill missing values only after validation. Formula fields are
+                # calculated first whenever their dependencies are available; never
+                # replace a calculable formula with an arbitrary dtype default.
+                active_fill_fields = set(event_defs.get(str(rec.get("event_type")), {}).get("fields", []) or []) if transactional else set(state.field_order)
+                for formula_field, formula_expr in formula_specs:
+                    if formula_field not in active_fill_fields or rec.get(formula_field) is not None:
+                        continue
+                    deps = _formula_dependencies(formula_expr)
+                    if deps and all(rec.get(dep) is not None for dep in deps):
+                        calculated = _safe_formula(formula_expr, rec)
+                        if calculated is not None:
+                            rec[formula_field] = calculated
+                            issues.append(f"{formula_field} calculated from formula")
 
-            # For transactional data, events are intentionally sparse: fill only
-            # fields declared by this event, never every variable in the global schema.
-            if transactional:
-                event_def = event_defs.get(str(rec.get("event_type")))
-                fill_order = list(event_def.get("fields", []) or []) if event_def else []
-            else:
-                fill_order = state.field_order
-            formula_field_names = {field for field, _ in formula_specs}
-            safe_fill_order = [f for f in fill_order if f not in formula_field_names or rec.get(f) is not None]
-            rec, filled = _fill_missing(rec, safe_fill_order, dtype_map)
-            if filled:
-                issues.append(f"{filled} event field(s) defaulted")
+                # For transactional data, events are intentionally sparse: fill only
+                # fields declared by this event, never every variable in the global schema.
+                if transactional:
+                    event_def = event_defs.get(str(rec.get("event_type")))
+                    fill_order = list(event_def.get("fields", []) or []) if event_def else []
+                else:
+                    fill_order = state.field_order
+                formula_field_names = {field for field, _ in formula_specs}
+                safe_fill_order = [f for f in fill_order if f not in formula_field_names or rec.get(f) is not None]
+                rec, filled = _fill_missing(rec, safe_fill_order, dtype_map)
+                if filled:
+                    issues.append(f"{filled} event field(s) defaulted")
 
-            # FINAL EDGE-CASE RECONCILIATION: all deterministic QA repairs/fills are
-            # complete now.  Re-apply the edge definition one last time so a normal
-            # range/choice/default repair cannot invalidate an edge condition.  This
-            # is the single source of truth for the edge flag and is intentionally
-            # generic for every industry and field name.
-            if rec.get("isEdgeCaseData") is True:
-                final_event_def = event_defs.get(str(rec.get("event_type"))) if transactional else None
-                final_event_fields = set(final_event_def.get("fields", []) or []) if final_event_def else set()
-                rec, repaired_ok = _repair_edge_record(
-                    rec, edge_groups, variables, profile=profile, rules=state.rules,
-                    event_fields=final_event_fields
-                )
-                if not repaired_ok:
-                    raise ValueError(
-                        "Generated edge-case record failed deterministic validation: "
-                        "isEdgeCaseData=true but the configured edge-case condition could "
-                        "not be satisfied after final QA reconciliation"
+                # FINAL EDGE-CASE RECONCILIATION: all deterministic QA repairs/fills are
+                # complete now.  Re-apply the edge definition one last time so a normal
+                # range/choice/default repair cannot invalidate an edge condition.  This
+                # is the single source of truth for the edge flag and is intentionally
+                # generic for every industry and field name.
+                if rec.get("isEdgeCaseData") is True:
+                    final_event_def = event_defs.get(str(rec.get("event_type"))) if transactional else None
+                    final_event_fields = set(final_event_def.get("fields", []) or []) if final_event_def else set()
+                    rec, repaired_ok = _repair_edge_record(
+                        rec, edge_groups, variables, profile=profile, rules=state.rules,
+                        event_fields=final_event_fields
                     )
-                if not any(_safe_edge_condition(g.get("condition", ""), rec)
-                           for g in _applicable_edge_groups(rec, edge_groups, transactional) if g.get("condition")):
-                    raise ValueError(
-                        "Generated edge-case record failed deterministic validation: "
-                        "isEdgeCaseData=true but no configured edge-case condition is satisfied"
-                    )
+                    if not repaired_ok:
+                        raise ValueError(
+                            "Generated edge-case record failed deterministic validation: "
+                            "isEdgeCaseData=true but the configured edge-case condition could "
+                            "not be satisfied after final QA reconciliation"
+                        )
+                    if not any(_safe_edge_condition(g.get("condition", ""), rec)
+                               for g in _applicable_edge_groups(rec, edge_groups, transactional) if g.get("condition")):
+                        raise ValueError(
+                            "Generated edge-case record failed deterministic validation: "
+                            "isEdgeCaseData=true but no configured edge-case condition is satisfied"
+                        )
 
-            # A later schema/default fill can also change a previously-normal record
-            # into an edge state. Reconcile once more after ALL deterministic repairs.
-            # Never allow a false label to coexist with a true edge condition.
-            if rec.get("isEdgeCaseData") is not True and any(
-                _safe_edge_condition(group.get("condition", ""), rec)
-                for group in _applicable_edge_groups(rec, edge_groups, transactional)
-                if group.get("condition")
-            ):
-                rec, normal_ok = _make_non_edge_record(
-                    rec, edge_groups, variables, profile=profile, rules=state.rules, transactional=transactional
-                )
-                if not normal_ok or any(
+                # A later schema/default fill can also change a previously-normal record
+                # into an edge state. Reconcile once more after ALL deterministic repairs.
+                # Never allow a false label to coexist with a true edge condition.
+                if rec.get("isEdgeCaseData") is not True and any(
                     _safe_edge_condition(group.get("condition", ""), rec)
                     for group in _applicable_edge_groups(rec, edge_groups, transactional)
                     if group.get("condition")
                 ):
-                    raise ValueError(
-                        "Generated normal record satisfies a configured edge-case condition "
-                        "after final QA reconciliation and no schema-valid non-edge value could be derived dynamically"
+                    rec, normal_ok = _make_non_edge_record(
+                        rec, edge_groups, variables, profile=profile, rules=state.rules, transactional=transactional
                     )
+                    if not normal_ok or any(
+                        _safe_edge_condition(group.get("condition", ""), rec)
+                        for group in _applicable_edge_groups(rec, edge_groups, transactional)
+                        if group.get("condition")
+                    ):
+                        raise ValueError(
+                            "Generated normal record satisfies a configured edge-case condition "
+                            "after final QA reconciliation and no schema-valid non-edge value could be derived dynamically"
+                        )
 
-            algo_fixed += len(issues)
-            checked.append(rec)
-            if transactional:
-                journey_id_for_edge = str(rec.get("journey_id") or "")
-                if journey_id_for_edge:
-                    ctx = journey_edge_context.setdefault(journey_id_for_edge, {})
-                    for key, value in rec.items():
-                        if key not in {"journey_id", "transaction_id", "event_type", "event_sequence",
-                                       "event_occurrence", "event_timestamp", "isEdgeCaseData"} and value is not None:
-                            ctx[key] = value
+                algo_fixed += len(issues)
+                checked.append(rec)
+                if transactional:
+                    journey_id_for_edge = str(rec.get("journey_id") or "")
+                    if journey_id_for_edge:
+                        ctx = journey_edge_context.setdefault(journey_id_for_edge, {})
+                        for key, value in rec.items():
+                            if key not in {"journey_id", "transaction_id", "event_type", "event_sequence",
+                                           "event_occurrence", "event_timestamp", "isEdgeCaseData"} and value is not None:
+                                ctx[key] = value
+
+            except Exception as exc:
+                error = {
+                    "record_index": record_index,
+                    "error": str(exc),
+                    "record": dict(rec) if isinstance(rec, dict) else {},
+                }
+                state.record_errors.append(error)
+                logger.warning("[QA] Skipping invalid record %d: %s", record_index, exc)
+                continue
 
         # Transactional edge-case labels are record-level. A sparse event must
         # satisfy an edge condition using the fields actually present on that
@@ -2387,10 +2463,15 @@ class DataGenerationAgent:
                     if group.get("condition")
                 )
                 if not matched:
-                    raise ValueError(
-                        "Generated transactional edge-case record failed deterministic validation: "
-                        "isEdgeCaseData=true but no configured edge-case condition is satisfied"
-                    )
+                    state.record_errors.append({
+                        "record_index": checked.index(rec),
+                        "error": (
+                            "Generated transactional edge-case record failed deterministic validation: "
+                            "isEdgeCaseData=true but no configured edge-case condition is satisfied"
+                        ),
+                        "record": dict(rec),
+                    })
+                    checked.remove(rec)
 
         # Optional LLM semantic audit. Deterministic validation above always runs.
         rules_text = "\n".join(f"- {r}" for r in state.rules.get("business_rules", []))
@@ -2424,7 +2505,14 @@ class DataGenerationAgent:
                     validated = result.get("valid_records", chunk)
                     validated = [{k: r[k] for k in state.field_order if k in r} for r in validated]
                     valid_all.extend(validated)
-                    dropped_all.extend(result.get("dropped_records", []))
+                    dropped_records = result.get("dropped_records", []) or []
+                    dropped_all.extend(dropped_records)
+                    for dropped_offset, dropped in enumerate(dropped_records):
+                        state.record_errors.append({
+                            "record_index": i + dropped_offset,
+                            "error": "Record dropped by LLM QA validation",
+                            "record": dropped if isinstance(dropped, dict) else {},
+                        })
                     llm_fixes += int(result.get("fixes_applied", 0))
                     llm_issues += int(result.get("issues_found", 0))
                 except Exception as exc:
@@ -2453,7 +2541,8 @@ class DataGenerationAgent:
         state.validation_report = {
             "total_input": len(records),
             "total_valid": len(valid_all),
-            "total_dropped": len(dropped_all),
+            "total_dropped": len(dropped_all) + len(state.record_errors),
+            "record_errors": len(state.record_errors),
             "recovered": 0,
             "algo_fixes": algo_fixed,
             "llm_fixes": llm_fixes,

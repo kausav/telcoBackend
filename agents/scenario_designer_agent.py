@@ -313,8 +313,8 @@ Rules:
    allowed (""" + str(MAX_VARIABLES) + """), and never fewer than """ + str(MIN_VARIABLES) + """. Prefer
    completeness: include identity, segmentation, financial, behavioral, timestamp, channel, and
    outcome/decision fields.
-5. ALWAYS include these 2 variables (verbatim names, anywhere in the list):
-   customer_lifetime_value, loyalty_tier_customer.
+5. customer_lifetime_value is auto-injected by the backend. Do not create or duplicate it in the variables list.
+   loyalty_tier_customer is a generic-only legacy field and MUST NOT be created for Telecom.
 """
 
 # If a variable represents one of these concepts, reuse the exact name — keeps field
@@ -413,6 +413,10 @@ class ScenarioDesignerAgent:
                 "- Do NOT invent a churn_risk_score/churn_propensity_score field; churn is derived downstream "
                 "from the already auto-injected historical_low_balance_frequency, offer_acceptance_rate_historical "
                 "and preferred_topup_channel fields.\n"
+                "- customer_lifetime_value MUST be categorical with choices exactly low, medium, high.\n"
+                f"- recharge_status (including aliases such as topup_status/recharge_result) MUST be named exactly 'recharge_status' "
+                f"and MUST be categorical with choices exactly {_TELECOM_RECHARGE_STATUS_CHOICES}.\n"
+                "- Do NOT create loyalty_tier_customer; it is not part of the Telecom schema.\n"
                 "- If this scenario needs a trigger/cause field, name it exactly 'trigger_cause' with categorical "
                 f"choices exactly {_TELECOM_TRIGGER_CAUSE_CHOICES}.\n"
             )
@@ -701,8 +705,33 @@ class ScenarioDesignerAgent:
                 continue
             if _TELECOM_CHURN_NAME_MARKER in lname:
                 continue
-            v = dict(v)
-            if name == "trigger_cause":
+            if lname in _TELECOM_DROPPED_MANDATORY_NAMES:
+                continue
+
+            # Telecom client contract: canonicalize all recharge-status synonyms and
+            # force the exact four allowed values regardless of what Gemini proposed.
+            if lname in {x.lower() for x in _TELECOM_RECHARGE_STATUS_SYNONYMS}:
+                v = dict(v)
+                v["name"] = "recharge_status"
+                v["dtype"] = "categorical"
+                v["gen"] = "weighted_choice"
+                v["params"] = {
+                    "choices": list(_TELECOM_RECHARGE_STATUS_CHOICES),
+                    "weights": list(_TELECOM_RECHARGE_STATUS_WEIGHTS),
+                }
+                name = "recharge_status"
+                lname = name
+            else:
+                v = dict(v)
+
+            if name == "customer_lifetime_value":
+                v["dtype"] = "categorical"
+                v["gen"] = "weighted_choice"
+                v["params"] = {
+                    "choices": list(_TELECOM_CLV_CHOICES),
+                    "weights": list(_TELECOM_CLV_WEIGHTS),
+                }
+            elif name == "trigger_cause":
                 v["dtype"] = "categorical"
                 v["gen"] = "weighted_choice"
                 v["params"] = {
@@ -720,11 +749,20 @@ class ScenarioDesignerAgent:
                     v["params"] = params
             out.append(v)
 
-        # Dropping a field can leave a dangling depends_on reference; drop those too.
-        valid_names = {v["name"] for v in out}
+        # Deduplicate fields after canonicalization (e.g. recharge_status + topup_status)
+        # and repair dependencies after telecom-only fields have been removed.
+        deduped: list[dict] = []
+        seen_names: set[str] = set()
         for v in out:
+            field_name = str(v.get("name", ""))
+            if not field_name or field_name in seen_names:
+                continue
+            seen_names.add(field_name)
+            deduped.append(v)
+        valid_names = {v["name"] for v in deduped}
+        for v in deduped:
             v["depends_on"] = [d for d in v.get("depends_on", []) if d in valid_names]
-        return out
+        return deduped
 
     def _enforce_variable_bounds(
         self, variables: list[dict], prompt: str, protected_names: set[str], industry_key: str = "generic"

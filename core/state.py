@@ -33,5 +33,6 @@ class WorkflowState(BaseModel):
     final_records: list[dict[str, Any]] = Field(default_factory=list)
     validation_report: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
+    record_errors: list[dict[str, Any]] = Field(default_factory=list)
     field_order: list[str] = Field(default_factory=list)
     transactional_event_counts: dict[str, dict[str, int]] = Field(default_factory=dict)
