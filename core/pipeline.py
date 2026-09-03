@@ -14,7 +14,7 @@ from agents.edge_case_agent import EdgeCaseAgent
 from agents.orchestrator import OrchestratorAgent
 from agents.schema_agent import SchemaAgent
 from core.dynamic_scenarios import resolve_data_type, resolve_scenario_context
-from core.llm_client import GeminiClient
+from core.llm_client import GeminiClient, get_default_gemini_client
 from core.state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ def _build_graph(llm: GeminiClient):
 
 
 def run_pipeline(scenario: str, count: int, industry: str = "generic", country: str | None = None, api_key: str = "", type_of_data: str | None = None, scenario_context: dict | None = None) -> WorkflowState:
-    llm = GeminiClient(api_key=api_key or None)
+    llm = get_default_gemini_client() if not api_key else GeminiClient(api_key=api_key)
     resolved_type = type_of_data or resolve_data_type(scenario)
     context = scenario_context or resolve_scenario_context(scenario)
     # The resolver may only have partial metadata; never let that override explicit function arguments.

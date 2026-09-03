@@ -27,7 +27,7 @@ from core.dynamic_scenarios import (
     save_draft,
     scenario_exists,
 )
-from core.llm_client import GeminiClient
+from core.llm_client import GeminiClient, get_default_gemini_client
 from core.compiled_schema import invalidate_scenario
 from agents.data_generation_agent import _condition_compatible_with_schema
 from core.runtime_cache import clear_scenario
@@ -226,7 +226,7 @@ def propose_scenario(req: ProposeRequest):
     # because two different users can propose the same one concurrently. draftId (minted
     # below) is the only unique handle — /scenario/confirm resolves any scenarioId clash.
     try:
-        llm = GeminiClient()
+        llm = get_default_gemini_client()
         agent = ScenarioDesignerAgent(llm)
         draft = agent.propose(
             industry_type=req.industryType,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import os
+from functools import lru_cache
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -65,3 +66,13 @@ class GeminiClient:
         )
         return response.text.strip()
     
+
+@lru_cache(maxsize=1)
+def get_default_gemini_client() -> GeminiClient:
+    """Return the process-wide Gemini client for the configured API key.
+
+    Reusing the SDK client avoids rebuilding the client and its underlying HTTP
+    resources on every request. Callers that supply an explicit API key continue
+    to create a dedicated GeminiClient as before.
+    """
+    return GeminiClient()

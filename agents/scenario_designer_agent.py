@@ -8,6 +8,7 @@ knows how to execute — so the result can be run through the existing
 """
 from __future__ import annotations
 import logging
+from functools import lru_cache
 import ast
 import math
 
@@ -251,6 +252,7 @@ def _build_base_variables(industry_key: str, profile: dict) -> list[dict]:
     return base + [dict(m) for m in _MANDATORY_VARIABLES]
 
 
+@lru_cache(maxsize=None)
 def _build_alias_map(industry_key: str) -> dict[str, str]:
     """Synonym -> canonical name mapping for this industry (e.g. telecom canonicalizes
     to subscriber_id, banking/retail/etc. canonicalize to customer_id)."""
@@ -268,6 +270,7 @@ def _build_alias_map(industry_key: str) -> dict[str, str]:
     return alias_map
 
 
+@lru_cache(maxsize=None)
 def _build_glossary_text(industry_key: str) -> str:
     lines = [
         "Canonical field names for this industry — if a variable represents one of these "
