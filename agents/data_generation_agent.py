@@ -2174,31 +2174,32 @@ class DataGenerationAgent:
                             logger.warning("[DataGeneration] Skipping aggregational record %d: %s", index, error["error"])
                             continue
                     else:
-                        # A record whose actual values satisfy a configured edge condition
-                        # cannot be labelled false. Regenerate normal records until they are
-                        # outside every edge condition. This makes the flag a deterministic
-                        # property of the record, so identical condition-relevant data can
-                        # never receive contradictory true/false labels.
+                        # Normal records must be explicitly outside every configured
+                        # edge condition. Use the same generic non-edge solver used by QA
+                        # instead of relying only on random retries; this is important for
+                        # categorical/low-cardinality fields where random retries can
+                        # otherwise discard most or all normal records.
                         if edge_groups and state.edge_case_percentage > 0:
-                            normal_ok = False
-                            for _attempt in range(_MAX_EDGE_CASE_ATTEMPTS):
-                                if not _matches_any_edge_condition(rec, edge_groups):
-                                    normal_ok = True
-                                    break
-                                rec = _generate_record(variables, profile=profile, rules=state.rules)
-                            if not normal_ok:
+                            if _matches_any_edge_condition(rec, edge_groups):
+                                rec, normal_ok = _make_non_edge_record(
+                                    rec, edge_groups, variables, profile=profile,
+                                    rules=state.rules, transactional=False
+                                )
+                            else:
+                                normal_ok = True
+                            if not normal_ok or _matches_any_edge_condition(rec, edge_groups):
                                 error = {
-                                "record_index": index,
-                                "error": (
-                                    "Unable to generate a normal aggregational record that does not "
-                                    "satisfy any configured edge-case condition. The edge-case "
-                                    "definitions leave no valid normal-domain value."
-                                ),
-                                "record": dict(rec) if isinstance(rec, dict) else {},
-                            }
-                            state.record_errors.append(error)
-                            logger.warning("[DataGeneration] Skipping aggregational record %d: %s", index, error["error"])
-                            continue
+                                    "record_index": index,
+                                    "error": (
+                                        "Unable to generate a normal aggregational record that does not "
+                                        "satisfy any configured edge-case condition. The edge-case "
+                                        "definitions leave no valid normal-domain value."
+                                    ),
+                                    "record": dict(rec) if isinstance(rec, dict) else {},
+                                }
+                                state.record_errors.append(error)
+                                logger.warning("[DataGeneration] Skipping aggregational record %d: %s", index, error["error"])
+                                continue
                         rec["isEdgeCaseData"] = False
                     records.append(rec)
                 except Exception as exc:
