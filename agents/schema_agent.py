@@ -211,6 +211,7 @@ class SchemaAgent:
 
         # Normalize and retain only executable conditional rules that reference fields
         # in the confirmed schema. These are consumed deterministically by data generation.
+        var_names = {str(v.get("name")) for v in VARS if v.get("name")}
         raw_conditional = rules.get("conditional_rules", [])
         normalized_conditional = []
         if isinstance(raw_conditional, list):

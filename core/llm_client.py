@@ -28,13 +28,20 @@ class GeminiClient:
         temperature: float = 0.7,
     ) -> dict | list:
         """Call Gemini and parse the response as JSON."""
+        # Gemini 3.x is optimized around its default sampling configuration.
+        # Keep the public method signature unchanged for all agents, but do not send
+        # legacy sampling knobs to Gemini 3.x. This is especially important on the
+        # generation path, where the orchestrator/schema agents can otherwise fail
+        # before any records are produced.
+        config_kwargs = {
+            "system_instruction": system_instruction,
+            "response_mime_type": "application/json",
+        }
+        if not self.MODEL.startswith("gemini-3"):
+            config_kwargs["temperature"] = temperature
         response = self._client.models.generate_content(
             model=self.MODEL,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                response_mime_type="application/json",
-                temperature=temperature,
-            ),
+            config=types.GenerateContentConfig(**config_kwargs),
             contents=user_prompt,
         )
         text = (response.text or "").strip()
@@ -55,12 +62,12 @@ class GeminiClient:
         temperature: float = 0.4,
     ) -> str:
         """Call Gemini and return plain text."""
+        config_kwargs = {"system_instruction": system_instruction}
+        if not self.MODEL.startswith("gemini-3"):
+            config_kwargs["temperature"] = temperature
         response = self._client.models.generate_content(
             model=self.MODEL,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=temperature,
-            ),
+            config=types.GenerateContentConfig(**config_kwargs),
             contents=user_prompt,
         )
         return response.text.strip()
