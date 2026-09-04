@@ -573,8 +573,8 @@ class ScenarioDesignerAgent:
                 "- Choose variables based on the requested journey and business outcome; do not generate a "
                 "fixed scenario template. For any missing non-mandatory fields, the backend may select from "
                 "its reusable Telecom schema catalog after this response.\n"
-                "- Return only schema definitions (names, types, generators, parameters, dependencies), never "
-                "static customer/transaction records or pre-filled sample data.\n"
+                "- Return schema definitions and, for transactional output, the required event definitions. "
+                "Never return static customer/transaction records or pre-filled sample data.\n"
             )
 
         if industry_key == "telecom" and str(scenario_id or "").strip().upper() == "LB-06":
@@ -986,16 +986,31 @@ class ScenarioDesignerAgent:
                 "min_occurrences": min_occurrences,
                 "max_occurrences": max_occurrences,
             })
+        # A transactional proposal must always have at least one executable event.
+        # Gemini can occasionally omit events or return event fields that do not map to
+        # the confirmed variable catalog. Previously that left a weak BUSINESS_EVENT
+        # definition (or an empty event list after normalization), which could result
+        # in no useful transactional output for ordinary scenarios. Build a generic
+        # executable event from the actual scenario variables instead of requiring an
+        # LB-06/LB-07 special case.
         if not normalized:
+            preferred = [
+                v["name"] for v in variables
+                if v.get("name") not in {"event_timestamp"}
+            ]
             normalized = [{
                 "event_type": "BUSINESS_EVENT",
                 "sequence": 1,
-                "fields": [],
-                "description": "",
+                "fields": preferred,
+                "description": "Primary business event for the requested transactional scenario.",
                 "min_occurrences": 1,
                 "max_occurrences": 10,
             }]
-        return normalized[:8]
+
+        # Keep the full client-defined lifecycle when supplied (LB-07 currently has
+        # 12 events). The previous 8-event cap silently removed valid events. A bounded
+        # ceiling prevents malformed LLM output from creating unbounded event lists.
+        return normalized[:32]
 
     def _normalize_field_names(self, variables: list[dict], industry_key: str = "generic") -> list[dict]:
         """Collapse known synonyms (customer_id, phone_number, ...) to the canonical name
