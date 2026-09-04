@@ -440,7 +440,7 @@
 
 
     <h3>3.1 Scenario Designer Agent</h3>
-      <div class="note"><strong>Current proposal contract and latency optimization:</strong> The Scenario Designer targets a <b>maximum 35-field catalog</b>. Gemini is responsible for reasoning about the requested scenario and selecting/generating relevant scenario-specific schema definitions; it is not asked to invent static customer or transaction records. Telecom has a reusable, process-cached <b>schema metadata catalog</b> used only to fill any remaining slots to 35 after the LLM response. This removes the unnecessary second Gemini round trip while preserving the maximum-35 requirement. Telecom-wide mandatory fields are <code>subscriber_id</code>, <code>account_id</code>, <code>subscriber_msisdn</code>, <code>balance_after</code>, and <code>payment_gateway</code>; these are enforced independently of scenario ID. Scenario-specific LB-06/LB-07 requirements are layered on top of that common contract. The cache stores schema definitions/metadata only — generated customer and transaction records are never reused across proposals.</div>
+      <div class="note"><strong>Current proposal contract and latency optimization:</strong> The Scenario Designer targets a <b>maximum 35-field catalog</b>. Gemini is responsible for reasoning about the requested scenario and selecting/generating relevant scenario-specific schema definitions; it is not asked to invent static customer or transaction records. Telecom has a reusable, process-cached <b>schema metadata catalog</b> used only to fill any remaining slots to 35 after the LLM response. This removes the unnecessary second Gemini round trip while preserving the maximum-35 requirement. Telecom-wide mandatory fields are <code>subscriber_id</code>, <code>account_id</code>, <code>subscriber_msisdn</code>, and <code>balance_after</code>; these are enforced independently of scenario ID. Scenario-specific LB-06/LB-07 requirements are layered on top of that common contract. The cache stores schema definitions/metadata only — generated customer and transaction records are never reused across proposals.</div>
 
     <p><b>Role:</b>
         Generates the variable catalog. Runs first, standalone, before any other agent — it is the source of the
@@ -463,7 +463,7 @@
             <code>subscriber_id</code>)
         </li>
 
-        <li>Force-includes the baseline mandatory fields for the active industry; Telecom additionally requires subscriber_id, account_id, subscriber_msisdn, balance_after, and payment_gateway for every proposal</li>
+        <li>Force-includes the baseline mandatory fields for the active industry; Telecom additionally requires subscriber_id, account_id, subscriber_msisdn, and balance_after for every proposal</li>
 
         <li>Uses a bounded expansion path: Gemini selects scenario-relevant fields first; Telecom fills only the remaining slots from its cached reusable schema metadata catalog until the final catalog reaches 35 fields, avoiding a second Gemini round trip</li>
 
@@ -943,7 +943,7 @@
 
     <h2>9.5 Telecom proposal contract and caching
 
-        For Telecom, the Scenario Designer enforces a common schema contract across all scenario IDs. The mandatory fields are subscriber_id, account_id, subscriber_msisdn, balance_after, and payment_gateway. LB-06 and LB-07 add scenario-specific fields/events on top of this contract. Reusable Telecom proposal definitions are held in the runtime schema cache and used to fill the catalog toward the 35-variable maximum. This cache is for reusable schema metadata, not generated customer/transaction records, so scenario-specific data is not incorrectly reused across proposals. The optimization removes an unnecessary Gemini expansion call for Telecom while retaining the 35-variable maximum and the existing downstream pipeline.
+        For Telecom, the Scenario Designer enforces a common schema contract across all scenario IDs. The mandatory fields are subscriber_id, account_id, subscriber_msisdn, and balance_after. LB-06 and LB-07 add scenario-specific fields/events on top of this contract. Reusable Telecom proposal definitions are held in the runtime schema cache and used to fill the catalog toward the 35-variable maximum. This cache is for reusable schema metadata, not generated customer/transaction records, so scenario-specific data is not incorrectly reused across proposals. The optimization removes an unnecessary Gemini expansion call for Telecom while retaining the 35-variable maximum and the existing downstream pipeline.
 
       10. Final End-to-End Flow (actual)</h2>
 

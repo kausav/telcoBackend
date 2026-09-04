@@ -26,6 +26,32 @@ logger = logging.getLogger(__name__)
 
 _MAX_EDGE_CASE_ATTEMPTS = 20
 
+
+def _normalize_upi_in_generated_value(value: Any):
+    """Normalize UPI references for Telecom output only.
+
+    The caller must explicitly enable this for Telecom. Other industries may
+    legitimately use UPI and must preserve it unchanged.
+    """
+    if isinstance(value, dict):
+        return {k: _normalize_upi_in_generated_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_upi_in_generated_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_normalize_upi_in_generated_value(v) for v in value)
+    if isinstance(value, str) and "upi" in value.lower():
+        # Canonicalize the whole generated value rather than leaking phrases such
+        # as "UPI Payment" or "UPI-linked Account" into final synthetic data.
+        return "DIGITAL_WALLET"
+    return value
+
+
+def _normalize_upi_in_records(records: list[dict], industry: str | None = None) -> list[dict]:
+    """Normalize UPI only for Telecom records; preserve it for other industries."""
+    if str(industry or "").strip().lower() != "telecom":
+        return records
+    return [_normalize_upi_in_generated_value(dict(record)) for record in records]
+
 def _edge_case_groups(edge_case_variables: list[dict] | None) -> dict[str, dict]:
     groups: dict[str, dict] = {}
     for item in edge_case_variables or []:
@@ -1663,6 +1689,33 @@ and transactional event semantics.
 Do not invent fields that are intentionally absent from sparse transactional
 events. Do not rewrite valid records unnecessarily.
 
+SEMANTIC RELEVANCE IS A HARD REQUIREMENT, NOT A STYLE PREFERENCE:
+- Every value must make business sense for the target industry, domain, scenario, and country.
+- A value can be syntactically valid and still be invalid. Reject/repair semantically wrong values.
+- Never use placeholder organization/entity values such as Provider_A, Provider_B, Company_A, Product_A, Gateway_A, Synthetic_Provider, or similar.
+- When the scenario schema identifies a real-world entity field (provider, operator, merchant, bank, retailer, carrier, manufacturer, etc.), use the country/industry vocabulary supplied by the scenario profile.
+- Never borrow terminology from another industry merely because it fits the datatype.
+- Do not create filler values solely to satisfy a variable count; every generated value must serve the scenario.
+- Cross-field and event-state consistency is mandatory: validate relationships between fields, not only individual field types.
+- INDUSTRY RELEVANCE IS A HARD GATE: every generated value must make sense for the exact
+  target industry, country, domain, and scenario. A value that merely matches a datatype
+  or a generic category is invalid if it belongs to another industry.
+- REAL ENTITY FIELDS (provider/operator/bank/merchant/retailer/carrier/manufacturer/etc.)
+  must use target-industry entities. Never use Provider_A, Company_A, telecom operators
+  in non-telecom datasets, or another industry's brands. If the profile has no entity list,
+  do not invent an unrelated cross-industry entity.
+- VALUE-LEVEL AUDIT: inspect every categorical value individually and repair/drop values
+  that fail the industry + country + scenario relevance test.
+- STATE CONSISTENCY: after field-level validation, re-evaluate dependent fields together.
+  Never allow a failure/decline/cancellation state to coexist with a success-only outcome
+  unless the record explicitly represents a later recovery/completion state.
+- TELECOM-SPECIFIC PAYMENT RULE: when Industry is Telecom, UPI must never appear
+  in final generated data. Any Telecom generated value containing UPI (including
+  "UPI payment", "UPI transaction", "UPI-linked", or similar) must be represented
+  as the canonical value "DIGITAL_WALLET". This rule applies only to Telecom.
+- For non-Telecom industries, do not remove, rename, or normalize UPI merely because
+  it appears. Preserve UPI when it is valid for that industry's scenario and profile.
+
 Return JSON:
   - "valid_records": [ ... ]
   - "dropped_records": [ ... ]
@@ -1734,9 +1787,21 @@ def _normalize(v: Any) -> str:
 def _country_repair(name: str, value: Any, profile: dict):
     if value is None:
         return value, None
+    # Telecom-only output contract: UPI is represented as DIGITAL_WALLET.
+    # Other industries are allowed to retain UPI when it is a valid value.
+    if str(profile.get("industry", "")).strip().lower() == "telecom":
+        normalized_value = _normalize_upi_in_generated_value(value)
+        if normalized_value != value:
+            return normalized_value, f"{name} normalized from UPI to DIGITAL_WALLET"
     lname = name.lower()
     if country_allowed_value(name, value, profile):
         return value, None
+    if "service_provider" in lname or "provider" == lname or lname.endswith("_provider"):
+        choices = profile.get("service_providers") or []
+        if choices:
+            normalized = {_normalize(c) for c in choices}
+            if _normalize(value) not in normalized:
+                return choices[0], f"{name} corrected to an industry/country-appropriate provider"
     if "payment" in lname or "pay_method" in lname:
         choices = payment_methods_for_profile(profile)
         if choices:
@@ -1839,9 +1904,18 @@ def _validate_record(
         # 3. Categorical values must stay within the declared scenario vocabulary.
         if dtype in {"categorical", "string"} and params.get("choices") and rec.get(name) is not None:
             choices = list(params.get("choices", []))
+            # Real-world entity/payment vocabularies from the active country/industry
+            # profile override stale choices that may exist in an already-confirmed
+            # scenario or an older cached schema. This prevents a later categorical
+            # check from undoing semantic country repair (e.g. Jio -> Provider_A).
+            lname = str(name).strip().lower()
+            if lname == "service_provider" and profile.get("service_providers"):
+                choices = list(profile.get("service_providers") or [])
+            elif lname == "payment_method" and str(profile.get("industry", "")).strip().lower() == "telecom":
+                choices = ["DEBIT_CARD", "CREDIT_CARD", "DIGITAL_WALLET", "NETBANKING"]
             if choices and _normalize(rec[name]) not in {_normalize(c) for c in choices}:
                 rec[name] = choices[0]
-                issues.append(f"{name} corrected to declared choice")
+                issues.append(f"{name} corrected to authoritative industry/country choice")
 
         # 4. Generic numeric ranges from the variable definition.
         if isinstance(rec.get(name), (int, float)) and not isinstance(rec.get(name), bool):
@@ -2192,7 +2266,6 @@ def _apply_telecom_client_contract(records: list[dict], scenario_id: str, indust
                 row["balance_before"] = round(balance, 2)
                 row["recharge_amount"] = round(amount, 2)
                 row["transaction_status"] = "SUCCESS"
-                row["payment_gateway"] = row.get("payment_gateway") or "Gateway_A"
                 if et in {"TOPUP_INITIATED", "PAYMENT_AUTHORIZED", "PAYMENT_SETTLED"}:
                     row["balance_after"] = round(balance, 2)
                     if et == "PAYMENT_SETTLED":
@@ -2390,6 +2463,9 @@ class DataGenerationAgent:
                         len(records), len(variables), edge_count)
 
         records = _apply_telecom_client_contract(records, state.scenario, state.industry)
+        # Final pre-QA normalization: no UPI token/value is allowed to enter the
+        # validation pipeline, even if it came from a legacy schema or generator.
+        records = _normalize_upi_in_records(records, state.industry)
         state.raw_records = records
         return state
 
@@ -2703,7 +2779,8 @@ class DataGenerationAgent:
                     f"Industry: {state.industry}\nCountry: {state.country or 'GLOBAL'}\n"
                     f"Domain: {state.domain}\nBusiness scenario: {state.business_scenario}\n"
                     f"Use case: {state.use_case or ''}\n"
-                    f"This is a QA audit sample only. Do not rewrite the dataset.\nRecords:\n{json.dumps(checked[:sample_size], default=str)}",
+                    + ("For this Telecom dataset, UPI is forbidden; represent any UPI-related value as DIGITAL_WALLET.\n" if str(state.industry or "").strip().lower() == "telecom" else "For this non-Telecom dataset, preserve valid UPI values; do not apply the Telecom UPI rule.\n")
+                    + f"This is a QA audit sample only. Do not rewrite the dataset.\nRecords:\n{json.dumps(checked[:sample_size], default=str)}",
                     temperature=0.1,
                 )
                 llm_fixes = int(result.get("fixes_applied", 0))
@@ -2712,6 +2789,10 @@ class DataGenerationAgent:
                 logger.warning("[QA] Sample audit error: %s — deterministic validation retained", exc)
                 state.errors.append(f"QA sample error: {exc}")
 
+        # LLM QA is not authoritative for vocabulary. Re-apply the Telecom-only
+        # output contract after LLM validation so it cannot reintroduce UPI into
+        # Telecom final data. Other industries preserve UPI.
+        valid_all = _normalize_upi_in_records(valid_all, state.industry)
         state.final_records = valid_all
         state.validation_report = {
             "total_input": len(records),

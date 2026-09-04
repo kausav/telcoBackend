@@ -41,6 +41,35 @@ Return a JSON object with:
       preferred_values: [str]}} — machine-readable constraints the generator should use
   - "formula_rules": [{"field": str, "expression": str}] — authoritative formulas to
       calculate and validate generated fields
+
+SEMANTIC ACCURACY IS MANDATORY:
+- Every field and every categorical value must be relevant to the target industry,
+  country, domain, and scenario.
+- Reject placeholder values such as Provider_A, Company_A, Product_A, Gateway_A,
+  Synthetic_Provider, or similar when the field represents a real-world entity.
+- Use real-world industry/country vocabulary supplied in the profile whenever available.
+- Do not treat syntactic validity as semantic validity. A value that fits a datatype is
+  still invalid if it does not make business sense for the target industry.
+- Preserve the scenario variable definitions as the source of truth, and make
+  generation_constraints reflect their actual business vocabulary.
+- Check cross-field semantics, not only individual fields. If two fields describe
+  related business states, explicitly encode the dependency in cross_field_rules.
+- Perform a VALUE-BY-VALUE INDUSTRY AUDIT before returning rules: every categorical
+  value must belong to the target industry's real vocabulary. Do not accept a value
+  merely because it is syntactically valid or common in another industry.
+- REAL ENTITY FIELDS require real target-industry/country entities. For example, a
+  telecom service_provider must be an actual telecom operator; a banking provider
+  must be a bank/payment institution when such a field is appropriate; a retail
+  provider/merchant must be retail-appropriate. Never use Provider_A, Company_A,
+  telecom brands in banking/retail/etc., or any other cross-industry placeholder.
+- If the supplied profile has no authoritative entity list for a field, do NOT borrow
+  an entity list from another industry. Use scenario-supported domain vocabulary or
+  leave the field unconstrained rather than introducing unrelated entities.
+- Treat semantic relevance as a HARD validation rule. If a variable/value fails the
+  industry + country + scenario audit, reject or replace it before generation.
+- Encode important state dependencies explicitly. Example: if a scenario states that
+  transaction failure causes recharge failure, encode that as a machine-checkable
+  conditional rule; do not leave the relationship only in prose.
 """
 
 
@@ -110,15 +139,21 @@ class SchemaAgent:
             f"Target industry: {profile['industry']}; country: {profile['country_name']} ({state.country})\n"
             f"Currency: {profile['currency']}; Regulator: {profile['regulator']}\n"
             f"Country-appropriate payment methods: {profile.get('payment_methods', [])}\n"
+            f"Industry-appropriate service providers/operators (when applicable): {profile.get('service_providers', [])}\n"
             f"Market character: {profile['market_character']}\n"
             f"Output data type: {state.type_of_data}\n"
             f"Transactional events: {sc.get('events', [])}\n"
             f"Typical product/plan types: {profile['product_types']}\n"
             f"Variables: {field_summary}\n"
             f"Complete confirmed scenario context (source of truth): {json.dumps(state.scenario_context, default=str, sort_keys=True)}\n\n"
-            "IMPORTANT: generation_constraints and formula_rules are machine-readable and must be "
+            "IMPORTANT: generation_constraints, cross_field_rules, and formula_rules are machine-readable and must be "
             "derived from the supplied scenario/use case, not generic filler. Do not invent a constraint "
-            "unless it is supported by the scenario, industry, country, or explicit variable definition.\n"
+            "unless it is supported by the scenario, industry, country, or explicit variable definition. "
+            "Before returning, audit every field AND every categorical value for industry/country relevance. "
+            "A syntactically valid value from another industry is still invalid and must be replaced. "
+            "Do not use telecom entities as generic providers for non-telecom industries. "
+            "For every meaningful relationship between business-state fields, add an explicit conditional rule "
+            "that the data generator can enforce.\n"
             f"Produce a complete rules document covering all {len(VARS)} variables, "
             f"consistent with this industry and country's real-world standards. "
             f"For transactional output, also validate event_sequence is increasing within each journey, "

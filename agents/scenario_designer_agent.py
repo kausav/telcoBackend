@@ -57,8 +57,7 @@ _TELECOM_SEGMENT_CHOICES = [
     "Heavy Data Users", "Frequent Data Exhausters", "Low Data Users",
 ]
 _TELECOM_SEGMENT_WEIGHTS = [0.22, 0.18, 0.15, 0.20, 0.15, 0.10]
-_TELECOM_SERVICE_PROVIDERS = ["Provider_A", "Provider_B"]
-_TELECOM_SERVICE_PROVIDER_WEIGHTS = [0.6, 0.4]
+_TELECOM_SERVICE_PROVIDER_WEIGHTS = [0.40, 0.30, 0.20, 0.10]
 _TELECOM_TRIGGER_CAUSE_SYNONYMS = ["trigger_type", "triggertype", "trigger", "event_trigger_type", "trigger_reason"]
 _TELECOM_TRIGGER_CAUSE_CHOICES = ["LOW_BALANCE_THRESHOLD", "VALIDITY_EXPIRY_WARNING", "ZERO_BALANCE"]
 _TELECOM_TRIGGER_CAUSE_WEIGHTS = [0.5, 0.3, 0.2]
@@ -103,35 +102,16 @@ _UPI_FIELD_NAME_MARKERS = ("payment", "pay_method", "channel")
 _UPI_VALUE_MARKER = "upi"
 _UPI_MASK_LABEL = "MASKED"
 
+# Telecom-only generated-data vocabulary contract: UPI must not appear in Telecom
+# generated output. Any Telecom UPI-related payment terminology is represented as DIGITAL_WALLET.
+_UPI_CANONICAL_OUTPUT = "DIGITAL_WALLET"
+
 # Telecom-wide mandatory client contract. These fields are injected for EVERY
 # Telecom proposal, independent of scenario id. Scenario-specific requirements
 # below are layered on top only for the requested LB-06/LB-07 journeys.
-_TELECOM_CORE_MANDATORY = [
-    {
-        "name": "subscriber_msisdn", "dtype": "string",
-        "description": "Subscriber mobile number in E.164 format.",
-        "gen": "e164_phone", "params": {"country_codes": ["+91"]},
-        "depends_on": [], "nullable": False,
-    },
-    {
-        "name": "account_id", "dtype": "string",
-        "description": "Billing account identifier tied to subscriber_id.",
-        "gen": "id_mirror", "params": {"prefix": "ACC-", "source_field": "subscriber_id", "source_prefix": "SUB-"},
-        "depends_on": ["subscriber_id"], "nullable": False,
-    },
-    {
-        "name": "balance_after", "dtype": "float",
-        "description": "Subscriber account balance after the relevant transaction/event.",
-        "gen": "uniform", "params": {"min": 0.0, "max": 5000.0},
-        "depends_on": [], "nullable": False,
-    },
-    {
-        "name": "payment_gateway", "dtype": "categorical",
-        "description": "Synthetic payment gateway name; never expose a real provider name.",
-        "gen": "weighted_choice", "params": {"choices": ["Gateway_A", "Gateway_B", "Gateway_C"], "weights": [0.50, 0.30, 0.20]},
-        "depends_on": [], "nullable": False,
-    },
-]
+_TELECOM_CORE_MANDATORY = []
+
+
 
 # Reusable Telecom proposal catalog. These definitions are immutable templates used
 # only to fill the requested 35-field catalog when Gemini returns fewer fields.
@@ -139,13 +119,13 @@ _TELECOM_CORE_MANDATORY = [
 # the 35-variable target. Scenario-specific fields from Gemini always take precedence.
 _TELECOM_CACHED_PROPOSAL_CATALOG = [
     {"name":"subscriber_segment","dtype":"categorical","description":"Subscriber usage/behavior segment.","gen":"weighted_choice","params":{"choices":list(_TELECOM_SEGMENT_CHOICES),"weights":list(_TELECOM_SEGMENT_WEIGHTS)},"depends_on":[],"nullable":False},
-    {"name":"service_provider","dtype":"categorical","description":"Synthetic telecom service provider.","gen":"weighted_choice","params":{"choices":list(_TELECOM_SERVICE_PROVIDERS),"weights":list(_TELECOM_SERVICE_PROVIDER_WEIGHTS)},"depends_on":[],"nullable":False},
-    {"name":"rate_plan_code","dtype":"categorical","description":"Synthetic rate plan associated with the service provider.","gen":"weighted_choice","params":{"choices":["PLAN_A","PLAN_B","PLAN_C","PLAN_D"],"weights":[0.35,0.30,0.20,0.15]},"depends_on":["service_provider"],"nullable":False},
+    {"name":"service_provider","dtype":"categorical","description":"Real-world telecom operator/service-provider brand appropriate to the target country.","gen":"weighted_choice","params":{"choices":["Vodafone","Orange","Telefónica","Deutsche Telekom"],"weights":[0.40,0.30,0.20,0.10]},"depends_on":[],"nullable":False},
+    {"name":"rate_plan_code","dtype":"categorical","description":"Synthetic rate plan associated with the service provider.","gen":"weighted_choice","params":{"choices":["PREPAID_DAILY","PREPAID_MONTHLY","POSTPAID_INDIVIDUAL","POSTPAID_FAMILY","DATA_ONLY"],"weights":[0.25,0.25,0.20,0.20,0.10]},"depends_on":["service_provider"],"nullable":False},
     {"name":"trigger_cause","dtype":"categorical","description":"Cause that triggered the telecom journey.","gen":"weighted_choice","params":{"choices":list(_TELECOM_TRIGGER_CAUSE_CHOICES),"weights":list(_TELECOM_TRIGGER_CAUSE_WEIGHTS)},"depends_on":[],"nullable":False},
     {"name":"recharge_status","dtype":"categorical","description":"Recharge/top-up outcome.","gen":"weighted_choice","params":{"choices":list(_TELECOM_RECHARGE_STATUS_CHOICES),"weights":list(_TELECOM_RECHARGE_STATUS_WEIGHTS)},"depends_on":[],"nullable":False},
     {"name":"balance_before","dtype":"float","description":"Subscriber balance before a relevant transaction.","gen":"uniform","params":{"min":0.0,"max":1000.0},"depends_on":[],"nullable":False},
     {"name":"recharge_amount","dtype":"float","description":"Recharge/top-up amount.","gen":"uniform","params":{"min":10.0,"max":500.0},"depends_on":[],"nullable":False},
-    {"name":"payment_method","dtype":"categorical","description":"Synthetic payment method.","gen":"weighted_choice","params":{"choices":["Virtual_Payment","CARD_SYNTHETIC","BANK_SYNTHETIC","WALLET_SYNTHETIC"],"weights":[0.40,0.25,0.20,0.15]},"depends_on":[],"nullable":False},
+    {"name":"payment_method","dtype":"categorical","description":"Synthetic payment method.","gen":"weighted_choice","params":{"choices":["DEBIT_CARD","CREDIT_CARD","DIGITAL_WALLET","NETBANKING"],"weights":[0.35,0.30,0.20,0.15]},"depends_on":[],"nullable":False},
     {"name":"failure_reason","dtype":"categorical","description":"Recharge/payment failure reason.","gen":"weighted_choice","params":{"choices":["INSUFFICIENT_FUNDS","GATEWAY_TIMEOUT","NETWORK_FAILURE","BANK_DECLINE","AUTHENTICATION_FAILURE","PAYMENT_INSTRUMENT_UNAVAILABLE"],"weights":[0.30,0.15,0.15,0.15,0.10,0.15]},"depends_on":[],"nullable":False},
     {"name":"recovery_action","dtype":"categorical","description":"Recovery action after a failed recharge.","gen":"weighted_choice","params":{"choices":["RETRY_SAME_METHOD","USE_ALTERNATE_PAYMENT_METHOD","REAUTHENTICATE","CONTACT_SUPPORT"],"weights":[0.35,0.35,0.15,0.15]},"depends_on":[],"nullable":False},
     {"name":"recovery_status","dtype":"categorical","description":"Recovery outcome.","gen":"weighted_choice","params":{"choices":["RECOVERY_PENDING","RECOVERED_SAME_METHOD","RECOVERED_ALTERNATE_METHOD","ESCALATED","ABANDONED"],"weights":[0.10,0.35,0.35,0.10,0.10]},"depends_on":[],"nullable":False},
@@ -172,7 +152,7 @@ _TELECOM_CACHED_PROPOSAL_CATALOG = [
 _LB06_VARIABLES = [
     {"name":"balance_before","dtype":"float","description":"Subscriber balance immediately before the recharge/recovery transaction.","gen":"uniform","params":{"min":0.0,"max":100.0},"depends_on":[],"nullable":False},
     {"name":"recharge_amount","dtype":"float","description":"Recharge/top-up amount.","gen":"uniform","params":{"min":10.0,"max":500.0},"depends_on":[],"nullable":False},
-    {"name":"payment_method","dtype":"categorical","description":"Synthetic payment method used for recharge/retry.","gen":"weighted_choice","params":{"choices":["Virtual_Payment","CARD_SYNTHETIC","BANK_SYNTHETIC","WALLET_SYNTHETIC"],"weights":[0.40,0.25,0.20,0.15]},"depends_on":[],"nullable":False},
+    {"name":"payment_method","dtype":"categorical","description":"Synthetic payment method used for recharge/retry.","gen":"weighted_choice","params":{"choices":["DEBIT_CARD","CREDIT_CARD","DIGITAL_WALLET","NETBANKING"],"weights":[0.35,0.30,0.20,0.15]},"depends_on":[],"nullable":False},
     {"name":"failure_reason","dtype":"categorical","description":"Reason for failed recharge attempt.","gen":"weighted_choice","params":{"choices":["INSUFFICIENT_FUNDS","GATEWAY_TIMEOUT","NETWORK_FAILURE","BANK_DECLINE","AUTHENTICATION_FAILURE","PAYMENT_INSTRUMENT_UNAVAILABLE"],"weights":[0.30,0.15,0.15,0.15,0.10,0.15]},"depends_on":[],"nullable":False},
     {"name":"recovery_action","dtype":"categorical","description":"Recovery action actually taken after a failed recharge.","gen":"weighted_choice","params":{"choices":["RETRY_SAME_METHOD","USE_ALTERNATE_PAYMENT_METHOD","REAUTHENTICATE","CONTACT_SUPPORT"],"weights":[0.35,0.35,0.15,0.15]},"depends_on":[],"nullable":False},
     {"name":"recovery_status","dtype":"categorical","description":"Outcome of the recovery action.","gen":"weighted_choice","params":{"choices":["RECOVERY_PENDING","RECOVERED_SAME_METHOD","RECOVERED_ALTERNATE_METHOD","ESCALATED","ABANDONED"],"weights":[0.10,0.35,0.35,0.10,0.10]},"depends_on":[],"nullable":False},
@@ -184,11 +164,11 @@ _LB06_VARIABLES = [
 ]
 _LB06_EVENTS = [
     ("LOW_BALANCE_DETECTED",1,["subscriber_id","account_id","subscriber_msisdn","balance_after","trigger_cause"]),
-    ("TOPUP_ATTEMPT",2,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","payment_gateway","recharge_amount","recharge_status","failure_reason","payment_method"]),
-    ("TOPUP_FAILURE",3,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","payment_gateway","recharge_amount","recharge_status","failure_reason","payment_method"]),
+    ("TOPUP_ATTEMPT",2,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","recharge_amount","recharge_status","failure_reason","payment_method"]),
+    ("TOPUP_FAILURE",3,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","recharge_amount","recharge_status","failure_reason","payment_method"]),
     ("RECOVERY_GUIDANCE",4,["subscriber_id","account_id","subscriber_msisdn","balance_after","recovery_channel","recovery_action"]),
-    ("TOPUP_RETRY",5,["subscriber_id","account_id","subscriber_msisdn","balance_after","payment_gateway","recharge_amount","recharge_status","parent_transaction_id","retry_count"]),
-    ("TOPUP_SUCCESS",6,["subscriber_id","account_id","subscriber_msisdn","balance_after","payment_gateway","recharge_amount","recharge_status","recovery_status","recovery_timestamp","parent_transaction_id","final_journey_status"]),
+    ("TOPUP_RETRY",5,["subscriber_id","account_id","subscriber_msisdn","balance_after","recharge_amount","recharge_status","parent_transaction_id","retry_count"]),
+    ("TOPUP_SUCCESS",6,["subscriber_id","account_id","subscriber_msisdn","balance_after","recharge_amount","recharge_status","recovery_status","recovery_timestamp","parent_transaction_id","final_journey_status"]),
 ]
 
 _LB07_VARIABLES = [
@@ -210,13 +190,13 @@ _LB07_VARIABLES = [
     {"name":"resolution_type","dtype":"categorical","description":"How the discrepancy was resolved.","gen":"weighted_choice","params":{"choices":["AUTO_RECONCILIATION","MANUAL_REVIEW","BALANCE_CORRECTION","STATUS_CLARIFICATION"],"weights":[0.45,0.20,0.25,0.10]},"depends_on":[],"nullable":False},
 ]
 _LB07_EVENTS = [
-    ("TOPUP_INITIATED",1,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","payment_gateway","recharge_amount","transaction_status"]),
-    ("PAYMENT_AUTHORIZED",2,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","payment_gateway","recharge_amount","transaction_status"]),
-    ("PAYMENT_SETTLED",3,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","payment_gateway","recharge_amount","transaction_status","settlement_status"]),
+    ("TOPUP_INITIATED",1,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","recharge_amount","transaction_status"]),
+    ("PAYMENT_AUTHORIZED",2,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","recharge_amount","transaction_status"]),
+    ("PAYMENT_SETTLED",3,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","recharge_amount","transaction_status","settlement_status"]),
     ("BALANCE_UPDATE_FAILED",4,["subscriber_id","account_id","subscriber_msisdn","balance_before","balance_after","expected_balance","observed_balance","balance_update_status","balance_variance","exception_reason","transaction_status"]),
     ("DISCREPANCY_DETECTED",5,["subscriber_id","account_id","subscriber_msisdn","balance_after","expected_balance","observed_balance","balance_variance","exception_detected_flag"]),
     ("VERIFICATION_REQUESTED",6,["subscriber_id","account_id","subscriber_msisdn","balance_after","verification_status","verification_attempt_count"]),
-    ("TRANSACTION_LOOKUP",7,["subscriber_id","account_id","subscriber_msisdn","balance_after","payment_gateway","settlement_status","verification_status"]),
+    ("TRANSACTION_LOOKUP",7,["subscriber_id","account_id","subscriber_msisdn","balance_after","settlement_status","verification_status"]),
     ("RECONCILIATION_STARTED",8,["subscriber_id","account_id","subscriber_msisdn","balance_after","reconciliation_status","resolution_type"]),
     ("STATUS_CONFIRMED",9,["subscriber_id","account_id","subscriber_msisdn","balance_after","verification_status","settlement_status","reconciliation_status","final_status"]),
     ("CUSTOMER_NOTIFIED",10,["subscriber_id","account_id","subscriber_msisdn","balance_after","final_status"]),
@@ -241,7 +221,7 @@ def _telecom_requirement_contract(scenario_id: str, type_of_data: str) -> tuple[
     ]
 
 
-def _telecom_mandatory_variables() -> list[dict]:
+def _telecom_mandatory_variables(profile: dict | None = None) -> list[dict]:
     """Telecom client override of the generic mandatory fields: fixed CLV tiers,
     fixed subscriber segments, a synthetic service_provider, and churn-helper fields
     instead of a raw churn score. loyalty_tier_customer is dropped — redundant with
@@ -265,9 +245,12 @@ def _telecom_mandatory_variables() -> list[dict]:
     service_provider = {
         "name": "service_provider",
         "dtype": "categorical",
-        "description": "Synthetic telecom service provider operating the subscriber connection.",
+        "description": "Real-world telecom operator/service-provider brand appropriate to the target country.",
         "gen": "weighted_choice",
-        "params": {"choices": list(_TELECOM_SERVICE_PROVIDERS), "weights": list(_TELECOM_SERVICE_PROVIDER_WEIGHTS)},
+        "params": {
+            "choices": list((profile or {}).get("service_providers") or ["Vodafone", "Orange", "Telefónica", "Deutsche Telekom"]),
+            "weights": ([1.0] * len((profile or {}).get("service_providers"))) if (profile or {}).get("service_providers") else [0.40, 0.30, 0.20, 0.10],
+        },
         "depends_on": [],
         "nullable": False,
     }
@@ -390,7 +373,7 @@ def _build_base_variables(industry_key: str, profile: dict) -> list[dict]:
         for item in core:
             if item.get("name") == "subscriber_msisdn":
                 item["params"] = {"country_codes": [profile["phone_country_code"]]}
-        return base + _telecom_mandatory_variables() + core
+        return base + _telecom_mandatory_variables(profile) + core
     return base + [dict(m) for m in _MANDATORY_VARIABLES]
 
 
@@ -467,6 +450,21 @@ Rules:
 
 _SYSTEM = """
 You are the Scenario Designer Agent for a synthetic data generation platform.
+
+REAL-WORLD DATA GROUNDING CONTRACT — NON-NEGOTIABLE:
+- Every generated value must be semantically appropriate to the TARGET INDUSTRY, DOMAIN, USE CASE, and COUNTRY. Never use a value merely because it is syntactically valid.
+- Never use placeholder/fake template values such as Provider_A, Provider_B, Company_A, Product_A, Service_A, Gateway_A, Test_Company, Synthetic_Provider, or similar when the field represents a real-world organization, operator, product, plan, regulator, location, payment method, or other industry entity.
+- If a field represents a real-world company/operator/provider, use a real company/operator/provider appropriate to the target industry and country. Prefer the supplied industry profile vocabulary when available.
+- If a field represents an industry-specific product, plan, service, instrument, channel, status, reason, role, or event, use terminology that actually exists in that industry; do not invent telecom-like values for non-telecom industries.
+- Synthetic identifiers (IDs, UUIDs, account numbers, masked values) may be fabricated, but their FORMAT and semantic role must match the target industry.
+- Do not add filler variables just to reach MAX_VARIABLES. Every variable must have a clear business purpose in the supplied scenario.
+- Before returning the schema, perform a semantic relevance audit: for EACH variable, confirm that its description, generator choices, ranges, dependencies, and event usage are appropriate for the target industry/country. Remove or replace anything that fails this audit.
+- For categorical fields, choices are an authoritative domain. Do not generate values outside those choices downstream.
+- DATA RELEVANCE GATE: before accepting ANY variable, ask: “Would a domain expert in this exact industry, country, and scenario recognize this field and its values as normal business data?” If no, remove/replace it.
+- REAL ENTITY GATE: for fields such as service_provider, operator, bank, insurer, hospital, merchant, retailer, carrier, manufacturer, regulator, or similar, use entities that actually belong to the TARGET INDUSTRY and TARGET COUNTRY. Never use a telecom operator as a generic company/provider for another industry.
+- NO GENERIC FALLBACK: when the profile has no entity vocabulary for a field, do not copy vocabulary from another industry. Prefer scenario-supported domain terminology or omit the field rather than introducing an unrelated entity.
+- VALUE-LEVEL AUDIT: audit every categorical choice individually, not only the field name. A plausible-looking value is invalid if it belongs to another industry, country, product category, or business process.
+- DEPENDENCY AUDIT: after the value-level audit, verify that related fields describe the same business state. A failed/declined/cancelled state must not coexist with a success-only outcome unless the scenario explicitly represents a later recovery state.
 Given an industry, a domain, and a business scenario description, invent a complete
 synthetic-data scenario definition.
 
@@ -560,7 +558,7 @@ class ScenarioDesignerAgent:
                 "Telecom-specific requirements for this scenario:\n"
                 "- Do NOT invent any KYC/identity-verification field (no field name containing 'kyc').\n"
                 "- Any plan/rate-plan/data-plan field (e.g. rate_plan_code) MUST depend_on service_provider "
-                "and describe plans realistic for that specific synthetic provider (Provider_A, Provider_B), not generic plans.\n"
+                "and describe plans/products realistic for the actual operator brands supplied by the target-country profile, not placeholder names.\n"
                 "- Do NOT invent a churn_risk_score/churn_propensity_score field; churn is derived downstream "
                 "from the already auto-injected historical_low_balance_frequency, offer_acceptance_rate_historical "
                 "and preferred_topup_channel fields.\n"
@@ -570,6 +568,7 @@ class ScenarioDesignerAgent:
                 "- Do NOT create loyalty_tier_customer; it is not part of the Telecom schema.\n"
                 "- If this scenario needs a trigger/cause field, name it exactly 'trigger_cause' with categorical "
                 f"choices exactly {_TELECOM_TRIGGER_CAUSE_CHOICES}.\n"
+                "- service_provider MUST use real operator/company brands from the target-country profile; NEVER use Provider_A, Provider_B, Company_A, or other placeholders. "
                 "- Choose variables based on the requested journey and business outcome; do not generate a "
                 "fixed scenario template. For any missing non-mandatory fields, the backend may select from "
                 "its reusable Telecom schema catalog after this response.\n"
@@ -596,6 +595,7 @@ class ScenarioDesignerAgent:
             f"Regulator: {profile['regulator']}\n"
             f"Currency: {profile['currency']}\n"
             f"Country-appropriate payment methods: {profile.get('payment_methods', [])}\n"
+            f"Industry-appropriate service providers/operators (when applicable): {profile.get('service_providers', [])}\n"
             f"Phone country code: {profile['phone_country_code']}; format: {profile['phone_format']}\n"
             f"Market character: {profile['market_character']}\n"
             f"Typical product/plan types in this industry+country: {profile['product_types']}\n"
@@ -619,11 +619,11 @@ class ScenarioDesignerAgent:
             raise ValueError("Gemini response contained no usable variables")
         llm_variables = self._normalize_field_names(llm_variables, industry_key)
         if industry_key == "telecom":
-            llm_variables = self._apply_telecom_overrides(llm_variables)
+            llm_variables = self._apply_telecom_overrides(llm_variables, profile)
         combined = base_variables + llm_variables
-        result["variables"] = self._enforce_variable_bounds(combined, prompt, base_names, industry_key)
+        result["variables"] = self._enforce_variable_bounds(combined, prompt, base_names, industry_key, profile)
         if industry_key == "telecom":
-            result["variables"] = self._apply_telecom_overrides(result["variables"])
+            result["variables"] = self._apply_telecom_overrides(result["variables"], profile)
         # Deterministic client contract for the two audited Telecom scenarios.
         # The LLM remains responsible for additional scenario detail, but these
         # required fields/events cannot be omitted or renamed.
@@ -657,14 +657,23 @@ class ScenarioDesignerAgent:
             # proposal still targets the requested maximum of 35 fields.
             if len(result["variables"]) < MAX_VARIABLES:
                 existing_names = {v["name"] for v in result["variables"]}
-                catalog_key = ("telecom_proposal_catalog",)
+                catalog_key = ("telecom_proposal_catalog", str(profile.get("country_code") or "GLOBAL"))
                 catalog = get_schema(catalog_key)
                 if catalog is None:
                     catalog = [dict(v) for v in _TELECOM_CACHED_PROPOSAL_CATALOG]
                     set_schema(catalog_key, catalog)
+                providers = list(profile.get("service_providers") or ["Vodafone", "Orange", "Telefónica", "Deutsche Telekom"])
+                payment_methods = list(profile.get("payment_methods") or ["credit_card", "debit_card", "digital_wallet", "bank_transfer"])
                 for candidate in catalog:
                     if len(result["variables"]) >= MAX_VARIABLES:
                         break
+                    candidate = dict(candidate)
+                    if candidate.get("name") == "service_provider":
+                        candidate["params"] = {"choices": providers, "weights": [1.0] * len(providers)}
+                    elif candidate.get("name") == "payment_method":
+                        candidate["params"] = {"choices": payment_methods, "weights": [1.0] * len(payment_methods)}
+                    if candidate["name"] == "payment_gateway":
+                        continue
                     if candidate["name"] not in existing_names:
                         result["variables"].append(dict(candidate))
                         existing_names.add(candidate["name"])
@@ -1043,7 +1052,7 @@ class ScenarioDesignerAgent:
         return result
 
     @staticmethod
-    def _apply_telecom_overrides(variables: list[dict]) -> list[dict]:
+    def _apply_telecom_overrides(variables: list[dict], profile: dict | None = None) -> list[dict]:
         """Telecom-only client requirements: drop KYC fields and raw churn scores,
         mask UPI in payment/channel choices, and force trigger_cause's fixed enum
         when that field is present. Only ever called when industry_key == "telecom";
@@ -1075,6 +1084,25 @@ class ScenarioDesignerAgent:
             else:
                 v = dict(v)
 
+            # Telecom provider is a real-world operator, not a synthetic placeholder.
+            # The country profile is the authoritative vocabulary for this field.
+            if name == "service_provider":
+                providers = list((profile or {}).get("service_providers") or ["Vodafone", "Orange", "Telefónica", "Deutsche Telekom"])
+                weights = [1.0] * len(providers)
+                v["dtype"] = "categorical"
+                v["gen"] = "weighted_choice"
+                v["description"] = "Real-world telecom operator/service-provider brand appropriate to the target country."
+                v["params"] = {"choices": providers, "weights": weights}
+            elif name == "payment_method":
+                # Telecom client vocabulary is explicit and must be identical across
+                # Telecom proposals. UPI is intentionally represented as DIGITAL_WALLET.
+                v["dtype"] = "categorical"
+                v["gen"] = "weighted_choice"
+                v["params"] = {
+                    "choices": ["DEBIT_CARD", "CREDIT_CARD", "DIGITAL_WALLET", "NETBANKING"],
+                    "weights": [0.35, 0.30, 0.20, 0.15],
+                }
+
             if name == "customer_lifetime_value":
                 v["dtype"] = "categorical"
                 v["gen"] = "weighted_choice"
@@ -1094,7 +1122,7 @@ class ScenarioDesignerAgent:
                 if isinstance(params, dict) and isinstance(params.get("choices"), list):
                     params = dict(params)
                     params["choices"] = [
-                        _UPI_MASK_LABEL if _UPI_VALUE_MARKER in str(c).lower() else c
+                        _UPI_CANONICAL_OUTPUT if _UPI_VALUE_MARKER in str(c).lower() else c
                         for c in params["choices"]
                     ]
                     v["params"] = params
@@ -1116,7 +1144,7 @@ class ScenarioDesignerAgent:
         return deduped
 
     def _enforce_variable_bounds(
-        self, variables: list[dict], prompt: str, protected_names: set[str], industry_key: str = "generic"
+        self, variables: list[dict], prompt: str, protected_names: set[str], industry_key: str = "generic", profile: dict | None = None
     ) -> list[dict]:
         """Trim/expand the LLM-supplied portion only — protected_names (base + mandatory
         fields, pre-injected in propose()) are never removed and never re-requested."""
@@ -1138,14 +1166,26 @@ class ScenarioDesignerAgent:
             # Gemini chooses the scenario-specific fields; Python fills only the remaining
             # slots from reusable schema metadata. No customer/transaction records are cached.
             existing = {v["name"] for v in variables}
-            catalog_key = ("telecom_proposal_catalog",)
+            catalog_key = ("telecom_proposal_catalog", str(profile.get("country_code") or "GLOBAL"))
             catalog = get_schema(catalog_key)
             if catalog is None:
                 catalog = [dict(v) for v in _TELECOM_CACHED_PROPOSAL_CATALOG]
                 set_schema(catalog_key, catalog)
+            # Always re-ground reusable catalog values to the current country profile.
+            providers = list(profile.get("service_providers") or ["Vodafone", "Orange", "Telefónica", "Deutsche Telekom"]) if profile else ["Vodafone", "Orange", "Telefónica", "Deutsche Telekom"]
+            payment_methods = list(profile.get("payment_methods") or ["credit_card", "debit_card", "digital_wallet", "bank_transfer"]) if profile else ["credit_card", "debit_card", "digital_wallet", "bank_transfer"]
+            for candidate in catalog:
+                if candidate.get("name") == "service_provider":
+                    candidate["params"] = {"choices": providers, "weights": [1.0] * len(providers)}
+                elif candidate.get("name") == "payment_method":
+                    candidate["params"] = {"choices": payment_methods, "weights": [1.0] * len(payment_methods)}
+                elif candidate.get("name") == "payment_gateway":
+                    continue
             for candidate in catalog:
                 if len(variables) >= MAX_VARIABLES:
                     break
+                if candidate["name"] == "payment_gateway":
+                    continue
                 if candidate["name"] not in existing:
                     variables.append(dict(candidate))
                     existing.add(candidate["name"])

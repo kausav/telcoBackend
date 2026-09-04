@@ -42,7 +42,7 @@ COUNTRY_BASE: dict[str, dict] = {
         "currency": "INR",
         "phone_country_code": "+91",
         "phone_format": "10-digit mobile number starting with 6, 7, 8, or 9 (no leading 0 in E.164 form)",
-        "payment_methods": ["upi", "credit_card", "debit_card", "net_banking", "bank_transfer", "digital_wallet", "cash", "cod"],
+        "payment_methods": ["credit_card", "debit_card", "net_banking", "bank_transfer", "digital_wallet", "cash", "cod"],
     },
     "GB": {
         "country_name": "United Kingdom",
@@ -68,6 +68,7 @@ INDUSTRY_NOTES: dict[str, dict[str, dict]] = {
             "market_character": "Postpaid-dominant; prepaid mainly MVNOs and budget segments",
             "product_types": ["Postpaid Unlimited", "Postpaid Family Share", "Prepaid Pay-as-you-go", "Prepaid Monthly"],
             "identity_notes": "No national biometric SIM KYC requirement; account tied to billing address/credit check for postpaid",
+            "service_providers": ["AT&T", "Verizon", "T-Mobile"],
             "typical_denominations": [10.00, 25.00, 50.00, 100.00],
         },
         "IN": {
@@ -75,6 +76,7 @@ INDUSTRY_NOTES: dict[str, dict[str, dict]] = {
             "market_character": "Prepaid-dominant (~95% of subscribers); postpaid a small premium segment",
             "product_types": ["Prepaid Combo (data+voice+SMS)", "Prepaid Unlimited Daily Data", "Postpaid Family Plan", "Prepaid Top-up Voucher"],
             "identity_notes": "Mandatory Aadhaar/e-KYC or biometric verification for SIM issuance; circle-based numbering",
+            "service_providers": ["Jio", "Airtel", "Vi", "BSNL"],
             "typical_denominations": [10.00, 19.00, 49.00, 99.00, 199.00, 299.00, 599.00],
         },
         "GB": {
@@ -82,6 +84,7 @@ INDUSTRY_NOTES: dict[str, dict[str, dict]] = {
             "market_character": "Mixed prepaid (PAYG)/postpaid (SIM-only and contract) market",
             "product_types": ["Pay Monthly SIM-only", "Pay Monthly Handset Contract", "Pay As You Go (PAYG)"],
             "identity_notes": "No mandatory biometric KYC; identity/credit check required for postpaid contracts",
+            "service_providers": ["EE", "O2", "Vodafone", "Three"],
             "typical_denominations": [10.00, 15.00, 20.00, 30.00],
         },
         "AE": {
@@ -89,6 +92,7 @@ INDUSTRY_NOTES: dict[str, dict[str, dict]] = {
             "market_character": "Prepaid-dominant among expatriate population; postpaid common for residents/business",
             "product_types": ["Prepaid Visitor SIM", "Prepaid Data+Voice Bundle", "Postpaid Family Plan"],
             "identity_notes": "Mandatory Emirates ID verification for SIM registration",
+            "service_providers": ["e&", "du"],
             "typical_denominations": [10.00, 25.00, 55.00, 100.00],
         },
     },
@@ -103,7 +107,7 @@ INDUSTRY_NOTES: dict[str, dict[str, dict]] = {
         "IN": {
             "regulator": "RBI (Reserve Bank of India)",
             "market_character": "Rapid UPI/digital-payments growth alongside traditional branch banking; large unbanked-to-banked transition",
-            "product_types": ["Savings Account", "Current Account", "UPI-linked Account", "Fixed Deposit", "Personal Loan"],
+            "product_types": ["Savings Account", "Current Account", "Digital Payments Account", "Fixed Deposit", "Personal Loan"],
             "identity_notes": "Mandatory Aadhaar/PAN-based KYC",
             "typical_denominations": [100.00, 500.00, 1000.00, 5000.00],
         },
@@ -133,6 +137,9 @@ _GENERIC_NOTES = {
     "identity_notes": "No specific identity/KYC convention modeled (country not specified)",
     "typical_denominations": [10.00, 25.00, 50.00, 100.00],
     "payment_methods": ["credit_card", "debit_card", "bank_transfer", "digital_wallet", "cash"],
+    # Deliberately no cross-industry service-provider fallback. If an industry
+    # does not define real entities, agents must infer/use domain-appropriate
+    # vocabulary rather than borrowing telecom operators.
 }
 
 
