@@ -37,6 +37,7 @@ Return a JSON object with:
   - "business_rules": [str]   — logical invariants that MUST hold across all records
   - "field_constraints": {field_name: {description: str, valid_values: str, nullable: bool}}
   - "cross_field_rules": [str] — mathematical / temporal dependencies between fields
+  - "field_relationships": [{"controller_field": str, "dependent_field": str, "mapping": {controller_value: [allowed_dependent_values]}}] — executable categorical dependencies
   - "generation_constraints": {field_name: {valid_values: [str], min: number, max: number,
       preferred_values: [str]}} — machine-readable constraints the generator should use
   - "formula_rules": [{"field": str, "expression": str}] — authoritative formulas to
@@ -70,6 +71,13 @@ SEMANTIC ACCURACY IS MANDATORY:
 - Encode important state dependencies explicitly. Example: if a scenario states that
   transaction failure causes recharge failure, encode that as a machine-checkable
   conditional rule; do not leave the relationship only in prose.
+- FIELD RELATIONSHIP REQUIREMENT: whenever one categorical field determines or constrains
+  another categorical field (provider -> plan, product -> product-specific attribute,
+  account type -> account behavior, order state -> fulfillment state, etc.), emit a
+  field_relationships entry with an explicit mapping. The generator will execute this
+  mapping, so do not leave the dependency only in cross_field_rules prose.
+- Do not invent impossible combinations merely because each value is individually valid.
+  Validate complete RECORDS and ENTITY PROFILES, not isolated columns.
 """
 
 
@@ -163,6 +171,8 @@ class SchemaAgent:
         rules = self._llm.generate_json(_SYSTEM, prompt, temperature=0.1)
         if not isinstance(rules, dict):
             rules = {}
+        if not isinstance(rules.get("field_relationships"), list):
+            rules["field_relationships"] = []
 
         # Variable definitions are authoritative. Always preserve their formulas
         # as machine-readable rules so validation/generation cannot lose a formula

@@ -473,6 +473,9 @@ You are the Scenario Designer Agent for a synthetic data generation platform.
 
 REAL-WORLD DATA GROUNDING CONTRACT — NON-NEGOTIABLE:
 - Every generated value must be semantically appropriate to the TARGET INDUSTRY, DOMAIN, USE CASE, and COUNTRY. Never use a value merely because it is syntactically valid.
+- RECORD-LEVEL COHERENCE IS A HARD GATE: generate related fields as one business entity/profile, not as independent random columns. If field B depends on field A, B MUST be selected from the valid domain implied by the actual value of A.
+- DEPENDENCY COMPLETENESS: every declared depends_on relationship must be executable during generation. Do not merely document a dependency in prose.
+- PRODUCT/PLAN OWNERSHIP: if a provider/operator/bank/merchant/carrier is selected, any plan/product/service field belonging to that entity must use a product/plan from that same entity. Never combine one company's brand with another company's plan.
 - Never use placeholder/fake template values such as Provider_A, Provider_B, Company_A, Product_A, Service_A, Gateway_A, Test_Company, Synthetic_Provider, or similar when the field represents a real-world organization, operator, product, plan, regulator, location, payment method, or other industry entity.
 - If a field represents a real-world company/operator/provider, use a real company/operator/provider appropriate to the target industry and country. Prefer the supplied industry profile vocabulary when available.
 - If a field represents an industry-specific product, plan, service, instrument, channel, status, reason, role, or event, use terminology that actually exists in that industry; do not invent telecom-like values for non-telecom industries.
@@ -1128,6 +1131,17 @@ class ScenarioDesignerAgent:
                 v["gen"] = "weighted_choice"
                 v["description"] = "Real-world telecom operator/service-provider brand appropriate to the target country."
                 v["params"] = {"choices": providers, "weights": weights}
+            elif name == "subscriber_segment":
+                # Telecom client contract: all three requested recharge/customer
+                # segments must be valid generation choices; do not let Gemini
+                # collapse the vocabulary to a single segment.
+                v["dtype"] = "categorical"
+                v["gen"] = "weighted_choice"
+                v["description"] = "Telecom subscriber usage/value segment."
+                v["params"] = {
+                    "choices": list(_TELECOM_SEGMENT_CHOICES),
+                    "weights": list(_TELECOM_SEGMENT_WEIGHTS),
+                }
             elif name == "payment_method":
                 # Telecom client vocabulary is explicit and must be identical across
                 # Telecom proposals. UPI is intentionally represented as DIGITAL_WALLET.
