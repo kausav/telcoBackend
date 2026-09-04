@@ -58,6 +58,7 @@ _TELECOM_SEGMENT_CHOICES = [
 ]
 _TELECOM_SEGMENT_WEIGHTS = [0.22, 0.18, 0.15, 0.20, 0.15, 0.10]
 _TELECOM_SERVICE_PROVIDER_WEIGHTS = [0.40, 0.30, 0.20, 0.10]
+_TELECOM_GLOBAL_PROVIDERS = ["Vodafone", "Orange", "Telefónica", "Deutsche Telekom"]
 _TELECOM_TRIGGER_CAUSE_SYNONYMS = ["trigger_type", "triggertype", "trigger", "event_trigger_type", "trigger_reason"]
 _TELECOM_TRIGGER_CAUSE_CHOICES = ["LOW_BALANCE_THRESHOLD", "VALIDITY_EXPIRY_WARNING", "ZERO_BALANCE"]
 _TELECOM_TRIGGER_CAUSE_WEIGHTS = [0.5, 0.3, 0.2]
@@ -109,7 +110,26 @@ _UPI_CANONICAL_OUTPUT = "DIGITAL_WALLET"
 # Telecom-wide mandatory client contract. These fields are injected for EVERY
 # Telecom proposal, independent of scenario id. Scenario-specific requirements
 # below are layered on top only for the requested LB-06/LB-07 journeys.
-_TELECOM_CORE_MANDATORY = []
+_TELECOM_CORE_MANDATORY = [
+    {
+        "name": "subscriber_msisdn",
+        "dtype": "string",
+        "description": "Subscriber mobile number in the target country's valid E.164 telecom format.",
+        "gen": "e164_phone",
+        "params": {"country_codes": ["+91"]},
+        "depends_on": [],
+        "nullable": False,
+    },
+    {
+        "name": "account_id",
+        "dtype": "string",
+        "description": "Telecom billing/account identifier associated with the subscriber_id.",
+        "gen": "id_mirror",
+        "params": {"prefix": "ACC-", "source_field": "subscriber_id", "source_prefix": "SUB-"},
+        "depends_on": ["subscriber_id"],
+        "nullable": False,
+    },
+]
 
 
 
@@ -119,7 +139,7 @@ _TELECOM_CORE_MANDATORY = []
 # the 35-variable target. Scenario-specific fields from Gemini always take precedence.
 _TELECOM_CACHED_PROPOSAL_CATALOG = [
     {"name":"subscriber_segment","dtype":"categorical","description":"Subscriber usage/behavior segment.","gen":"weighted_choice","params":{"choices":list(_TELECOM_SEGMENT_CHOICES),"weights":list(_TELECOM_SEGMENT_WEIGHTS)},"depends_on":[],"nullable":False},
-    {"name":"service_provider","dtype":"categorical","description":"Real-world telecom operator/service-provider brand appropriate to the target country.","gen":"weighted_choice","params":{"choices":["Vodafone","Orange","Telefónica","Deutsche Telekom"],"weights":[0.40,0.30,0.20,0.10]},"depends_on":[],"nullable":False},
+    {"name":"service_provider","dtype":"categorical","description":"Real-world telecom operator/service-provider brand appropriate to the target country.","gen":"weighted_choice","params":{"choices":["Jio","Airtel","Vi","BSNL"],"weights":[0.40,0.30,0.20,0.10]},"depends_on":[],"nullable":False},
     {"name":"rate_plan_code","dtype":"categorical","description":"Synthetic rate plan associated with the service provider.","gen":"weighted_choice","params":{"choices":["PREPAID_DAILY","PREPAID_MONTHLY","POSTPAID_INDIVIDUAL","POSTPAID_FAMILY","DATA_ONLY"],"weights":[0.25,0.25,0.20,0.20,0.10]},"depends_on":["service_provider"],"nullable":False},
     {"name":"trigger_cause","dtype":"categorical","description":"Cause that triggered the telecom journey.","gen":"weighted_choice","params":{"choices":list(_TELECOM_TRIGGER_CAUSE_CHOICES),"weights":list(_TELECOM_TRIGGER_CAUSE_WEIGHTS)},"depends_on":[],"nullable":False},
     {"name":"recharge_status","dtype":"categorical","description":"Recharge/top-up outcome.","gen":"weighted_choice","params":{"choices":list(_TELECOM_RECHARGE_STATUS_CHOICES),"weights":list(_TELECOM_RECHARGE_STATUS_WEIGHTS)},"depends_on":[],"nullable":False},
@@ -248,8 +268,8 @@ def _telecom_mandatory_variables(profile: dict | None = None) -> list[dict]:
         "description": "Real-world telecom operator/service-provider brand appropriate to the target country.",
         "gen": "weighted_choice",
         "params": {
-            "choices": list((profile or {}).get("service_providers") or ["Vodafone", "Orange", "Telefónica", "Deutsche Telekom"]),
-            "weights": ([1.0] * len((profile or {}).get("service_providers"))) if (profile or {}).get("service_providers") else [0.40, 0.30, 0.20, 0.10],
+            "choices": list((profile or {}).get("service_providers") or _TELECOM_GLOBAL_PROVIDERS),
+            "weights": ([1.0] * len((profile or {}).get("service_providers"))) if (profile or {}).get("service_providers") else list(_TELECOM_SERVICE_PROVIDER_WEIGHTS),
         },
         "depends_on": [],
         "nullable": False,
@@ -542,6 +562,21 @@ class ScenarioDesignerAgent:
             base_variables = _build_base_variables(industry_key, profile)
             set_schema(base_cache_key, base_variables)
         base_variables = [dict(v) for v in base_variables]
+        # Self-heal a stale in-process proposal cache created before the current
+        # Telecom mandatory identity contract. The current base schema is authoritative.
+        if industry_key == "telecom":
+            authoritative_base = _build_base_variables(industry_key, profile)
+            existing_base_names = {v.get("name") for v in base_variables}
+            for required_base in authoritative_base:
+                if required_base.get("name") not in existing_base_names:
+                    base_variables.append(dict(required_base))
+                    existing_base_names.add(required_base.get("name"))
+            # Re-ground the Telecom identity generators to the current country profile.
+            for item in base_variables:
+                if item.get("name") == "subscriber_msisdn":
+                    item["params"] = {"country_codes": [profile["phone_country_code"]]}
+                elif item.get("name") == "account_id":
+                    item["params"] = {"prefix": "ACC-", "source_field": "subscriber_id", "source_prefix": "SUB-"}
         base_names = {v["name"] for v in base_variables}
         preinjected_note = (
             f"These {len(base_variables)} fields are auto-injected and ALREADY generated — "
@@ -662,7 +697,7 @@ class ScenarioDesignerAgent:
                 if catalog is None:
                     catalog = [dict(v) for v in _TELECOM_CACHED_PROPOSAL_CATALOG]
                     set_schema(catalog_key, catalog)
-                providers = list(profile.get("service_providers") or ["Vodafone", "Orange", "Telefónica", "Deutsche Telekom"])
+                providers = list(profile.get("service_providers") or [])
                 payment_methods = list(profile.get("payment_methods") or ["credit_card", "debit_card", "digital_wallet", "bank_transfer"])
                 for candidate in catalog:
                     if len(result["variables"]) >= MAX_VARIABLES:
@@ -1087,7 +1122,7 @@ class ScenarioDesignerAgent:
             # Telecom provider is a real-world operator, not a synthetic placeholder.
             # The country profile is the authoritative vocabulary for this field.
             if name == "service_provider":
-                providers = list((profile or {}).get("service_providers") or ["Vodafone", "Orange", "Telefónica", "Deutsche Telekom"])
+                providers = list((profile or {}).get("service_providers") or [])
                 weights = [1.0] * len(providers)
                 v["dtype"] = "categorical"
                 v["gen"] = "weighted_choice"
@@ -1172,7 +1207,7 @@ class ScenarioDesignerAgent:
                 catalog = [dict(v) for v in _TELECOM_CACHED_PROPOSAL_CATALOG]
                 set_schema(catalog_key, catalog)
             # Always re-ground reusable catalog values to the current country profile.
-            providers = list(profile.get("service_providers") or ["Vodafone", "Orange", "Telefónica", "Deutsche Telekom"]) if profile else ["Vodafone", "Orange", "Telefónica", "Deutsche Telekom"]
+            providers = list(profile.get("service_providers") or _TELECOM_GLOBAL_PROVIDERS) if profile else list(_TELECOM_GLOBAL_PROVIDERS)
             payment_methods = list(profile.get("payment_methods") or ["credit_card", "debit_card", "digital_wallet", "bank_transfer"]) if profile else ["credit_card", "debit_card", "digital_wallet", "bank_transfer"]
             for candidate in catalog:
                 if candidate.get("name") == "service_provider":
