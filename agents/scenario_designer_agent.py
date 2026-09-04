@@ -473,9 +473,6 @@ You are the Scenario Designer Agent for a synthetic data generation platform.
 
 REAL-WORLD DATA GROUNDING CONTRACT — NON-NEGOTIABLE:
 - Every generated value must be semantically appropriate to the TARGET INDUSTRY, DOMAIN, USE CASE, and COUNTRY. Never use a value merely because it is syntactically valid.
-- RECORD-LEVEL COHERENCE IS A HARD GATE: generate related fields as one business entity/profile, not as independent random columns. If field B depends on field A, B MUST be selected from the valid domain implied by the actual value of A.
-- DEPENDENCY COMPLETENESS: every declared depends_on relationship must be executable during generation. Do not merely document a dependency in prose.
-- PRODUCT/PLAN OWNERSHIP: if a provider/operator/bank/merchant/carrier is selected, any plan/product/service field belonging to that entity must use a product/plan from that same entity. Never combine one company's brand with another company's plan.
 - Never use placeholder/fake template values such as Provider_A, Provider_B, Company_A, Product_A, Service_A, Gateway_A, Test_Company, Synthetic_Provider, or similar when the field represents a real-world organization, operator, product, plan, regulator, location, payment method, or other industry entity.
 - If a field represents a real-world company/operator/provider, use a real company/operator/provider appropriate to the target industry and country. Prefer the supplied industry profile vocabulary when available.
 - If a field represents an industry-specific product, plan, service, instrument, channel, status, reason, role, or event, use terminology that actually exists in that industry; do not invent telecom-like values for non-telecom industries.
@@ -488,6 +485,8 @@ REAL-WORLD DATA GROUNDING CONTRACT — NON-NEGOTIABLE:
 - NO GENERIC FALLBACK: when the profile has no entity vocabulary for a field, do not copy vocabulary from another industry. Prefer scenario-supported domain terminology or omit the field rather than introducing an unrelated entity.
 - VALUE-LEVEL AUDIT: audit every categorical choice individually, not only the field name. A plausible-looking value is invalid if it belongs to another industry, country, product category, or business process.
 - DEPENDENCY AUDIT: after the value-level audit, verify that related fields describe the same business state. A failed/declined/cancelled state must not coexist with a success-only outcome unless the scenario explicitly represents a later recovery state.
+- PROFILE COHERENCE: fields that describe the same entity must be generated as one coherent profile, not as independent random columns. If one field determines the valid domain of another (provider→plan, account type→product, order status→shipment status, etc.), declare depends_on and an explicit machine-readable relationship.
+- TRANSACTIONAL IDENTITY: for transactional data, entity-level identifiers and profile attributes must remain stable across every event belonging to the same entity/journey. Do not regenerate subscriber/customer phone numbers, account IDs, providers, segments, or plans on each event.
 Given an industry, a domain, and a business scenario description, invent a complete
 synthetic-data scenario definition.
 
@@ -597,6 +596,8 @@ class ScenarioDesignerAgent:
                 "- Do NOT invent any KYC/identity-verification field (no field name containing 'kyc').\n"
                 "- Any plan/rate-plan/data-plan field (e.g. rate_plan_code) MUST depend_on service_provider "
                 "and describe plans/products realistic for the actual operator brands supplied by the target-country profile, not placeholder names.\n"
+                "- Provider-to-plan coherence is mandatory: the chosen plan/rate_plan_code MUST belong to the selected service_provider. Never pair Jio with an Airtel plan, Airtel with a Jio plan, or any other provider with another provider's plan.\n"
+                "- Customer-segment coherence is mandatory: when subscriber_segment includes Occasional Rechargers, Habitual Rechargers, or Valued Customers, generated behavior fields must be plausible for that segment. For transactional datasets with at least three subscriber journeys, ensure all three requested segments are represented rather than relying only on random weights.\n"
                 "- Do NOT invent a churn_risk_score/churn_propensity_score field; churn is derived downstream "
                 "from the already auto-injected historical_low_balance_frequency, offer_acceptance_rate_historical "
                 "and preferred_topup_channel fields.\n"
@@ -1131,17 +1132,6 @@ class ScenarioDesignerAgent:
                 v["gen"] = "weighted_choice"
                 v["description"] = "Real-world telecom operator/service-provider brand appropriate to the target country."
                 v["params"] = {"choices": providers, "weights": weights}
-            elif name == "subscriber_segment":
-                # Telecom client contract: all three requested recharge/customer
-                # segments must be valid generation choices; do not let Gemini
-                # collapse the vocabulary to a single segment.
-                v["dtype"] = "categorical"
-                v["gen"] = "weighted_choice"
-                v["description"] = "Telecom subscriber usage/value segment."
-                v["params"] = {
-                    "choices": list(_TELECOM_SEGMENT_CHOICES),
-                    "weights": list(_TELECOM_SEGMENT_WEIGHTS),
-                }
             elif name == "payment_method":
                 # Telecom client vocabulary is explicit and must be identical across
                 # Telecom proposals. UPI is intentionally represented as DIGITAL_WALLET.
@@ -1258,34 +1248,6 @@ class ScenarioDesignerAgent:
                 retried_vars = self._normalize_field_names(retried_vars, industry_key)
                 if len(retried_vars) > len(scenario_specific):
                     protected = [v for v in variables if v["name"] in protected_names]
-                    variables = (protected + retried_vars)[:MAX_VARIABLES]
-            except Exception as exc:
-                logger.warning("[ScenarioDesigner] Expansion retry failed: %s", exc)
-
-        return variables
-
-        if len(variables) < _EXPAND_TARGET:
-            logger.info("[ScenarioDesigner] Only %d variables produced, requesting more (target ~%d)",
-                        len(variables), _EXPAND_TARGET)
-            scenario_specific = [v for v in variables if v["name"] not in protected_names]
-            expand_prompt = (
-                prompt + "\n\n"
-                f"Your previous attempt produced only {len(scenario_specific)} scenario-specific variables:\n"
-                f"{[v['name'] for v in scenario_specific]}\n"
-                f"Add as many NEW, distinct, relevant variables as possible so the scenario-specific TOTAL "
-                f"reaches close to {MAX_VARIABLES - len(protected_names)}. Do NOT include the auto-injected "
-                f"fields again. Return the FULL combined scenario-specific variables list (previous ones + "
-                "new ones) under the \"variables\" key, in dependency order."
-            )
-            try:
-                retry = self._llm.generate_json(_SYSTEM, expand_prompt, temperature=0.3)
-                retried_vars = [v for v in retry.get("variables", []) if isinstance(v, dict) and v.get("name")]
-                retried_vars = [v for v in retried_vars if v["name"] not in protected_names]
-                retried_vars = self._normalize_field_names(retried_vars, industry_key)
-                if len(retried_vars) > len(scenario_specific):
-                    protected = [v for v in variables if v["name"] in protected_names]
-                    # protected is always small (base + mandatory fields, ~7) relative to
-                    # MAX_VARIABLES (35), so this slice never truncates a protected field.
                     variables = (protected + retried_vars)[:MAX_VARIABLES]
             except Exception as exc:
                 logger.warning("[ScenarioDesigner] Expansion retry failed: %s", exc)

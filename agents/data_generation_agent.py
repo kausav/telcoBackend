@@ -20,11 +20,15 @@ from langgraph.graph import StateGraph, END
 from core.dynamic_scenarios import resolve_variables, resolve_events, resolve_entity_key
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
-from config.industry_profiles import get_profile, country_allowed_value, payment_methods_for_profile
+from config.industry_profiles import get_profile, country_allowed_value, payment_methods_for_profile, match_industry_key
 
 logger = logging.getLogger(__name__)
 
 _MAX_EDGE_CASE_ATTEMPTS = 20
+
+def _is_telecom_industry(industry: str | None) -> bool:
+    """Recognize Telecom regardless of the UI label (Telecom/Telecommunications)."""
+    return match_industry_key(industry) == "telecom"
 
 
 def _normalize_upi_in_generated_value(value: Any):
@@ -48,7 +52,7 @@ def _normalize_upi_in_generated_value(value: Any):
 
 def _normalize_upi_in_records(records: list[dict], industry: str | None = None) -> list[dict]:
     """Normalize UPI only for Telecom records; preserve it for other industries."""
-    if str(industry or "").strip().lower() != "telecom":
+    if not _is_telecom_industry(industry):
         return records
     return [_normalize_upi_in_generated_value(dict(record)) for record in records]
 
@@ -534,6 +538,109 @@ def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None
     return value
 
 
+def _apply_conditional_rules(rec: dict, rules: dict | None) -> dict:
+    """Apply structured cross-field rules deterministically.
+
+    Rules are intentionally industry-agnostic. SchemaAgent may return:
+      {"when": {"field": value}, "then": {"dependent": value_or_list}}
+    or the equivalent ``conditions``/``set`` keys. Multiple passes allow chained
+    dependencies to settle. A condition is only applied when every referenced
+    controller field is present and matches semantically.
+    """
+    if not isinstance(rules, dict):
+        return rec
+    raw = rules.get("conditional_rules") or rules.get("relationship_rules") or []
+    if not isinstance(raw, list):
+        return rec
+
+    def norm(v):
+        return str(v).strip().lower().replace("-", "_").replace(" ", "_")
+
+    def matches(actual, expected):
+        if isinstance(expected, list):
+            return any(matches(actual, x) for x in expected)
+        if isinstance(expected, bool):
+            return _boolean_semantic(actual) is expected
+        try:
+            if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+                return _to_finite_float(actual, None) == float(expected)
+        except Exception:
+            pass
+        return norm(actual) == norm(expected)
+
+    def condition_matches(when):
+        if not isinstance(when, dict):
+            return False
+        for field, expected in when.items():
+            if field not in rec or rec.get(field) is None or not matches(rec.get(field), expected):
+                return False
+        return True
+
+    def set_dependent(field, desired):
+        if field not in rec:
+            return False
+        if isinstance(desired, dict):
+            if "value" in desired:
+                desired = desired["value"]
+            elif "values" in desired:
+                desired = desired["values"]
+            elif "valid_values" in desired:
+                desired = desired["valid_values"]
+        if isinstance(desired, list):
+            if not desired:
+                return False
+            if not any(matches(rec.get(field), x) for x in desired):
+                rec[field] = random.choice(desired)
+                return True
+            return False
+        if not matches(rec.get(field), desired):
+            rec[field] = desired
+            return True
+        return False
+
+    for _ in range(max(2, len(raw) * 2)):
+        changed = False
+        for rule in raw:
+            if not isinstance(rule, dict):
+                continue
+            when = rule.get("when") or rule.get("conditions")
+            then = rule.get("then") or rule.get("set") or rule.get("dependent_values")
+            if condition_matches(when) and isinstance(then, dict):
+                for field, desired in then.items():
+                    changed = set_dependent(str(field), desired) or changed
+        if not changed:
+            break
+    return rec
+
+
+def _apply_profile_relationships(rec: dict, profile: dict | None) -> dict:
+    """Enforce authoritative profile-level relationships without industry hard-coding.
+
+    Profiles may declare provider_plans (or future analogous relationship maps). The
+    generic generator merely consumes that metadata; it does not know Telecom fields
+    by name except for the canonical provider/plan concept already exposed by profiles.
+    """
+    if not isinstance(profile, dict):
+        return rec
+    provider = rec.get("service_provider")
+    mapping = profile.get("provider_plans")
+    if provider is not None and isinstance(mapping, dict):
+        plans = mapping.get(str(provider))
+        if isinstance(plans, list) and plans:
+            for field in ("rate_plan_code", "plan_code", "tariff_plan", "subscription_plan", "data_plan"):
+                if field in rec:
+                    current = str(rec.get(field) or "").strip().lower()
+                    if not any(current == str(plan).strip().lower() for plan in plans):
+                        rec[field] = random.choice(plans)
+    return rec
+
+
+def _apply_relationship_contract(rec: dict, profile: dict | None, rules: dict | None) -> dict:
+    """Run generic machine-readable relationships, then authoritative profile mappings."""
+    rec = _apply_conditional_rules(rec, rules)
+    rec = _apply_profile_relationships(rec, profile)
+    return rec
+
 def _formula_from_rules(field_name: str, rules: dict | None):
     if not isinstance(rules, dict):
         return None
@@ -551,124 +658,6 @@ def _formula_dependencies(expression: str) -> set[str]:
                 and node.id not in {"round", "min", "max", "abs", "sum"}}
     except Exception:
         return set()
-
-
-def _semantic_relationships_for_profile(rec: dict, profile: dict | None, variables: list[dict], rules: dict | None = None) -> dict:
-    """Enforce record-level semantic relationships after independent field generation.
-
-    The generic path consumes machine-readable ``field_relationships`` supplied by
-    SchemaAgent. Telecom additionally has an authoritative provider->plan catalog and
-    telecom lifecycle relationships. This is intentionally relationship-driven rather
-    than a collection of one-off value patches.
-    """
-    rec = dict(rec)
-    profile = profile or {}
-    industry = str(profile.get("industry", "")).strip().lower()
-    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
-
-    # Generic conditional value maps produced by SchemaAgent. Supported shapes:
-    # {"controller_field":"service_provider", "dependent_field":"plan",
-    #   "mapping":{"Jio":[...]}} or a list of such objects.
-    relationships = (rules or {}).get("field_relationships", []) if isinstance(rules, dict) else []
-    if isinstance(relationships, dict):
-        relationships = [relationships]
-    for rel in relationships or []:
-        if not isinstance(rel, dict):
-            continue
-        controller = str(rel.get("controller_field") or rel.get("when_field") or "").strip()
-        dependent = str(rel.get("dependent_field") or rel.get("then_field") or "").strip()
-        mapping = rel.get("mapping") or rel.get("allowed_values_by_controller")
-        if not controller or not dependent or not isinstance(mapping, dict):
-            continue
-        controller_value = rec.get(controller)
-        if controller_value is None or dependent not in by_name:
-            continue
-        options = None
-        for key, vals in mapping.items():
-            if str(key).strip().lower() == str(controller_value).strip().lower():
-                options = vals if isinstance(vals, list) else [vals]
-                break
-        if options:
-            current = rec.get(dependent)
-            normalized = {str(x).strip().lower().replace("-", "_").replace(" ", "_") for x in options}
-            if str(current).strip().lower().replace("-", "_").replace(" ", "_") not in normalized:
-                rec[dependent] = random.choice(options)
-
-    if industry == "telecom":
-        # Authoritative country-specific operator -> plan relationship. This prevents
-        # impossible combinations such as service_provider=Jio + Airtel plan.
-        provider = rec.get("service_provider")
-        plan_map = profile.get("plan_catalog_by_provider") or {}
-        if provider and isinstance(plan_map, dict):
-            plans = next((vals for key, vals in plan_map.items()
-                          if str(key).strip().lower() == str(provider).strip().lower()), None)
-            if plans:
-                for name in list(rec):
-                    lname = str(name).lower()
-                    if name == "service_provider" or name not in by_name:
-                        continue
-                    if any(token in lname for token in ("rate_plan", "data_plan", "tariff_plan", "plan_code", "plan_name")):
-                        current = rec.get(name)
-                        # If a schema intentionally uses provider-neutral plan types, keep
-                        # them. If it contains a branded plan from another provider, repair it.
-                        if current is None or any(brand.lower() in str(current).lower() for brand in (profile.get("service_providers") or []) if str(brand).lower() != str(provider).lower()):
-                            rec[name] = random.choice(plans)
-
-        # Telecom lifecycle semantics. Only apply when the relevant fields exist.
-        tx = str(rec.get("transaction_status", "")).strip().lower()
-        if tx in {"failed", "false", "failure", "declined"} and "recharge_status" in rec:
-            rec["recharge_status"] = "FAILED"
-        elif tx in {"pending", "processing"} and "recharge_status" in rec:
-            rec["recharge_status"] = "PENDING"
-
-        recharge = str(rec.get("recharge_status", "")).strip().lower()
-        recovery_fields = [n for n in ("recovery_action", "recovery_channel", "recovery_status", "recovery_timestamp") if n in rec]
-        if recharge not in {"failed", "failure", "gateway_timeout"}:
-            # Recovery is not a normal-success attribute. Null it before the existing
-            # final fill so sparse event schemas do not fabricate recovery actions.
-            for name in recovery_fields:
-                rec[name] = None
-
-        # Ensure the three requested recharge/customer segments are represented as
-        # authoritative vocabulary whenever the field exists. The distribution remains
-        # weighted, but an invalid/LLM-only value can never leak into generated output.
-        if "subscriber_segment" in rec:
-            choices = ["Occasional Rechargers", "Habitual Rechargers", "Valued Customers",
-                       "Heavy Data Users", "Frequent Data Exhausters", "Low Data Users"]
-            if str(rec.get("subscriber_segment")) not in choices:
-                rec["subscriber_segment"] = random.choice(choices)
-
-    return rec
-
-
-def _ensure_telecom_segment_coverage(records: list[dict], profile: dict | None) -> list[dict]:
-    """Ensure the three client-required recharge/customer segments are observable.
-
-    Random weighted sampling can legitimately omit a category in a small sample. For
-    Telecom datasets with at least three normal records, guarantee at least one record
-    for Occasional Rechargers, Habitual Rechargers, and Valued Customers without
-    modifying edge-case records. This is a dataset-level coverage guarantee, not a
-    field-specific generation hack.
-    """
-    if str((profile or {}).get("industry", "")).strip().lower() != "telecom":
-        return records
-    required = ["Occasional Rechargers", "Habitual Rechargers", "Valued Customers"]
-    candidates = [r for r in records if isinstance(r, dict) and r.get("isEdgeCaseData") is not True and "subscriber_segment" in r]
-    if len(candidates) < len(required):
-        return records
-    present = {str(r.get("subscriber_segment")) for r in candidates}
-    missing = [seg for seg in required if seg not in present]
-    if not missing:
-        return records
-    used_targets: set[int] = set()
-    for segment in missing:
-        target = next((r for r in candidates
-                       if id(r) not in used_targets and str(r.get("subscriber_segment")) not in missing), None)
-        if target is None:
-            target = next((r for r in candidates if id(r) not in used_targets), candidates[-1])
-        used_targets.add(id(target))
-        target["subscriber_segment"] = segment
-    return records
 
 
 def _generate_record(variables: list[dict], profile: dict | None = None, rules: dict | None = None) -> dict:
@@ -693,7 +682,7 @@ def _generate_record(variables: list[dict], profile: dict | None = None, rules: 
         else:
             value = None
         rec[var["name"]] = _apply_generation_constraint(var, value, rec, rules)
-    return _semantic_relationships_for_profile(rec, profile, variables, rules)
+    return rec
 
 
 def _generate_selected_record(
@@ -744,7 +733,7 @@ def _generate_selected_record(
         else:
             value = None
         rec[name] = _apply_generation_constraint(var, value, rec, rules)
-    return _semantic_relationships_for_profile(rec, profile, variables, rules)
+    return rec
 
 
 # ── Transactional generation helpers ─────────────────────────────────────────
@@ -1530,9 +1519,17 @@ def _transactional_records(
 
     for entity_index in range(response_entity_count):
         try:
+            stable_entity_fields = set(compiled.entity_fields)
+            # Entity-level identity/profile attributes must be generated once and reused
+            # across every event in the journey. This prevents a subscriber's MSISDN,
+            # segment, provider, or plan from changing between events.
+            for stable_name in ("subscriber_id", "subscriber_msisdn", "account_id", "subscriber_segment", "service_provider", "rate_plan_code", "plan_code", "tariff_plan", "subscription_plan", "data_plan"):
+                if stable_name in compiled.variable_by_name:
+                    stable_entity_fields.add(stable_name)
             entity_context = _generate_selected_record(
-                variables, set(compiled.entity_fields), profile=profile, rules=rules
+                variables, stable_entity_fields, profile=profile, rules=rules
             )
+            entity_context = _apply_relationship_contract(entity_context, profile, rules)
         except Exception as exc:
             error = {
                 "record_index": len(generated),
@@ -1580,6 +1577,7 @@ def _transactional_records(
                             profile=profile,
                             rules=rules,
                         )
+                        candidate_row = _apply_relationship_contract(candidate_row, profile, rules)
                         candidate_row.update({
                             "journey_id": journey_id,
                             "transaction_id": f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}",
@@ -1815,8 +1813,6 @@ SEMANTIC RELEVANCE IS A HARD REQUIREMENT, NOT A STYLE PREFERENCE:
 - Never borrow terminology from another industry merely because it fits the datatype.
 - Do not create filler values solely to satisfy a variable count; every generated value must serve the scenario.
 - Cross-field and event-state consistency is mandatory: validate relationships between fields, not only individual field types.
-- DEPENDENT CATEGORICAL FIELDS MUST AGREE: if one field determines another (for example provider -> plan, account type -> product, order state -> fulfillment state), validate the pair as a single business relationship using any supplied field_relationships mapping. Never accept two individually valid values when their combination is impossible.
-- Treat declared depends_on metadata as an executable dependency, not merely documentation.
 - INDUSTRY RELEVANCE IS A HARD GATE: every generated value must make sense for the exact
   target industry, country, domain, and scenario. A value that merely matches a datatype
   or a generic category is invalid if it belongs to another industry.
@@ -1909,7 +1905,7 @@ def _country_repair(name: str, value: Any, profile: dict):
         return value, None
     # Telecom-only output contract: UPI is represented as DIGITAL_WALLET.
     # Other industries are allowed to retain UPI when it is a valid value.
-    if str(profile.get("industry", "")).strip().lower() == "telecom":
+    if _is_telecom_industry(profile.get("industry")):
         normalized_value = _normalize_upi_in_generated_value(value)
         if normalized_value != value:
             return normalized_value, f"{name} normalized from UPI to DIGITAL_WALLET"
@@ -2031,7 +2027,7 @@ def _validate_record(
             lname = str(name).strip().lower()
             if lname == "service_provider" and profile.get("service_providers"):
                 choices = list(profile.get("service_providers") or [])
-            elif lname == "payment_method" and str(profile.get("industry", "")).strip().lower() == "telecom":
+            elif lname == "payment_method" and _is_telecom_industry(profile.get("industry")):
                 choices = ["DEBIT_CARD", "CREDIT_CARD", "DIGITAL_WALLET", "NETBANKING"]
             if choices and _normalize(rec[name]) not in {_normalize(c) for c in choices}:
                 rec[name] = choices[0]
@@ -2312,7 +2308,7 @@ def _apply_telecom_client_contract(records: list[dict], scenario_id: str, indust
     behavior for other industries/scenarios. The schema remains the source of field
     definitions; this helper only reconciles values across the lifecycle events.
     """
-    if str(industry or "").strip().lower() != "telecom":
+    if not _is_telecom_industry(industry):
         return records
     sid = str(scenario_id or "").strip().upper()
     if sid not in {"LB-06", "LB-07"}:
@@ -2437,6 +2433,46 @@ def _apply_telecom_client_contract(records: list[dict], scenario_id: str, indust
     return records
 
 
+def _ensure_telecom_population_coherence(records: list[dict], industry: str | None, scenario_id: str | None, profile: dict | None = None) -> list[dict]:
+    """Ensure Telecom transactional rows represent coherent subscriber populations.
+
+    This is a population-level safeguard, not a field-by-field random patch. For a
+    dataset with >=3 journeys and a subscriber_segment field, the first three stable
+    subscriber profiles are assigned the three required business segments so each is
+    represented. All rows for a subscriber inherit one stable profile. Provider/plan
+    compatibility is enforced through profile metadata.
+    """
+    if not _is_telecom_industry(industry) or not records:
+        return records
+    # Group by journey first; journey is the stable unit used by transactional output.
+    groups: dict[str, list[dict]] = {}
+    for row in records:
+        groups.setdefault(str(row.get("journey_id", "")), []).append(row)
+    journeys = [k for k in groups if k]
+    required_segments = ["Occasional Rechargers", "Habitual Rechargers", "Valued Customers"]
+    for idx, journey_id in enumerate(journeys[:len(required_segments)]):
+        rows = groups[journey_id]
+        if any("subscriber_segment" in r for r in rows):
+            desired = required_segments[idx]
+            for r in rows:
+                if "subscriber_segment" in r:
+                    r["subscriber_segment"] = desired
+    # Make all subscriber-level identity/profile fields stable across the journey.
+    for rows in groups.values():
+        if not rows:
+            continue
+        first = rows[0]
+        for field in ("subscriber_id", "subscriber_msisdn", "account_id", "subscriber_segment", "service_provider", "rate_plan_code", "plan_code", "tariff_plan", "subscription_plan", "data_plan"):
+            value = next((r.get(field) for r in rows if r.get(field) not in (None, "")), None)
+            if value is None:
+                continue
+            for r in rows:
+                if field in r or field in {"subscriber_id", "subscriber_msisdn", "account_id", "subscriber_segment", "service_provider", "rate_plan_code"}:
+                    r[field] = value
+        for r in rows:
+            _apply_profile_relationships(r, profile)
+    return records
+
 # ── Agent ──────────────────────────────────────────────────────────────────────
 
 class DataGenerationAgent:
@@ -2508,6 +2544,7 @@ class DataGenerationAgent:
                 rec = {}
                 try:
                     rec = _generate_record(variables, profile=profile, rules=state.rules)
+                    rec = _apply_relationship_contract(rec, profile, state.rules)
                     if index < edge_count and edge_names:
                         group = edge_groups[edge_names[index % len(edge_names)]]
                         matched = False
@@ -2527,6 +2564,7 @@ class DataGenerationAgent:
                             # Regenerate the normal base so random-dependent conditions
                             # get another opportunity; deterministic constraints still win.
                             rec = _generate_record(variables, profile=profile, rules=state.rules)
+                            rec = _apply_relationship_contract(rec, profile, state.rules)
                         if not matched:
                             error = {
                                 "record_index": index,
@@ -2583,9 +2621,9 @@ class DataGenerationAgent:
                         len(records), len(variables), edge_count)
 
         records = _apply_telecom_client_contract(records, state.scenario, state.industry)
+        records = _ensure_telecom_population_coherence(records, state.industry, state.scenario, profile=profile)
         # Final pre-QA normalization: no UPI token/value is allowed to enter the
         # validation pipeline, even if it came from a legacy schema or generator.
-        records = _ensure_telecom_segment_coverage(records, profile)
         records = _normalize_upi_in_records(records, state.industry)
         state.raw_records = records
         return state
@@ -2801,6 +2839,7 @@ class DataGenerationAgent:
                             "after final QA reconciliation and no schema-valid non-edge value could be derived dynamically"
                         )
 
+                rec = _apply_relationship_contract(rec, profile, state.rules)
                 algo_fixed += len(issues)
                 checked.append(rec)
                 if transactional:
@@ -2900,7 +2939,7 @@ class DataGenerationAgent:
                     f"Industry: {state.industry}\nCountry: {state.country or 'GLOBAL'}\n"
                     f"Domain: {state.domain}\nBusiness scenario: {state.business_scenario}\n"
                     f"Use case: {state.use_case or ''}\n"
-                    + ("For this Telecom dataset, UPI is forbidden; represent any UPI-related value as DIGITAL_WALLET.\n" if str(state.industry or "").strip().lower() == "telecom" else "For this non-Telecom dataset, preserve valid UPI values; do not apply the Telecom UPI rule.\n")
+                    + ("For this Telecom dataset, UPI is forbidden; represent any UPI-related value as DIGITAL_WALLET.\n" if _is_telecom_industry(state.industry) else "For this non-Telecom dataset, preserve valid UPI values; do not apply the Telecom UPI rule.\n")
                     + f"This is a QA audit sample only. Do not rewrite the dataset.\nRecords:\n{json.dumps(checked[:sample_size], default=str)}",
                     temperature=0.1,
                 )
@@ -2913,24 +2952,9 @@ class DataGenerationAgent:
         # LLM QA is not authoritative for vocabulary. Re-apply the Telecom-only
         # output contract after LLM validation so it cannot reintroduce UPI into
         # Telecom final data. Other industries preserve UPI.
+        valid_all = [_apply_relationship_contract(dict(r), profile, state.rules) for r in valid_all]
+        valid_all = _ensure_telecom_population_coherence(valid_all, state.industry, state.scenario, profile=profile)
         valid_all = _normalize_upi_in_records(valid_all, state.industry)
-        # Final record-level semantic pass. LLM QA is not authoritative for business
-        # relationships; re-derive dependent fields after any LLM output so impossible
-        # combinations cannot survive to the API response.
-        semantically_repaired = []
-        for record in valid_all:
-            repaired = _semantic_relationships_for_profile(record, profile, variables, state.rules)
-            repaired, final_issues = _validate_record(
-                repaired, variables, state.field_order, profile, transactional,
-                event_fields=(set(event_defs.get(str(repaired.get("event_type")), {}).get("fields", []) or [])
-                              if transactional and str(repaired.get("event_type")) in event_defs else None),
-                rules=state.rules,
-            )
-            repaired = _semantic_relationships_for_profile(repaired, profile, variables, state.rules)
-            if final_issues:
-                algo_fixed += len(final_issues)
-            semantically_repaired.append(repaired)
-        valid_all = _normalize_upi_in_records(semantically_repaired, state.industry)
         state.final_records = valid_all
         state.validation_report = {
             "total_input": len(records),

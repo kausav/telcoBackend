@@ -36,8 +36,8 @@ Return a JSON object with:
   - "scenario_summary": str
   - "business_rules": [str]   — logical invariants that MUST hold across all records
   - "field_constraints": {field_name: {description: str, valid_values: str, nullable: bool}}
-  - "cross_field_rules": [str] — mathematical / temporal dependencies between fields
-  - "field_relationships": [{"controller_field": str, "dependent_field": str, "mapping": {controller_value: [allowed_dependent_values]}}] — executable categorical dependencies
+  - "cross_field_rules": [str] — human-readable mathematical / temporal dependencies between fields
+  - "conditional_rules": [{"when": {field: value}, "then": {field: value_or_list}}] — executable cross-field business relationships. Use exact field names from the variables.
   - "generation_constraints": {field_name: {valid_values: [str], min: number, max: number,
       preferred_values: [str]}} — machine-readable constraints the generator should use
   - "formula_rules": [{"field": str, "expression": str}] — authoritative formulas to
@@ -71,13 +71,6 @@ SEMANTIC ACCURACY IS MANDATORY:
 - Encode important state dependencies explicitly. Example: if a scenario states that
   transaction failure causes recharge failure, encode that as a machine-checkable
   conditional rule; do not leave the relationship only in prose.
-- FIELD RELATIONSHIP REQUIREMENT: whenever one categorical field determines or constrains
-  another categorical field (provider -> plan, product -> product-specific attribute,
-  account type -> account behavior, order state -> fulfillment state, etc.), emit a
-  field_relationships entry with an explicit mapping. The generator will execute this
-  mapping, so do not leave the dependency only in cross_field_rules prose.
-- Do not invent impossible combinations merely because each value is individually valid.
-  Validate complete RECORDS and ENTITY PROFILES, not isolated columns.
 """
 
 
@@ -171,8 +164,6 @@ class SchemaAgent:
         rules = self._llm.generate_json(_SYSTEM, prompt, temperature=0.1)
         if not isinstance(rules, dict):
             rules = {}
-        if not isinstance(rules.get("field_relationships"), list):
-            rules["field_relationships"] = []
 
         # Variable definitions are authoritative. Always preserve their formulas
         # as machine-readable rules so validation/generation cannot lose a formula
@@ -217,6 +208,23 @@ class SchemaAgent:
                 gc["max"] = params.get("max")
             generation_constraints[field] = gc
         rules["generation_constraints"] = generation_constraints
+
+        # Normalize and retain only executable conditional rules that reference fields
+        # in the confirmed schema. These are consumed deterministically by data generation.
+        raw_conditional = rules.get("conditional_rules", [])
+        normalized_conditional = []
+        if isinstance(raw_conditional, list):
+            for item in raw_conditional:
+                if not isinstance(item, dict):
+                    continue
+                when = item.get("when") or item.get("conditions")
+                then = item.get("then") or item.get("set")
+                if not isinstance(when, dict) or not isinstance(then, dict):
+                    continue
+                if not all(str(k) in var_names for k in when) or not all(str(k) in var_names for k in then):
+                    continue
+                normalized_conditional.append({"when": {str(k): v for k, v in when.items()}, "then": {str(k): v for k, v in then.items()}})
+        rules["conditional_rules"] = normalized_conditional
 
         set_schema(cache_key, rules)
         state.rules = rules

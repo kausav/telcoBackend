@@ -69,10 +69,10 @@ INDUSTRY_NOTES: dict[str, dict[str, dict]] = {
             "product_types": ["Postpaid Unlimited", "Postpaid Family Share", "Prepaid Pay-as-you-go", "Prepaid Monthly"],
             "identity_notes": "No national biometric SIM KYC requirement; account tied to billing address/credit check for postpaid",
             "service_providers": ["AT&T", "Verizon", "T-Mobile"],
-            "plan_catalog_by_provider": {
-                "AT&T": ["AT&T Unlimited Starter", "AT&T Unlimited Extra", "AT&T Unlimited Premium"],
-                "Verizon": ["Verizon Unlimited Welcome", "Verizon Unlimited Plus", "Verizon Unlimited Ultimate"],
-                "T-Mobile": ["T-Mobile Essentials", "T-Mobile Go5G", "T-Mobile Go5G Plus"],
+            "provider_plans": {
+                "AT&T": ["ATT_PREPAID", "ATT_UNLIMITED", "ATT_FAMILY", "ATT_POSTPAID", "ATT_DATA_ONLY"],
+                "Verizon": ["VERIZON_PREPAID", "VERIZON_UNLIMITED", "VERIZON_FAMILY", "VERIZON_POSTPAID", "VERIZON_DATA_ONLY"],
+                "T-Mobile": ["TMOBILE_PREPAID", "TMOBILE_ESSENTIALS", "TMOBILE_GO5G", "TMOBILE_FAMILY", "TMOBILE_DATA_ONLY"],
             },
             "typical_denominations": [10.00, 25.00, 50.00, 100.00],
         },
@@ -82,11 +82,11 @@ INDUSTRY_NOTES: dict[str, dict[str, dict]] = {
             "product_types": ["Prepaid Combo (data+voice+SMS)", "Prepaid Unlimited Daily Data", "Postpaid Family Plan", "Prepaid Top-up Voucher"],
             "identity_notes": "Mandatory Aadhaar/e-KYC or biometric verification for SIM issuance; circle-based numbering",
             "service_providers": ["Jio", "Airtel", "Vi", "BSNL"],
-            "plan_catalog_by_provider": {
-                "Jio": ["Jio Prepaid 199", "Jio Prepaid 299", "Jio Prepaid 399", "Jio Postpaid Plus"],
-                "Airtel": ["Airtel Prepaid 199", "Airtel Prepaid 299", "Airtel Prepaid 399", "Airtel Postpaid"],
-                "Vi": ["Vi Prepaid 199", "Vi Prepaid 299", "Vi Hero Unlimited", "Vi Postpaid"],
-                "BSNL": ["BSNL Prepaid 199", "BSNL Prepaid 299", "BSNL Bharat Fiber", "BSNL Postpaid"],
+            "provider_plans": {
+                "Jio": ["JIO_PREPAID_DAILY", "JIO_PREPAID_MONTHLY", "JIO_UNLIMITED", "JIO_POSTPAID_INDIVIDUAL", "JIO_POSTPAID_FAMILY"],
+                "Airtel": ["AIRTEL_PREPAID_DAILY", "AIRTEL_PREPAID_MONTHLY", "AIRTEL_UNLIMITED", "AIRTEL_POSTPAID_INDIVIDUAL", "AIRTEL_POSTPAID_FAMILY"],
+                "Vi": ["VI_PREPAID_DAILY", "VI_PREPAID_MONTHLY", "VI_UNLIMITED", "VI_POSTPAID_INDIVIDUAL", "VI_POSTPAID_FAMILY"],
+                "BSNL": ["BSNL_PREPAID_DAILY", "BSNL_PREPAID_MONTHLY", "BSNL_UNLIMITED", "BSNL_POSTPAID_INDIVIDUAL", "BSNL_POSTPAID_FAMILY"],
             },
             "typical_denominations": [10.00, 19.00, 49.00, 99.00, 199.00, 299.00, 599.00],
         },
@@ -96,11 +96,11 @@ INDUSTRY_NOTES: dict[str, dict[str, dict]] = {
             "product_types": ["Pay Monthly SIM-only", "Pay Monthly Handset Contract", "Pay As You Go (PAYG)"],
             "identity_notes": "No mandatory biometric KYC; identity/credit check required for postpaid contracts",
             "service_providers": ["EE", "O2", "Vodafone", "Three"],
-            "plan_catalog_by_provider": {
-                "EE": ["EE Pay As You Go", "EE SIM Only", "EE Smart Plan"],
-                "O2": ["O2 Pay As You Go", "O2 SIM Only", "O2 Refresh"],
-                "Vodafone": ["Vodafone Pay As You Go", "Vodafone SIM Only", "Vodafone Unlimited"],
-                "Three": ["Three Pay As You Go", "Three SIM Only", "Three Unlimited"],
+            "provider_plans": {
+                "EE": ["EE_PAYG", "EE_SMART_PLAN", "EE_UNLIMITED", "EE_SIM_ONLY", "EE_FAMILY"],
+                "O2": ["O2_PAYG", "O2_REFRESH", "O2_UNLIMITED", "O2_SIM_ONLY", "O2_FAMILY"],
+                "Vodafone": ["VODAFONE_PAYG", "VODAFONE_UNLIMITED", "VODAFONE_SIM_ONLY", "VODAFONE_FAMILY", "VODAFONE_DATA"],
+                "Three": ["THREE_PAYG", "THREE_UNLIMITED", "THREE_SIM_ONLY", "THREE_FAMILY", "THREE_DATA"],
             },
             "typical_denominations": [10.00, 15.00, 20.00, 30.00],
         },
@@ -110,9 +110,9 @@ INDUSTRY_NOTES: dict[str, dict[str, dict]] = {
             "product_types": ["Prepaid Visitor SIM", "Prepaid Data+Voice Bundle", "Postpaid Family Plan"],
             "identity_notes": "Mandatory Emirates ID verification for SIM registration",
             "service_providers": ["e&", "du"],
-            "plan_catalog_by_provider": {
-                "e&": ["e& Prepaid Combo", "e& Freedom Plan", "e& Postpaid Plan"],
-                "du": ["du Prepaid Flexi", "du Power Plan", "du Postpaid Plan"],
+            "provider_plans": {
+                "e&": ["EAND_PREPAID_COMBO", "EAND_UNLIMITED_DATA", "EAND_POSTPAID_FAMILY", "EAND_PREPAID_DATA", "EAND_POSTPAID_INDIVIDUAL"],
+                "du": ["DU_PREPAID_COMBO", "DU_POWER_PLAN", "DU_POSTPAID_FAMILY", "DU_PREPAID_DATA", "DU_POSTPAID_INDIVIDUAL"],
             },
             "typical_denominations": [10.00, 25.00, 55.00, 100.00],
         },
