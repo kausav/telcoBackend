@@ -23,6 +23,28 @@ from core.state import WorkflowState
 
 logger = logging.getLogger(__name__)
 
+# Canonical numeric dtypes used by the CSV schema/generation QA layer.
+# csv_scenario.py normalizes integer/decimal/uuid client types before they
+# reach the generation agent, but keeping the aliases here makes the helper
+# safe for both normalized and direct callers.
+_NUMERIC_DTYPES = {"int", "integer", "float", "decimal", "number", "numeric"}
+
+# Optional LLM QA configuration.  Deterministic QA remains the default; these
+# constants are only used when QA_LLM_MODE=full is explicitly enabled.
+_CHUNK = max(1, int(os.getenv("QA_LLM_CHUNK_SIZE", "10")))
+_QA_SYSTEM = """You are the final QA validator for generated synthetic data.
+Validate each supplied record against the CSV-defined schema and the supplied
+business/cross-field rules. Preserve valid values, repair only clear deterministic
+violations when possible, and do not invent fields that are not in the schema.
+Return JSON with keys: valid_records, dropped_records, fixes_applied, issues_found.
+
+Schema/business rules:
+{rules}
+
+Cross-field rules:
+{cross_field_rules}
+"""
+
 
 def _boolean_semantic(value):
     if isinstance(value, bool):
