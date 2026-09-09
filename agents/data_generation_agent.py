@@ -786,9 +786,18 @@ def _validate_record(
                 old = rec[name]; rec[name] = max(0, min(100, old))
                 if old != rec[name]: issues.append(f"{name} clamped to percentage range")
 
+    variable_by_name = {str(v.get("name")): v for v in variables if v.get("name")}
     for field, expr in _collect_formula_specs(variables, rules):
         if field not in active_fields:
             continue
+        # A derived_timestamp formula is descriptive in the client CSV. The
+        # executable source of truth is its delay_seconds range + base dependency;
+        # formulas such as "event_timestamp + notification_delay" contain a
+        # symbolic delay that is intentionally not a separate schema variable.
+        field_def = variable_by_name.get(field) or {}
+        if str(field_def.get("gen", "")).strip().lower() in {"derived_timestamp", "ts_offset"}:
+            if (field_def.get("params") or {}).get("delay_seconds") is not None:
+                continue
         deps = _formula_dependencies(expr)
         if any(rec.get(dep) is None for dep in deps):
             issues.append(f"{field} formula could not be evaluated; missing dependencies")

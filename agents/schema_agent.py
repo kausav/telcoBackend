@@ -277,10 +277,17 @@ class SchemaAgent:
             except SyntaxError as exc:
                 problems.append(f"formula for '{field}' is not a valid expression: {exc}")
                 continue
-            unknown = sorted(
-                name for name in refs
-                if name not in var_names and name not in {"round", "min", "max", "abs", "sum"}
-            )
+            allowed_names = {"round", "min", "max", "abs", "sum"}
+            # Client CSV convention: derived_timestamp formulas may use a symbolic
+            # delay name (for example notification_delay) while the actual delay
+            # distribution is declared in params.delay_seconds. The timestamp
+            # generator samples that delay directly, so the symbolic delay is not
+            # a schema variable and must not fail schema validation.
+            variable_def = next((v for v in variables if str(v.get("name")) == field), None)
+            if variable_def and str(variable_def.get("gen", "")).strip().lower() in {"derived_timestamp", "ts_offset"}:
+                if (variable_def.get("params") or {}).get("delay_seconds") is not None:
+                    allowed_names.update(name for name in refs if name.endswith("_delay"))
+            unknown = sorted(name for name in refs if name not in var_names and name not in allowed_names)
             if unknown:
                 problems.append(f"formula for '{field}' references undefined variable(s): {unknown}")
 
