@@ -537,7 +537,7 @@ def generate_scenario(req: GenerateRequest):
         events=meta.get("events", []),
         draft_id=req.draftId,
         scenario_label=meta["label"],
-        fields=state.field_order or _get_field_order(scenario_id),
+        fields=state.field_order or ((resolve_variables(scenario_id) or ([], []))[1]),
         total_records=len(final_records),
         validation_report=state.validation_report,
         records=response_records,
