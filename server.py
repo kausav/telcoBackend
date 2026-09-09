@@ -1,6 +1,5 @@
 from __future__ import annotations
 import logging
-import math
 import uuid
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -10,8 +9,7 @@ from pydantic import BaseModel, Field
 from typing import Literal
 
 from core.pipeline import run_pipeline
-from agents.scenario_designer_agent import ScenarioDesignerAgent
-from core.csv_scenario import parse_definition_csv
+from core.csv_scenario import infer_type_of_data, parse_definition_csv
 from core.dynamic_scenarios import (
     add_feedback,
     confirm_scenario,
@@ -27,18 +25,10 @@ from core.dynamic_scenarios import (
     save_draft,
     scenario_exists,
 )
-from core.llm_client import GeminiClient
 from core.compiled_schema import invalidate_scenario
-from agents.data_generation_agent import _condition_compatible_with_schema
 from core.runtime_cache import clear_scenario
 
 
-def _get_field_order(scenario: str) -> list[str]:
-    """Return the persisted field order for a confirmed scenario."""
-    dyn = resolve_variables(scenario)
-    if dyn is None:
-        raise HTTPException(400, detail={"error": f"Unknown scenario '{scenario}'"})
-    return dyn[1]
 
 
 def _is_placeholder(value) -> bool:
@@ -114,7 +104,6 @@ class GenerateResponse(BaseModel):
     scenario_id: str
     typeOfData: Literal["transactional", "aggregational"]
     events: list[dict] = Field(default_factory=list)
-    requested_scenario_id: str | None = Field(None, description="The scenarioId originally requested at /scenario/propose time, persisted from confirm — may differ from scenario_id if it was reassigned due to a collision")
     draft_id: str | None = None
     scenario_label: str
     fields: list[str]
@@ -126,27 +115,14 @@ class GenerateResponse(BaseModel):
     eventData: list[dict] = Field(default_factory=list, description="Deprecated compatibility field; transactional data is grouped under records by entityKey")
     errors: list[str]
     record_errors: list[dict] = Field(default_factory=list, description="Errors for individual records that could not be generated or validated; successful records are still returned")
-    edgeCasePercentage: float = Field(0.0, ge=0.0, le=1.0)
 
 
-class ProposeRequest(BaseModel):
-    scenarioId: str = Field(..., examples=["LB-04"])
-    scenarioType: str = Field(..., examples=["Normal", "No Response", "Customer Declines"])
-    industryType: str = Field(..., examples=["Telecom"])
-    domain: str = Field(..., examples=["Low Balance & Top-up"])
-    businessScenario: str = Field(..., examples=["Balance reaches the defined low-balance threshold"])
-    businessResponse: str | None = Field(None, examples=["Recognise the situation"])
-    expectedOutcome: str | None = Field(None, examples=["Potential recharge opportunity identified"])
-    country: str | None = Field(None, description="ISO 3166-1 alpha-2 country code; if omitted, generic/global (non-country-specific) conventions are used instead of assuming a country", examples=["US", "IN", "GB", "AE"])
-    useCase: str | None = Field(None, description="Specific use case within the domain, gives the designer sharper context than domain alone", examples=["Proactive low-balance recharge nudge"])
-    typeOfData: Literal["transactional", "aggregational"] = Field(..., description="Output data grain: one journey-level record or multiple event/transaction records per entity")
 
 
-class ProposeResponse(BaseModel):
+class ScenarioImportResponse(BaseModel):
     success: bool = Field(True, description="True when the API request completed successfully")
     draft_id: str
     scenario_id: str
-    scenario_id_available: bool = Field(True, description="False if this scenarioId is already confirmed under a different draft — /scenario/confirm will mint a new id in that case")
     label: str
     journey: str
     description: str
@@ -154,7 +130,6 @@ class ProposeResponse(BaseModel):
     field_order: list[str]
     typeOfData: Literal["transactional", "aggregational"]
     events: list[dict] = Field(default_factory=list)
-    edgeCaseVariables: list[dict] = Field(default_factory=list)
 
 
 class VariableEdit(BaseModel):
@@ -181,11 +156,6 @@ class ConfirmRequest(BaseModel):
     eventEdit: list[EventEdit] = Field(default_factory=list, description="Transactional events to edit by event_type")
     eventDelete: list[str] = Field(default_factory=list, description="Transactional event_type values to delete")
 
-    # Edge-case variable changes are supported for both data types.
-    edgeCaseAdd: list[dict] = Field(default_factory=list, description="Edge-case variable definitions to add")
-    edgeCaseEdit: list[VariableEdit] = Field(default_factory=list, description="Edge-case variables to edit by name")
-    edgeCaseDelete: list[str] = Field(default_factory=list, description="Edge-case variable names to delete")
-    edgeCasePercentage: float | None = Field(None, ge=0.0, le=1.0, description="Fraction of generated records/entities that must be edge-case data (0.02 = 2%)")
 
     feedback: str | None = None
 
@@ -193,7 +163,7 @@ class ConfirmRequest(BaseModel):
 class ConfirmResponse(BaseModel):
     success: bool = Field(True, description="True when the API request completed successfully")
     scenario_id: str
-    requested_scenario_id: str | None = Field(None, description="The scenarioId originally requested at propose time, for comparison")
+    requested_scenario_id: str | None = Field(None, description="The scenarioId supplied during CSV import, for comparison")
     scenario_id_reassigned: bool = Field(False, description="True if scenario_id differs from requested_scenario_id because the requested id was already confirmed under a different draft")
     draft_id: str
     label: str
@@ -203,8 +173,6 @@ class ConfirmResponse(BaseModel):
     field_order: list[str]
     typeOfData: Literal["transactional", "aggregational"]
     events: list[dict] = Field(default_factory=list)
-    edgeCaseVariables: list[dict] = Field(default_factory=list)
-    edgeCasePercentage: float = Field(0.0, ge=0.0, le=1.0)
 
 
 @app.get("/")
@@ -219,75 +187,12 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/scenario/propose", response_model=ProposeResponse)
-def propose_scenario(req: ProposeRequest):
-    """API 1a — ask the designer agent to invent a new scenario + variable catalog."""
-    # scenarioId is just the user's preferred label at this stage; it's not reserved here
-    # because two different users can propose the same one concurrently. draftId (minted
-    # below) is the only unique handle — /scenario/confirm resolves any scenarioId clash.
-    try:
-        llm = GeminiClient()
-        agent = ScenarioDesignerAgent(llm)
-        draft = agent.propose(
-            industry_type=req.industryType,
-            domain=req.domain,
-            business_scenario=req.businessScenario,
-            business_response=req.businessResponse,
-            expected_outcome=req.expectedOutcome,
-            scenario_id=req.scenarioId,
-            scenario_type=req.scenarioType,
-            country=req.country,
-            use_case=req.useCase,
-            type_of_data=req.typeOfData,
-        )
-    except EnvironmentError as exc:
-        raise HTTPException(500, detail={"error": str(exc)}) from exc
-    except Exception as exc:
-        raise HTTPException(502, detail={"error": f"Scenario proposal failed: {exc}"}) from exc
-
-    draft_id = new_draft_id()
-    draft["domain"] = req.domain
-    draft["business_scenario"] = req.businessScenario
-    draft["scenario_id"] = req.scenarioId
-    draft["scenario_type"] = req.scenarioType
-    draft["industry_type"] = req.industryType
-    draft["country"] = req.country
-    draft["use_case"] = req.useCase
-    draft["business_response"] = req.businessResponse
-    draft["expected_outcome"] = req.expectedOutcome
-    draft["type_of_data"] = req.typeOfData
-    draft.setdefault("edge_case_variables", [])
-    draft.setdefault("edge_case_percentage", 0.0)
-    save_draft(draft_id, draft)
-    scenario_id_available = not scenario_exists(req.scenarioId)
-    if not scenario_id_available:
-        logger.warning(
-            "[propose] scenarioId '%s' is already confirmed under a different draft; "
-            "/scenario/confirm for draft_id=%s will mint a new id unless that scenario_id is freed up.",
-            req.scenarioId, draft_id,
-        )
-    return ProposeResponse(
-        success=True,
-        draft_id=draft_id,
-        scenario_id=req.scenarioId,
-        scenario_id_available=scenario_id_available,
-        label=draft.get("label", ""),
-        journey=draft.get("journey", req.domain),
-        description=draft.get("description", ""),
-        variables=draft.get("variables", []),
-        field_order=draft.get("field_order", []),
-        typeOfData=draft.get("type_of_data", "aggregational"),
-        events=draft.get("events", []),
-        edgeCaseVariables=draft.get("edge_case_variables", []),
-    )
-
-
-@app.post("/scenario/import-csv", response_model=ProposeResponse)
+@app.post("/scenario/import-csv", response_model=ScenarioImportResponse)
 def import_scenario_csv(
     file: UploadFile = File(..., description="CSV scenario definition: variables and, for transactional data, events"),
     scenarioId: str = Form(...),
     domain: str = Form(...),
-    typeOfData: Literal["transactional", "aggregational"] = Form(...),
+    typeOfData: Literal["transactional", "aggregational"] | None = Form(None),
     industryType: str = Form("generic"),
     country: str | None = Form(None),
     businessScenario: str = Form(""),
@@ -297,15 +202,8 @@ def import_scenario_csv(
     useCase: str | None = Form(None),
     label: str = Form(""),
     entityKey: str | None = Form(None),
-    edgeCasePercentage: float | None = Form(None),
 ):
-    """API 1b — CSV alternative to /scenario/propose.
-
-    The uploaded CSV is a *scenario definition*, not sample/output data. It tells
-    the backend which variables the user wants and, for transactional scenarios,
-    which events and event fields the user wants. The resulting draft is stored in
-    exactly the same draft store consumed by /scenario/confirm and /scenario/generate.
-    """
+    """Import a CSV scenario definition and create a draft for confirmation/generation."""
     raw = file.file.read()
     try:
         csv_text = raw.decode("utf-8-sig")
@@ -313,43 +211,37 @@ def import_scenario_csv(
         raise HTTPException(400, detail={"error": f"CSV must be UTF-8 encoded: {exc}"}) from exc
 
     try:
-        variables, field_order, events, edge_case_variables, csv_metadata = parse_definition_csv(
-            csv_text, type_of_data=typeOfData
+        detected_type = infer_type_of_data(csv_text)
+        variables, field_order, events = parse_definition_csv(
+            csv_text, type_of_data=detected_type
         )
     except ValueError as exc:
         raise HTTPException(400, detail={"error": str(exc)}) from exc
 
+    typeOfData = detected_type
+    variable_names = {v["name"] for v in variables}
     if typeOfData == "transactional":
-        if not entityKey:
-            raise HTTPException(400, detail={
-                "error": "entityKey is required for transactional CSV imports",
-                "example": "subscriber_id",
-            })
-        if entityKey not in {v["name"] for v in variables}:
+        # entityKey is optional for the new CSV contract. Prefer an explicit key;
+        # otherwise infer a stable entity identifier from the non-event fields.
+        if entityKey and entityKey not in variable_names:
             raise HTTPException(400, detail={
                 "error": f"entityKey '{entityKey}' must be one of the CSV variable names"
             })
+        if not entityKey:
+            preferred = (
+                "subscriber_id", "customer_id", "account_id", "user_id",
+                "entity_id", "customer_key", "entity_key", "id",
+            )
+            event_fields = {f for e in events for f in e.get("fields", [])}
+            entity_names = [v["name"] for v in variables if v["name"] not in event_fields]
+            entityKey = next((name for name in preferred if name in entity_names), None)
+            entityKey = entityKey or (entity_names[0] if entity_names else None)
+        if not entityKey:
+            raise HTTPException(400, detail={
+                "error": "Transactional CSV must contain at least one entity field so a journey entity can be identified"
+            })
     else:
         entityKey = None
-
-    # CSV can define edgeCasePercentage; an explicit form value overrides it.
-    edge_case_percentage = float(csv_metadata.get("edge_case_percentage", 0.0) or 0.0)
-    if edgeCasePercentage is not None:
-        edge_case_percentage = edgeCasePercentage
-    if not math.isfinite(edge_case_percentage) or not 0.0 <= edge_case_percentage <= 1.0:
-        raise HTTPException(400, detail={
-            "error": "edgeCasePercentage must be between 0 and 1",
-            "value": edge_case_percentage,
-        })
-    if not edge_case_variables:
-        edge_case_percentage = 0.0
-    else:
-        valid_names = {v["name"] for v in variables}
-        for item in edge_case_variables:
-            if item.get("name") not in valid_names:
-                raise HTTPException(400, detail={"error": f"Edge-case variable '{item.get('name')}' is not a normal CSV variable"})
-            if not str(item.get("condition", "")).strip():
-                raise HTTPException(400, detail={"error": f"Edge-case variable '{item.get('name')}' requires condition"})
 
     draft_id = new_draft_id()
     draft = {
@@ -370,15 +262,12 @@ def import_scenario_csv(
         "type_of_data": typeOfData,
         "entity_key": entityKey,
         "events": events,
-        "edge_case_variables": edge_case_variables,
-        "edge_case_percentage": edge_case_percentage,
     }
     save_draft(draft_id, draft)
-    return ProposeResponse(
+    return ScenarioImportResponse(
         success=True,
         draft_id=draft_id,
         scenario_id=scenarioId,
-        scenario_id_available=not scenario_exists(scenarioId),
         label=draft["label"],
         journey=draft["journey"],
         description=draft["description"],
@@ -386,96 +275,71 @@ def import_scenario_csv(
         field_order=field_order,
         typeOfData=typeOfData,
         events=events,
-        edgeCaseVariables=edge_case_variables,
     )
 
 
 @app.post("/scenario/confirm", response_model=ConfirmResponse)
 def confirm_scenario_route(req: ConfirmRequest):
-    """API 2 — apply user add/edit/delete + feedback, then finalize the scenario."""
+    """Finalize an imported CSV draft, applying optional variable/event edits."""
     draft = get_draft(req.draft_id)
     if draft is None:
         raise HTTPException(404, detail={"error": f"Unknown or expired draft_id '{req.draft_id}'"})
 
-    variables: list[dict] = [dict(v) for v in draft.get("variables", [])]
-    by_name = {v["name"]: v for v in variables}
+    variables = [dict(v) for v in draft.get("variables", []) if isinstance(v, dict)]
+    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
 
     for name in req.delete:
-        if _is_placeholder(name):
+        if not _is_placeholder(name):
+            by_name.pop(name, None)
+    for edit in req.edit:
+        if _is_placeholder(edit.name):
             continue
-        by_name.pop(name, None)
-    variables = list(by_name.values())
-    by_name = {v["name"]: v for v in variables}
-
-    for e in req.edit:
-        if _is_placeholder(e.name):
-            continue
-        changes = _clean_dict(e.changes or {})
-        if e.name in by_name and changes:
-            by_name[e.name].update(changes)
-
+        changes = _clean_dict(edit.changes or {})
+        if edit.name in by_name and changes:
+            by_name[edit.name].update(changes)
     for new_var in req.add:
-        cleaned_var = _clean_dict(new_var)
-        if not _is_placeholder(cleaned_var.get("name")):
-            by_name[cleaned_var["name"]] = cleaned_var
+        cleaned = _clean_dict(new_var)
+        name = cleaned.get("name")
+        if not _is_placeholder(name):
+            by_name[str(name)] = cleaned
 
     variables = list(by_name.values())
-    field_order = [v["name"] for v in variables]
+    field_order = [str(v["name"]) for v in variables if v.get("name")]
 
-    # Placeholder/blank event entries are no-ops, same as variable add/edit/delete above.
-    clean_event_delete = [v for v in req.eventDelete if not _is_placeholder(v)]
-    clean_event_edits: list[tuple[str, dict]] = []
-    for ee in req.eventEdit:
-        if _is_placeholder(ee.event_type):
-            continue
-        changes = _clean_dict(ee.changes or {})
-        if changes:
-            clean_event_edits.append((ee.event_type, changes))
-    clean_event_adds = [_clean_dict(ea) for ea in req.eventAdd if isinstance(ea, dict)]
-    clean_event_adds = [ea for ea in clean_event_adds if ea]
-
-    # Event-level changes are available ONLY for transactional scenarios.
-    # Aggregational scenarios have a variables-only confirm contract.
     type_of_data = draft.get("type_of_data", "aggregational")
-    has_event_changes = bool(clean_event_adds or clean_event_edits or clean_event_delete)
-    if type_of_data != "transactional" and has_event_changes:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "Event add/edit/delete is only supported for transactional scenarios",
-                "typeOfData": type_of_data,
-                "allowedChanges": ["add", "edit", "delete"],
-            },
-        )
+    clean_event_delete = [v for v in req.eventDelete if not _is_placeholder(v)]
+    clean_event_edits = []
+    for edit in req.eventEdit:
+        if not _is_placeholder(edit.event_type):
+            changes = _clean_dict(edit.changes or {})
+            if changes:
+                clean_event_edits.append((edit.event_type, changes))
+    clean_event_adds = [_clean_dict(v) for v in req.eventAdd if isinstance(v, dict)]
+    clean_event_adds = [v for v in clean_event_adds if v]
 
-    events: list[dict] = [dict(e) for e in draft.get("events", []) if isinstance(e, dict)]
+    if type_of_data != "transactional" and (clean_event_adds or clean_event_edits or clean_event_delete):
+        raise HTTPException(400, detail={
+            "error": "Event add/edit/delete is only supported for transactional scenarios",
+            "typeOfData": type_of_data,
+            "allowedChanges": ["add", "edit", "delete"],
+        })
+
+    events = [dict(e) for e in draft.get("events", []) if isinstance(e, dict)]
     if type_of_data == "transactional":
-        delete_event_types = {str(v).strip().upper() for v in clean_event_delete}
-        events = [
-            e for e in events
-            if str(e.get("event_type", "")).strip().upper() not in delete_event_types
-        ]
+        delete_types = {str(v).strip().upper().replace(" ", "_") for v in clean_event_delete}
+        events = [e for e in events if str(e.get("event_type", "")).strip().upper().replace(" ", "_") not in delete_types]
+        event_by_type = {str(e.get("event_type", "")).strip().upper().replace(" ", "_"): e for e in events}
 
-        event_by_type = {str(e.get("event_type", "")).strip().upper(): e for e in events}
-
-        # Apply edits against the pre-edit event_type. If an edit renames the event,
-        # rebuild the lookup map so subsequent edits/adds operate on the new name.
         for event_type, changes in clean_event_edits:
-            old_key = event_type.strip().upper().replace(" ", "_")
+            old_key = str(event_type).strip().upper().replace(" ", "_")
             if old_key not in event_by_type:
-                raise HTTPException(
-                    status_code=400,
-                    detail={"error": "Event not found", "event_type": old_key},
-                )
+                raise HTTPException(400, detail={"error": "Event not found", "event_type": old_key})
             if "event_type" in changes:
                 new_key = str(changes["event_type"]).strip().upper().replace(" ", "_")
                 if not new_key:
-                    raise HTTPException(status_code=400, detail={"error": "event_type cannot be empty"})
+                    raise HTTPException(400, detail={"error": "event_type cannot be empty"})
                 if new_key != old_key and new_key in event_by_type:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={"error": "Event type already exists", "event_type": new_key},
-                    )
+                    raise HTTPException(400, detail={"error": "Event type already exists", "event_type": new_key})
                 changes["event_type"] = new_key
             event = event_by_type.pop(old_key)
             event.update(changes)
@@ -486,12 +350,9 @@ def confirm_scenario_route(req: ConfirmRequest):
         for new_event in clean_event_adds:
             event_type = str(new_event.get("event_type", "")).strip().upper().replace(" ", "_")
             if not event_type:
-                raise HTTPException(status_code=400, detail={"error": "eventAdd requires event_type"})
+                raise HTTPException(400, detail={"error": "eventAdd requires event_type"})
             if event_type in event_by_type:
-                raise HTTPException(
-                    status_code=400,
-                    detail={"error": "Event type already exists", "event_type": event_type},
-                )
+                raise HTTPException(400, detail={"error": "Event type already exists", "event_type": event_type})
             event = dict(new_event)
             event["event_type"] = event_type
             event_by_type[event_type] = event
@@ -501,174 +362,18 @@ def confirm_scenario_route(req: ConfirmRequest):
             event["sequence"] = index
             fields = event.get("fields", [])
             event["fields"] = fields if isinstance(fields, list) else []
-            # Each transactional event can repeat for the same entity. The API
-            # returns at most 10 records per event; these defaults make newly
-            # proposed transactional events capable of producing multiple rows.
             min_occ = max(1, int(event.get("min_occurrences", 1)))
             max_occ = max(min_occ, min(1000, int(event.get("max_occurrences", 10))))
             event["min_occurrences"] = min_occ
             event["max_occurrences"] = max_occ
 
-    # Edge-case variables: add/edit/delete independently from normal variables.
-    edge_case_variables: list[dict] = [dict(v) for v in draft.get("edge_case_variables", []) if isinstance(v, dict)]
-    # Edge-case definitions may legitimately reuse the same variable name in
-    # different edge cases. Use (edge_case_name, variable_name) as the identity
-    # rather than collapsing all definitions with the same field name.
-    edge_by_key = {
-        (str(v.get("edge_case_name") or "Scenario Edge Case"), str(v.get("name"))): v
-        for v in edge_case_variables if v.get("name")
-    }
-    for name in req.edgeCaseDelete:
-        if not _is_placeholder(name):
-            target = str(name).strip()
-            target_key = target.casefold()
-            # Accept either the edge-case group name (preferred by the UI) or
-            # an individual edge-case variable name. Matching is case-insensitive
-            # so UI/display casing cannot leave a deleted group behind. Deleting an
-            # edge case always removes the complete group.
-            edge_by_key = {
-                k: v for k, v in edge_by_key.items()
-                if str(k[0]).strip().casefold() != target_key
-                and str(k[1]).strip().casefold() != target_key
-            }
-    for e in req.edgeCaseEdit:
-        if _is_placeholder(e.name):
-            continue
-        changes = _clean_dict(e.changes or {})
-        if not changes:
-            continue
-        target = str(e.name)
-        for key, value in list(edge_by_key.items()):
-            if key[1] == target:
-                value.update(changes)
-    for new_var in req.edgeCaseAdd:
-        cleaned = _clean_dict(new_var)
-        name = cleaned.get("name")
-        if _is_placeholder(name):
-            continue
-        edge_name = str(cleaned.get("edge_case_name") or "Scenario Edge Case")
-        cleaned["edge_case_name"] = edge_name
-        edge_by_key[(edge_name, str(name))] = cleaned
-    edge_case_variables = list(edge_by_key.values())
-
-    # Edge-case variables are allowed to introduce fields that are not present in
-    # the normal catalog, but those fields must have a complete executable schema.
-    # Promote them into the persisted scenario schema so generation and QA share one
-    # canonical definition rather than guessing at runtime.
-    variable_by_name = {str(v.get("name")): v for v in variables if v.get("name")}
-    for edge_var in edge_case_variables:
-        name = str(edge_var.get("name") or "").strip()
-        if not name:
-            raise HTTPException(400, detail={"error": "edge-case variable requires name"})
-        if name not in variable_by_name:
-            if not edge_var.get("gen") or not edge_var.get("dtype"):
-                raise HTTPException(400, detail={
-                    "error": f"Edge-case-only variable '{name}' must include dtype and gen"
-                })
-            promoted = {k: edge_var[k] for k in (
-                "name", "dtype", "description", "gen", "params", "depends_on",
-                "nullable", "formula"
-            ) if k in edge_var}
-            promoted.setdefault("params", {})
-            promoted.setdefault("depends_on", [])
-            promoted.setdefault("nullable", False)
-            variables.append(promoted)
-            field_order.append(name)
-            variable_by_name[name] = promoted
-
-    # Validate every configured edge condition against the canonical schema before
-    # persisting the scenario. Normal numeric min/max values describe the ordinary
-    # generation distribution; explicit edge-case conditions are allowed to target
-    # values outside that ordinary range. Hard categorical/boolean domains and
-    # undefined fields are still rejected here.
-    edge_groups_for_validation: dict[str, dict] = {}
-    for item in edge_case_variables:
-        group_name = str(item.get("edge_case_name") or "Scenario Edge Case")
-        group = edge_groups_for_validation.setdefault(group_name, {
-            "condition": str(item.get("condition") or "").strip(),
-            "variables": [],
-        })
-        group["variables"].append(item)
-        if item.get("condition") and not group.get("condition"):
-            group["condition"] = str(item["condition"]).strip()
-    for group_name, group in edge_groups_for_validation.items():
-        condition = group.get("condition", "")
-        if not condition:
-            raise HTTPException(400, detail={"error": f"Edge case '{group_name}' requires a condition"})
-        refs = set()
-        try:
-            import ast
-            tree = ast.parse(condition, mode="eval")
-            allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Not, ast.Compare,
-                       ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In, ast.NotIn,
-                       ast.Is, ast.IsNot, ast.Name, ast.Constant, ast.List, ast.Tuple,
-                       ast.UnaryOp, ast.USub, ast.UAdd, ast.Load)
-            if any(not isinstance(n, allowed) for n in ast.walk(tree)):
-                raise ValueError("unsupported condition syntax")
-            refs = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        except Exception as exc:
-            raise HTTPException(400, detail={"error": f"Invalid edge-case condition for '{group_name}': {exc}"}) from exc
-        declared = {str(v.get("name")) for v in variables if v.get("name")}
-        missing = sorted(refs - declared)
-        if missing:
-            raise HTTPException(400, detail={"error": f"Edge case '{group_name}' references undefined variable(s): {missing}"})
-        # Validate against the effective schema for THIS edge case. An edge definition
-        # may override dtype/choices/generator/params for a field. Normal-generation
-        # metadata must not make a valid edge condition look impossible. Numeric min/max
-        # remain ordinary-generation bounds; explicit categorical choices remain hard
-        # domains unless the edge definition explicitly supplies a replacement domain.
-        effective_variables = [dict(v) for v in variables]
-        effective_by_name = {str(v.get("name")): v for v in effective_variables if v.get("name")}
-        for edge_var in group.get("variables", []):
-            edge_name = str(edge_var.get("name") or "").strip()
-            if not edge_name:
-                continue
-            base = effective_by_name.get(edge_name)
-            if base is None:
-                effective_by_name[edge_name] = dict(edge_var)
-                effective_variables.append(effective_by_name[edge_name])
-                continue
-            for key in ("dtype", "gen", "params", "formula", "depends_on", "nullable"):
-                if key in edge_var and edge_var[key] not in (None, ""):
-                    base[key] = edge_var[key]
-        if not _condition_compatible_with_schema(
-            condition, effective_variables,
-            edge_override_names={str(v.get("name")) for v in group.get("variables", []) if v.get("name")},
-        ): 
-            raise HTTPException(400, detail={
-                "error": f"Edge case '{group_name}' condition is incompatible with its effective variable schema",
-                "condition": condition,
-            })
-
-    edge_case_percentage = draft.get("edge_case_percentage", 0.0)
-    if req.edgeCasePercentage is not None:
-        edge_case_percentage = req.edgeCasePercentage
-    try:
-        edge_case_percentage = float(edge_case_percentage or 0.0)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(400, detail={"error": "edgeCasePercentage must be a finite float between 0 and 1"}) from exc
-    if not math.isfinite(edge_case_percentage) or not 0.0 <= edge_case_percentage <= 1.0:
-        raise HTTPException(400, detail={"error": "edgeCasePercentage must be between 0 and 1", "value": edge_case_percentage})
-
-    # Edge cases are optional. If the confirmed scenario has no edge-case
-    # definitions, percentage is normalized to 0 rather than producing an
-    # impossible request.
-    if not edge_case_variables:
-        edge_case_percentage = 0.0
-
     scenario_id = draft.get("scenario_id") or next_scenario_id()
     requested_scenario_id = draft.get("scenario_id")
-    # scenarioId is user-chosen at propose time, so two different users' drafts can pick the
-    # same one; if it's already confirmed under a different draft, don't clobber it — mint a
-    # fresh id and keep the original draft_id as the unambiguous handle for /generate.
     if scenario_exists(scenario_id) and resolve_scenario_id_from_draft(req.draft_id) != scenario_id:
         reassigned_from = scenario_id
         scenario_id = next_scenario_id()
-        logger.warning(
-            "[confirm] requested scenarioId '%s' (draft_id=%s) is already confirmed under a "
-            "different draft; reassigning this draft to '%s' instead.",
-            reassigned_from, req.draft_id, scenario_id,
-        )
+        logger.warning("[confirm] scenarioId '%s' already exists; reassigned to '%s'", reassigned_from, scenario_id)
+
     meta = {
         "label": draft.get("label", scenario_id),
         "journey": draft.get("journey", draft.get("domain", "")),
@@ -682,21 +387,16 @@ def confirm_scenario_route(req: ConfirmRequest):
         "industry": draft.get("industry_type", "generic"),
         "country": draft.get("country"),
         "requested_scenario_id": requested_scenario_id,
-        "proposed_scenario_id": requested_scenario_id or scenario_id,
         "type_of_data": type_of_data,
         "events": events,
         "entity_key": draft.get("entity_key"),
-        "edge_case_variables": edge_case_variables,
-        "edge_case_percentage": edge_case_percentage,
     }
     confirm_scenario(scenario_id, meta, variables, field_order, draft_id=req.draft_id)
-    # Confirmed scenario changed: invalidate all runtime artifacts compiled from the old version.
     invalidate_scenario(scenario_id)
     clear_scenario(scenario_id)
 
     if not _is_placeholder(req.feedback):
         add_feedback(draft.get("domain", ""), draft.get("business_scenario", ""), req.feedback)
-
     pop_draft(req.draft_id)
 
     return ConfirmResponse(
@@ -712,14 +412,12 @@ def confirm_scenario_route(req: ConfirmRequest):
         field_order=field_order,
         typeOfData=meta["type_of_data"],
         events=meta.get("events", []),
-        edgeCaseVariables=edge_case_variables,
-        edgeCasePercentage=edge_case_percentage,
     )
 
 
 @app.post("/scenario/generate", response_model=GenerateResponse)
 def generate_scenario(req: GenerateRequest):
-    """API 3 — confirm a draft/scenario into records via the 4-agent pipeline."""
+    """Generate records from a confirmed CSV-defined scenario."""
     scenario_id = req.scenario
     if req.draftId:
         # draftId is the unambiguous handle when two users' scenarioId choices collided.
@@ -787,9 +485,6 @@ def generate_scenario(req: GenerateRequest):
 
         entity_records: list[dict] = []
         for entity_value, entity_rows in latest_entity_items:
-            # isEdgeCaseData is a property of the actual event record.  Do not
-            # promote it to the entity/journey wrapper: one edge-case event must
-            # not turn every event for that subscriber into an edge case.
             entity_output = {entity_key: entity_value}
 
             # Include useful identity fields alongside the grouping key.
@@ -818,7 +513,6 @@ def generate_scenario(req: GenerateRequest):
                 if not rows:
                     continue
                 actual_count = state.transactional_event_counts.get(str(entity_value), {}).get(event_type, len(rows))
-                # Preserve the edge-case flag on the actual event record.
                 clean_rows = [dict(event_row) for event_row in rows[-10:]]
                 events_for_entity.append({
                     "event_type": event_type,
@@ -841,7 +535,6 @@ def generate_scenario(req: GenerateRequest):
         entityKey=entity_key,
         totalCount=total_count,
         events=meta.get("events", []),
-        requested_scenario_id=meta.get("requested_scenario_id"),
         draft_id=req.draftId,
         scenario_label=meta["label"],
         fields=state.field_order or _get_field_order(scenario_id),
@@ -851,5 +544,4 @@ def generate_scenario(req: GenerateRequest):
         eventData=event_data,
         errors=state.errors,
         record_errors=state.record_errors,
-        edgeCasePercentage=float(meta.get("edge_case_percentage", 0.0) or 0.0),
     )

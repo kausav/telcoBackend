@@ -14,7 +14,7 @@ class WorkflowState(BaseModel):
     batch_size: int = 50
 
     # Complete confirmed scenario context.  The generator pipeline receives the
-    # full /scenario/propose context through the confirmed scenario, including
+    # Full context persisted by the CSV import/confirm flow.
     # use case and business intent, rather than only industry/country/type.
     domain: str = ""
     business_scenario: str = ""
@@ -24,8 +24,6 @@ class WorkflowState(BaseModel):
     use_case: str | None = None
     entity_key: str | None = None
     scenario_context: dict[str, Any] = Field(default_factory=dict)
-    edge_case_variables: list[dict[str, Any]] = Field(default_factory=list)
-    edge_case_percentage: float = 0.0
 
     # ── Agent outputs (populated as pipeline runs) ────────────────────────
     rules: dict[str, Any] = Field(default_factory=dict)

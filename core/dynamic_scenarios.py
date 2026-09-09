@@ -1,10 +1,10 @@
 """
-Shared store for LLM-proposed scenarios (LB-01, LB-02, ...).
+Shared store for imported and confirmed CSV scenario definitions.
 
-Scenarios proposed via the /scenario/* API are persisted in a SQLite file
+Imported scenario drafts and confirmed scenarios are persisted in SQLite.
 (not plain process-memory dicts) so that they are visible across all uvicorn
 worker processes, not just the one that happened to handle the
-/scenario/propose or /scenario/confirm call. They are still wiped if the DB
+/scenario/import-csv or /scenario/confirm call. They are still wiped if the DB
 file is deleted / the volume is reset.
 """
 from __future__ import annotations
@@ -184,8 +184,6 @@ def resolve_scenario_context(scenario_id: str) -> dict[str, Any]:
         "type_of_data": meta.get("type_of_data", "aggregational"),
         "entity_key": meta.get("entity_key"),
         "events": meta.get("events", []),
-        "edge_case_variables": meta.get("edge_case_variables", []),
-        "edge_case_percentage": float(meta.get("edge_case_percentage", 0.0) or 0.0),
     }
 
 

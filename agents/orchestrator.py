@@ -1,9 +1,7 @@
 """
-Agent 2 — Orchestrator
-Gatekeeper that runs AFTER the Scenario Designer Agent has already produced and
-confirmed the scenario's variable data (via /scenario/propose + /scenario/confirm).
-Checks that variable data is present and coherent before Schema/EdgeCase/DataGeneration
-run. Internally implemented as a small LangGraph StateGraph: variable-data check ->
+Agent 1 — Orchestrator
+Gatekeeper for confirmed CSV scenario definitions. Checks that variable data is present
+and coherent before Schema/DataGeneration run. Internally implemented as a small LangGraph StateGraph: variable-data check ->
 cache check -> LLM validation, each step short-circuiting to END as soon as a decision
 (reject or cache hit) is reached.
 """
@@ -24,8 +22,8 @@ logger = logging.getLogger(__name__)
 _SYSTEM = """
 You are the Orchestrator Agent for a synthetic data generation pipeline covering
 any business industry (telecom, banking, retail, healthcare, etc.).
-You run AFTER the scenario's variable catalog has already been generated and
-confirmed by the Scenario Designer Agent. Gatekeep that variable data against the
+You run AFTER the CSV scenario definition has been imported and confirmed. Gatekeep the
+CSV-defined variable data against the
 target industry's and country's real-world conventions (product/plan types,
 regulator, market character) and return a JSON object with:
   - "valid": bool
@@ -70,8 +68,7 @@ class OrchestratorAgent:
         return "hit" if self._cache_hit else "miss"
 
     def _check_existence(self, state: WorkflowState) -> WorkflowState:
-        """Gatekeeper: confirm the scenario exists AND that the Scenario Designer Agent
-        actually produced usable variable data before anything downstream runs."""
+        """Gatekeeper: confirm the scenario exists and contains usable CSV-defined variables."""
         if not scenario_exists(state.scenario):
             valid = [s["id"] for s in list_scenarios()]
             state.errors.append(f"Unknown scenario '{state.scenario}'. Valid: {valid}")
@@ -80,8 +77,8 @@ class OrchestratorAgent:
         dyn = resolve_variables(state.scenario)
         if dyn is None or not dyn[0]:
             state.errors.append(
-                f"Scenario '{state.scenario}' has no variable data to gatekeep. The Scenario "
-                "Designer Agent's output must be confirmed via /scenario/confirm before generation can run."
+                f"Scenario '{state.scenario}' has no variable data to gatekeep. The CSV definition "
+                "must be confirmed via /scenario/confirm before generation can run."
             )
             return state
         self._variables = dyn[0]
@@ -124,7 +121,7 @@ class OrchestratorAgent:
             f"Use case: {state.use_case or sc.get('use_case', '')}\n"
             f"Scenario type: {state.scenario_type or sc.get('scenario_type', '')}\n"
             f"Records requested: {state.count}\n"
-            f"Variable data produced by the Scenario Designer Agent ({len(variable_summary)} fields): {variable_summary}\n"
+            f"CSV-defined variable data ({len(variable_summary)} fields): {variable_summary}\n"
             f"Complete confirmed scenario context (source of truth): {json.dumps(state.scenario_context, default=str, sort_keys=True)}\n"
             f"Target industry: {profile['industry']}; country: {profile['country_name']} ({state.country}) — "
             f"regulator {profile['regulator']}, market character: {profile['market_character']}\n"

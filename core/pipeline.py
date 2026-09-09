@@ -1,8 +1,6 @@
 """
 Generation pipeline (Gemini-powered), orchestrated as a LangGraph StateGraph.
-run_pipeline() is the shared entry point used by server.py's /scenario/generate
-endpoint. The Scenario Designer Agent is not part of this pipeline; it runs
-earlier, at /scenario/propose time.
+The CSV import is the source of truth for scenario variables and transactional events.
 """
 from __future__ import annotations
 import logging
@@ -10,7 +8,6 @@ import logging
 from langgraph.graph import StateGraph, END
 
 from agents.data_generation_agent import DataGenerationAgent
-from agents.edge_case_agent import EdgeCaseAgent
 from agents.orchestrator import OrchestratorAgent
 from agents.schema_agent import SchemaAgent
 from core.dynamic_scenarios import resolve_data_type, resolve_scenario_context
@@ -22,8 +19,7 @@ logger = logging.getLogger(__name__)
 _STAGES = [
     ("orchestrator", "1. Orchestrator",       OrchestratorAgent),
     ("schema",       "2. Schema",             SchemaAgent),
-    ("edge_case",    "3. Edge Case",          EdgeCaseAgent),
-    ("generation",   "4. Data Generation",    DataGenerationAgent),
+    ("generation",   "3. Data Generation",    DataGenerationAgent),
 ]
 
 
@@ -76,8 +72,6 @@ def run_pipeline(scenario: str, count: int, industry: str = "generic", country: 
         expected_outcome=context.get("expected_outcome"),
         scenario_type=context.get("scenario_type"), use_case=context.get("use_case"),
         entity_key=context.get("entity_key"), scenario_context=context,
-        edge_case_variables=context.get("edge_case_variables", []),
-        edge_case_percentage=float(context.get("edge_case_percentage", 0.0) or 0.0),
     )
 
     graph = _build_graph(llm)

@@ -2,12 +2,11 @@
 Agent 2 — Schema Agent
 Uses Gemini to articulate business rules, field constraints and formulas for the
 selected scenario, then deterministically validates the derived schema for
-missing variables, missing rules, and incomplete logic before edge-case
-handling or generation ever run.
+missing variables, missing rules, and incomplete logic before generation runs.
 
 Internally implemented as a 2-node LangGraph subgraph: derive_schema ->
 validate_schema. A failed validation appends to state.errors, which the outer
-pipeline graph (core/pipeline.py) uses to halt before the Edge Case Agent runs.
+pipeline graph (core/pipeline.py) uses to halt before generation runs.
 """
 from __future__ import annotations
 import ast
