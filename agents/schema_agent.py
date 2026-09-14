@@ -155,7 +155,7 @@ class SchemaAgent:
             "that the data generator can enforce.\n"
             f"Produce a complete rules document covering all {len(VARS)} variables, "
             f"consistent with this industry and country's real-world standards. "
-            "For transactional output, validate that user-scope fields stay stable across each user history, "
+            "For transactional output, validate that stable user-context fields stay consistent across each user history, "
             "record identifiers are unique when defined, and record timestamps are non-decreasing within each user history."
         )
 

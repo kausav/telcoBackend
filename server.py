@@ -26,7 +26,7 @@ from core.dynamic_scenarios import (
     save_draft,
     scenario_exists,
 )
-from core.compiled_schema import invalidate_scenario
+from core.compiled_schema import invalidate_scenario, infer_history_field_sets
 from core.runtime_cache import clear_scenario
 from config.industry_profiles import COUNTRY_BASE
 
@@ -290,7 +290,7 @@ def _country_from_csv_params(variables: list[dict]) -> str | None:
 
 @app.post("/scenario/import-csv", response_model=ScenarioImportResponse)
 def import_scenario_csv(
-    file: UploadFile = File(..., description="CSV scenario definition containing variables; transactional schemas can mark scope=user/record"),
+    file: UploadFile = File(..., description="CSV scenario definition containing variables"),
     scenarioId: str = Form(...),
     domain: str = Form(...),
     typeOfData: Literal["transactional", "aggregational"] | None = Form(None),
@@ -438,7 +438,8 @@ def generate_scenario(req: GenerateRequest):
             grouped.setdefault(str(value),[]).append(row)
         entity_records=[]
         resolved_vars,_ = resolve_variables(scenario_id) or ([],[])
-        user_field_names={str(v.get("name")) for v in resolved_vars if str(v.get("scope","record")).lower()=="user" and v.get("name")}
+        user_fields, _record_fields = infer_history_field_sets(resolved_vars, entity_key)
+        user_field_names=set(user_fields)
         user_field_names.add(entity_key)
         for entity_value,rows in grouped.items():
             # Newest first, with the user-level context outside the history rows.

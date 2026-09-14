@@ -688,8 +688,8 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                             rules: dict | None = None, record_errors_out: list[dict] | None = None) -> list[dict]:
     """Generate a fixed-length recent history for each user/entity.
 
-    User-scope variables are generated once and copied into each row. Record-scope
-    variables are regenerated for every historical row. The output remains flat so
+    Stable user-context variables are generated once and copied into each row.
+    History variables are regenerated for every historical row. The output remains flat so
     downstream QA operates on ordinary records; the API groups those records by
     entity_key after generation.
     """
@@ -702,7 +702,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
         try:
             user_context=_generate_selected_record(variables,set(compiled.user_fields),rules=rules)
             if entity_key and entity_key not in user_context:
-                # Ensure the entity key is generated even if scope metadata omitted it.
+                # Ensure the entity key is generated even if inferred user context omitted it.
                 key_var=compiled.variable_by_name.get(entity_key)
                 if key_var:
                     user_context=_generate_selected_record(variables,{entity_key},base=user_context,rules=rules)

@@ -1,9 +1,9 @@
 """CSV scenario-definition parser.
 
 The CSV is the source of truth for the schema.  A row is treated as an
-The CSV is a variable-level schema. Transactional schemas can optionally mark
-variables as user-scope or record-scope so history can be generated per entity.
-``record_type`` optional metadata rather than the mechanism used to distinguish
+The CSV is a variable-level schema. Transactional history is derived from the
+entity key and the first history timestamp field; no user-facing scope metadata is required.
+``record_type`` is optional metadata rather than the mechanism used to distinguish
 transactional from aggregational input.
 
 Data type and generator names used by client CSVs are normalized to the
@@ -795,11 +795,11 @@ def infer_type_of_data(csv_text: str) -> str:
 
 
 def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tuple[list[dict], list[str]]:
-    """Parse a CSV schema definition with no event model.
+    """Parse a CSV schema definition with no event or scope model.
 
-    Every row describes one variable. Transactional scenarios use scope=user for
-    stable entity attributes and scope=record for historical rows. Aggregational
-    scenarios use the same schema as a flat record definition.
+    Every row describes one variable. Transactional history grouping is inferred
+    later from the configured entity key and the first history timestamp field.
+    Aggregational scenarios use the same schema as a flat record definition.
     """
     reader = csv.DictReader(io.StringIO(csv_text))
     if not reader.fieldnames:
@@ -847,16 +847,6 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
         formula=row.get("formula","").strip()
         if formula.upper()=="NULL": formula=""
 
-        # Scope metadata: user fields are generated once per user; record fields
-        # are regenerated for every historical row.
-        scope_raw=(row.get("scope") or row.get("record_scope") or row.get("grain") or row.get("level") or "record").strip().lower()
-        if scope_raw in {"entity","customer","subscriber","user_level","user-level","identity"}:
-            scope="user"
-        elif scope_raw in {"user","record","transaction","transactional","row","record_level","record-level"}:
-            scope="user" if scope_raw=="user" else "record"
-        else:
-            raise ValueError(f"Row {row_number} ('{name}'): scope must be 'user' or 'record'")
-
         gen_raw=row.get("gen","").strip().lower()
         gen,params=_normalize_generator(gen_raw,params,depends_on,dtype,formula)
         gen,params=_coerce_executable_generator(gen,params,dtype,formula)
@@ -881,7 +871,6 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
         variable={
             "name":name,"dtype":dtype,"description":row.get("description",""),"gen":gen,
             "params":params,"depends_on":depends_on,"nullable":row.get("nullable","").lower() in _TRUE_STRINGS,
-            "scope":scope,
         }
         normalized_formula=_coerce_formula_text(formula) if formula else ""
         if normalized_formula:
@@ -899,8 +888,6 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
         else:
             if not _merge_duplicate_variable(existing,variable):
                 raise ValueError(f"Row {row_number}: duplicate variable name '{name}' has conflicting definition")
-            # Promote a repeated variable to user scope if any declaration says so.
-            if scope=="user": existing["scope"]="user"
 
     if not variables:
         raise ValueError("CSV must contain at least one variable row")
@@ -910,19 +897,6 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
     unknown_dependencies=sorted({dep for v in variables for dep in v["depends_on"] if dep not in all_names})
     if unknown_dependencies:
         raise ValueError(f"depends_on references undefined variable(s): {unknown_dependencies}")
-
-    # If a user-level field depends on a record-level field, promote the dependency
-    # closure to user scope so the generated value is stable for that user.
-    changed=True
-    by_name={str(v["name"]):v for v in variables}
-    while changed:
-        changed=False
-        for v in variables:
-            if v.get("scope")!="user": continue
-            for dep in v.get("depends_on",[]) or []:
-                dv=by_name.get(str(dep))
-                if dv and dv.get("scope")!="user":
-                    dv["scope"]="user"; changed=True
 
     # Transactional definitions must have a usable entity/user key; API import can
     # infer it separately, so the parser only validates that variables exist.
