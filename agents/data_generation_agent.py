@@ -63,9 +63,42 @@ def _boolean_semantic(value):
 # ── Generator functions ────────────────────────────────────────────────────────
 
 def _prefixed_int(params: dict, _rec: dict) -> str:
+    """Generate a prefixed numeric ID from flexible digit/range encodings.
+
+    Never allow a malformed ``digits`` value to abort the whole transactional
+    user. Examples like ``0000001-9999999`` are interpreted as a suffix range
+    with seven-character zero padding.
+    """
     prefix = str(params.get("prefix", ""))
-    digits = int(params.get("digits", 8) or 8)
-    number = random.randint(0, max(0, 10**digits - 1))
+    raw_digits = params.get("digits", 8)
+    digits = 8
+    number_min = params.get("number_min", 0)
+    number_max = params.get("number_max")
+
+    try:
+        digits = max(1, int(float(raw_digits)))
+    except (TypeError, ValueError):
+        text = str(raw_digits or "").strip()
+        match = re.fullmatch(r"(\d+)\s*(?:-|\.\.)\s*(\d+)", text)
+        if match:
+            lo_text, hi_text = match.groups()
+            number_min = int(lo_text)
+            number_max = int(hi_text)
+            digits = max(len(lo_text), len(hi_text))
+
+    if number_max is None:
+        number_max = (10 ** digits) - 1
+    try:
+        number_min = int(float(number_min))
+    except (TypeError, ValueError):
+        number_min = 0
+    try:
+        number_max = int(float(number_max))
+    except (TypeError, ValueError):
+        number_max = (10 ** digits) - 1
+
+    lo, hi = sorted((number_min, number_max))
+    number = random.randint(lo, hi)
     return f"{prefix}{str(number).zfill(digits)}"
 
 
@@ -98,10 +131,14 @@ def _constant(params: dict, _rec: dict):
 
 def _weighted_choice(params: dict, _rec: dict):
     choices = list(params.get("choices", []))
-    weights = list(params.get("weights", []))
+    raw_weights = params.get("weights", [])
     if not choices:
         return None
-    if len(weights) != len(choices) or sum(weights) <= 0:
+    try:
+        weights = [float(x) for x in (list(raw_weights) if isinstance(raw_weights, (list, tuple)) else [])]
+    except (TypeError, ValueError):
+        weights = []
+    if len(weights) != len(choices) or any((not math.isfinite(w) or w < 0) for w in weights) or sum(weights) <= 0:
         weights = [1.0] * len(choices)
     return random.choices(choices, weights=weights, k=1)[0]
 
@@ -192,15 +229,23 @@ def _to_finite_float(value, default: float | None = None) -> float | None:
         return default
 
 
-def _uniform_bounded(params: dict, rec: dict) -> float:
+def _uniform_bounded(params: dict, rec: dict):
+    """Generate a value with one or both bounds optionally coming from fields."""
     precision = int(params.get("precision", 2) or 2)
-    hi = _to_finite_float(rec.get(params.get("hi_field")), None)
+    hi = _to_finite_float(rec.get(params.get("hi_field")), None) if params.get("hi_field") else None
+    lo = _to_finite_float(rec.get(params.get("lo_field")), None) if params.get("lo_field") else None
     if hi is None:
         hi = _to_finite_float(params.get("hi", params.get("max")), 1.00)
-    lo = _to_finite_float(params.get("lo", params.get("min")), 0.00)
+    if lo is None:
+        lo = _to_finite_float(params.get("lo", params.get("min")), 0.00)
     if lo is None:
         lo = 0.00
-    return round(float(random.uniform(lo, max(lo, hi))), precision)
+    if hi is None:
+        hi = lo
+    lo, hi = min(lo, hi), max(lo, hi)
+    if params.get("integer"):
+        return random.randint(int(math.ceil(lo)), int(math.floor(hi)))
+    return round(float(random.uniform(lo, hi)), precision)
 
 
 def _recent_datetime(params: dict, _rec: dict) -> str:
@@ -693,6 +738,16 @@ def _generate_selected_record(
             value = generator(effective_var, helper_rec)
         else:
             value = None
+
+        declared_dtype = str(var.get("dtype", "")).strip().lower()
+        try:
+            if declared_dtype in {"int", "integer"} and isinstance(value, (int, float)) and not isinstance(value, bool):
+                value = int(round(value))
+            elif declared_dtype in {"float", "decimal", "number", "numeric"} and isinstance(value, (int, float)) and not isinstance(value, bool):
+                precision = int((var.get("params") or {}).get("precision", 2) or 2)
+                value = round(float(value), precision)
+        except (TypeError, ValueError, OverflowError):
+            pass
         rec[name] = _apply_generation_constraint(var, value, rec, rules)
     rec = _apply_conditional_rules(rec, rules)
     return _apply_scenario_semantics(rec, rules)
@@ -936,11 +991,25 @@ def _validate_record(
 
         if isinstance(rec.get(name), (int, float)) and not isinstance(rec.get(name), bool):
             val = float(rec[name])
-            lo, hi = params.get("min"), params.get("max")
-            if lo is not None and val < float(lo):
-                rec[name] = int(lo) if dtype == "int" else float(lo); issues.append(f"{name} raised to minimum")
-            if hi is not None and val > float(hi):
-                rec[name] = int(hi) if dtype == "int" else float(hi); issues.append(f"{name} lowered to maximum")
+
+            def resolve_bound(raw):
+                # CSV bounds may be literal numbers (min=0) or references to
+                # another generated field (min=recharge_count_30d). Never call
+                # float() directly on a field name; resolve it from the record.
+                if raw is None:
+                    return None
+                if isinstance(raw, str):
+                    text = raw.strip()
+                    if text in rec:
+                        return _to_finite_float(rec.get(text), None)
+                return _to_finite_float(raw, None)
+
+            lo = resolve_bound(params.get("min", params.get("lo")))
+            hi = resolve_bound(params.get("max", params.get("hi")))
+            if lo is not None and val < lo:
+                rec[name] = int(lo) if dtype in {"int", "integer"} else float(lo); issues.append(f"{name} raised to minimum")
+            if hi is not None and val > hi:
+                rec[name] = int(hi) if dtype in {"int", "integer"} else float(hi); issues.append(f"{name} lowered to maximum")
             if "pct" in name.lower() or "percent" in name.lower() or "percentage" in name.lower():
                 old = rec[name]; rec[name] = max(0, min(100, old))
                 if old != rec[name]: issues.append(f"{name} clamped to percentage range")

@@ -108,6 +108,18 @@ def _range_from_text(value: Any) -> tuple[int | float, int | float] | None:
 
 
 def _infer_prefixed_id_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Normalize flexible unique-id encodings into safe executable parameters.
+
+    Supported examples include:
+      digits=7
+      digits=0000001-9999999
+      range=0000001-9999999
+      example=SUB-0000001
+      length=10
+
+    The old implementation attempted ``int(digits)`` later in the generator,
+    which made a perfectly reasonable range expression fail every record.
+    """
     p = dict(params)
     example = str(p.get("example", "")).strip()
     prefix = str(p.get("prefix", ""))
@@ -120,6 +132,29 @@ def _infer_prefixed_id_params(params: dict[str, Any]) -> dict[str, Any]:
                 prefix = example_prefix
             p.setdefault("digits", len(digits_text))
 
+    # ``digits`` is sometimes used as a numeric range rather than a count.
+    # Accept both meanings and preserve zero padding width from the tokens.
+    digits_raw = p.get("digits")
+    if isinstance(digits_raw, str):
+        digits_text = digits_raw.strip()
+        rng = _range_from_text(digits_text)
+        if rng is not None:
+            lo, hi = int(rng[0]), int(rng[1])
+            parts = re.fullmatch(r"\s*(\d+)\s*(?:-|\.\.)\s*(\d+)\s*", digits_text)
+            if parts:
+                lo_token, hi_token = parts.groups()
+                width = max(len(lo_token), len(hi_token))
+            else:
+                width = max(len(str(abs(lo))), len(str(abs(hi))))
+            p["digits"] = max(1, width)
+            p.setdefault("number_min", lo)
+            p.setdefault("number_max", hi)
+        else:
+            try:
+                p["digits"] = max(1, int(float(digits_text)))
+            except Exception:
+                p.pop("digits", None)
+
     if "digits" not in p and "length" in p:
         try:
             length = int(p.get("length"))
@@ -128,6 +163,18 @@ def _infer_prefixed_id_params(params: dict[str, Any]) -> dict[str, Any]:
             p["digits"] = digits
         except Exception:
             pass
+
+    # Accept min/max, lo/hi, or range for the numeric suffix.
+    for lo_key, hi_key in (("min", "max"), ("lo", "hi"), ("number_min", "number_max")):
+        if lo_key in p or hi_key in p:
+            try:
+                if lo_key in p and p.get("number_min") is None:
+                    p["number_min"] = int(float(p[lo_key]))
+                if hi_key in p and p.get("number_max") is None:
+                    p["number_max"] = int(float(p[hi_key]))
+            except Exception:
+                pass
+            break
 
     if prefix:
         p["prefix"] = prefix
@@ -143,30 +190,62 @@ def _choose_temporal_base_field(depends_on: list[str]) -> str | None:
 
 
 def _normalize_dtype(dtype: str) -> str:
-    value = dtype.strip().lower()
-    if value == "timestamp":
-        return "datetime"
+    """Map common SQL/Python/pandas/warehouse dtypes into generator families.
+
+    Parameterized forms such as ``decimal(10,2)`` and ``varchar(255)`` are
+    accepted. Unknown types intentionally degrade to ``string`` so a new client
+    dtype cannot crash generation merely because the backend does not have a
+    dedicated semantic type for it.
+    """
+    value = re.sub(r"\s+", " ", dtype.strip().lower())
+    base = re.sub(r"\s*\(.*\)$", "", value).strip()
+
+    integer_aliases = {
+        "int", "integer", "bigint", "smallint", "tinyint", "mediumint",
+        "long", "short", "byte", "int8", "int16", "int32", "int64",
+        "uint", "uint8", "uint16", "uint32", "uint64", "unsigned integer",
+    }
+    float_aliases = {
+        "float", "double", "double precision", "real", "number", "numeric",
+        "float16", "float32", "float64", "decimal", "money", "smallmoney",
+    }
+    string_aliases = {
+        "string", "object", "str", "text", "varchar", "nvarchar", "char",
+        "nchar", "clob", "ntext", "character", "character varying",
+        "json", "jsonb", "xml", "variant", "sql_variant", "binary", "varbinary",
+        "blob", "bytes", "bytea", "base64", "uri", "url", "email",
+    }
+    datetime_aliases = {
+        "timestamp", "timestamp with time zone", "timestamp without time zone",
+        "timestamptz", "datetime", "datetime2", "datetime64",
+    }
+    date_aliases = {"date", "date32", "date64"}
+    boolean_aliases = {"bool", "boolean", "bit"}
+
     if value in {"enum", "category"}:
         return "categorical"
-    if value in {"object", "str", "text", "varchar"}:
+    if base in integer_aliases:
+        return "int"
+    if base in float_aliases:
+        return "float"
+    if base in string_aliases:
         return "string"
-    if value in {"double"}:
-        return "float"
-    if value in {"long", "short"}:
-        return "int"
-    if value in {"number", "numeric"}:
-        return "float"
-    if value.startswith("decimal"):
-        return "float"
-    if value == "integer":
-        return "int"
-    if value == "bool":
+    if base in datetime_aliases:
+        return "datetime"
+    if base in date_aliases:
+        return "date"
+    if base in boolean_aliases:
         return "boolean"
-    if value == "uuid":
+    if base == "uuid":
         return "string"
-    if value in ALLOWED_DTYPES:
-        return value
-    # Tolerant fallback for unknown client dtypes.
+    if base in {"time", "time with time zone", "timetz", "interval", "duration"}:
+        # Preserve these generic temporal values safely as strings unless a
+        # dedicated generator is explicitly supplied.
+        return "string"
+    if base in {"array", "list", "struct", "map", "record", "dict", "dictionary"}:
+        return "string"
+    if base in ALLOWED_DTYPES:
+        return base
     return "string"
 
 
@@ -243,22 +322,29 @@ def _coerce_formula_text(formula: str) -> str:
         return ""
 
 
-def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str], dtype: str, formula: str) -> tuple[str, dict[str, Any]]:
+def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str], dtype: str, formula: str, name: str = "") -> tuple[str, dict[str, Any]]:
     """Map client-facing generator vocabulary into executable generators."""
     g = (gen or "").strip().lower()
     p = dict(params)
 
     if g == "unique_id":
         p = _infer_prefixed_id_params(p)
-        # When a unique id depends on another id-like field, preserve the source
-        # suffix while applying this field's own prefix (e.g. SUB77668 -> EVT77668).
+        # A dependency means linkage, not necessarily ID mirroring.  Only mirror
+        # when the CSV explicitly asks for it, or for the conventional account-id
+        # pattern where a stable account key commonly shares the subscriber suffix.
+        explicit_source = str(p.get("source_field", "")).strip()
+        mirror_flag = str(p.get("mirror", "")).strip().lower() in {"true", "1", "yes", "y"}
+        field_name = str(name or "").strip().lower()
         source_dep = next((str(dep) for dep in depends_on if str(dep).strip().lower().endswith("_id")), None)
-        if source_dep and p.get("prefix") is not None:
-            return "id_mirror", {
-                **p,
-                "source_field": source_dep,
-                "source_prefix": str(p.get("source_prefix", "")),
-            }
+        should_mirror = bool(explicit_source or mirror_flag or (field_name.endswith("account_id") and source_dep))
+        if should_mirror and p.get("prefix") is not None:
+            source_field = explicit_source or source_dep
+            if source_field:
+                return "id_mirror", {
+                    **p,
+                    "source_field": source_field,
+                    "source_prefix": str(p.get("source_prefix", "")),
+                }
         if p.get("prefix") is not None and p.get("digits") is not None:
             return "prefixed_int", p
         if p.get("prefix") is not None:
@@ -289,7 +375,21 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
         return "weighted_choice", p
 
     if g == "range":
-        return "uniform" if dtype == "float" else "uniform", p
+        # Allow bounds to reference another field, e.g.
+        # ``min=recharge_count_30d;max=20``.
+        lo_ref = p.get("min", p.get("lo"))
+        hi_ref = p.get("max", p.get("hi"))
+        field_ref = None
+        if isinstance(lo_ref, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", lo_ref):
+            field_ref = ("lo_field", lo_ref)
+        elif isinstance(hi_ref, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", hi_ref):
+            field_ref = ("hi_field", hi_ref)
+        if field_ref:
+            out = dict(p)
+            out[field_ref[0]] = field_ref[1]
+            out["integer"] = dtype == "int"
+            return "uniform_bounded", out
+        return "uniform_int" if dtype == "int" else "uniform", p
 
     if g == "dependent_range":
         # dependent_range(min=0;max=controller) -> uniform_bounded.
@@ -814,10 +914,31 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
         raise ValueError(f"CSV is missing required column(s): {sorted(missing)}")
 
     raw_rows=[]
-    for raw in reader:
-        normalized={(k or "").strip().lower():(v or "").strip() for k,v in raw.items()}
-        if not any(normalized.values()):
+    # DictReader can silently shift every column when a parameterized dtype such
+    # as DECIMAL(10,2) is supplied without CSV quotes. Recover that common export
+    # mistake before normalizing fields; valid quoted CSV continues to behave as-is.
+    rows_reader = csv.reader(io.StringIO(csv_text))
+    next(rows_reader, None)
+    expected_columns = len(reader.fieldnames)
+    for values in rows_reader:
+        values = list(values)
+        if not any(str(v).strip() for v in values):
             continue
+        if len(values) > expected_columns and expected_columns >= 2:
+            dtype_parts = [values[1]]
+            idx = 1
+            while idx + 1 < len(values) and ")" not in dtype_parts[-1]:
+                idx += 1
+                dtype_parts.append(values[idx])
+            if ")" in dtype_parts[-1] and len(dtype_parts) > 1:
+                values = [values[0], ",".join(dtype_parts)] + values[idx + 1:]
+        if len(values) < expected_columns:
+            values.extend([""] * (expected_columns - len(values)))
+        elif len(values) > expected_columns:
+            # Preserve the fixed leading schema columns and fold any remaining
+            # unquoted tail into the final formula column rather than dropping data.
+            values = values[:expected_columns - 1] + [",".join(values[expected_columns - 1:])]
+        normalized = {str(k).strip().lower(): str(v or "").strip() for k, v in zip(reader.fieldnames, values)}
         raw_rows.append(normalized)
 
     requested=str(type_of_data or "").strip().lower()
@@ -848,7 +969,27 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
         if formula.upper()=="NULL": formula=""
 
         gen_raw=row.get("gen","").strip().lower()
-        gen,params=_normalize_generator(gen_raw,params,depends_on,dtype,formula)
+        # ``gen`` is optional for generic CSV producers. Infer a safe default
+        # from dtype/params instead of forcing every producer to know our internal
+        # generator vocabulary.
+        if not gen_raw:
+            if formula:
+                gen_raw = "derived"
+            elif "choices" in params or "values" in params:
+                gen_raw = "choice"
+            elif "value" in params:
+                gen_raw = "constant"
+            elif dtype == "int":
+                gen_raw = "range"
+            elif dtype == "float":
+                gen_raw = "range"
+            elif dtype in {"datetime", "date"}:
+                gen_raw = "timestamp"
+            elif dtype == "boolean":
+                gen_raw = "boolean"
+            else:
+                gen_raw = "string"
+        gen,params=_normalize_generator(gen_raw,params,depends_on,dtype,formula,name)
         gen,params=_coerce_executable_generator(gen,params,dtype,formula)
         # Numeric categorical/choice values must remain numeric so downstream formulas
         # (for example recharge_amount -> balance_after) can perform arithmetic.
