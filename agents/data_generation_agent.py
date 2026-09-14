@@ -60,6 +60,60 @@ def _boolean_semantic(value):
             return False
     return None
 
+
+def _safe_number(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _semantic_placeholder(name: str, params: dict, rec: dict) -> str:
+    """Generate a deterministic semantic value for a generic event/object field.
+
+    Never emit an accidental ``unknown`` solely because a client schema used
+    ``gen=event``/``object`` without parameters.
+    """
+    p = params or {}
+    if "value" in p and p.get("value") is not None:
+        return str(p.get("value"))
+    choices = p.get("choices", p.get("values"))
+    if isinstance(choices, (list, tuple)) and choices:
+        return str(choices[0])
+    field = str(name or rec.get("__current_field__") or "event").strip()
+    token = re.sub(r"[^A-Za-z0-9]+", "_", field).strip("_").upper()
+    return token or "EVENT"
+
+
+def _generic_value(var: dict, rec: dict):
+    """Best-effort generic generator for client vocab not known to the core."""
+    p = dict(var.get("params") or {})
+    dtype = str(var.get("dtype") or "string").lower()
+    name = str(var.get("name") or rec.get("__current_field__") or "")
+    if var.get("formula"):
+        return _formula(var, rec)
+    if "choices" in p or "values" in p:
+        vals = p.get("choices", p.get("values"))
+        if isinstance(vals, str):
+            vals = [x.strip() for x in re.split(r"[;,|]", vals) if x.strip()]
+        if vals:
+            return random.choice(list(vals))
+    if "value" in p and p.get("value") is not None:
+        return p.get("value")
+    if dtype in _NUMERIC_DTYPES:
+        lo = _safe_number(p.get("min", p.get("lo")), 0.0)
+        hi = _safe_number(p.get("max", p.get("hi")), 100.0)
+        if dtype in {"int", "integer"}:
+            return random.randint(int(round(min(lo, hi))), int(round(max(lo, hi))))
+        return round(random.uniform(min(lo, hi), max(lo, hi)), int(p.get("precision", 2) or 2))
+    if dtype == "boolean":
+        return random.choice([True, False])
+    if dtype == "datetime":
+        return _recent_datetime(p, rec)
+    if dtype == "date":
+        return _recent_datetime(p, rec)[:10]
+    return _semantic_placeholder(name, p, rec)
+
 # ── Generator functions ────────────────────────────────────────────────────────
 
 def _prefixed_int(params: dict, _rec: dict) -> str:
@@ -362,6 +416,8 @@ _GENERATORS = {
     "prefixed_uuid":  lambda v, rec: _prefixed_uuid(v["params"], rec),
     "tx_id":          lambda v, rec: _tx_id(v["params"], rec),
     "formula":        lambda v, rec: _formula(v, rec),
+    "generic":        lambda v, rec: _generic_value(v, rec),
+    "semantic_event": lambda v, rec: _semantic_placeholder(v.get("name"), v.get("params") or {}, rec),
 }
 
 
@@ -872,7 +928,20 @@ def _fill_missing(rec: dict, field_order: list, dtype_map: dict) -> tuple[dict, 
 
 def _safe_formula(expr: str, rec: dict):
     """Evaluate the same small arithmetic expression language used by the generator."""
-    allowed_funcs = {"round": round, "min": min, "max": max, "abs": abs}
+    def DATE(value):
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        parsed = _qa_parse_dt(value)
+        if parsed is not None:
+            return parsed.date()
+        try:
+            return date.fromisoformat(str(value)[:10])
+        except Exception:
+            return None
+
+    allowed_funcs = {"round": round, "min": min, "max": max, "abs": abs, "DATE": DATE}
     names = {}
     for k, v in rec.items():
         if k == "__current_field__" or v is None:
@@ -949,7 +1018,26 @@ def _validate_record(
     for var in variables:
         name = var["name"]
         if name not in rec or rec[name] is None:
-            continue
+            # Do not silently replace a failed generation with a dtype default
+            # (e.g. 0 for integers). Regenerate from the declared CSV schema first,
+            # including any dependencies required by that field.
+            regenerated = None
+            try:
+                regenerated = _generate_selected_record(
+                    variables, {name}, base=rec, rules=rules
+                ).get(name)
+            except Exception as exc:
+                logger.debug("[QA] regeneration failed for %s: %s", name, exc)
+            if regenerated is not None:
+                rec[name] = regenerated
+                issues.append(f"{name} regenerated from declared schema")
+            elif var.get("nullable"):
+                continue
+            else:
+                rec[name] = _default_for_dtype(var.get("dtype", "string"))
+                issues.append(f"{name} filled with safe dtype default")
+            if rec.get(name) is None:
+                continue
         value = rec[name]
         dtype = var.get("dtype", "string")
         params = var.get("params") or {}

@@ -28,25 +28,30 @@ ALLOWED_DTYPES = {
     # Common external aliases from pandas/warehouse exports.
     "object", "str", "text", "varchar", "number", "numeric",
     # Common schema/tooling aliases.
-    "enum", "category", "double", "long", "short",
+    "enum", "category", "double", "double precision", "real", "long", "short", "smallint", "bigint", "tinyint", "int32", "int64", "uint32", "uint64", "float32", "float64", "decimal64", "numeric64", "bool8", "bit", "json", "jsonb", "xml", "bytes", "binary", "blob", "bytea", "array", "list", "map", "struct",
 }
 _TRUE_STRINGS = {"true", "1", "yes", "y"}
 
 
 def _split_list(value: str) -> list[str]:
+    """Split client choice/list encodings across common delimiters.
+
+    Supports comma, pipe, and semicolon separated values.  This is intentionally
+    used only for list-valued parameters after key/value parsing has happened.
+    """
     return [x.strip() for x in re.split(r"[;|,]", value or "") if x.strip()]
 
 
 def _parse_scalar(value: str) -> Any:
     text = value.strip()
-    if not text or text.upper() == "NULL":
+    if not text or text.upper() in {"NULL", "NONE", "N/A", "NA"}:
         return None
     if text.lower() in {"true", "false"}:
         return text.lower() == "true"
     try:
         if re.fullmatch(r"[-+]?\d+", text):
             return int(text)
-        if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+)", text):
+        if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+)(?:[eE][-+]?\d+)?", text):
             return float(text)
     except ValueError:
         pass
@@ -54,46 +59,76 @@ def _parse_scalar(value: str) -> Any:
 
 
 def _parse_params(raw: str, row_number: int, name: str) -> dict[str, Any]:
-    """Parse legacy JSON or client's compact semicolon-separated parameters."""
+    """Parse flexible JSON or key/value parameter encodings.
+
+    Supported:
+      * JSON objects
+      * key=value;key=value
+      * key=value,key=value
+      * key=value;key=value with semicolon-separated choice payloads
+      * key=value,key=value with comma-separated choice payloads
+      * bare values/choice lists such as ``TOPUP_99;TOPUP_149``
+      * range strings such as ``1-10`` or ``0000001-9999999``
+    """
     text = (raw or "").strip()
-    if not text or text.upper() == "NULL":
+    if not text or text.upper() in {"NULL", "NONE"}:
         return {}
     if text.startswith("{"):
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"Row {row_number} ('{name}'): 'params' must be valid JSON or key=value pairs: {exc}") from exc
+            raise ValueError(
+                f"Row {row_number} ('{name}'): 'params' must be valid JSON or key=value pairs: {exc}"
+            ) from exc
         if not isinstance(parsed, dict):
             raise ValueError(f"Row {row_number} ('{name}'): 'params' must be a JSON object")
         return parsed
 
+    # Detect key=value starts.  A key may be followed by semicolon or comma.
+    matches = list(re.finditer(
+        r"(?:(?<=^)|(?<=[;,]))\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*=",
+        text,
+    ))
     params: dict[str, Any] = {}
-    # Client params use semicolons both as key/value separators and inside
-    # unquoted choice lists (for example ``A;B;C``).  Split only at a semicolon
-    # that starts another ``key=`` pair, so choice values are preserved.
-    matches = list(re.finditer(r"(?:^|;)\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", text))
     if matches:
-        prefix = text[:matches[0].start()].strip(" ;")
+        prefix = text[:matches[0].start()].strip(" ;,")
         if prefix:
             params["value"] = _parse_scalar(prefix)
         for index, match in enumerate(matches):
             key = match.group(1).strip()
             value_start = match.end()
             value_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-            value = text[value_start:value_end].strip(" ;")
+            value = text[value_start:value_end].strip(" ;,")
+            # Do not split choice payloads here; they may legitimately contain commas.
             params[key] = _parse_scalar(value)
     else:
-        # Bare params are commonly used for constant/choice generators.
         params["value"] = _parse_scalar(text)
 
-    # Normalize common compact encodings.
+    # Normalize common list/range encodings.
     for key in ("choices", "values", "country_codes"):
         if isinstance(params.get(key), str):
             params[key] = _split_list(str(params[key]))
     if isinstance(params.get("weights"), str):
-        params["weights"] = [float(x) for x in _split_list(str(params["weights"]))]
-    return params
+        raw_weights = _split_list(str(params["weights"]))
+        try:
+            params["weights"] = [float(x) for x in raw_weights]
+        except Exception:
+            # Keep malformed weights from making import fail; generator will
+            # fall back to uniform choice probabilities.
+            params.pop("weights", None)
 
+    # Numeric parameters are normalized eagerly where unambiguous.
+    for key in ("min", "max", "lo", "hi", "precision", "length", "days_back",
+                "window_minutes", "default", "min_sec", "max_sec"):
+        if key in params and isinstance(params[key], str):
+            parsed = _parse_scalar(params[key])
+            params[key] = parsed
+
+    # Some client exports place categorical weights in the formula column,
+    # e.g. ``28 = 30%, 30 = 30%, 56 = 35%, 84 = 5%``.  The caller can merge
+    # these weights into a weighted-choice generator without treating the text
+    # as an executable arithmetic formula.
+    return params
 
 def _range_from_text(value: Any) -> tuple[int | float, int | float] | None:
     if not isinstance(value, str):
@@ -224,9 +259,11 @@ def _normalize_dtype(dtype: str) -> str:
 
     if value in {"enum", "category"}:
         return "categorical"
-    if base in integer_aliases:
+    if base in {"event", "state", "object", "event_container"}:
+        return "string"
+    if base in integer_aliases or base in {"smallint","bigint","tinyint","int2","int4","int8","uint8","uint16","uint32","uint64","int32","int64","long","short"}:
         return "int"
-    if base in float_aliases:
+    if base in float_aliases or base in {"double precision","real","float32","float64","double"}:
         return "float"
     if base in string_aliases:
         return "string"
@@ -242,7 +279,7 @@ def _normalize_dtype(dtype: str) -> str:
         # Preserve these generic temporal values safely as strings unless a
         # dedicated generator is explicitly supplied.
         return "string"
-    if base in {"array", "list", "struct", "map", "record", "dict", "dictionary"}:
+    if base in {"array", "list", "struct", "map", "record", "dict", "dictionary", "json", "jsonb", "xml", "bytes", "binary", "blob", "bytea"}:
         return "string"
     if base in ALLOWED_DTYPES:
         return base
@@ -315,6 +352,53 @@ def _coerce_formula_text(formula: str) -> str:
                 b = f"'{b}'"
             expr = f"({a} if {c1} else ({b} if {c2} else None))"
 
+    # Quote common bare enum/string literals used in formulas, e.g.
+    # ``transaction_status = FAILED`` or ``action IN (SUPPRESS,NO_ACTION)``.
+    # Only transform tokens in comparison/list contexts; field references remain names.
+    expr = re.sub(
+        r"(==|!=|<=|>=|<|>)\s*([A-Z][A-Z0-9_]+)\b",
+        lambda m: f"{m.group(1)} '{m.group(2)}'",
+        expr,
+    )
+    def _quote_in_token(match: re.Match[str]) -> str:
+        body = match.group(1)
+        toks = [x.strip() for x in body.split(",")]
+        out = []
+        for tok in toks:
+            if re.fullmatch(r"[A-Z][A-Z0-9_]+", tok):
+                out.append(f"'{tok}'")
+            else:
+                out.append(tok)
+        return "in (" + ", ".join(out) + ")"
+    expr = re.sub(r"\bin\s*\(([^)]*)\)", _quote_in_token, expr, flags=re.IGNORECASE)
+
+    # Common SQL DATE(...) wrapper.
+    expr = re.sub(r"\bDATE\s*\(", "DATE(", expr, flags=re.IGNORECASE)
+
+    # Common natural-language IF/THEN/ELSE expressions.
+    m_if = re.fullmatch(
+        r"IF\s+(.+?)\s+THEN\s+IF\s+(.+?)\s+THEN\s+(.+?)\s+ELSE\s+(.+?)\s+ELSE\s+(.+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m_if:
+        c1, c2, a, b, c = [x.strip() for x in m_if.groups()]
+        for tok in (a, b, c):
+            pass
+        def qterm(x):
+            return f"'{x}'" if re.fullmatch(r"[A-Z][A-Z0-9_]+", x) else x
+        expr = f"({qterm(a)} if ({c1}) and ({c2}) else ({qterm(b)} if ({c1}) else {qterm(c)}))"
+        expr = re.sub(r"(==|!=|<=|>=|<|>)\s*([A-Z][A-Z0-9_]+)\b", lambda m: f"{m.group(1)} '{m.group(2)}'", expr)
+
+    # Simple IF condition THEN value ELSE value.
+    m_if_simple = re.fullmatch(r"IF\s+(.+?)\s+THEN\s+(.+?)\s+ELSE\s+(.+)", text, flags=re.IGNORECASE)
+    if m_if_simple and not m_if:
+        cond, a, b = [x.strip() for x in m_if_simple.groups()]
+        def qterm2(x):
+            return f"'{x}'" if re.fullmatch(r"[A-Z][A-Z0-9_]+", x) else x
+        expr = f"({qterm2(a)} if {cond} else {qterm2(b)})"
+        expr = re.sub(r"(==|!=|<=|>=|<|>)\s*([A-Z][A-Z0-9_]+)\b", lambda m: f"{m.group(1)} '{m.group(2)}'", expr)
+
     try:
         ast.parse(expr, mode="eval")
         return expr
@@ -361,7 +445,28 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
     if g in {"uuid", "prefixed_uuid"}:
         return "prefixed_uuid", {"prefix": str(p.get("prefix", ""))}
 
+    if g in {"reference", "ref", "foreign_key", "lookup"}:
+        # A reference field should point to an already-generated field whenever
+        # possible, rather than falling through to an ``unknown`` placeholder.
+        source_field = str(p.get("source_field", "")).strip()
+        if not source_field:
+            raw_refs = p.get("references")
+            if isinstance(raw_refs, str):
+                refs = [x.strip() for x in re.split(r"[;,|]", raw_refs) if x.strip()]
+                source_field = refs[0] if refs else ""
+            elif isinstance(raw_refs, (list, tuple)) and raw_refs:
+                source_field = str(raw_refs[0]).strip()
+        if not source_field and depends_on:
+            source_field = str(depends_on[-1]).strip()
+        if source_field:
+            return "id_mirror", {**p, "source_field": source_field}
+        return "prefixed_uuid", {"prefix": "REF-"}
+
     if g in {"choice", "weighted_choice"}:
+        if formula:
+            coerced = _coerce_formula_text(formula)
+            if coerced:
+                return "formula", p
         choices = p.get("choices", p.get("values"))
         if choices is None and "value" in p:
             choices = _split_list(str(p.get("value", "")))
@@ -451,15 +556,32 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
 
     if g == "derived_date":
         base_field = _choose_temporal_base_field(depends_on)
-        rng = _range_from_text(p.get("cooling_off_days")) or _range_from_text(p.get("days"))
-        if base_field and rng:
-            return "date_offset_range", {"base_field": base_field, "min_days": int(rng[0]), "max_days": int(rng[1])}
+        raw_days = p.get("cooling_off_days", p.get("days"))
+        rng = _range_from_text(raw_days)
+        if rng:
+            if base_field:
+                return "date_offset_range", {"base_field": base_field, "min_days": int(rng[0]), "max_days": int(rng[1])}
+        # Also accept comma/semicolon/pipe separated day choices: 7,14,21,28.
+        if isinstance(raw_days, str):
+            tokens = _split_list(raw_days)
+            numeric = []
+            for tok in tokens:
+                try: numeric.append(float(tok))
+                except Exception: pass
+            if base_field and numeric:
+                lo, hi = int(min(numeric)), int(max(numeric))
+                return "date_offset_range", {"base_field": base_field, "min_days": lo, "max_days": hi}
         if base_field and p.get("days") is not None:
-            return "date_offset", {"base_field": base_field, "days": int(p.get("days"))}
+            try:
+                return "date_offset", {"base_field": base_field, "days": int(p.get("days"))}
+            except Exception:
+                pass
         return "recent_datetime", {"days_back": 30}
 
     # Compatibility: some CSVs put dtype-like values in the `gen` column.
     if g in {"categorical", "category"}:
+        if formula and _coerce_formula_text(formula):
+            return "formula", p
         choices = p.get("choices", p.get("values"))
         if choices is None and "value" in p:
             raw = p.get("value")
@@ -471,7 +593,7 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
                 return "constant", {"value": choices[0]}
             p["choices"] = choices
             return "weighted_choice", p
-        return "constant", {"value": "UNKNOWN"}
+        return "generic", p
 
     if g in {"string", "text", "object", "varchar"}:
         if "value" in p:
@@ -503,9 +625,10 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
         days_back = p.get("days_back", 30)
         return "recent_datetime", {"days_back": days_back}
 
-    if g == "synthetic_event":
-        # Deprecated compatibility alias. Treat it as a generic categorical choice,
-        # not as a separate event model.
+    if g in {"event", "event_type", "synthetic_event", "generated", "event_container"}:
+        # Event rows are schema-level semantic markers, not an invitation to emit
+        # the literal string ``unknown``.  If the CSV provides choices/values we
+        # respect them; otherwise derive a stable event label from the field name.
         choices = p.get("choices", p.get("values"))
         if choices is None and "value" in p:
             raw = p.get("value")
@@ -526,7 +649,8 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
 
         if dtype in {"bool", "boolean"}:
             return "constant", {"value": True}
-        return "constant", {"value": "unknown"}
+        event_label = re.sub(r"[^A-Za-z0-9]+", "_", str(name or "event")).strip("_").upper() or "EVENT"
+        return "constant", {"value": event_label}
 
     if g == "configuration":
         # Client alias for fixed or enumerated config values.
@@ -582,7 +706,7 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
             p["choices"] = choices
             return "weighted_choice", p
 
-        return "constant", {"value": "unknown_state"}
+        return "constant", {"value": re.sub(r"[^A-Za-z0-9]+", "_", str(name or "state")).strip("_").upper() or "STATE"}
 
     if g == "derived_event":
         # Deprecated compatibility alias. Treat it as a generic derived value.
@@ -607,7 +731,8 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
             p["choices"] = choices
             return "weighted_choice", p
 
-        return "constant", {"value": "unknown"}
+        event_label = re.sub(r"[^A-Za-z0-9]+", "_", str(name or "event")).strip("_").upper() or "EVENT"
+        return "constant", {"value": event_label}
 
     # Additional compatibility aliases commonly seen in client templates.
     if g in {"random_numeric", "random_number", "random_float", "numeric_random"}:
@@ -707,7 +832,7 @@ def _coerce_executable_generator(gen: str, params: dict[str, Any], dtype: str, f
     if "value" in p:
         return "constant", {"value": p.get("value")}
 
-    return "constant", {"value": "unknown"}
+    return "generic", p
 
 
 def _to_numeric_param(value: Any, default: float) -> float:
@@ -969,6 +1094,17 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
         if formula.upper()=="NULL": formula=""
 
         gen_raw=row.get("gen","").strip().lower()
+        # Weight specifications are occasionally emitted in the formula column
+        # even though they describe a distribution rather than a formula.
+        if gen_raw in {"weighted_choice", "choice"} and "weights" not in params and params.get("values") is not None:
+            pairs = re.findall(r"([^,;]+?)\\s*=\\s*(\\d+(?:\\.\\d+)?)\\s*%", formula)
+            if pairs:
+                labels = params.get("values") if isinstance(params.get("values"), list) else _split_list(str(params.get("values")))
+                weight_map = {label.strip(): float(w) / 100.0 for label, w in pairs}
+                weights = [weight_map.get(str(label).strip(), 0.0) for label in labels]
+                if any(weights) and len(weights) == len(labels):
+                    params["weights"] = weights
+                    formula = ""
         # ``gen`` is optional for generic CSV producers. Infer a safe default
         # from dtype/params instead of forcing every producer to know our internal
         # generator vocabulary.
