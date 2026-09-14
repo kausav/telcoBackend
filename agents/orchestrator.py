@@ -89,7 +89,7 @@ class OrchestratorAgent:
             state.scenario, state.industry, (state.country or "GLOBAL").upper(), state.type_of_data,
             state.domain or "", state.business_scenario or "", state.business_response or "",
             state.expected_outcome or "", state.scenario_type or "", state.use_case or "",
-            state.entity_key or "", str(state.scenario_context.get("events", [])),
+            state.entity_key or "",
         )
 
     def _check_cache(self, state: WorkflowState) -> WorkflowState:

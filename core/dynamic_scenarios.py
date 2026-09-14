@@ -1,5 +1,5 @@
 """
-Shared store for imported and confirmed CSV scenario definitions.
+Shared store for imported and confirmed CSV variable definitions.
 
 Imported scenario drafts and confirmed scenarios are persisted in SQLite.
 (not plain process-memory dicts) so that they are visible across all uvicorn
@@ -183,7 +183,7 @@ def resolve_scenario_context(scenario_id: str) -> dict[str, Any]:
         "country": meta.get("country"),
         "type_of_data": meta.get("type_of_data", "aggregational"),
         "entity_key": meta.get("entity_key"),
-        "events": meta.get("events", []),
+        "records_per_user": int(meta.get("records_per_user", 10) or 10),
     }
 
 
@@ -204,11 +204,6 @@ def resolve_entity_key(scenario_id: str) -> str | None:
     return str(value) if value else None
 
 
-def resolve_events(scenario_id: str) -> list[dict[str, Any]]:
-    """Return transactional event definitions persisted with a scenario."""
-    meta = resolve_scenario_meta(scenario_id) or {}
-    events = meta.get("events", [])
-    return events if isinstance(events, list) else []
 
 def list_scenarios() -> list[dict[str, Any]]:
     with _connect() as conn:

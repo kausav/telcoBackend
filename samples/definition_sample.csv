@@ -1,0 +1,13 @@
+scope,name,dtype,description,gen,params,depends_on,nullable,formula
+user,subscriber_id,string,Unique identifier assigned to the subscriber,unique_id,prefix=SUB-;digits=7,,FALSE,NULL
+user,subscriber_segment,categorical,Customer value segment,weighted_choice,"choices=Occasional Rechargers;Habitual Rechargers;Valued Customers;weights=0.50;0.35;0.15",subscriber_id,FALSE,NULL
+user,is_prepaid,boolean,Whether the subscriber is on a prepaid plan,boolean,,,FALSE,NULL
+user,wallet_currency,string,Currency used for the account,constant,INR,,FALSE,NULL
+record,record_timestamp,datetime,Timestamp of the historical record,timestamp,timezone=Asia/Kolkata,subscriber_id,FALSE,NULL
+record,balance_before,float,Account balance immediately before the record,range,min=20;max=500,subscriber_segment,FALSE,NULL
+record,recharge_amount,float,Amount recharged in this historical record,weighted_choice,"choices=99;149;199;249;399;499;weights=0.30;0.22;0.18;0.12;0.10;0.08",subscriber_segment,FALSE,NULL
+record,recharge_channel,categorical,Channel used for the recharge,weighted_choice,"choices=UPI;DEBIT_CARD;WEB_PORTAL;APP;USSD;weights=0.55;0.15;0.10;0.15;0.05",subscriber_segment,FALSE,NULL
+record,recharge_success,boolean,Whether the recharge completed successfully,boolean,,,FALSE,NULL
+record,balance_after,float,Account balance after the historical record,derived,currency=INR,"balance_before,recharge_amount",FALSE,balance_before + recharge_amount
+record,usage_level,categorical,Recent usage level,weighted_choice,"choices=LOW;MEDIUM;HIGH;weights=0.25;0.50;0.25",subscriber_segment,FALSE,NULL
+record,retention_offer_eligible,boolean,Whether the subscriber qualifies for a retention intervention,boolean,"","subscriber_segment,balance_after",FALSE,NULL

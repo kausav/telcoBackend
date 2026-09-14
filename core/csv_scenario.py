@@ -1,8 +1,8 @@
 """CSV scenario-definition parser.
 
 The CSV is the source of truth for the schema.  A row is treated as an
-entity/aggregational field when ``fields`` is empty.  A row is treated as an
-event-owned field when ``fields`` contains one or more field names.  This makes
+The CSV is a variable-level schema. Transactional schemas can optionally mark
+variables as user-scope or record-scope so history can be generated per entity.
 ``record_type`` optional metadata rather than the mechanism used to distinguish
 transactional from aggregational input.
 
@@ -404,8 +404,8 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
         return "recent_datetime", {"days_back": days_back}
 
     if g == "synthetic_event":
-        # Legacy/client alias used in some CSV templates.
-        # Prefer explicit choices/value when provided; otherwise create a safe constant.
+        # Deprecated compatibility alias. Treat it as a generic categorical choice,
+        # not as a separate event model.
         choices = p.get("choices", p.get("values"))
         if choices is None and "value" in p:
             raw = p.get("value")
@@ -426,7 +426,7 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
 
         if dtype in {"bool", "boolean"}:
             return "constant", {"value": True}
-        return "constant", {"value": "event"}
+        return "constant", {"value": "unknown"}
 
     if g == "configuration":
         # Client alias for fixed or enumerated config values.
@@ -485,8 +485,7 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
         return "constant", {"value": "unknown_state"}
 
     if g == "derived_event":
-        # Client alias for event-level outcomes derived from context.
-        # Reuse the same compatibility behavior as derived_state.
+        # Deprecated compatibility alias. Treat it as a generic derived value.
         if formula:
             return "formula", p
 
@@ -508,7 +507,7 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
             p["choices"] = choices
             return "weighted_choice", p
 
-        return "constant", {"value": "unknown_event"}
+        return "constant", {"value": "unknown"}
 
     # Additional compatibility aliases commonly seen in client templates.
     if g in {"random_numeric", "random_number", "random_float", "numeric_random"}:
@@ -576,11 +575,6 @@ def _coerce_executable_generator(gen: str, params: dict[str, Any], dtype: str, f
     if formula:
         return "formula", p
 
-    # Event/container style aliases should become stable textual markers.
-    if any(token in g for token in ("event", "container", "state", "stage", "node")):
-        if "value" in p:
-            return "constant", {"value": p.get("value")}
-        return "constant", {"value": "event"}
 
     choices = p.get("choices", p.get("values"))
     if isinstance(choices, str):
@@ -623,15 +617,9 @@ def _to_numeric_param(value: Any, default: float) -> float:
         return float(default)
 
 
-def _infer_transactional(rows: list[dict[str, str]]) -> bool:
-    """Transactional iff at least one row has non-empty ``fields`` data."""
-    return any(bool(_split_list(row.get("fields", ""))) for row in rows)
-
-
 def _resolve_dependency_aliases(
     variables: list[dict[str, Any]],
     all_names: set[str],
-    event_type_names: set[str],
 ) -> None:
     """Normalize client depends_on aliases to concrete variable names in-place.
 
@@ -665,10 +653,6 @@ def _resolve_dependency_aliases(
             # Exact lowercase match fallback for case/format drift.
             elif key in lowered:
                 mapped = lowered[key]
-            # Event/control token: not a variable dependency, keep out of strict check.
-            elif key in {x.lower() for x in event_type_names}:
-                mapped = None
-
             if mapped and mapped not in normalized:
                 normalized.append(mapped)
         var["depends_on"] = normalized
@@ -792,17 +776,31 @@ def _merge_duplicate_variable(existing: dict[str, Any], incoming: dict[str, Any]
 
 
 def infer_type_of_data(csv_text: str) -> str:
-    """Infer output type solely from whether the CSV contains event-owned fields."""
+    """Infer data grain from an explicit CSV metadata column when present.
+
+    When no type metadata is present, aggregational is the safe default. API callers
+    may pass typeOfData explicitly.
+    """
     reader = csv.DictReader(io.StringIO(csv_text))
     if not reader.fieldnames:
         raise ValueError("CSV appears to be empty (no header row found)")
-    return "transactional" if _infer_transactional([
-        {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
-        for row in reader
-    ]) else "aggregational"
+    headers = {(h or "").strip().lower() for h in reader.fieldnames}
+    for meta_key in ("type_of_data", "typeofdata", "data_type"):
+        if meta_key in headers:
+            for row in reader:
+                raw = (row.get(meta_key) or "").strip().lower()
+                if raw in {"transactional", "aggregational"}:
+                    return raw
+    return "aggregational"
 
 
-def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tuple[list[dict], list[str], list[dict]]:
+def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tuple[list[dict], list[str]]:
+    """Parse a CSV schema definition with no event model.
+
+    Every row describes one variable. Transactional scenarios use scope=user for
+    stable entity attributes and scope=record for historical rows. Aggregational
+    scenarios use the same schema as a flat record definition.
+    """
     reader = csv.DictReader(io.StringIO(csv_text))
     if not reader.fieldnames:
         raise ValueError("CSV appears to be empty (no header row found)")
@@ -815,168 +813,117 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
     if missing:
         raise ValueError(f"CSV is missing required column(s): {sorted(missing)}")
 
-    raw_rows = []
+    raw_rows=[]
     for raw in reader:
-        normalized = {(k or "").strip().lower(): (v or "").strip() for k, v in raw.items()}
+        normalized={(k or "").strip().lower():(v or "").strip() for k,v in raw.items()}
         if not any(normalized.values()):
             continue
         raw_rows.append(normalized)
-    inferred_type = "transactional" if _infer_transactional(raw_rows) else "aggregational"
-    normalized_requested = str(type_of_data or "").strip().lower()
-    if normalized_requested and normalized_requested not in {"transactional", "aggregational"}:
+
+    requested=str(type_of_data or "").strip().lower()
+    if requested and requested not in {"transactional","aggregational"}:
         raise ValueError("typeOfData must be 'transactional' or 'aggregational'")
-    # CSV structure is authoritative. If a caller sends the old form field, reject
-    # mismatches rather than silently interpreting a transactional CSV as aggregate.
-    if normalized_requested and normalized_requested != inferred_type:
-        raise ValueError(
-            f"typeOfData '{normalized_requested}' does not match the CSV. "
-            f"The CSV is detected as '{inferred_type}' because fields data is "
-            f"{'present' if inferred_type == 'transactional' else 'absent'} in event rows."
-        )
-    detected_type = inferred_type
+    detected_type=requested or infer_type_of_data(csv_text)
 
-    known_gens = get_known_generator_types() | {
-        "unique_id", "indian_msisdn", "uuid", "timestamp", "recent_timestamp",
-        "choice", "range", "dependent_range", "derived_distribution", "derived_timestamp", "derived",
-        "datetime",
-        "synthetic_event",
-        "configuration",
-        "derived_state",
-        "derived_event",
-        "categorical", "category",
-        "string", "text", "object", "varchar",
-        "int", "integer", "float", "decimal", "number", "numeric",
-        "bool", "boolean", "date",
+    known_gens=get_known_generator_types() | {
+        "unique_id","indian_msisdn","uuid","timestamp","recent_timestamp","choice","range",
+        "dependent_range","derived_distribution","derived_timestamp","derived","datetime",
+        "synthetic_event","configuration","derived_state","derived_event","categorical","category",
+        "string","text","object","varchar","int","integer","float","decimal","number","numeric",
+        "bool","boolean","date",
     }
-    variables: list[dict] = []
-    field_order: list[str] = []
-    event_groups: dict[tuple[str, int], dict[str, Any]] = {}
-    event_type_names: set[str] = set()
-    variable_by_name: dict[str, dict[str, Any]] = {}
-    all_names: set[str] = set()
 
-    # First pass: validate/normalize variables. Dependencies are allowed to point
-    # forward because client schemas may use formulas whose source field appears later.
-    # Some client templates repeat the same variable row across multiple event rows.
-    # We allow duplicate names only when the normalized definition is equivalent.
-    for row_number, row in enumerate(raw_rows, start=2):
-        name = row.get("name", "").strip()
+    variables=[]; field_order=[]; variable_by_name={}; all_names=set()
+    for row_number,row in enumerate(raw_rows,start=2):
+        name=row.get("name","").strip()
         if not name:
             raise ValueError(f"Row {row_number}: 'name' is empty")
-
-        dtype_raw = row.get("dtype", "").strip().lower()
+        dtype_raw=row.get("dtype","").strip().lower()
         if not dtype_raw:
             raise ValueError(f"Row {row_number} ('{name}'): dtype is empty")
-        dtype = _normalize_dtype(dtype_raw)
+        dtype=_normalize_dtype(dtype_raw)
+        depends_on=_split_list(row.get("depends_on",""))
+        params=_parse_params(row.get("params",""),row_number,name)
+        formula=row.get("formula","").strip()
+        if formula.upper()=="NULL": formula=""
 
-        depends_on = _split_list(row.get("depends_on", ""))
-        params = _parse_params(row.get("params", ""), row_number, name)
-        formula = row.get("formula", "").strip()
-        if formula.upper() == "NULL":
-            formula = ""
-
-        fields = _split_list(row.get("fields", ""))
-        is_event_field = bool(fields)
-        if detected_type == "aggregational" and is_event_field:
-            raise ValueError(f"Row {row_number} ('{name}'): fields data is not allowed in an aggregational CSV")
-
-        gen_raw = row.get("gen", "").strip().lower()
-        gen, params = _normalize_generator(gen_raw, params, depends_on, dtype, formula)
-        gen, params = _coerce_executable_generator(gen, params, dtype, formula)
-
-        variable = {
-            "name": name,
-            "dtype": dtype,
-            "description": row.get("description", ""),
-            "gen": gen,
-            "params": params,
-            "depends_on": depends_on,
-            "nullable": row.get("nullable", "").lower() in _TRUE_STRINGS,
-        }
-        normalized_formula = _coerce_formula_text(formula) if formula else ""
-        if normalized_formula:
-            # A parseable sheet formula is authoritative regardless of the original
-            # CSV gen label, and still coexists with deterministic constraints.
-            variable["formula"] = normalized_formula
-        elif gen == "formula":
-            # Invalid formula text should not halt imports.
-            fallback_gen, fallback_params = _coerce_executable_generator("", params, dtype, "")
-            variable["gen"] = fallback_gen
-            variable["params"] = fallback_params
-            if formula:
-                variable.setdefault("params", {})["formula_text"] = formula
-        elif formula:
-            # Preserve non-parseable formula prose as metadata only.
-            variable.setdefault("params", {})["formula_text"] = formula
-
-        existing = variable_by_name.get(name)
-        if existing is None:
-            variable_by_name[name] = variable
-            variables.append(variable)
-            field_order.append(name)
-            all_names.add(name)
+        # Scope metadata: user fields are generated once per user; record fields
+        # are regenerated for every historical row.
+        scope_raw=(row.get("scope") or row.get("record_scope") or row.get("grain") or row.get("level") or "record").strip().lower()
+        if scope_raw in {"entity","customer","subscriber","user_level","user-level","identity"}:
+            scope="user"
+        elif scope_raw in {"user","record","transaction","transactional","row","record_level","record-level"}:
+            scope="user" if scope_raw=="user" else "record"
         else:
-            if not _merge_duplicate_variable(existing, variable):
-                raise ValueError(
-                    f"Row {row_number}: duplicate variable name '{name}' has conflicting definition"
-                )
+            raise ValueError(f"Row {row_number} ('{name}'): scope must be 'user' or 'record'")
 
-        if is_event_field:
-            event_type = (row.get("event_type") or "").strip().upper().replace(" ", "_")
-            if not event_type:
-                raise ValueError(f"Row {row_number} ('{name}'): event row requires 'event_type'")
-            event_type_names.add(event_type)
+        gen_raw=row.get("gen","").strip().lower()
+        gen,params=_normalize_generator(gen_raw,params,depends_on,dtype,formula)
+        gen,params=_coerce_executable_generator(gen,params,dtype,formula)
+        # Numeric categorical/choice values must remain numeric so downstream formulas
+        # (for example recharge_amount -> balance_after) can perform arithmetic.
+        if dtype in {"int", "float"} and isinstance(params.get("choices"), list):
+            converted=[]
+            for choice in params["choices"]:
+                try:
+                    num=float(choice)
+                    if dtype=="int" and num.is_integer(): num=int(num)
+                    converted.append(num)
+                except (TypeError,ValueError):
+                    converted.append(choice)
+            params["choices"]=converted
+        if dtype in {"int", "float"} and "value" in params:
             try:
-                sequence = int(row.get("sequence", "") or len(event_groups) + 1)
-            except ValueError as exc:
-                raise ValueError(f"Row {row_number} ('{name}'): sequence must be an integer") from exc
-            if sequence < 1:
-                raise ValueError(f"Row {row_number} ('{name}'): sequence must be >= 1")
-            key = (event_type, sequence)
-            event = event_groups.setdefault(key, {
-                "event_type": event_type,
-                "sequence": sequence,
-                "fields": [],
-                "description": row.get("description", ""),
-                "min_occurrences": row.get("min_occurrences", "1") or "1",
-                "max_occurrences": row.get("max_occurrences", "10") or "10",
-            })
-            # Client sample repeats the complete event field list on every event row.
-            # Preserve declared order, and ensure the current variable is included.
-            for field in fields + [name]:
-                if field not in event["fields"]:
-                    event["fields"].append(field)
+                num=float(params["value"])
+                params["value"] = int(num) if dtype=="int" and num.is_integer() else num
+            except (TypeError,ValueError):
+                pass
+        variable={
+            "name":name,"dtype":dtype,"description":row.get("description",""),"gen":gen,
+            "params":params,"depends_on":depends_on,"nullable":row.get("nullable","").lower() in _TRUE_STRINGS,
+            "scope":scope,
+        }
+        normalized_formula=_coerce_formula_text(formula) if formula else ""
+        if normalized_formula:
+            variable["formula"]=normalized_formula
+        elif gen=="formula":
+            fallback_gen,fallback_params=_coerce_executable_generator("",params,dtype,"")
+            variable["gen"]=fallback_gen; variable["params"]=fallback_params
+            if formula: variable.setdefault("params",{})["formula_text"]=formula
+        elif formula:
+            variable.setdefault("params",{})["formula_text"]=formula
+
+        existing=variable_by_name.get(name)
+        if existing is None:
+            variable_by_name[name]=variable; variables.append(variable); field_order.append(name); all_names.add(name)
+        else:
+            if not _merge_duplicate_variable(existing,variable):
+                raise ValueError(f"Row {row_number}: duplicate variable name '{name}' has conflicting definition")
+            # Promote a repeated variable to user scope if any declaration says so.
+            if scope=="user": existing["scope"]="user"
 
     if not variables:
         raise ValueError("CSV must contain at least one variable row")
 
-    _resolve_dependency_aliases(variables, all_names, event_type_names)
-    _align_id_mirror_sources(variables, all_names)
-
-    unknown_dependencies = sorted({dep for v in variables for dep in v["depends_on"] if dep not in all_names})
+    _resolve_dependency_aliases(variables,all_names)
+    _align_id_mirror_sources(variables,all_names)
+    unknown_dependencies=sorted({dep for v in variables for dep in v["depends_on"] if dep not in all_names})
     if unknown_dependencies:
         raise ValueError(f"depends_on references undefined variable(s): {unknown_dependencies}")
 
-    events: list[dict] = []
-    if detected_type == "transactional":
-        for event in sorted(event_groups.values(), key=lambda e: (e["sequence"], e["event_type"])):
-            missing = [f for f in event["fields"] if f not in all_names]
-            if missing:
-                raise ValueError(f"Event '{event['event_type']}' references undefined variable(s): {missing}")
-            try:
-                min_occ = max(1, int(event["min_occurrences"]))
-                max_occ = max(min_occ, min(1000, int(event["max_occurrences"])))
-            except ValueError as exc:
-                raise ValueError(f"Event '{event['event_type']}': min_occurrences/max_occurrences must be integers") from exc
-            events.append({
-                "event_type": event["event_type"],
-                "sequence": event["sequence"],
-                "fields": event["fields"],
-                "description": event["description"],
-                "min_occurrences": min_occ,
-                "max_occurrences": max_occ,
-            })
-        if not events:
-            raise ValueError("Transactional CSV must contain at least one row with non-empty fields data")
+    # If a user-level field depends on a record-level field, promote the dependency
+    # closure to user scope so the generated value is stable for that user.
+    changed=True
+    by_name={str(v["name"]):v for v in variables}
+    while changed:
+        changed=False
+        for v in variables:
+            if v.get("scope")!="user": continue
+            for dep in v.get("depends_on",[]) or []:
+                dv=by_name.get(str(dep))
+                if dv and dv.get("scope")!="user":
+                    dv["scope"]="user"; changed=True
 
-    return variables, field_order, events
+    # Transactional definitions must have a usable entity/user key; API import can
+    # infer it separately, so the parser only validates that variables exist.
+    return variables, field_order

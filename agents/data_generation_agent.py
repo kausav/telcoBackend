@@ -18,7 +18,7 @@ from typing import Any
 
 from langgraph.graph import StateGraph, END
 
-from core.dynamic_scenarios import resolve_variables, resolve_events
+from core.dynamic_scenarios import resolve_variables
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
 
@@ -271,7 +271,7 @@ def _prefixed_uuid(params: dict, _rec: dict) -> str:
 
 
 def _tx_id(params: dict, rec: dict) -> str:
-    ts = rec.get("event_timestamp", datetime.now(timezone.utc).isoformat())
+    ts = rec.get("record_timestamp", datetime.now(timezone.utc).isoformat())
     date_part = ts[:10].replace("-", "")
     rand_part = random.randint(1_000_000, 9_999_999)
     return f"{params['prefix']}{date_part}-{rand_part}"
@@ -670,97 +670,87 @@ def _generate_selected_record(
     return _apply_conditional_rules(rec, rules)
 
 
-# ── Transactional generation helpers ─────────────────────────────────────────
+# ── Transactional/user-history generation helpers ─────────────────────────────
 
-# Publicly documented response behavior: at most 10 entities and 10 records/event/entity.
-def _journey_id() -> str:
-    return f"JRN-{uuid.uuid4().hex[:12].upper()}"
+def _pick_timestamp_field(variables: list[dict]) -> str | None:
+    preferred=("record_timestamp","transaction_timestamp","timestamp","created_at","updated_at")
+    names={str(v.get("name")):v for v in variables if v.get("name")}
+    for name in preferred:
+        if name in names and str(names[name].get("dtype","")).lower() in {"datetime","date"}:
+            return name
+    for v in variables:
+        if str(v.get("dtype","")).lower()=="datetime" and v.get("name"):
+            return str(v["name"])
+    return None
 
 
-def _transactional_records(
-    compiled,
-    journey_count: int,
-    event_counts_out: dict[str, dict[str, int]] | None = None,
-    rules: dict | None = None,
-    record_errors_out: list[dict] | None = None,
-) -> list[dict]:
-    """Generate transactional records from the confirmed CSV schema and events."""
-    events = compiled.events
-    variables = list(compiled.variables)
-    entity_key = compiled.entity_key
-    if not events:
-        from types import SimpleNamespace
-        events = (SimpleNamespace(event_type="BUSINESS_EVENT", sequence=1, fields=(), min_occurrences=1, max_occurrences=10),)
+def _transactional_records(compiled, user_count: int, records_per_user: int = 10,
+                            rules: dict | None = None, record_errors_out: list[dict] | None = None) -> list[dict]:
+    """Generate a fixed-length recent history for each user/entity.
 
-    generated: list[dict] = []
-    used_entity_keys: set[str] = set()
+    User-scope variables are generated once and copied into each row. Record-scope
+    variables are regenerated for every historical row. The output remains flat so
+    downstream QA operates on ordinary records; the API groups those records by
+    entity_key after generation.
+    """
+    variables=list(compiled.variables); entity_key=compiled.entity_key
+    records_per_user=max(1,min(50,int(records_per_user or 10)))
+    timestamp_field=_pick_timestamp_field(variables)
+    generated=[]; used_entity_keys=set()
 
-    for entity_index in range(journey_count):
+    for user_index in range(user_count):
         try:
-            entity_context = _generate_selected_record(
-                variables, set(compiled.entity_fields), rules=rules
-            )
+            user_context=_generate_selected_record(variables,set(compiled.user_fields),rules=rules)
+            if entity_key and entity_key not in user_context:
+                # Ensure the entity key is generated even if scope metadata omitted it.
+                key_var=compiled.variable_by_name.get(entity_key)
+                if key_var:
+                    user_context=_generate_selected_record(variables,{entity_key},base=user_context,rules=rules)
+            if entity_key and entity_key in user_context:
+                attempts=0
+                while str(user_context[entity_key]) in used_entity_keys and attempts < 10:
+                    key_var=compiled.variable_by_name.get(entity_key)
+                    if key_var:
+                        user_context=_generate_selected_record(variables,{entity_key},base=user_context,rules=rules)
+                    attempts+=1
+                used_entity_keys.add(str(user_context.get(entity_key)))
         except Exception as exc:
-            error = {"record_index": len(generated), "error": str(exc), "record": {"entity_index": entity_index}}
-            if record_errors_out is not None:
-                record_errors_out.append(error)
-            logger.warning("[DataGeneration] Skipping transactional entity %d: %s", entity_index, exc)
+            err={"user_index":user_index,"error":str(exc),"record":{}}
+            if record_errors_out is not None: record_errors_out.append(err)
+            logger.warning("[DataGeneration] Skipping transactional user %d: %s",user_index,exc)
             continue
 
-        if entity_key and entity_key in entity_context:
-            attempts = 0
-            while str(entity_context[entity_key]) in used_entity_keys and attempts < 10:
-                key_var = compiled.variable_by_name.get(entity_key)
-                if key_var:
-                    generator = _GENERATORS.get(key_var.get("gen"))
-                    if generator:
-                        entity_context[entity_key] = generator(key_var, entity_context)
-                attempts += 1
-            used_entity_keys.add(str(entity_context[entity_key]))
+        # Generate timestamps for the history window first, then sort newest-first
+        # at the API boundary. Keep the period bounded to the last 90 days.
+        end_ts=datetime.now(timezone.utc)
+        span=max(records_per_user,1)-1
+        if span:
+            step_seconds=random.randint(6*3600, 72*3600)
+            start_ts=end_ts-timedelta(seconds=step_seconds*span)
+        else:
+            start_ts=end_ts
+        timestamps=[]
+        if timestamp_field:
+            for i in range(records_per_user):
+                jitter=random.randint(0,max(60,min(6*3600,step_seconds if span else 60)))
+                ts=start_ts+timedelta(seconds=(step_seconds*i if span else 0)+jitter)
+                ts=min(ts,end_ts)
+                timestamps.append(ts)
+            timestamps=sorted(timestamps)
 
-        journey_id = _journey_id()
-        entity_value = str(entity_context.get(entity_key, "")) if entity_key else journey_id
-        if event_counts_out is not None:
-            event_counts_out.setdefault(entity_value, {})
-        base_ts = _parse_dt(entity_context.get("event_timestamp", datetime.now(timezone.utc).isoformat()))
-        elapsed_seconds = 0
-
-        for event in events:
-            occurrence_count = random.randint(event.min_occurrences, event.max_occurrences)
-            if event_counts_out is not None:
-                event_counts_out[entity_value][event.event_type] = occurrence_count
-            for occurrence in range(occurrence_count):
-                elapsed_seconds += random.randint(5, 300)
-                event_ts = base_ts + timedelta(seconds=elapsed_seconds)
-                try:
-                    event_base = dict(entity_context)
-                    # Event timestamp is a generated schema field, but its value is
-                    # also the canonical timestamp for the emitted journey row. Put
-                    # it in the base before generating dependent event fields so
-                    # derived_timestamp/temporal formulas can reference it.
-                    if any(v.get("name") == "event_timestamp" for v in variables):
-                        event_base["event_timestamp"] = event_ts.isoformat()
-                    row = _generate_selected_record(
-                        variables, set(event.fields), base=event_base, rules=rules
-                    )
-                    row.update({
-                        "journey_id": journey_id,
-                        "transaction_id": f"TXN-{event_ts.strftime('%Y%m%d')}-{uuid.uuid4().hex[:10].upper()}",
-                        "event_type": event.event_type,
-                        "event_sequence": event.sequence,
-                        "event_occurrence": occurrence + 1,
-                        "event_timestamp": event_ts.isoformat(),
-                    })
-                    generated.append(row)
-                except Exception as exc:
-                    error = {
-                        "record_index": len(generated),
-                        "error": str(exc),
-                        "record": {"journey_id": journey_id, "event_type": event.event_type, "event_sequence": event.sequence, "event_occurrence": occurrence + 1},
-                    }
-                    if record_errors_out is not None:
-                        record_errors_out.append(error)
-                    logger.warning("[DataGeneration] Skipping transactional record: %s", exc)
+        for record_index in range(records_per_user):
+            try:
+                base=dict(user_context)
+                if timestamp_field:
+                    base[timestamp_field]=timestamps[record_index].isoformat()
+                row=_generate_selected_record(variables,set(compiled.record_fields),base=base,rules=rules)
+                if timestamp_field and timestamp_field not in row:
+                    row[timestamp_field]=timestamps[record_index].isoformat()
+                generated.append(row)
+            except Exception as exc:
+                err={"user_index":user_index,"record_index":record_index,"error":str(exc),"record":dict(user_context)}
+                if record_errors_out is not None: record_errors_out.append(err)
+                logger.warning("[DataGeneration] Skipping transactional record user=%d record=%d: %s",user_index,record_index,exc)
     return generated
 
 
@@ -800,11 +790,15 @@ def _fill_missing(rec: dict, field_order: list, dtype_map: dict) -> tuple[dict, 
 def _safe_formula(expr: str, rec: dict):
     """Evaluate the same small arithmetic expression language used by the generator."""
     allowed_funcs = {"round": round, "min": min, "max": max, "abs": abs}
-    names = {
-        k: v
-        for k, v in rec.items()
-        if k != "__current_field__" and isinstance(v, (str, int, float, bool)) and v is not None
-    }
+    names = {}
+    for k, v in rec.items():
+        if k == "__current_field__" or v is None:
+            continue
+        if isinstance(v, str):
+            parsed = _qa_parse_dt(v)
+            names[k] = parsed if parsed is not None and ("T" in v or "+" in v or v.endswith("Z")) else v
+        else:
+            names[k] = v
     try:
         tree = ast.parse(expr, mode="eval")
         allowed_nodes = (
@@ -822,7 +816,10 @@ def _safe_formula(expr: str, rec: dict):
                 return None
             if isinstance(node, ast.Call) and (not isinstance(node.func, ast.Name) or node.func.id not in allowed_funcs):
                 return None
-        return eval(compile(tree, "<formula>", "eval"), {"__builtins__": {}}, {**names, **allowed_funcs})
+        result = eval(compile(tree, "<formula>", "eval"), {"__builtins__": {}}, {**names, **allowed_funcs})
+        if isinstance(result, timedelta):
+            return result.total_seconds()
+        return result
     except Exception:
         return None
 
@@ -859,13 +856,12 @@ def _validate_record(
     variables: list[dict],
     field_order: list[str],
     transactional: bool,
-    event_fields: set[str] | None = None,
     rules: dict | None = None,
 ) -> tuple[dict, list[str]]:
     """Validate and repair one record using only the confirmed CSV schema."""
     rec = dict(rec)
     issues: list[str] = []
-    active_fields = set(event_fields or field_order) if transactional else set(field_order)
+    active_fields = set(field_order)
 
     for var in variables:
         name = var["name"]
@@ -925,10 +921,8 @@ def _validate_record(
     for field, expr in _collect_formula_specs(variables, rules):
         if field not in active_fields:
             continue
-        # A derived_timestamp formula is descriptive in the client CSV. The
-        # executable source of truth is its delay_seconds range + base dependency;
-        # formulas such as "event_timestamp + notification_delay" contain a
-        # symbolic delay that is intentionally not a separate schema variable.
+        # A derived timestamp formula can be descriptive in the CSV. The executable
+        # source of truth is its delay_seconds range plus the declared base dependency.
         field_def = variable_by_name.get(field) or {}
         if str(field_def.get("gen", "")).strip().lower() in {"derived_timestamp", "ts_offset"}:
             if (field_def.get("params") or {}).get("delay_seconds") is not None:
@@ -948,16 +942,16 @@ def _validate_record(
         if mismatch:
             rec[field] = expected; issues.append(f"{field} corrected from formula")
 
-    event_ts = _qa_parse_dt(rec.get("event_timestamp"))
+    timestamp_field = next((name for name in ("record_timestamp", "transaction_timestamp", "timestamp", "created_at", "updated_at") if name in rec), None)
+    base_ts = _qa_parse_dt(rec.get(timestamp_field)) if timestamp_field else None
     dispatch_ts = _qa_parse_dt(rec.get("notification_dispatch_ts"))
     response_ts = _qa_parse_dt(rec.get("customer_response_ts"))
-    if event_ts and dispatch_ts and dispatch_ts < event_ts:
-        rec["notification_dispatch_ts"] = event_ts.isoformat(); issues.append("notification_dispatch_ts corrected")
+    if base_ts and dispatch_ts and dispatch_ts < base_ts:
+        rec["notification_dispatch_ts"] = base_ts.isoformat(); issues.append("notification_dispatch_ts corrected")
     if dispatch_ts and response_ts and response_ts < dispatch_ts:
         rec["customer_response_ts"] = dispatch_ts.isoformat(); issues.append("customer_response_ts corrected")
 
-    metadata = {"journey_id", "transaction_id", "event_type", "event_sequence", "event_occurrence", "event_timestamp"}
-    allowed = set(field_order) | metadata if transactional else set(field_order)
+    allowed = set(field_order)
     return {k: v for k, v in rec.items() if k in allowed}, issues
 
 
@@ -988,15 +982,11 @@ class DataGenerationAgent:
         if state.type_of_data == "transactional":
             from core.compiled_schema import compile_scenario
             compiled = compile_scenario(state.scenario)
-            state.transactional_event_counts = {}
             records = _transactional_records(
-                compiled, state.count, state.transactional_event_counts,
+                compiled, state.count, state.records_per_user,
                 rules=state.rules, record_errors_out=state.record_errors,
             )
-            state.field_order = [
-                "journey_id", "transaction_id", "event_type", "event_sequence",
-                "event_occurrence", "event_timestamp",
-            ] + [name for name in csv_field_order if name != "event_timestamp"]
+            state.field_order = list(csv_field_order)
         else:
             state.field_order = list(csv_field_order)
             records = []
@@ -1019,17 +1009,14 @@ class DataGenerationAgent:
             raise ValueError(f"Unknown scenario '{state.scenario}'")
         variables, _ = dyn
         transactional = state.type_of_data == "transactional"
-        event_defs = {str(e.get("event_type")): e for e in resolve_events(state.scenario)} if transactional else {}
 
         checked: list[dict] = []
         algo_fixed = 0
         for record_index, record in enumerate(records):
             try:
-                event_def = event_defs.get(str(record.get("event_type"))) if transactional else None
-                event_fields = set(event_def.get("fields", []) or []) if event_def else set()
                 repaired, issues = _validate_record(
                     record, variables, state.field_order, transactional,
-                    event_fields=event_fields, rules=state.rules,
+                    rules=state.rules,
                 )
                 algo_fixed += len(issues)
                 checked.append(repaired)
@@ -1045,7 +1032,7 @@ class DataGenerationAgent:
             valid_all: list[dict] = []
             system_prompt = _QA_SYSTEM.format(
                 rules="\n".join(f"- {r}" for r in state.rules.get("business_rules", [])) or "Apply the supplied CSV schema and deterministic checks.",
-                cross_field_rules="\n".join(f"- {r}" for r in state.rules.get("cross_field_rules", [])) or "Validate declared mathematical, temporal, event and business relationships.",
+                cross_field_rules="\n".join(f"- {r}" for r in state.rules.get("cross_field_rules", [])) or "Validate declared mathematical, temporal, and business relationships.",
             )
             for i in range(0, len(checked), _CHUNK):
                 chunk = checked[i:i + _CHUNK]
@@ -1082,7 +1069,7 @@ class DataGenerationAgent:
             "llm_issues": llm_issues,
             "deterministic_checks": [
                 "schema_and_type", "declared_ranges_and_choices", "formula_and_arithmetic",
-                "timestamp_relationships", "transactional_event_sequence",
+                "timestamp_relationships", "user_history_consistency",
             ],
         }
         return state

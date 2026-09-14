@@ -7,11 +7,12 @@ class WorkflowState(BaseModel):
 
     # ── Inputs ────────────────────────────────────────────────────────────
     scenario: str       # e.g. "LB-01"
-    count: int          # total records requested
+    count: int          # number of users/entities requested for transactional scenarios
     industry: str = "generic"  # e.g. "Telecom", "Banking", "Retail" — drives industry conventions (see config/industry_profiles.py)
     country: str | None = None  # None means GLOBAL/non-country-specific conventions
     type_of_data: Literal["transactional", "aggregational"] = "aggregational"
     batch_size: int = 50
+    records_per_user: int = 10
 
     # Complete confirmed scenario context.  The generator pipeline receives the
     # Full context persisted by the CSV import/confirm flow.
@@ -33,4 +34,3 @@ class WorkflowState(BaseModel):
     errors: list[str] = Field(default_factory=list)
     record_errors: list[dict[str, Any]] = Field(default_factory=list)
     field_order: list[str] = Field(default_factory=list)
-    transactional_event_counts: dict[str, dict[str, int]] = Field(default_factory=dict)

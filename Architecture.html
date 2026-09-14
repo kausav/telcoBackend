@@ -32,7 +32,7 @@
 <body>
 <header>
   <h1>Telco Agentic Synthetic Data Generator</h1>
-  <p>Current architecture after the CSV-first cleanup. The uploaded CSV is the single source of truth for variables and journey events. Transactional versus aggregational output is inferred from the presence of non-empty <code>fields</code> values; <code>record_type</code> is optional metadata and is not used for classification. The backend no longer invents scenario variables and contains no edge-case generation pipeline.</p>
+  <p>Current architecture after the CSV-first cleanup. The uploaded CSV is the single source of truth for variables. The event model has been removed. Transactional output is user/entity history: stable <code>scope=user</code> fields plus repeated <code>scope=record</code> rows. Aggregational output is a flat record set. The backend no longer invents scenario variables and contains no edge-case generation pipeline.</p>
 </header>
 <main>
   <section>
@@ -52,7 +52,7 @@
       <div class="node">Data Generation Agent</div><div class="arrow">→</div>
       <div class="node">Validated Records</div>
     </div>
-    <div class="note"><strong>Source of truth:</strong> variable name, datatype, generator, parameters, dependencies, formulas, descriptions, and transactional event definitions originate in the imported CSV. LLM agents can validate and derive rules from that schema, but they do not create a replacement variable catalog.</div>
+    <div class="note"><strong>Source of truth:</strong> variable name, datatype, generator, parameters, dependencies, formulas, descriptions, and scope metadata originate in the imported CSV. LLM agents can validate and derive rules from that schema, but they do not create a replacement variable catalog.</div>
   </section>
 
   <section>
@@ -60,7 +60,7 @@
     <table>
       <tr><th>Endpoint</th><th>Purpose</th><th>Status</th></tr>
       <tr><td><code>POST /scenario/import-csv</code></td><td>Required scenario-definition input. Parses and validates the uploaded CSV, then creates a draft.</td><td>Primary input API</td></tr>
-      <tr><td><code>POST /scenario/confirm</code></td><td>Finalizes a draft and optionally applies variable/event edits before persistence.</td><td>Retained for existing workflow compatibility</td></tr>
+      <tr><td><code>POST /scenario/confirm</code></td><td>Finalizes a draft and optionally applies variable edits before persistence.</td><td>Retained for existing workflow compatibility</td></tr>
       <tr><td><code>POST /scenario/generate</code></td><td>Generates synthetic records from a confirmed scenario.</td><td>Retained because generation still requires an execution API</td></tr>
       <tr><td><code>GET /</code></td><td>Liveness endpoint.</td><td>Retained</td></tr>
       <tr><td><code>GET /health</code></td><td>Health endpoint.</td><td>Retained</td></tr>
@@ -75,15 +75,15 @@
       <div class="card"><h3>Dependencies</h3><p><code>depends_on</code> may reference any declared field. The importer validates references globally, so client rows do not have to be topologically ordered.</p></div>
       <div class="card"><h3>Generator parameters</h3><p><code>params</code> accepts legacy JSON or the client compact format such as <code>prefix=SUB-;digits=7</code>, <code>min=50;max=1000</code>, and <code>delay_seconds=5-120</code>.</p></div>
       <div class="card"><h3>Formulas</h3><p>Formula variables use <code>gen=formula</code> and provide the expression in the <code>formula</code> column.</p></div>
-      <div class="card"><h3>Transactional events</h3><p>A row with non-empty <code>fields</code> is an event-owned field. Rows are grouped by <code>event_type</code> and <code>sequence</code>; repeated field lists are de-duplicated.</p></div>
+      <div class="card"><h3>User history</h3><p>Transactional variables are split by optional <code>scope</code>. User-scope fields are generated once per entity; record-scope fields are regenerated for each recent history row.</p></div>
       <div class="card"><h3>Aggregational data</h3><p>If every row has empty <code>fields</code>, the CSV is aggregational. The resulting records are one record per requested unit.</p></div>
     </div>
   </section>
 
   <section>
     <h2>4. Transactional detection rule</h2>
-    <div class="note"><strong>CSV structure is authoritative:</strong> the importer scans the <code>fields</code> column. If at least one row contains non-empty <code>fields</code>, the input is transactional. If all <code>fields</code> cells are empty, it is aggregational. The optional <code>record_type</code> column is ignored for classification, which supports the client's journey format where entity rows can have an <code>event_type</code> but no <code>fields</code>.</div>
-    <p>For transactional input, each non-empty <code>fields</code> row contributes its <code>name</code> to the owning event. The importer also preserves the complete repeated field list supplied by the client and removes duplicates.</p>
+    <div class="note"><strong>CSV structure is authoritative:</strong> each row defines a variable. No event_type, sequence, or event grouping is used. Transactional generation returns users/entities with their most recent configured history rows.</div>
+    <p>For transactional input, <code>scope=user</code> marks stable user/entity attributes and <code>scope=record</code> marks fields regenerated for each history row.</p>
   </section>
 
   <section>
@@ -117,9 +117,9 @@
     <table>
       <tr><th>Aspect</th><th>Transactional</th><th>Aggregational</th></tr>
       <tr><td>CSV variables</td><td>Declared by variable rows</td><td>Declared by variable rows</td></tr>
-      <tr><td>Events</td><td>Created from rows with non-empty <code>fields</code>; grouped by event type/sequence</td><td>No event-owned fields</td></tr>
-      <tr><td>Entity key</td><td>Optional in import API; inferred from common entity identifiers or the first non-event field when omitted</td><td>Not used</td></tr>
-      <tr><td>Generated output</td><td>Journey/event records with generated transactional metadata</td><td>One generated record per requested unit</td></tr>
+      <tr><td>History grain</td><td>Variables may be marked <code>scope=user</code> or <code>scope=record</code></td><td>User-level values are stable across each history; record-level values are regenerated per row</td></tr>
+      <tr><td>Entity key</td><td>Optional in import API; inferred from common entity identifiers or the first variable when omitted</td><td>Not used</td></tr>
+      <tr><td>Generated output</td><td>User/entity objects containing the most recent history rows</td><td>One generated record per requested unit</td></tr>
       <tr><td>Response optimization</td><td>Latest response window is preserved</td><td>Requested records are generated directly</td></tr>
     </table>
   </section>
@@ -127,8 +127,8 @@
   <section>
     <h2>8. Persistence and caching</h2>
     <div class="grid">
-      <div class="card"><h3>SQLite dynamic scenario store</h3><p>Stores imported drafts and confirmed scenario metadata, variables, field order, and transactional events. Confirmed data remains the source used by generation.</p></div>
-      <div class="card"><h3>Compiled schema cache</h3><p>Turns confirmed variables/events into fast lookup structures for repeated generation calls. It is invalidated after scenario confirmation changes.</p></div>
+      <div class="card"><h3>SQLite dynamic scenario store</h3><p>Stores imported drafts and confirmed scenario metadata, variables, field order, entity key, and history settings. Confirmed data remains the source used by generation.</p></div>
+      <div class="card"><h3>Compiled schema cache</h3><p>Turns confirmed variables into fast user-scope/record-scope lookup structures for repeated generation calls. It is invalidated after scenario confirmation changes.</p></div>
       <div class="card"><h3>Runtime schema cache</h3><p>Caches immutable runtime artifacts such as Schema Agent results. Cache misses recompute safely.</p></div>
     </div>
   </section>
@@ -164,7 +164,7 @@ formula</pre>
       <li><span class="removed">Edge Case Agent and edge-case generation/validation code</span> — removed.</li>
       <li><span class="removed">Edge-case CSV rows/metadata and isEdgeCaseData output</span> — removed.</li>
       <li><span class="removed">Static scenario variable catalogs and mandatory variable injection</span> — removed with the Scenario Designer.</li>
-      <li>CSV parsing is now intentionally limited to normal variable and transactional event definitions.</li>
+      <li>CSV parsing is intentionally limited to variable definitions with optional scope metadata.</li>
       <li>Data generation no longer injects scenario-specific Telecom fields, LB-06/LB-07 fields, or static variable contracts.</li>
       <li>Declared CSV categorical choices and ranges remain authoritative, while Schema Agent rules can provide additional generic business relationships.</li>
     </ul>
@@ -175,13 +175,13 @@ formula</pre>
     <table>
       <tr><th>File</th><th>Responsibility</th></tr>
       <tr><td><code>server.py</code></td><td>HTTP API, draft import/confirmation, generation response shaping, request validation.</td></tr>
-      <tr><td><code>core/csv_scenario.py</code></td><td>CSV schema/event parser and validation.</td></tr>
+      <tr><td><code>core/csv_scenario.py</code></td><td>CSV variable schema parser and validation.</td></tr>
       <tr><td><code>core/dynamic_scenarios.py</code></td><td>SQLite draft/confirmed scenario persistence and resolution.</td></tr>
       <tr><td><code>core/pipeline.py</code></td><td>Three-stage LangGraph generation pipeline.</td></tr>
       <tr><td><code>agents/orchestrator.py</code></td><td>Scenario existence and business/industry coherence gate.</td></tr>
       <tr><td><code>agents/schema_agent.py</code></td><td>Derives business/generation rules from the confirmed CSV schema.</td></tr>
       <tr><td><code>agents/data_generation_agent.py</code></td><td>Generic generators, deterministic generation, formula/constraint handling, and QA.</td></tr>
-      <tr><td><code>core/compiled_schema.py</code></td><td>Compiled variable/event lookup cache.</td></tr>
+      <tr><td><code>core/compiled_schema.py</code></td><td>Compiled user-scope/record-scope lookup cache.</td></tr>
       <tr><td><code>core/runtime_cache.py</code></td><td>Process-local runtime artifact cache.</td></tr>
       <tr><td><code>config/industry_profiles.py</code></td><td>Industry/country context used for agent grounding; it is not a variable catalog.</td></tr>
     </table>

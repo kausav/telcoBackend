@@ -1,6 +1,6 @@
 """
 Generation pipeline (Gemini-powered), orchestrated as a LangGraph StateGraph.
-The CSV import is the source of truth for scenario variables and transactional events.
+The CSV import is the source of truth for scenario variables and user-history generation settings.
 """
 from __future__ import annotations
 import logging
@@ -56,7 +56,7 @@ def _build_graph(llm: GeminiClient):
     return graph.compile()
 
 
-def run_pipeline(scenario: str, count: int, industry: str = "generic", country: str | None = None, api_key: str = "", type_of_data: str | None = None, scenario_context: dict | None = None) -> WorkflowState:
+def run_pipeline(scenario: str, count: int, industry: str = "generic", country: str | None = None, api_key: str = "", type_of_data: str | None = None, scenario_context: dict | None = None, records_per_user: int = 10) -> WorkflowState:
     llm = GeminiClient(api_key=api_key or None)
     resolved_type = type_of_data or resolve_data_type(scenario)
     context = scenario_context or resolve_scenario_context(scenario)
@@ -66,7 +66,7 @@ def run_pipeline(scenario: str, count: int, industry: str = "generic", country: 
     context["type_of_data"] = resolved_type
     state = WorkflowState(
         scenario=scenario, count=count, industry=industry, country=country,
-        type_of_data=resolved_type, domain=context.get("domain", ""),
+        type_of_data=resolved_type, records_per_user=max(1, min(10, int(records_per_user or context.get("records_per_user", 10) or 10))), domain=context.get("domain", ""),
         business_scenario=context.get("business_scenario", ""),
         business_response=context.get("business_response"),
         expected_outcome=context.get("expected_outcome"),

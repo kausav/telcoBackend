@@ -1,6 +1,0 @@
-name,dtype,description,gen,params,depends_on,nullable,formula
-subscriber_id,string,Unique subscriber identifier,unique_id,prefix=SUB-;digits=8,,false,
-balance,float,Current account balance,range,min=0;max=500,,false,
-plan_type,categorical,Subscription type,choice,prepaid;postpaid,,false,
-account_status,categorical,Account status,choice,ACTIVE;SUSPENDED;CLOSED,,false,
-monthly_spend,float,Monthly spend,range,min=0;max=1000,,false,

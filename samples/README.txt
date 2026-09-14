@@ -1,23 +1,27 @@
-CSV scenario-definition samples (UPLOAD/INPUT examples)
+CSV scenario sample
+===================
 
-These files are scenario-definition CSVs, NOT final generated data. They describe what the user wants the generator to produce.
+Use `definition_sample.csv` as the single canonical CSV example for both transactional and aggregational scenarios. The API `typeOfData` form field determines which generation mode is used; the CSV format stays the same.
 
-transactional_definition_sample.csv
-- Normal variables describe the transactional data model.
-- Event rows define which variables belong to each event.
-- edge_case_variable rows define edge-case overrides and their machine-checkable condition.
-- The transactional sample includes two edge cases and edgeCasePercentage=0.02 (2%).
+Schema columns
+- `scope`: use `user` for stable user/entity attributes in transactional history generation; use `record` for fields generated on each historical row. Aggregational generation treats the schema as one flat record definition.
+- `name`: variable name.
+- `dtype`: variable datatype.
+- `description`: business meaning of the variable.
+- `gen`: generator type.
+- `params`: generator parameters, either JSON or compact `key=value;key=value` syntax. Bare values are also supported for simple generators.
+- `depends_on`: comma-separated variable dependencies.
+- `nullable`: TRUE/FALSE.
+- `formula`: optional executable formula.
 
-aggregational_definition_sample.csv
-- Normal variables describe one aggregational record.
-- edge_case_variable rows define edge-case overrides and their machine-checkable condition.
-- The aggregational sample includes three edge cases and edgeCasePercentage=0.04 (4%).
+The sample intentionally includes both `weighted_choice` and `boolean` generators.
 
-CSV rules
-- record_type=variable: normal variable definition.
-- record_type=edge_case_variable: edge-case override/condition. Multiple rows may belong to the same edge_case_name.
-- record_type=event: transactional event definition.
-- record_type=metadata with name=edgeCasePercentage and value=<number>: optional edge-case percentage.
-- edgeCasePercentage must be a finite number between 0 and 1.
-- If no edge-case variables are supplied, the backend normalizes edgeCasePercentage to 0.
-- Conditions must reference declared variables and use supported expression syntax.
+Transactional output
+- `count` means the number of users/entities.
+- `recordsPerUser` controls the number of recent history rows returned per user and defaults to 10.
+- User-scope fields are emitted once per user; record-scope fields appear inside that user’s `records` array.
+
+Aggregational output
+- `count` means the number of flat records returned.
+
+There is no event model in the current API or CSV schema: no `event_type`, event sequence, event grouping, `events`, or event-specific confirm operations.

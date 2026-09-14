@@ -99,7 +99,7 @@ class SchemaAgent:
             state.scenario, state.industry, (state.country or "GLOBAL").upper(), state.type_of_data,
             state.domain or "", state.business_scenario or "", state.business_response or "",
             state.expected_outcome or "", state.scenario_type or "", state.use_case or "",
-            state.entity_key or "", str(state.scenario_context.get("events", [])),
+            state.entity_key or "",
         )
 
     def _derive_schema(self, state: WorkflowState) -> WorkflowState:
@@ -142,7 +142,6 @@ class SchemaAgent:
             f"Industry-appropriate service providers/operators (when applicable): {profile.get('service_providers', [])}\n"
             f"Market character: {profile['market_character']}\n"
             f"Output data type: {state.type_of_data}\n"
-            f"Transactional events: {sc.get('events', [])}\n"
             f"Typical product/plan types: {profile['product_types']}\n"
             f"Variables: {field_summary}\n"
             f"Complete confirmed scenario context (source of truth): {json.dumps(state.scenario_context, default=str, sort_keys=True)}\n\n"
@@ -156,8 +155,8 @@ class SchemaAgent:
             "that the data generator can enforce.\n"
             f"Produce a complete rules document covering all {len(VARS)} variables, "
             f"consistent with this industry and country's real-world standards. "
-            f"For transactional output, also validate event_sequence is increasing within each journey, "
-            f"transaction_id is unique, and event_timestamp is non-decreasing within each journey."
+            "For transactional output, validate that user-scope fields stay stable across each user history, "
+            "record identifiers are unique when defined, and record timestamps are non-decreasing within each user history."
         )
 
         rules = self._llm.generate_json(_SYSTEM, prompt, temperature=0.1)
