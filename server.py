@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import re
 import uuid
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -27,6 +28,7 @@ from core.dynamic_scenarios import (
 )
 from core.compiled_schema import invalidate_scenario
 from core.runtime_cache import clear_scenario
+from config.industry_profiles import COUNTRY_BASE
 
 
 
@@ -187,6 +189,122 @@ def health():
     return {"status": "ok"}
 
 
+def _country_from_csv_params(variables: list[dict]) -> str | None:
+    """Infer country code/name from CSV variable params when present.
+
+    This lets CSV definitions be self-contained. If country is declared in params,
+    the importer prefers that over payload country.
+    """
+    currency_to_country: dict[str, str] = {}
+    phone_to_country: dict[str, str] = {}
+    country_name_to_code: dict[str, str] = {}
+    for code, data in COUNTRY_BASE.items():
+        if code == "GLOBAL":
+            continue
+        currency = str(data.get("currency", "")).strip().upper()
+        if currency and currency not in currency_to_country:
+            currency_to_country[currency] = code
+        phone_cc = str(data.get("phone_country_code", "")).strip()
+        if phone_cc:
+            phone_to_country[phone_cc] = code
+        country_name = str(data.get("country_name", "")).strip().lower()
+        if country_name:
+            country_name_to_code[country_name] = code
+
+    known_country_codes = {code for code in COUNTRY_BASE if code != "GLOBAL"}
+    known_currency_codes = set(currency_to_country.keys())
+
+    def _normalize_country_hint(raw: object) -> str | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        upper = text.upper()
+        if upper in known_country_codes:
+            return upper
+        if upper in currency_to_country:
+            return currency_to_country[upper]
+        if text in phone_to_country:
+            return phone_to_country[text]
+        lower = text.lower()
+        if lower in country_name_to_code:
+            return country_name_to_code[lower]
+        return None
+
+    def _scan_text_hints(text: str) -> list[str]:
+        """Extract country signals from free text (description/examples/params strings)."""
+        hits: list[str] = []
+        if not text:
+            return hits
+        normalized_text = str(text)
+        # Tokenize while keeping + for phone country codes.
+        tokens = [t for t in re.split(r"[^A-Za-z0-9+]+", normalized_text) if t]
+        for token in tokens:
+            mapped = _normalize_country_hint(token)
+            if mapped:
+                hits.append(mapped)
+        # Country names can include spaces, so also scan full lowercase text.
+        lower_text = normalized_text.lower()
+        for name, code in country_name_to_code.items():
+            if name in lower_text:
+                hits.append(code)
+        # Prefer currency signals in textual phrases like "amount in INR".
+        for currency in known_currency_codes:
+            if re.search(rf"\b{re.escape(currency)}\b", normalized_text, flags=re.IGNORECASE):
+                hits.append(currency_to_country[currency])
+        return hits
+
+    candidates: list[str] = []
+    for var in variables:
+        if not isinstance(var, dict):
+            continue
+        # Free-text hints outside params.
+        for text_key in ("description", "name"):
+            candidates.extend(_scan_text_hints(str(var.get(text_key, ""))))
+
+        params = var.get("params")
+        if not isinstance(params, dict):
+            continue
+
+        # Direct explicit keys.
+        for key in ("country", "country_code", "countryCode"):
+            value = params.get(key)
+            if value is None:
+                continue
+            normalized = _normalize_country_hint(value)
+            if normalized:
+                candidates.append(normalized)
+        currency_value = params.get("currency")
+        if currency_value is not None:
+            normalized = _normalize_country_hint(currency_value)
+            if normalized:
+                candidates.append(normalized)
+
+        # List-style country hints.
+        country_codes = params.get("country_codes")
+        if isinstance(country_codes, list):
+            for entry in country_codes:
+                normalized = _normalize_country_hint(entry)
+                if normalized:
+                    candidates.append(normalized)
+
+        # Generic scan across all string/list params for hints embedded in arbitrary keys.
+        for value in params.values():
+            if isinstance(value, str):
+                candidates.extend(_scan_text_hints(value))
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str):
+                        candidates.extend(_scan_text_hints(item))
+
+    if not candidates:
+        return None
+    # Most frequent normalized token wins for deterministic behavior.
+    counts: dict[str, int] = {}
+    for c in candidates:
+        counts[c] = counts.get(c, 0) + 1
+    return sorted(counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
+
+
 @app.post("/scenario/import-csv", response_model=ScenarioImportResponse)
 def import_scenario_csv(
     file: UploadFile = File(..., description="CSV scenario definition: variables and, for transactional data, events"),
@@ -219,14 +337,32 @@ def import_scenario_csv(
         raise HTTPException(400, detail={"error": str(exc)}) from exc
 
     typeOfData = detected_type
+    csv_country = _country_from_csv_params(variables)
+    effective_country = csv_country or country
     variable_names = {v["name"] for v in variables}
     if typeOfData == "transactional":
         # entityKey is optional for the new CSV contract. Prefer an explicit key;
         # otherwise infer a stable entity identifier from the non-event fields.
-        if entityKey and entityKey not in variable_names:
-            raise HTTPException(400, detail={
-                "error": f"entityKey '{entityKey}' must be one of the CSV variable names"
-            })
+        if entityKey:
+            token = str(entityKey).strip()
+            if token in variable_names:
+                entityKey = token
+            else:
+                lowered = {name.lower(): name for name in variable_names}
+                normalized = lowered.get(token.lower()) if token else None
+                # Common UI/default alias drift: map between customer/subscriber keys
+                # when one side is present in the CSV schema.
+                if not normalized:
+                    alias_map = {
+                        "customer_id": "subscriber_id",
+                        "subscriber_id": "customer_id",
+                    }
+                    alias = alias_map.get(token.lower()) if token else None
+                    if alias and alias in variable_names:
+                        normalized = alias
+                # Do not hard-fail on stale/invalid entityKey from client payload.
+                # Fall back to schema inference below.
+                entityKey = normalized
         if not entityKey:
             preferred = (
                 "subscriber_id", "customer_id", "account_id", "user_id",
@@ -234,6 +370,10 @@ def import_scenario_csv(
             )
             event_fields = {f for e in events for f in e.get("fields", [])}
             entity_names = [v["name"] for v in variables if v["name"] not in event_fields]
+            # Some client event containers enumerate every field, including the
+            # entity identifier. In that shape, derive from the full schema.
+            if not entity_names:
+                entity_names = [v["name"] for v in variables]
             entityKey = next((name for name in preferred if name in entity_names), None)
             entityKey = entityKey or (entity_names[0] if entity_names else None)
         if not entityKey:
@@ -258,7 +398,7 @@ def import_scenario_csv(
         "scenario_id": scenarioId,
         "scenario_type": scenarioType,
         "industry_type": industryType,
-        "country": country,
+        "country": effective_country,
         "type_of_data": typeOfData,
         "entity_key": entityKey,
         "events": events,
@@ -458,8 +598,7 @@ def generate_scenario(req: GenerateRequest):
     final_records = state.final_records
 
     # Transactional responses are grouped by the scenario-defined entity key.
-    # Only the latest 10 entities are returned. Within each entity, each event
-    # contains its own totalCount and latest 10 records.
+    # Return the full generated entity set for the requested count.
     event_data: list[dict] = []
     response_records: list[dict] = final_records
     entity_key = meta.get("entity_key")
@@ -476,15 +615,12 @@ def generate_scenario(req: GenerateRequest):
             key = str(record[entity_key])
             grouped_entities.setdefault(key, []).append(record)
 
-        # The requested count represents the full number of entities in the conceptual
-        # dataset. Only the latest 10 entities are materialized for the response.
+        # The requested count represents the full number of entities in the dataset.
         total_count = state.count
-        # Generated records are ordered by generation time, so insertion order
-        # preserves the most recently generated entities at the end.
-        latest_entity_items = list(grouped_entities.items())[-10:]
+        entity_items = list(grouped_entities.items())
 
         entity_records: list[dict] = []
-        for entity_value, entity_rows in latest_entity_items:
+        for entity_value, entity_rows in entity_items:
             entity_output = {entity_key: entity_value}
 
             # Include useful identity fields alongside the grouping key.
@@ -513,7 +649,7 @@ def generate_scenario(req: GenerateRequest):
                 if not rows:
                     continue
                 actual_count = state.transactional_event_counts.get(str(entity_value), {}).get(event_type, len(rows))
-                clean_rows = [dict(event_row) for event_row in rows[-10:]]
+                clean_rows = [dict(event_row) for event_row in rows]
                 events_for_entity.append({
                     "event_type": event_type,
                     "totalCount": actual_count,
@@ -545,3 +681,4 @@ def generate_scenario(req: GenerateRequest):
         errors=state.errors,
         record_errors=state.record_errors,
     )
+	

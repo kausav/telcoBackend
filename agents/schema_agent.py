@@ -257,39 +257,43 @@ class SchemaAgent:
             if v.get("formula") and str(v.get("name")) not in formula_fields:
                 problems.append(f"variable '{v.get('name')}' has a formula but no formula_rules entry")
 
-        # Incomplete logic: a formula expression that doesn't parse, or that
-        # references a variable outside the declared schema. Only variable-declared
-        # formulas are authoritative and strictly checked here; formula_rules entries
-        # the LLM added on its own (with no matching variable.formula) are supplementary
-        # and already degrade gracefully downstream (QA skips an unevaluable formula
-        # instead of failing the record), so they are not a hard gate.
+        # Incomplete logic: malformed or drifting formula references should not halt
+        # CSV-first pipelines. Keep only parseable, schema-safe authoritative formulas.
         authoritative_fields = {str(v.get("name")) for v in variables if v.get("formula")}
+        valid_formula_rules: list[dict] = []
+        skipped_formula_messages: list[str] = []
         for item in rules.get("formula_rules", []) or []:
             if not isinstance(item, dict):
                 continue
             field = str(item.get("field", ""))
             if field not in authoritative_fields:
+                # Supplementary (LLM-only) formula rules are already best-effort.
+                valid_formula_rules.append(item)
                 continue
             expression = str(item.get("expression", ""))
             try:
                 tree = ast.parse(expression, mode="eval")
                 refs = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
             except SyntaxError as exc:
-                problems.append(f"formula for '{field}' is not a valid expression: {exc}")
+                skipped_formula_messages.append(f"formula for '{field}' skipped (invalid expression: {exc})")
                 continue
             allowed_names = {"round", "min", "max", "abs", "sum"}
-            # Client CSV convention: derived_timestamp formulas may use a symbolic
-            # delay name (for example notification_delay) while the actual delay
-            # distribution is declared in params.delay_seconds. The timestamp
-            # generator samples that delay directly, so the symbolic delay is not
-            # a schema variable and must not fail schema validation.
             variable_def = next((v for v in variables if str(v.get("name")) == field), None)
             if variable_def and str(variable_def.get("gen", "")).strip().lower() in {"derived_timestamp", "ts_offset"}:
                 if (variable_def.get("params") or {}).get("delay_seconds") is not None:
                     allowed_names.update(name for name in refs if name.endswith("_delay"))
             unknown = sorted(name for name in refs if name not in var_names and name not in allowed_names)
             if unknown:
-                problems.append(f"formula for '{field}' references undefined variable(s): {unknown}")
+                skipped_formula_messages.append(
+                    f"formula for '{field}' skipped (undefined variable(s): {unknown})"
+                )
+                continue
+            valid_formula_rules.append(item)
+
+        if skipped_formula_messages:
+            rules["formula_rules"] = valid_formula_rules
+            state.rules = rules
+            logger.warning("[SchemaAgent] %s", "; ".join(skipped_formula_messages))
 
         if problems:
             state.errors.append("Schema validation failed: " + "; ".join(problems))

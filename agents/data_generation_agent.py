@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import ast
+import re
 import random
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -59,23 +60,13 @@ def _boolean_semantic(value):
             return False
     return None
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ── Generator functions ────────────────────────────────────────────────────────
 
 def _prefixed_int(params: dict, _rec: dict) -> str:
-    return f"{params['prefix']}{random.randint(10**( params['digits']-1), 10**params['digits']-1)}"
+    prefix = str(params.get("prefix", ""))
+    digits = int(params.get("digits", 8) or 8)
+    number = random.randint(0, max(0, 10**digits - 1))
+    return f"{prefix}{str(number).zfill(digits)}"
 
 
 def _e164_phone(params: dict, _rec: dict) -> str:
@@ -116,23 +107,47 @@ def _weighted_choice(params: dict, _rec: dict):
 
 
 def _uniform(params: dict, _rec: dict) -> float:
+    precision = int(params.get("precision", 2) or 2)
     lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
     hi = _to_finite_float(params.get("max", params.get("hi")), lo)
     if lo is None:
         lo = 0.0
     if hi is None:
         hi = lo
-    return round(random.uniform(lo, max(lo, hi)), 2)
+    hi = max(lo, hi)
+    if precision > 0:
+        scale = 10 ** precision
+        lo_tick = int(math.ceil(lo * scale))
+        hi_tick = int(math.floor(hi * scale))
+        if hi_tick >= lo_tick:
+            tick = random.randint(lo_tick, hi_tick)
+            # Prefer non-integer decimal values when representable at this precision.
+            if hi_tick > lo_tick and tick % scale == 0:
+                if tick + 1 <= hi_tick:
+                    tick += 1
+                elif tick - 1 >= lo_tick:
+                    tick -= 1
+            return tick / scale
+    return round(float(random.uniform(lo, hi)), precision)
+
+
+def _uniform_int(params: dict, _rec: dict) -> int:
+    lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
+    hi = _to_finite_float(params.get("max", params.get("hi")), lo)
+    lo_int = int(round(lo if lo is not None else 0.0))
+    hi_int = int(round(hi if hi is not None else lo_int))
+    return random.randint(min(lo_int, hi_int), max(lo_int, hi_int))
 
 
 def _lognormal(params: dict, _rec: dict) -> float:
+    precision = int(params.get("precision", 2) or 2)
     mu = _to_finite_float(params.get("mu"), 0.0)
     sigma = _to_finite_float(params.get("sigma"), 1.0)
     lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
     hi = _to_finite_float(params.get("max", params.get("hi")), lo)
     raw = math.exp(random.gauss(mu if mu is not None else 0.0, sigma if sigma is not None else 1.0))
     clipped = max(lo if lo is not None else 0.0, min(hi if hi is not None else raw, raw))
-    return round(clipped, 2)
+    return round(float(clipped), precision)
 
 
 def _lognormal_int(params: dict, _rec: dict) -> int:
@@ -149,13 +164,14 @@ def _beta(params: dict, _rec: dict) -> float:
 
 
 def _segment_range(params: dict, rec: dict) -> float:
+    precision = int(params.get("precision", 4) or 4)
     controller = params.get("field") or params.get("segment_field") or ""
     key = rec.get(controller) if controller else None
     rng = params.get(key) if key in params else params.get("default")
     if not isinstance(rng, dict):
         numeric_ranges = [v for v in params.values() if isinstance(v, dict) and "min" in v and "max" in v]
         rng = numeric_ranges[0] if numeric_ranges else {"min": 0, "max": 1}
-    return round(random.uniform(float(rng.get("min", 0)), float(rng.get("max", 1))), 4)
+    return round(float(random.uniform(float(rng.get("min", 0)), float(rng.get("max", 1)))), precision)
 
 
 def _to_finite_float(value, default: float | None = None) -> float | None:
@@ -177,13 +193,14 @@ def _to_finite_float(value, default: float | None = None) -> float | None:
 
 
 def _uniform_bounded(params: dict, rec: dict) -> float:
+    precision = int(params.get("precision", 2) or 2)
     hi = _to_finite_float(rec.get(params.get("hi_field")), None)
     if hi is None:
         hi = _to_finite_float(params.get("hi", params.get("max")), 1.00)
     lo = _to_finite_float(params.get("lo", params.get("min")), 0.00)
     if lo is None:
         lo = 0.00
-    return round(random.uniform(lo, max(lo, hi)), 2)
+    return round(float(random.uniform(lo, max(lo, hi))), precision)
 
 
 def _recent_datetime(params: dict, _rec: dict) -> str:
@@ -217,11 +234,34 @@ def _date_offset(params: dict, rec: dict) -> str:
     return (base + timedelta(days=params["days"])).date().isoformat()
 
 
+def _date_offset_range(params: dict, rec: dict) -> str:
+    base_str = rec.get(params["base_field"], datetime.now(timezone.utc).isoformat())
+    base = _parse_dt(base_str)
+    min_days = int(params.get("min_days", 0))
+    max_days = int(params.get("max_days", min_days))
+    offset_days = random.randint(min(min_days, max_days), max(min_days, max_days))
+    return (base + timedelta(days=offset_days)).date().isoformat()
+
+
 def _id_mirror(params: dict, rec: dict) -> str:
     """Copy the numeric suffix from source_field and attach a new prefix."""
-    source = rec.get(params["source_field"], "")
-    number = source.replace(params["source_prefix"], "")
-    return f"{params['prefix']}{number}"
+    prefix = str(params.get("prefix", ""))
+    source_field = str(params.get("source_field", ""))
+    source_prefix = str(params.get("source_prefix", ""))
+    source = str(rec.get(source_field, "") or "")
+
+    # Prefer a trailing numeric suffix so dependent IDs stay aligned.
+    number = ""
+    match = re.search(r"(\d+)$", source)
+    if match:
+        number = match.group(1)
+    elif source_prefix and source.startswith(source_prefix):
+        number = source[len(source_prefix):]
+
+    if not number:
+        digits = int(params.get("digits", 8) or 8)
+        number = str(random.randint(0, max(0, 10**digits - 1))).zfill(digits)
+    return f"{prefix}{number}"
 
 
 def _prefixed_uuid(params: dict, _rec: dict) -> str:
@@ -238,15 +278,11 @@ def _tx_id(params: dict, rec: dict) -> str:
 
 
 def _formula(var: dict, rec: dict):
-    """Evaluate a simple arithmetic/field-reference formula safely."""
-    expr = var["formula"]
-    # Build a local namespace from the current record (numeric fields only)
-    ns = {k: v for k, v in rec.items() if isinstance(v, (int, float))}
-    ns["round"] = round
-    try:
-        return eval(expr, {"__builtins__": {}, "round": round, "min": min, "max": max}, ns)  # noqa: S307
-    except Exception:
+    """Evaluate a constrained formula language against the current record."""
+    expr = str(var.get("formula", "") or "").strip()
+    if not expr:
         return None
+    return _safe_formula(expr, rec)
 
 
 def _parse_dt(s: str) -> datetime:
@@ -267,6 +303,7 @@ _GENERATORS = {
     "constant":       lambda v, rec: _constant(v["params"], rec),
     "weighted_choice":lambda v, rec: _weighted_choice(v["params"], rec),
     "uniform":        lambda v, rec: _uniform(v["params"], rec),
+    "uniform_int":    lambda v, rec: _uniform_int(v["params"], rec),
     "lognormal":      lambda v, rec: _lognormal(v["params"], rec),
     "lognormal_int":  lambda v, rec: _lognormal_int(v["params"], rec),
     "beta":           lambda v, rec: _beta(v["params"], rec),
@@ -276,6 +313,7 @@ _GENERATORS = {
     "ts_offset":      lambda v, rec: _ts_offset(v["params"], rec),
     "ts_add_field":   lambda v, rec: _ts_add_field(v["params"], rec),
     "date_offset":    lambda v, rec: _date_offset(v["params"], rec),
+    "date_offset_range": lambda v, rec: _date_offset_range(v["params"], rec),
     "prefixed_uuid":  lambda v, rec: _prefixed_uuid(v["params"], rec),
     "tx_id":          lambda v, rec: _tx_id(v["params"], rec),
     "formula":        lambda v, rec: _formula(v, rec),
@@ -319,16 +357,68 @@ def _coerce_rule_values(value):
     return []
 
 
+def _declared_param_options(params: dict) -> list[Any]:
+    """Return authoritative value options declared in params, if any."""
+    if not isinstance(params, dict):
+        return []
+    choices = params.get("choices")
+    if isinstance(choices, list) and choices:
+        return list(choices)
+    values = params.get("values")
+    if isinstance(values, list) and values:
+        return list(values)
+    if values is not None and not isinstance(values, list):
+        return [values]
+    if "value" in params:
+        return [params.get("value")]
+    return []
+
+
+def _matches_declared_option(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, bool):
+        return _boolean_semantic(actual) is expected
+    if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+        actual_num = _to_finite_float(actual, None)
+        return actual_num is not None and math.isclose(actual_num, float(expected), rel_tol=1e-12, abs_tol=1e-12)
+    return _normalize(actual) == _normalize(expected)
+
+
 def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None):
     """Apply safe machine-readable SchemaAgent constraints to a generated value."""
     constraint = _rule_constraint_for(str(var.get("name", "")), rules)
-    if not constraint or value is None:
+    if value is None:
+        return value
+
+    params = var.get("params") if isinstance(var.get("params"), dict) else {}
+    dtype = str(var.get("dtype", "")).strip().lower()
+    precision = int(params.get("precision", 2) or 2)
+
+    # Params are authoritative: if explicit values are provided, do not emit
+    # anything outside that set. Preserve the original token/casing from params.
+    declared_options = _declared_param_options(params)
+    if declared_options:
+        for opt in declared_options:
+            if _matches_declared_option(value, opt):
+                return opt
+        return random.choice(declared_options)
+
+    if dtype in {"float", "decimal", "number", "numeric"} and isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = round(float(value), precision)
+
+    if not constraint:
+        return value
+
+    numeric_param_bounded = (
+        dtype in {"float", "decimal", "number", "numeric", "int", "integer"}
+        and any(k in params for k in ("min", "max", "lo", "hi"))
+    )
+    if numeric_param_bounded:
         return value
 
     allowed = _coerce_rule_values(constraint.get("preferred_values"))
     if not allowed:
         allowed = _coerce_rule_values(constraint.get("valid_values"))
-    if allowed:
+    if allowed and not numeric_param_bounded:
         # Match case/format while preserving the canonical value supplied by rules.
         norm = str(value).strip().lower().replace("-", "_").replace(" ", "_")
         matches = [x for x in allowed if str(x).strip().lower().replace("-", "_").replace(" ", "_") == norm]
@@ -445,12 +535,16 @@ def _formula_dependencies(expression: str) -> set[str]:
     try:
         tree = ast.parse(expression, mode="eval")
         return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
-                and node.id not in {"round", "min", "max", "abs", "sum"}}
+                and node.id not in {"round", "min", "max", "abs", "sum", "True", "False", "None"}}
     except Exception:
         return set()
 
 
-def _variable_dependency_order(variables: list[dict], selected_names: set[str] | None = None) -> tuple[list[dict], set[str]]:
+def _variable_dependency_order(
+    variables: list[dict],
+    selected_names: set[str] | None = None,
+    rules: dict | None = None,
+) -> tuple[list[dict], set[str]]:
     """Return variables in dependency order and identify dependency cycles.
 
     CSV dependencies may point forward.  A topological pass makes those definitions
@@ -464,7 +558,13 @@ def _variable_dependency_order(variables: list[dict], selected_names: set[str] |
     while changed:
         changed = False
         for name in tuple(selected):
-            for dep in by_name[name].get("depends_on", []) or []:
+            dep_names = list(by_name[name].get("depends_on", []) or [])
+            expr = by_name[name].get("formula") or _formula_from_rules(name, rules)
+            if expr:
+                for dep in _formula_dependencies(str(expr)):
+                    if dep not in dep_names:
+                        dep_names.append(dep)
+            for dep in dep_names:
                 if dep in by_name and dep not in selected:
                     selected.add(dep)
                     changed = True
@@ -472,7 +572,13 @@ def _variable_dependency_order(variables: list[dict], selected_names: set[str] |
     indegree = {name: 0 for name in selected}
     outgoing = {name: [] for name in selected}
     for name in selected:
-        for dep in by_name[name].get("depends_on", []) or []:
+        dep_names = list(by_name[name].get("depends_on", []) or [])
+        expr = by_name[name].get("formula") or _formula_from_rules(name, rules)
+        if expr:
+            for dep in _formula_dependencies(str(expr)):
+                if dep not in dep_names:
+                    dep_names.append(dep)
+        for dep in dep_names:
             if dep in selected:
                 indegree[name] += 1
                 outgoing[dep].append(name)
@@ -497,7 +603,8 @@ def _variable_dependency_order(variables: list[dict], selected_names: set[str] |
 def _generate_record(variables: list[dict], rules: dict | None = None) -> dict:
     """Generate one record in dependency order, while safely handling cycles."""
     rec: dict = {}
-    ordered, cyclic = _variable_dependency_order(variables)
+    ordered, cyclic = _variable_dependency_order(variables, rules=rules)
+    known_fields = {str(v.get("name")) for v in variables if v.get("name")}
     for var in ordered:
         gen_type = var["gen"]
         effective_var = var
@@ -505,6 +612,13 @@ def _generate_record(variables: list[dict], rules: dict | None = None) -> dict:
         # cycle, seed the cyclic field from its declared generator so the remaining
         # fields can still be generated and QA can evaluate any resolvable formulas.
         rule_formula = None if var["name"] in cyclic else (var.get("formula") or _formula_from_rules(var["name"], rules))
+        if rule_formula:
+            deps = _formula_dependencies(str(rule_formula))
+            available = known_fields | set(rec.keys())
+            if deps and any(dep not in available for dep in deps):
+                # Keep the declared generator when formula text references symbolic
+                # tokens that are not schema fields (common in human-readable CSVs).
+                rule_formula = None
         if rule_formula:
             effective_var = dict(var)
             effective_var["gen"] = "formula"
@@ -528,13 +642,19 @@ def _generate_selected_record(
 ) -> dict:
     """Generate selected variables plus dependencies in dependency order."""
     rec = dict(base or {})
-    ordered, cyclic = _variable_dependency_order(variables, selected_names)
+    ordered, cyclic = _variable_dependency_order(variables, selected_names, rules=rules)
+    known_fields = {str(v.get("name")) for v in variables if v.get("name")}
     for var in ordered:
         name = var["name"]
         if name in rec:
             continue
         effective_var = var
         rule_formula = None if name in cyclic else (var.get("formula") or _formula_from_rules(name, rules))
+        if rule_formula:
+            deps = _formula_dependencies(str(rule_formula))
+            available = known_fields | set(rec.keys())
+            if deps and any(dep not in available for dep in deps):
+                rule_formula = None
         if rule_formula:
             effective_var = dict(var)
             effective_var["gen"] = "formula"
@@ -553,30 +673,8 @@ def _generate_selected_record(
 # ── Transactional generation helpers ─────────────────────────────────────────
 
 # Publicly documented response behavior: at most 10 entities and 10 records/event/entity.
-MAX_RESPONSE_ENTITIES = 10
-MAX_EVENT_RECORDS = 10
-
-
 def _journey_id() -> str:
     return f"JRN-{uuid.uuid4().hex[:12].upper()}"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _transactional_records(
@@ -594,11 +692,10 @@ def _transactional_records(
         from types import SimpleNamespace
         events = (SimpleNamespace(event_type="BUSINESS_EVENT", sequence=1, fields=(), min_occurrences=1, max_occurrences=10),)
 
-    response_entity_count = min(journey_count, MAX_RESPONSE_ENTITIES)
     generated: list[dict] = []
     used_entity_keys: set[str] = set()
 
-    for entity_index in range(response_entity_count):
+    for entity_index in range(journey_count):
         try:
             entity_context = _generate_selected_record(
                 variables, set(compiled.entity_fields), rules=rules
@@ -632,8 +729,7 @@ def _transactional_records(
             occurrence_count = random.randint(event.min_occurrences, event.max_occurrences)
             if event_counts_out is not None:
                 event_counts_out[entity_value][event.event_type] = occurrence_count
-            start_occurrence = max(0, occurrence_count - MAX_EVENT_RECORDS)
-            for occurrence in range(start_occurrence, occurrence_count):
+            for occurrence in range(occurrence_count):
                 elapsed_seconds += random.randint(5, 300)
                 event_ts = base_ts + timedelta(seconds=elapsed_seconds)
                 try:
@@ -704,13 +800,20 @@ def _fill_missing(rec: dict, field_order: list, dtype_map: dict) -> tuple[dict, 
 def _safe_formula(expr: str, rec: dict):
     """Evaluate the same small arithmetic expression language used by the generator."""
     allowed_funcs = {"round": round, "min": min, "max": max, "abs": abs}
-    names = {k: v for k, v in rec.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    names = {
+        k: v
+        for k, v in rec.items()
+        if k != "__current_field__" and isinstance(v, (str, int, float, bool)) and v is not None
+    }
     try:
         tree = ast.parse(expr, mode="eval")
         allowed_nodes = (
             ast.Expression, ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult,
             ast.Div, ast.Mod, ast.Pow, ast.USub, ast.UAdd, ast.Constant,
             ast.Name, ast.Call, ast.Load, ast.Tuple, ast.List,
+            ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+            ast.BoolOp, ast.And, ast.Or, ast.Not,
+            ast.IfExp,
         )
         for node in ast.walk(tree):
             if not isinstance(node, allowed_nodes):
@@ -771,6 +874,7 @@ def _validate_record(
         value = rec[name]
         dtype = var.get("dtype", "string")
         params = var.get("params") or {}
+        precision = int(params.get("precision", 2) or 2)
         try:
             if dtype == "int" and not isinstance(value, bool) and not isinstance(value, int):
                 rec[name] = int(float(value)); issues.append(f"{name} coerced to int")
@@ -791,11 +895,20 @@ def _validate_record(
             rec[name] = _default_for_dtype(dtype)
             issues.append(f"{name} repaired from invalid type")
 
-        if dtype in {"categorical", "string"} and params.get("choices") and rec.get(name) is not None:
-            choices = list(params.get("choices") or [])
-            if choices and _normalize(rec[name]) not in {_normalize(c) for c in choices}:
-                rec[name] = choices[0]
-                issues.append(f"{name} corrected to declared schema choice")
+        if dtype in {"float", "decimal", "number", "numeric"} and isinstance(rec.get(name), (int, float)) and not isinstance(rec.get(name), bool):
+            rec[name] = round(float(rec[name]), precision)
+
+        declared_options = _declared_param_options(params)
+        if declared_options and rec.get(name) is not None:
+            if not any(_matches_declared_option(rec.get(name), opt) for opt in declared_options):
+                rec[name] = declared_options[0]
+                issues.append(f"{name} corrected to declared schema params")
+            else:
+                for opt in declared_options:
+                    if _matches_declared_option(rec.get(name), opt):
+                        if rec.get(name) != opt:
+                            rec[name] = opt
+                        break
 
         if isinstance(rec.get(name), (int, float)) and not isinstance(rec.get(name), bool):
             val = float(rec[name])
@@ -973,4 +1086,3 @@ class DataGenerationAgent:
             ],
         }
         return state
-
