@@ -400,6 +400,16 @@ def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None
         for opt in declared_options:
             if _matches_declared_option(value, opt):
                 return opt
+        # CSV choices are authoritative as the allowed set, while scenario-derived
+        # preferred_values select the semantically appropriate member of that set.
+        preferred = _coerce_rule_values(constraint.get("preferred_values")) if constraint else []
+        if preferred:
+            preferred_allowed = [
+                opt for opt in declared_options
+                if any(_matches_declared_option(opt, wanted) for wanted in preferred)
+            ]
+            if preferred_allowed:
+                return preferred_allowed[0]
         return random.choice(declared_options)
 
     if dtype in {"float", "decimal", "number", "numeric"} and isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -441,6 +451,22 @@ def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None
     except (TypeError, ValueError):
         pass
     return value
+
+
+def _apply_scenario_semantics(rec: dict, rules: dict | None) -> dict:
+    """Apply schema-driven scenario-type guardrails after generic generation."""
+    if not isinstance(rules, dict):
+        return rec
+    semantics = rules.get("scenario_semantics")
+    if not isinstance(semantics, dict):
+        return rec
+    for field in semantics.get("force_true_fields", []) or []:
+        if field in rec:
+            rec[field] = True
+    for field in semantics.get("force_false_fields", []) or []:
+        if field in rec:
+            rec[field] = False
+    return rec
 
 
 def _apply_conditional_rules(rec: dict, rules: dict | None) -> dict:
@@ -631,7 +657,8 @@ def _generate_record(variables: list[dict], rules: dict | None = None) -> dict:
         else:
             value = None
         rec[var["name"]] = _apply_generation_constraint(var, value, rec, rules)
-    return _apply_conditional_rules(rec, rules)
+    rec = _apply_conditional_rules(rec, rules)
+    return _apply_scenario_semantics(rec, rules)
 
 
 def _generate_selected_record(
@@ -667,7 +694,8 @@ def _generate_selected_record(
         else:
             value = None
         rec[name] = _apply_generation_constraint(var, value, rec, rules)
-    return _apply_conditional_rules(rec, rules)
+    rec = _apply_conditional_rules(rec, rules)
+    return _apply_scenario_semantics(rec, rules)
 
 
 # ── Transactional/user-history generation helpers ─────────────────────────────
@@ -941,6 +969,34 @@ def _validate_record(
                     else str(actual) != str(expected))
         if mismatch:
             rec[field] = expected; issues.append(f"{field} corrected from formula")
+
+    before_semantics = dict(rec)
+    rec = _apply_conditional_rules(rec, rules)
+    rec = _apply_scenario_semantics(rec, rules)
+    for name in rec:
+        if name in before_semantics and rec.get(name) != before_semantics.get(name):
+            issues.append(f"{name} corrected to scenario semantics")
+
+    # Re-validate authoritative formulas after semantic/conditional repairs.
+    for field, expr in _collect_formula_specs(variables, rules):
+        if field not in active_fields:
+            continue
+        field_def = variable_by_name.get(field) or {}
+        if str(field_def.get("gen", "")).strip().lower() in {"derived_timestamp", "ts_offset"}:
+            if (field_def.get("params") or {}).get("delay_seconds") is not None:
+                continue
+        deps = _formula_dependencies(expr)
+        if any(rec.get(dep) is None for dep in deps):
+            continue
+        expected = _safe_formula(expr, rec)
+        if expected is None:
+            continue
+        actual = rec.get(field)
+        mismatch = (not math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=0.01)
+                    if isinstance(expected, (int, float)) and isinstance(actual, (int, float))
+                    else str(actual) != str(expected))
+        if mismatch:
+            rec[field] = expected; issues.append(f"{field} re-corrected after scenario semantics")
 
     timestamp_field = next((name for name in ("record_timestamp", "transaction_timestamp", "timestamp", "created_at", "updated_at") if name in rec), None)
     base_ts = _qa_parse_dt(rec.get(timestamp_field)) if timestamp_field else None

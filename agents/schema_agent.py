@@ -23,6 +23,155 @@ from core.runtime_cache import get_schema, set_schema
 
 logger = logging.getLogger(__name__)
 
+
+def _scenario_semantics(state, variables: list[dict]) -> dict:
+    """Derive generic, deterministic semantic guardrails from the full scenario context.
+
+    This is intentionally not tied to any one scenario type or field name.  The
+    hierarchy is:
+      1) explicit CSV value/formula constraints remain authoritative;
+      2) explicit outcome language in expected_outcome/business_response/business_scenario
+         overrides generic scenario-type defaults;
+      3) scenario_type supplies a fallback intent (positive/negative/mixed);
+      4) field meaning comes from its name + description.
+
+    The LLM still supplies richer cross-field rules.  These deterministic directives
+    are a safety net so semantic contradictions cannot be introduced merely because
+    the field generator is stochastic or the LLM omitted a machine-readable rule.
+    """
+    import re
+
+    def clean(value: object) -> str:
+        return str(value or "").strip()
+
+    def norm(value: object) -> str:
+        return re.sub(r"\s+", " ", clean(value).lower())
+
+    scenario_type = clean(getattr(state, "scenario_type", ""))
+    context = getattr(state, "scenario_context", {}) or {}
+    pieces = {
+        "expected_outcome": clean(getattr(state, "expected_outcome", "") or context.get("expected_outcome")),
+        "business_response": clean(getattr(state, "business_response", "") or context.get("business_response")),
+        "business_scenario": clean(getattr(state, "business_scenario", "") or context.get("business_scenario")),
+        "use_case": clean(getattr(state, "use_case", "") or context.get("use_case")),
+        "domain": clean(getattr(state, "domain", "") or context.get("domain")),
+        "scenario_type": scenario_type,
+        "description": clean(context.get("description")),
+        "journey": clean(context.get("journey")),
+        "label": clean(context.get("label")),
+    }
+
+    positive_terms = {
+        "success", "successful", "succeed", "succeeded", "completed", "completion",
+        "approved", "approval", "accepted", "acceptance", "passed", "pass", "delivered",
+        "fulfilled", "settled", "authorized", "enabled", "active", "eligible", "retained",
+    }
+    negative_terms = {
+        "failure", "failed", "unsuccessful", "rejected", "rejection", "declined", "decline",
+        "error", "errored", "denied", "denial", "blocked", "expired", "cancelled", "canceled",
+        "abandoned", "churn", "churned", "ineligible", "unpaid", "unsatisfied",
+    }
+    mixed_terms = {
+        "mixed", "distribution", "rate", "ratio", "probability", "probabilities", "both",
+        "varied", "variation", "realistic", "real-world", "realistic mix", "success rate",
+        "failure rate", "exception rate", "conversion rate",
+    }
+
+    def term_score(text: str, terms: set[str]) -> int:
+        lowered = norm(text)
+        return sum(len(re.findall(rf"(?<![a-z]){re.escape(term)}(?![a-z])", lowered)) for term in terms)
+
+    # Outcome statements have higher authority than descriptive/context fields.
+    weighted = {
+        "expected_outcome": 6,
+        "business_response": 5,
+        "business_scenario": 4,
+        "use_case": 3,
+        "domain": 2,
+        "scenario_type": 2,
+        "description": 1,
+        "journey": 1,
+        "label": 1,
+    }
+    pos = neg = mixed = 0
+    for key, text in pieces.items():
+        w = weighted[key]
+        pos += w * term_score(text, positive_terms)
+        neg += w * term_score(text, negative_terms)
+        mixed += w * term_score(text, mixed_terms)
+
+    mode_norm = norm(scenario_type).replace("-", " ").replace("_", " ")
+    normal_modes = {"normal", "standard", "happy path", "success", "successful", "positive", "nominal"}
+    adverse_modes = {"failure", "failed", "negative", "adverse", "error", "exception"}
+    mixed_modes = {"mixed", "realistic", "distribution", "edge cases", "both"}
+
+    # Do not let words such as "success rate" by themselves force a single outcome.
+    outcome_mode = "mixed"
+    if mixed >= max(pos, neg) and mixed > 0:
+        outcome_mode = "mixed"
+    elif pos > 0 or neg > 0:
+        if pos > neg * 1.15:
+            outcome_mode = "positive"
+        elif neg > pos * 1.15:
+            outcome_mode = "negative"
+    elif mode_norm in normal_modes:
+        outcome_mode = "positive"
+    elif mode_norm in adverse_modes:
+        outcome_mode = "negative"
+    elif mode_norm in mixed_modes:
+        outcome_mode = "mixed"
+
+    force_true, force_false, preferred_values = [], [], {}
+    for var in variables:
+        name = clean(var.get("name"))
+        dtype = clean(var.get("dtype")).lower()
+        params = var.get("params") if isinstance(var.get("params"), dict) else {}
+        if not name or dtype not in {"boolean", "bool", "categorical", "string"}:
+            continue
+
+        # A literal CSV value is an explicit instruction and cannot be semantically overridden.
+        if params.get("value") is not None:
+            continue
+
+        field_text = norm(f"{name} {var.get('description', '')}")
+        success_like = any(t in field_text for t in positive_terms)
+        failure_like = any(t in field_text for t in negative_terms)
+        status_like = "status" in field_text or success_like or failure_like or "outcome" in field_text
+        if not status_like:
+            continue
+
+        choices = params.get("choices") if isinstance(params.get("choices"), list) else []
+        normalized_choices = {
+            re.sub(r"[^a-z0-9]+", "_", str(choice).strip().lower()).strip("_"): choice
+            for choice in choices
+        }
+
+        if dtype in {"boolean", "bool"} and success_like and not failure_like:
+            if outcome_mode == "positive":
+                force_true.append(name)
+            elif outcome_mode == "negative":
+                force_false.append(name)
+        elif dtype in {"categorical", "string"} and choices and outcome_mode in {"positive", "negative"}:
+            wanted = (
+                {"success", "successful", "completed", "complete", "approved", "accepted", "passed", "delivered", "fulfilled", "settled", "authorized", "active", "eligible", "retained"}
+                if outcome_mode == "positive"
+                else {"failure", "failed", "unsuccessful", "rejected", "declined", "error", "denied", "blocked", "expired", "cancelled", "canceled", "abandoned", "churned", "ineligible"}
+            )
+            for candidate in wanted:
+                if candidate in normalized_choices:
+                    preferred_values[name] = [normalized_choices[candidate]]
+                    break
+
+    return {
+        "mode": scenario_type or "unspecified",
+        "outcome_mode": outcome_mode,
+        "force_true_fields": force_true,
+        "force_false_fields": force_false,
+        "preferred_values": preferred_values,
+        "context_used": {k: v for k, v in pieces.items() if v},
+    }
+
+
 _SYSTEM = """
 You are the Schema Agent for a synthetic data generation pipeline covering any
 business industry (telecom, banking, retail, healthcare, etc.).
@@ -70,6 +219,21 @@ SEMANTIC ACCURACY IS MANDATORY:
 - Encode important state dependencies explicitly. Example: if a scenario states that
   transaction failure causes recharge failure, encode that as a machine-checkable
   conditional rule; do not leave the relationship only in prose.
+- SCENARIO SEMANTICS MUST COME FROM THE COMPLETE INPUT CONTEXT, NOT FROM ONE FIELD.
+  Consider scenarioType together with businessScenario, businessResponse, expectedOutcome,
+  useCase, domain, industry, country, scenario description/journey, and the CSV variable
+  definitions. When these inputs clearly require a positive, negative, exceptional, or mixed
+  outcome, encode that intent as machine-checkable rules.
+- Do not assume every "Normal" scenario is necessarily successful, and do not assume every
+  non-Normal scenario is a failure. Explicit business intent and expectedOutcome take precedence.
+- Boolean/status fields must reflect the inferred business outcome. If the context clearly requires
+  success/completion/approval/acceptance, corresponding outcome booleans should be true; if it
+  clearly requires failure/rejection/decline/error, they should be false. For mixed/distribution
+  scenarios, preserve the declared distribution instead of forcing one outcome.
+- CSV literal values/formulas remain authoritative. CSV categorical choices define the allowed set;
+  semantic rules may choose the appropriate value from that set, but may not invent values outside it.
+- Never create a mathematically or semantically inconsistent state because fields were generated
+  independently. When an outcome controls another field, encode and enforce the dependency deterministically.
 """
 
 
@@ -224,6 +388,18 @@ class SchemaAgent:
                     continue
                 normalized_conditional.append({"when": {str(k): v for k, v in when.items()}, "then": {str(k): v for k, v in then.items()}})
         rules["conditional_rules"] = normalized_conditional
+
+        # Deterministic scenario-type semantics complement the LLM output.
+        semantics = _scenario_semantics(state, VARS)
+        rules["scenario_semantics"] = semantics
+        for field, preferred in semantics.get("preferred_values", {}).items():
+            gc = generation_constraints.get(field)
+            if not isinstance(gc, dict):
+                gc = {}
+            if preferred and "preferred_values" not in gc:
+                gc["preferred_values"] = preferred
+            generation_constraints[field] = gc
+        rules["generation_constraints"] = generation_constraints
 
         set_schema(cache_key, rules)
         state.rules = rules
