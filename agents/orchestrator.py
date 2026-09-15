@@ -23,9 +23,11 @@ _SYSTEM = """
 You are the Orchestrator Agent for a synthetic data generation pipeline covering
 any business industry (telecom, banking, retail, healthcare, etc.).
 You run AFTER the CSV scenario definition has been imported and confirmed. Gatekeep the
-CSV-defined variable data against the
-target industry's and country's real-world conventions (product/plan types,
-regulator, market character) and return a JSON object with:
+CSV-defined variable data against the target industry's and country's real-world conventions
+and the full CSV contract. The CSV fields, descriptions, params, dependencies, and formulas
+Include any declared timestamp_format/format exactly; timestamps are presentation constraints as well as semantic fields.
+are authoritative. Do not recommend or imply values outside explicit params choices/values,
+numeric ranges, buckets/weights, precision, currency, timezone, or formulas. Return a JSON object with:
   - "valid": bool
   - "reason": str  (empty string when valid)
   - "execution_notes": str
@@ -107,7 +109,16 @@ class OrchestratorAgent:
         sc = resolve_scenario_meta(state.scenario)
         profile = get_profile(state.industry, state.country)
         variable_summary = [
-            {"name": v.get("name"), "dtype": v.get("dtype"), "gen": v.get("gen")}
+            {
+                "name": v.get("name"),
+                "dtype": v.get("dtype"),
+                "description": v.get("description", ""),
+                "gen": v.get("gen"),
+                "params": v.get("params", {}),
+                "depends_on": v.get("depends_on", []),
+                "formula": v.get("formula", ""),
+                "nullable": v.get("nullable", False),
+            }
             for v in self._variables
         ]
         prompt = (

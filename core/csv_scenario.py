@@ -33,13 +33,102 @@ ALLOWED_DTYPES = {
 _TRUE_STRINGS = {"true", "1", "yes", "y"}
 
 
+def _strip_brackets(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] in "[(" and text[-1] in "])":
+        return text[1:-1].strip()
+    return text
+
+
 def _split_list(value: str) -> list[str]:
     """Split client choice/list encodings across common delimiters.
 
-    Supports comma, pipe, and semicolon separated values.  This is intentionally
-    used only for list-valued parameters after key/value parsing has happened.
+    Supports plain lists (``A,B;C``), bracketed lists (``[A, B, C]``), and
+    whitespace-separated values inside brackets.  Commas/semicolons remain the
+    preferred delimiters for values that themselves contain spaces.
     """
-    return [x.strip() for x in re.split(r"[;|,]", value or "") if x.strip()]
+    text = _strip_brackets(value)
+    if not text:
+        return []
+    parts = re.split(r"[;|,]", text)
+    out: list[str] = []
+    for part in parts:
+        item = part.strip()
+        if not item:
+            continue
+        # Inside bracket syntax, a simple whitespace-delimited run is also a
+        # valid compact list (e.g. ``[0.1 0.45 0.30]``).
+        if re.fullmatch(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?(?:\s+[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)+", item):
+            out.extend(x for x in item.split() if x)
+        else:
+            out.append(item)
+    return out
+
+
+def _parse_bracketed_groups(value: str) -> list[str]:
+    """Parse bracketed comma-delimited groups while preserving spaces in groups."""
+    text = _strip_brackets(value)
+    return [x.strip() for x in re.split(r",|;|\|", text) if x.strip()]
+
+
+def _parse_weight_values(value: Any) -> list[float]:
+    """Parse flexible weight syntax, including the client's ``0.1 5`` typo/export form.
+
+    A token such as ``0.1 5`` is interpreted as ``0.15`` when it occurs as one
+    comma-delimited weight item. This makes spreadsheet-style exports robust
+    without changing normal whitespace/comma separated weight lists.
+    """
+    if isinstance(value, (list, tuple)):
+        raw = [str(x).strip() for x in value]
+    else:
+        raw = _parse_bracketed_groups(str(value))
+    result: list[float] = []
+    for item in raw:
+        token = item.strip()
+        try:
+            result.append(float(token))
+            continue
+        except ValueError:
+            pass
+        nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", token)
+        if len(nums) == 2 and re.search(r"\s", token):
+            candidate = nums[0] + nums[1] if "." in nums[0] else nums[0] + "." + nums[1]
+            try:
+                result.append(float(candidate))
+                continue
+            except ValueError:
+                pass
+        # Fall back to whitespace splitting for conventional compact weights.
+        for part in token.split():
+            result.append(float(part))
+    return result
+
+
+def _parse_bucket_specs(value: Any) -> list[tuple[float, float]]:
+    """Parse weighted numeric bucket ranges from client-friendly CSV syntax."""
+    if isinstance(value, (list, tuple)):
+        groups = [str(x).strip() for x in value]
+    else:
+        groups = _parse_bracketed_groups(str(value))
+    buckets: list[tuple[float, float]] = []
+    for group in groups:
+        rng = _range_from_text(group)
+        if rng is not None:
+            lo, hi = rng
+            buckets.append((float(min(lo, hi)), float(max(lo, hi))))
+            continue
+        # Spreadsheet/CSV exports sometimes collapse ``1000-2999`` into
+        # ``10002999``. Split an even-length ascending digit token in half.
+        token = group.strip()
+        if re.fullmatch(r"\d{4}|\d{6}|\d{8}|\d{10}|\d{12}", token) and len(token) % 2 == 0:
+            half = len(token) // 2
+            left, right = token[:half], token[half:]
+            lo, hi = int(left), int(right)
+            if lo <= hi:
+                buckets.append((float(lo), float(hi)))
+                continue
+        raise ValueError(f"Invalid bucket range '{group}'. Use forms such as 0-250 or 1000-2999.")
+    return buckets
 
 
 def _parse_scalar(value: str) -> Any:
@@ -108,14 +197,22 @@ def _parse_params(raw: str, row_number: int, name: str) -> dict[str, Any]:
     for key in ("choices", "values", "country_codes"):
         if isinstance(params.get(key), str):
             params[key] = _split_list(str(params[key]))
-    if isinstance(params.get("weights"), str):
-        raw_weights = _split_list(str(params["weights"]))
+    if "weights" in params:
         try:
-            params["weights"] = [float(x) for x in raw_weights]
-        except Exception:
-            # Keep malformed weights from making import fail; generator will
-            # fall back to uniform choice probabilities.
-            params.pop("weights", None)
+            params["weights"] = _parse_weight_values(params["weights"])
+        except Exception as exc:
+            raise ValueError(f"Row {row_number} ('{name}'): invalid weights: {exc}") from exc
+
+    if "buckets" in params:
+        try:
+            params["buckets"] = _parse_bucket_specs(params["buckets"])
+        except Exception as exc:
+            raise ValueError(f"Row {row_number} ('{name}'): invalid buckets: {exc}") from exc
+
+    # Timestamp presentation is explicit configuration.  Keep the original
+    # client token so the generator can render exactly the requested style.
+    if "format" in params and "timestamp_format" not in params:
+        params["timestamp_format"] = params["format"]
 
     # Numeric parameters are normalized eagerly where unambiguous.
     for key in ("min", "max", "lo", "hi", "precision", "length", "days_back",
@@ -462,6 +559,11 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
             return "id_mirror", {**p, "source_field": source_field}
         return "prefixed_uuid", {"prefix": "REF-"}
 
+    # Client-facing bucket distributions: choose a bucket using weights, then
+    # sample a numeric value inside the selected inclusive range.
+    if "buckets" in p:
+        return "weighted_bucket", p
+
     if g in {"choice", "weighted_choice"}:
         if formula:
             coerced = _coerce_formula_text(formula)
@@ -529,6 +631,11 @@ def _normalize_generator(gen: str, params: dict[str, Any], depends_on: list[str]
         if formula:
             return "formula", p
         return "uniform", p
+
+    if g in {"constant", "const", "fixed", "literal"}:
+        if "value" in p:
+            return "constant", {"value": p.get("value")}
+        return "constant", {"value": p.get("default", "")}
 
     if g == "fixed_config":
         if "default" in p:
@@ -1076,7 +1183,7 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
         "dependent_range","derived_distribution","derived_timestamp","derived","datetime",
         "synthetic_event","configuration","derived_state","derived_event","categorical","category",
         "string","text","object","varchar","int","integer","float","decimal","number","numeric",
-        "bool","boolean","date",
+        "bool","boolean","date","weighted_bucket",
     }
 
     variables=[]; field_order=[]; variable_by_name={}; all_names=set()
@@ -1120,6 +1227,8 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
         if not gen_raw:
             if formula:
                 gen_raw = "derived"
+            elif "buckets" in params:
+                gen_raw = "weighted_bucket"
             elif "choices" in params or "values" in params:
                 gen_raw = "choice"
             elif "value" in params:

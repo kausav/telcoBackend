@@ -1,5 +1,5 @@
 """
-Agent 4 — Data Generation Agent
+Agent 3 — Data Generation Agent
 Generates records purely algorithmically (no LLM call per record), then
 validates them through an internal QA layer. Implemented as a 2-node
 LangGraph subgraph: generate -> qa_validate.
@@ -34,10 +34,14 @@ _NUMERIC_DTYPES = {"int", "integer", "float", "decimal", "number", "numeric"}
 # constants are only used when QA_LLM_MODE=full is explicitly enabled.
 _CHUNK = max(1, int(os.getenv("QA_LLM_CHUNK_SIZE", "10")))
 _QA_SYSTEM = """You are the final QA validator for generated synthetic data.
-Validate each supplied record against the CSV-defined schema and the supplied
-business/cross-field rules. Preserve valid values, repair only clear deterministic
-violations when possible, and do not invent fields that are not in the schema.
-Return JSON with keys: valid_records, dropped_records, fixes_applied, issues_found.
+Validate each supplied record against the FULL confirmed CSV contract and supplied
+business/cross-field rules. The CSV is authoritative. Preserve every declared literal
+choice/value, numeric min/max, bucket interval, weight distribution, precision, currency,
+date/time semantics, dependency, and formula. Never invent a category or normalize a value
+into a synonym not declared by params. Field descriptions are semantic constraints and must
+not be contradicted. Preserve valid values, repair only clear deterministic violations, and
+do not invent fields that are not in the schema. Return JSON with keys: valid_records,
+dropped_records, fixes_applied, issues_found.
 
 Schema/business rules:
 {rules}
@@ -197,6 +201,39 @@ def _weighted_choice(params: dict, _rec: dict):
     return random.choices(choices, weights=weights, k=1)[0]
 
 
+def _weighted_bucket(params: dict, _rec: dict):
+    """Choose a numeric bucket by weight, then sample within that bucket."""
+    buckets = params.get("buckets") or []
+    if not buckets:
+        return None
+    normalized: list[tuple[float, float]] = []
+    for bucket in buckets:
+        try:
+            lo, hi = bucket
+            normalized.append((float(min(lo, hi)), float(max(lo, hi))))
+        except (TypeError, ValueError):
+            continue
+    if not normalized:
+        return None
+    weights = params.get("weights") or []
+    try:
+        weights = [float(w) for w in weights]
+    except (TypeError, ValueError):
+        weights = []
+    if len(weights) != len(normalized) or any((not math.isfinite(w) or w < 0) for w in weights) or sum(weights) <= 0:
+        weights = [1.0] * len(normalized)
+    lo, hi = random.choices(normalized, weights=weights, k=1)[0]
+    precision = int(params.get("precision", 2) or 0)
+    if precision > 0:
+        scale = 10 ** precision
+        lo_tick = int(math.ceil(lo * scale))
+        hi_tick = int(math.floor(hi * scale))
+        if hi_tick < lo_tick:
+            return round(lo, precision)
+        return random.randint(lo_tick, hi_tick) / scale
+    return random.randint(int(math.ceil(lo)), int(math.floor(hi))) if lo.is_integer() and hi.is_integer() else random.uniform(lo, hi)
+
+
 def _uniform(params: dict, _rec: dict) -> float:
     precision = int(params.get("precision", 2) or 2)
     lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
@@ -310,21 +347,21 @@ def _recent_datetime(params: dict, _rec: dict) -> str:
         minutes=random.randint(0, 59),
         seconds=random.randint(0, 59),
     )
-    return base.isoformat()
+    return _format_datetime(base, params)
 
 
 def _ts_offset(params: dict, rec: dict) -> str:
     base_str = rec.get(params["base_field"], datetime.now(timezone.utc).isoformat())
     base = _parse_dt(base_str)
     offset = timedelta(seconds=random.randint(params["min_sec"], params["max_sec"]))
-    return (base + offset).isoformat()
+    return _format_datetime(base + offset, params)
 
 
 def _ts_add_field(params: dict, rec: dict) -> str:
     base_str = rec.get(params["base_field"], datetime.now(timezone.utc).isoformat())
     base = _parse_dt(base_str)
     seconds = int(rec.get(params["add_seconds_field"], 60))
-    return (base + timedelta(seconds=seconds)).isoformat()
+    return _format_datetime(base + timedelta(seconds=seconds), params)
 
 
 def _date_offset(params: dict, rec: dict) -> str:
@@ -384,13 +421,91 @@ def _formula(var: dict, rec: dict):
     return _safe_formula(expr, rec)
 
 
-def _parse_dt(s: str) -> datetime:
-    """Parse ISO-8601 string to timezone-aware datetime."""
-    s = s.replace("Z", "+00:00")
+DEFAULT_TIMESTAMP_FORMAT = "%d/%m/%Y %I:%M %p"
+
+_TIMESTAMP_FORMAT_ALIASES = {
+    "dd/mm/yyyy hh:mm a": DEFAULT_TIMESTAMP_FORMAT,
+    "dd/mm/yyyy hh:mm am/pm": DEFAULT_TIMESTAMP_FORMAT,
+    "dd/mm/yyyy hh:mm:ss a": "%d/%m/%Y %I:%M:%S %p",
+    "yyyy-mm-dd hh:mm:ss": "%Y-%m-%d %H:%M:%S",
+    "yyyy-mm-dd hh:mm": "%Y-%m-%d %H:%M",
+    "iso": "ISO",
+    "iso-8601": "ISO",
+}
+
+def _normalize_timestamp_format(params: dict | None = None) -> str:
+    params = params if isinstance(params, dict) else {}
+    raw = params.get("timestamp_format", params.get("format"))
+    if raw is None or not str(raw).strip():
+        return DEFAULT_TIMESTAMP_FORMAT
+    text = str(raw).strip()
+    # Match both exact strftime tokens and client-friendly case-insensitive aliases.
+    if text in {"ISO", "ISO-8601"}:
+        return "ISO"
+    return _TIMESTAMP_FORMAT_ALIASES.get(text.lower(), text)
+
+
+def _parse_timestamp_text(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    iso_text = text.replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(s)
+        return datetime.fromisoformat(iso_text)
     except Exception:
+        pass
+    for fmt in (
+        DEFAULT_TIMESTAMP_FORMAT,
+        "%d/%m/%Y %I:%M:%S %p",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%Y/%m/%d %I:%M %p",
+        "%m/%d/%Y %I:%M %p",
+    ):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+def _format_datetime(dt: datetime, params: dict | None = None) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    fmt = _normalize_timestamp_format(params)
+    if fmt.upper() in {"ISO", "ISO-8601"}:
+        return dt.isoformat()
+    try:
+        return dt.strftime(fmt)
+    except (TypeError, ValueError):
+        return dt.strftime(DEFAULT_TIMESTAMP_FORMAT)
+
+def _format_datetime_fields(rec: dict, variables: list[dict]) -> dict:
+    """Serialize all datetime fields according to their CSV-declared format.
+
+    Generation and formula evaluation may use real datetime objects internally;
+    this helper is the single deterministic boundary that converts them to the
+    client-facing representation for both raw_records and final_records.
+    """
+    out = dict(rec)
+    for var in variables:
+        name = str(var.get("name", ""))
+        if not name or name not in out or out.get(name) is None:
+            continue
+        if str(var.get("dtype", "")).strip().lower() != "datetime":
+            continue
+        dt = _qa_parse_dt(out.get(name))
+        if dt is not None:
+            out[name] = _format_datetime(dt, var.get("params") or {})
+    return out
+
+def _parse_dt(s: str) -> datetime:
+    """Parse ISO-8601 and common human-readable timestamps to timezone-aware datetime."""
+    parsed = _parse_timestamp_text(str(s))
+    if parsed is None:
         return datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 # ── Dispatch table ─────────────────────────────────────────────────────────────
@@ -401,6 +516,7 @@ _GENERATORS = {
     "e164_phone":     lambda v, rec: _e164_phone(v["params"], rec),
     "constant":       lambda v, rec: _constant(v["params"], rec),
     "weighted_choice":lambda v, rec: _weighted_choice(v["params"], rec),
+    "weighted_bucket":lambda v, rec: _weighted_bucket(v["params"], rec),
     "uniform":        lambda v, rec: _uniform(v["params"], rec),
     "uniform_int":    lambda v, rec: _uniform_int(v["params"], rec),
     "lognormal":      lambda v, rec: _lognormal(v["params"], rec),
@@ -786,7 +902,10 @@ def _generate_record(variables: list[dict], rules: dict | None = None) -> dict:
             value = None
         rec[var["name"]] = _apply_generation_constraint(var, value, rec, rules)
     rec = _apply_conditional_rules(rec, rules)
-    return _apply_scenario_semantics(rec, rules)
+    rec = _apply_scenario_semantics(rec, rules)
+    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+    rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
+    return _format_datetime_fields(rec, variables)
 
 
 def _generate_selected_record(
@@ -833,7 +952,10 @@ def _generate_selected_record(
             pass
         rec[name] = _apply_generation_constraint(var, value, rec, rules)
     rec = _apply_conditional_rules(rec, rules)
-    return _apply_scenario_semantics(rec, rules)
+    rec = _apply_scenario_semantics(rec, rules)
+    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+    rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
+    return _format_datetime_fields(rec, variables)
 
 
 # ── Transactional/user-history generation helpers ─────────────────────────────
@@ -932,9 +1054,8 @@ def _qa_parse_dt(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         dt = value
     elif isinstance(value, str):
-        try:
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except Exception:
+        dt = _parse_timestamp_text(value)
+        if dt is None:
             return None
     else:
         return None
@@ -975,7 +1096,7 @@ def _safe_formula(expr: str, rec: dict):
             continue
         if isinstance(v, str):
             parsed = _qa_parse_dt(v)
-            names[k] = parsed if parsed is not None and ("T" in v or "+" in v or v.endswith("Z")) else v
+            names[k] = parsed if parsed is not None else v
         else:
             names[k] = v
     try:
@@ -1028,6 +1149,122 @@ def _collect_formula_specs(variables: list[dict], rules: dict | None) -> list[tu
             specs.append((field, str(expr)))
             seen.add(field)
     return specs
+
+
+def _declared_numeric_bounds(params: dict) -> tuple[float | None, float | None]:
+    lo = _to_finite_float(params.get("min", params.get("lo")), None)
+    hi = _to_finite_float(params.get("max", params.get("hi")), None)
+    return lo, hi
+
+
+def _numeric_in_bucket(value: Any, bucket: tuple[float, float], precision: int = 2) -> bool:
+    number = _to_finite_float(value, None)
+    if number is None:
+        return False
+    lo, hi = bucket
+    # Compare at the schema's declared precision so decimal serialization does not
+    # create false negatives at exact bucket edges.
+    rounded = round(number, precision)
+    return rounded >= round(float(lo), precision) and rounded <= round(float(hi), precision)
+
+
+def _enforce_authoritative_formulas(
+    rec: dict, variables: list[dict], rules: dict | None = None
+) -> tuple[dict, list[str]]:
+    """Recalculate explicit CSV formulas after semantic/conditional mutations."""
+    rec = dict(rec)
+    issues: list[str] = []
+    variable_by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    for field, expr in _collect_formula_specs(variables, rules):
+        if field not in rec:
+            continue
+        field_def = variable_by_name.get(field) or {}
+        if str(field_def.get("gen", "")).strip().lower() in {"derived_timestamp", "ts_offset"}:
+            if (field_def.get("params") or {}).get("delay_seconds") is not None:
+                continue
+        deps = _formula_dependencies(expr)
+        if any(rec.get(dep) is None for dep in deps):
+            continue
+        expected = _safe_formula(expr, rec)
+        if expected is None:
+            continue
+        actual = rec.get(field)
+        if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+            mismatch = not math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=0.01)
+        else:
+            mismatch = str(actual) != str(expected)
+        if mismatch:
+            rec[field] = expected
+            issues.append(f"{field} recalculated from authoritative CSV formula")
+    return rec, issues
+
+
+def _enforce_csv_contract(
+    rec: dict, variables: list[dict], rules: dict | None = None, repair: bool = True
+) -> tuple[dict, list[str]]:
+    """Apply the confirmed CSV contract after *all* semantic mutations.
+
+    CSV params are hard constraints. Gemini/business rules can only select among
+    declared values; they can never introduce a new categorical value, leave a
+    numeric field outside declared bounds/buckets, or change declared precision.
+    """
+    rec = dict(rec)
+    issues: list[str] = []
+    for var in variables:
+        name = str(var.get("name", ""))
+        if not name or name not in rec or rec.get(name) is None:
+            continue
+        params = var.get("params") if isinstance(var.get("params"), dict) else {}
+        dtype = str(var.get("dtype", "")).strip().lower()
+        value = rec.get(name)
+
+        declared = _declared_param_options(params)
+        if declared and not any(_matches_declared_option(value, opt) for opt in declared):
+            if not repair:
+                continue
+            # Prefer a semantic preference only when it is inside the declared set.
+            constraint = _rule_constraint_for(name, rules)
+            preferred = _coerce_rule_values(constraint.get("preferred_values"))
+            selected = next((opt for opt in declared if any(_matches_declared_option(opt, p) for p in preferred)), None)
+            rec[name] = selected if selected is not None else declared[0]
+            value = rec[name]
+            issues.append(f"{name} restored to declared CSV value")
+
+        precision_raw = params.get("precision")
+        if precision_raw is not None and dtype in _NUMERIC_DTYPES and isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                precision = max(0, int(precision_raw))
+                rounded = round(float(value), precision)
+                if rounded != value:
+                    rec[name] = rounded
+                    value = rounded
+                    issues.append(f"{name} rounded to declared precision={precision}")
+            except (TypeError, ValueError):
+                pass
+
+        buckets = params.get("buckets")
+        if buckets and dtype in _NUMERIC_DTYPES:
+            try:
+                precision = int(params.get("precision", 2) or 0)
+                if not any(_numeric_in_bucket(value, (float(b[0]), float(b[1])), precision) for b in buckets):
+                    # Re-sample from the declared bucket distribution rather than
+                    # clamping into an arbitrary bucket. This preserves both range
+                    # membership and the requested probability model.
+                    rec[name] = _weighted_bucket(params, rec)
+                    value = rec[name]
+                    issues.append(f"{name} regenerated inside declared bucket distribution")
+            except Exception:
+                pass
+
+        lo, hi = _declared_numeric_bounds(params)
+        if dtype in _NUMERIC_DTYPES and isinstance(value, (int, float)) and not isinstance(value, bool):
+            if lo is not None and float(value) < lo and repair:
+                rec[name] = lo if dtype in {"float", "decimal", "number", "numeric"} else int(math.ceil(lo))
+                issues.append(f"{name} raised to declared minimum")
+            if hi is not None and float(rec[name]) > hi and repair:
+                rec[name] = hi if dtype in {"float", "decimal", "number", "numeric"} else int(math.floor(hi))
+                issues.append(f"{name} lowered to declared maximum")
+    return rec, issues
 
 
 def _validate_record(
@@ -1085,7 +1322,7 @@ def _validate_record(
                 else: raise ValueError("invalid boolean")
                 issues.append(f"{name} coerced to boolean")
             elif dtype == "datetime" and _qa_parse_dt(value) is None:
-                rec[name] = datetime.now(timezone.utc).isoformat(); issues.append(f"{name} repaired as datetime")
+                rec[name] = _format_datetime(datetime.now(timezone.utc), params); issues.append(f"{name} repaired as datetime")
             elif dtype == "date":
                 try: date.fromisoformat(str(value)[:10])
                 except Exception: rec[name] = date.today().isoformat(); issues.append(f"{name} repaired as date")
@@ -1165,7 +1402,12 @@ def _validate_record(
         if name in before_semantics and rec.get(name) != before_semantics.get(name):
             issues.append(f"{name} corrected to scenario semantics")
 
-    # Re-validate authoritative formulas after semantic/conditional repairs.
+    # CSV is the final authority after every semantic mutation. This prevents an
+    # LLM-derived conditional rule from reintroducing a value not declared by params.
+    rec, contract_issues = _enforce_csv_contract(rec, variables, rules=rules)
+    issues.extend(contract_issues)
+
+    # Re-validate authoritative formulas after semantic/conditional repairs and CSV contract enforcement.
     for field, expr in _collect_formula_specs(variables, rules):
         if field not in active_fields:
             continue
@@ -1186,14 +1428,28 @@ def _validate_record(
         if mismatch:
             rec[field] = expected; issues.append(f"{field} re-corrected after scenario semantics")
 
+    # Final contract pass guarantees both raw-style deterministic generation and final QA
+    # output satisfy the confirmed CSV params after formula corrections.
+    rec, final_contract_issues = _enforce_csv_contract(rec, variables, rules=rules)
+    issues.extend(final_contract_issues)
+
     timestamp_field = next((name for name in ("record_timestamp", "transaction_timestamp", "timestamp", "created_at", "updated_at") if name in rec), None)
     base_ts = _qa_parse_dt(rec.get(timestamp_field)) if timestamp_field else None
     dispatch_ts = _qa_parse_dt(rec.get("notification_dispatch_ts"))
     response_ts = _qa_parse_dt(rec.get("customer_response_ts"))
     if base_ts and dispatch_ts and dispatch_ts < base_ts:
-        rec["notification_dispatch_ts"] = base_ts.isoformat(); issues.append("notification_dispatch_ts corrected")
+        dispatch_var = next((v for v in variables if str(v.get("name")) == "notification_dispatch_ts"), {})
+        rec["notification_dispatch_ts"] = _format_datetime(base_ts, dispatch_var.get("params") or {})
+        issues.append("notification_dispatch_ts corrected")
     if dispatch_ts and response_ts and response_ts < dispatch_ts:
-        rec["customer_response_ts"] = dispatch_ts.isoformat(); issues.append("customer_response_ts corrected")
+        response_var = next((v for v in variables if str(v.get("name")) == "customer_response_ts"), {})
+        rec["customer_response_ts"] = _format_datetime(dispatch_ts, response_var.get("params") or {})
+        issues.append("customer_response_ts corrected")
+
+    # Presentation format is a deterministic CSV concern, not an LLM concern.
+    # Internally timestamps are parsed as real datetimes for formulas/comparisons;
+    # the record returned to callers uses each field's declared timestamp_format.
+    rec = _format_datetime_fields(rec, variables)
 
     allowed = set(field_order)
     return {k: v for k, v in rec.items() if k in allowed}, issues
@@ -1274,10 +1530,19 @@ class DataGenerationAgent:
         dropped_all: list[dict] = []
         if qa_mode == "full" and checked:
             valid_all: list[dict] = []
+            dyn_variables = variables
+            schema_contract = json.dumps([
+                {
+                    "name": v.get("name"), "dtype": v.get("dtype"),
+                    "description": v.get("description", ""), "params": v.get("params", {}),
+                    "depends_on": v.get("depends_on", []), "formula": v.get("formula", ""),
+                    "nullable": v.get("nullable", False),
+                } for v in dyn_variables
+            ], default=str, sort_keys=True)
             system_prompt = _QA_SYSTEM.format(
                 rules="\n".join(f"- {r}" for r in state.rules.get("business_rules", [])) or "Apply the supplied CSV schema and deterministic checks.",
                 cross_field_rules="\n".join(f"- {r}" for r in state.rules.get("cross_field_rules", [])) or "Validate declared mathematical, temporal, and business relationships.",
-            )
+            ) + f"\n\nFULL CSV SCHEMA CONTRACT (authoritative):\n{schema_contract}\n"
             for i in range(0, len(checked), _CHUNK):
                 chunk = checked[i:i + _CHUNK]
                 try:
@@ -1300,6 +1565,23 @@ class DataGenerationAgent:
                     state.errors.append(f"QA chunk {i} error: {exc}")
                     valid_all.extend(chunk)
             checked = valid_all
+
+        # Never trust an LLM QA response as the final authority. Re-run the complete
+        # deterministic CSV/formula contract after any LLM repair so final_records are
+        # guaranteed to remain inside the confirmed schema.
+        if checked:
+            deterministic_final: list[dict] = []
+            for record_index, record in enumerate(checked):
+                try:
+                    repaired, final_issues = _validate_record(
+                        record, variables, state.field_order, transactional, rules=state.rules
+                    )
+                    algo_fixed += len(final_issues)
+                    deterministic_final.append(repaired)
+                except Exception as exc:
+                    state.record_errors.append({"record_index": record_index, "error": str(exc), "record": dict(record)})
+                    logger.warning("[QA-final] Rejecting record %d after deterministic recheck: %s", record_index, exc)
+            checked = deterministic_final
 
         state.final_records = checked
         state.validation_report = {

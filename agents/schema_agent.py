@@ -187,7 +187,7 @@ Return a JSON object with:
   - "cross_field_rules": [str] — human-readable mathematical / temporal dependencies between fields
   - "conditional_rules": [{"when": {field: value}, "then": {field: value_or_list}}] — executable cross-field business relationships. Use exact field names from the variables.
   - "generation_constraints": {field_name: {valid_values: [str], min: number, max: number,
-      preferred_values: [str]}} — machine-readable constraints the generator should use
+      preferred_values: [str], buckets: [[number, number]], weights: [number], precision: number, currency: str}} — machine-readable constraints the generator should use
   - "formula_rules": [{"field": str, "expression": str}] — authoritative formulas to
       calculate and validate generated fields
 
@@ -231,7 +231,15 @@ SEMANTIC ACCURACY IS MANDATORY:
   clearly requires failure/rejection/decline/error, they should be false. For mixed/distribution
   scenarios, preserve the declared distribution instead of forcing one outcome.
 - CSV literal values/formulas remain authoritative. CSV categorical choices define the allowed set;
-  semantic rules may choose the appropriate value from that set, but may not invent values outside it.
+  semantic rules may choose the appropriate value from that set, but may never invent values outside it.
+- CSV params are hard constraints, not hints. Preserve every explicit choice/value, numeric min/max,
+  bucket distribution, weight list, precision, currency, timezone, delay/range, and dependency.
+- When params contain buckets=[...];weights=[...], the buckets are inclusive numeric intervals and the
+  corresponding weights define the sampling distribution. Never replace bucket sampling with a generic
+  min/max distribution. A compact/exported range token such as 10002999 represents 1000-2999 when
+  the confirmed parser has normalized it; reason over the normalized value, not a guessed alternative.
+- Field descriptions are binding semantic requirements. Do not contradict a description (for example,
+  a field described as a successful recharge amount must not become a failed/refund amount).
 - Never create a mathematically or semantically inconsistent state because fields were generated
   independently. When an outcome controls another field, encode and enforce the dependency deterministically.
 """
@@ -284,8 +292,16 @@ class SchemaAgent:
 
         sc = resolve_scenario_meta(state.scenario)
         field_summary = [
-            {"name": v["name"], "dtype": v["dtype"], "gen": v["gen"],
-             "depends_on": v.get("depends_on", [])}
+            {
+                "name": v["name"],
+                "dtype": v["dtype"],
+                "description": v.get("description", ""),
+                "gen": v["gen"],
+                "params": v.get("params", {}),
+                "depends_on": v.get("depends_on", []),
+                "formula": v.get("formula", ""),
+                "nullable": v.get("nullable", False),
+            }
             for v in VARS
         ]
 
@@ -315,6 +331,11 @@ class SchemaAgent:
             "Before returning, audit every field AND every categorical value for industry/country relevance. "
             "A syntactically valid value from another industry is still invalid and must be replaced. "
             "Do not use telecom entities as generic providers for non-telecom industries. "
+            "Timestamp rules are also part of the confirmed CSV contract. If a datetime field declares "
+            "params.timestamp_format (or params.format), treat that exact format as presentation authority. "
+            "Do not invent or change timestamp formats. Timestamp arithmetic/formulas must be evaluated using real "
+            "datetime values, then serialized back using the field's declared timestamp format. "
+            "A common requested format is DD/MM/YYYY hh:mm A, e.g. 18/08/2026 12:30 AM. "
             "For every meaningful relationship between business-state fields, add an explicit conditional rule "
             "that the data generator can enforce.\n"
             f"Produce a complete rules document covering all {len(VARS)} variables, "
@@ -362,12 +383,22 @@ class SchemaAgent:
             if not isinstance(gc, dict):
                 gc = {}
             params = var.get("params") if isinstance(var.get("params"), dict) else {}
-            if "choices" in params and "valid_values" not in gc:
+            if "choices" in params:
                 gc["valid_values"] = list(params.get("choices") or [])
-            if "min" in params and "min" not in gc:
+            if "values" in params and "choices" not in params:
+                gc["valid_values"] = params.get("values") if isinstance(params.get("values"), list) else [params.get("values")]
+            if "min" in params:
                 gc["min"] = params.get("min")
-            if "max" in params and "max" not in gc:
+            if "max" in params:
                 gc["max"] = params.get("max")
+            if "buckets" in params:
+                gc["buckets"] = list(params.get("buckets") or [])
+            if "weights" in params:
+                gc["weights"] = list(params.get("weights") or [])
+            if "precision" in params:
+                gc["precision"] = params.get("precision")
+            if "currency" in params:
+                gc["currency"] = params.get("currency")
             generation_constraints[field] = gc
         rules["generation_constraints"] = generation_constraints
 
