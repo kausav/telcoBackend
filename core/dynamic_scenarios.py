@@ -158,10 +158,49 @@ def resolve_scenario_meta(scenario_id: str) -> dict[str, Any] | None:
     return dyn["meta"] if dyn else None
 
 
+def _repair_legacy_variables(variables: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Repair legacy normalized variables saved by older parser versions.
+
+    Older confirmed scenarios could persist event/object fields as
+    ``constant(value="unknown")``. Generation must not continue replaying that
+    stale artifact after the parser has been fixed. This repair is deliberately
+    narrow: it only changes an exact legacy unknown placeholder on event-like
+    fields and otherwise leaves confirmed schema definitions untouched.
+    """
+    repaired = []
+    for raw in variables or []:
+        var = dict(raw) if isinstance(raw, dict) else raw
+        if not isinstance(var, dict):
+            repaired.append(var)
+            continue
+        name = str(var.get("name") or "")
+        dtype = str(var.get("dtype") or "").strip().lower()
+        gen = str(var.get("gen") or "").strip().lower()
+        params = dict(var.get("params") or {})
+        value = params.get("value")
+        semantic_like = (
+            dtype in {"event", "event_type", "event_container"}
+            or name.lower().endswith(("_event", "_decision", "_outcome", "_state", "_action"))
+            or " event " in f" {str(var.get('description') or '').lower()} "
+            or " decision " in f" {str(var.get('description') or '').lower()} "
+            or " outcome " in f" {str(var.get('description') or '').lower()} "
+            or " action " in f" {str(var.get('description') or '').lower()} "
+            or " state " in f" {str(var.get('description') or '').lower()} "
+        )
+        if semantic_like and gen in {"constant", ""} and isinstance(value, str) and value.strip().lower() in {"unknown", ""}:
+            var["gen"] = "semantic_event"
+            params.pop("value", None)
+            var["params"] = params
+        repaired.append(var)
+    return repaired
+
+
 def resolve_variables(scenario_id: str) -> tuple[list[dict[str, Any]], list[str]] | None:
-    """Return (variables, field_order) for a confirmed scenario, or None if unknown."""
+    """Return (variables, field_order) for a confirmed scenario, repairing legacy placeholders."""
     dyn = get_confirmed(scenario_id)
-    return (dyn["variables"], dyn["field_order"]) if dyn else None
+    if not dyn:
+        return None
+    return (_repair_legacy_variables(dyn["variables"]), list(dyn["field_order"]))
 
 
 

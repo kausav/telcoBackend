@@ -32,7 +32,6 @@
 <body>
 <header>
   <h1>Telco Agentic Synthetic Data Generator</h1>
-  <p>Current architecture after the CSV-first cleanup. The uploaded CSV is the single source of truth for variables. The event model has been removed. Transactional output is user/entity history: stable user/entity fields plus repeated historical rows. Aggregational output is a flat record set. The backend no longer invents scenario variables and contains no edge-case generation pipeline.</p>
 </header>
 <main>
   <section>
@@ -156,22 +155,8 @@ tx_id
 formula</pre>
     <p>The important architectural rule is that these are <strong>generic generator implementations</strong>; they are not a catalog of scenario variables. Which variables use them is decided entirely by the uploaded CSV.</p>
   </section>
-
   <section>
-    <h2>10. Cleanup performed</h2>
-    <ul>
-      <li><span class="removed">Scenario Designer Agent and /scenario/propose</span> — removed.</li>
-      <li><span class="removed">Edge Case Agent and edge-case generation/validation code</span> — removed.</li>
-      <li><span class="removed">Edge-case CSV rows/metadata and isEdgeCaseData output</span> — removed.</li>
-      <li><span class="removed">Static scenario variable catalogs and mandatory variable injection</span> — removed with the Scenario Designer.</li>
-      <li>CSV parsing is intentionally limited to variable definitions; transactional user/history grain is inferred from the entity key and history timestamp.</li>
-      <li>Data generation no longer injects scenario-specific Telecom fields, LB-06/LB-07 fields, or static variable contracts.</li>
-      <li>Declared CSV categorical choices and ranges remain authoritative, while Schema Agent rules can provide additional generic business relationships.</li>
-    </ul>
-  </section>
-
-  <section>
-    <h2>11. File responsibilities</h2>
+    <h2>10. File responsibilities</h2>
     <table>
       <tr><th>File</th><th>Responsibility</th></tr>
       <tr><td><code>server.py</code></td><td>HTTP API, draft import/confirmation, generation response shaping, request validation.</td></tr>

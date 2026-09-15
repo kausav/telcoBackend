@@ -1094,6 +1094,15 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
         if formula.upper()=="NULL": formula=""
 
         gen_raw=row.get("gen","").strip().lower()
+        # Some client exports put semantic event/state types in `dtype` and leave
+        # `gen` blank. Treat those as executable semantic events rather than
+        # falling back to a blank/string value. Also recognize event-like field
+        # names when producers use generic object/string dtypes.
+        if not gen_raw:
+            if dtype_raw in {"event", "event_type", "synthetic_event", "event_container"} or (
+                dtype in {"string"} and (name.lower().endswith("_event") or " event " in f" {row.get('description','').lower()} ")
+            ):
+                gen_raw = "event"
         # Weight specifications are occasionally emitted in the formula column
         # even though they describe a distribution rather than a formula.
         if gen_raw in {"weighted_choice", "choice"} and "weights" not in params and params.get("values") is not None:

@@ -484,6 +484,23 @@ def _matches_declared_option(actual: Any, expected: Any) -> bool:
     return _normalize(actual) == _normalize(expected)
 
 
+def _event_like_field(var: dict) -> bool:
+    name = str(var.get("name") or "").strip().lower()
+    dtype = str(var.get("dtype") or "").strip().lower()
+    desc = str(var.get("description") or "").strip().lower()
+    return (
+        dtype in {"event", "event_type", "event_container"}
+        or name.endswith("_event")
+        or " event " in f" {desc} "
+    )
+
+
+def _event_fallback_value(var: dict) -> str:
+    name = str(var.get("name") or "event").strip()
+    token = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
+    return token or "EVENT"
+
+
 def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None):
     """Apply safe machine-readable SchemaAgent constraints to a generated value."""
     constraint = _rule_constraint_for(str(var.get("name", "")), rules)
@@ -493,6 +510,12 @@ def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None
     params = var.get("params") if isinstance(var.get("params"), dict) else {}
     dtype = str(var.get("dtype", "")).strip().lower()
     precision = int(params.get("precision", 2) or 2)
+
+    # Never allow the generic/LLM constraint layer to reintroduce the literal
+    # placeholder "unknown" for semantic event fields. Event fields without an
+    # explicit value are represented by a deterministic event token instead.
+    if _event_like_field(var) and isinstance(value, str) and value.strip().lower() == "unknown":
+        value = _event_fallback_value(var)
 
     # Params are authoritative: if explicit values are provided, do not emit
     # anything outside that set. Preserve the original token/casing from params.
@@ -504,6 +527,8 @@ def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None
         # CSV choices are authoritative as the allowed set, while scenario-derived
         # preferred_values select the semantically appropriate member of that set.
         preferred = _coerce_rule_values(constraint.get("preferred_values")) if constraint else []
+        if _event_like_field(var):
+            preferred = [x for x in preferred if str(x).strip().lower() != "unknown"]
         if preferred:
             preferred_allowed = [
                 opt for opt in declared_options
@@ -529,6 +554,8 @@ def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None
     allowed = _coerce_rule_values(constraint.get("preferred_values"))
     if not allowed:
         allowed = _coerce_rule_values(constraint.get("valid_values"))
+    if _event_like_field(var):
+        allowed = [x for x in allowed if str(x).strip().lower() != "unknown"]
     if allowed and not numeric_param_bounded:
         # Match case/format while preserving the canonical value supplied by rules.
         norm = str(value).strip().lower().replace("-", "_").replace(" ", "_")
@@ -1041,6 +1068,10 @@ def _validate_record(
         value = rec[name]
         dtype = var.get("dtype", "string")
         params = var.get("params") or {}
+        if _event_like_field(var) and isinstance(value, str) and value.strip().lower() in {"unknown", ""}:
+            rec[name] = _event_fallback_value(var)
+            value = rec[name]
+            issues.append(f"{name} repaired from placeholder event value")
         precision = int(params.get("precision", 2) or 2)
         try:
             if dtype == "int" and not isinstance(value, bool) and not isinstance(value, int):
