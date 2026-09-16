@@ -1,5 +1,5 @@
 """
-Agent 3 — Data Generation Agent
+Agent 4 — Data Generation Agent
 Generates records purely algorithmically (no LLM call per record), then
 validates them through an internal QA layer. Implemented as a 2-node
 LangGraph subgraph: generate -> qa_validate.
@@ -40,8 +40,11 @@ choice/value, numeric min/max, bucket interval, weight distribution, precision, 
 date/time semantics, dependency, and formula. Never invent a category or normalize a value
 into a synonym not declared by params. Field descriptions are semantic constraints and must
 not be contradicted. Preserve valid values, repair only clear deterministic violations, and
-do not invent fields that are not in the schema. Return JSON with keys: valid_records,
-dropped_records, fixes_applied, issues_found.
+do not invent fields that are not in the schema. For related datetime fields, enforce the
+causal sequence and any declared min/max delay; never accept a child event before its parent
+or an absurd gap when the schema says the events are part of one workflow. Also check obvious
+state/amount/count/formula contradictions described by the schema. Return JSON with keys:
+valid_records, dropped_records, fixes_applied, issues_found.
 
 Schema/business rules:
 {rules}
@@ -904,7 +907,11 @@ def _generate_record(variables: list[dict], rules: dict | None = None) -> dict:
     rec = _apply_conditional_rules(rec, rules)
     rec = _apply_scenario_semantics(rec, rules)
     rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+    rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
     rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
+    rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
     return _format_datetime_fields(rec, variables)
 
 
@@ -954,7 +961,11 @@ def _generate_selected_record(
     rec = _apply_conditional_rules(rec, rules)
     rec = _apply_scenario_semantics(rec, rules)
     rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+    rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
     rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
+    rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
     return _format_datetime_fields(rec, variables)
 
 
@@ -1128,6 +1139,185 @@ def _normalize(v: Any) -> str:
     return str(v).strip().lower().replace(" ", "_").replace("-", "_")
 
 
+
+
+def _temporal_tokens(text: Any) -> set[str]:
+    """Normalize field/description text into temporal/business event tokens."""
+    raw = str(text or "").strip().lower().replace("-", "_")
+    return set(re.findall(r"[a-z]+", raw))
+
+
+def _temporal_role(var: dict) -> str:
+    """Classify a datetime field into a coarse causal event role.
+
+    This is deliberately conservative.  It is a safety net for obvious causal
+    timelines, not a substitute for an explicit CSV formula or business rule.
+    """
+    name = str(var.get("name", ""))
+    desc = str(var.get("description", ""))
+    text = f"{name} {desc}".lower()
+    if any(k in text for k in ("decision", "response", "reply", "decline", "acceptance", "customer response")):
+        return "response"
+    if any(k in text for k in ("completion", "completed", "finished", "settled", "processed", "fulfilled")):
+        return "completion"
+    if any(k in text for k in ("presented", "displayed", "shown", "offered", "offer presented")):
+        return "presentation"
+    if any(k in text for k in ("sent", "dispatch", "dispatched", "notification")):
+        return "dispatch"
+    if any(k in text for k in ("created", "creation", "initiated", "start", "started", "opened", "request", "requested")):
+        return "start"
+    if any(k in text for k in ("end", "ended", "closed", "closure", "expired", "expiry")):
+        return "end"
+    return "generic"
+
+
+def _temporal_delay_limit_seconds(child: dict, parent: dict) -> int | None:
+    """Choose a conservative maximum gap for a causal timestamp edge.
+
+    The CSV/LLM-declared rule wins. This fallback is deliberately used only for an
+    explicit datetime dependency when the schema has not supplied a bound.
+    """
+    text = f"{child.get('name','')} {child.get('description','')}".lower()
+    match = re.search(r"within\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days)", text)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2)
+        multiplier = {
+            "second": 1, "seconds": 1,
+            "minute": 60, "minutes": 60,
+            "hour": 3600, "hours": 3600,
+            "day": 86400, "days": 86400,
+        }[unit]
+        return amount * multiplier
+    if "same day" in text or "same-day" in text:
+        return 86400
+
+    child_role = _temporal_role(child)
+    parent_role = _temporal_role(parent)
+    if child_role == "response" and parent_role == "presentation":
+        return 7 * 86400
+    if child_role == "completion" and parent_role in {"presentation", "dispatch", "response", "start"}:
+        return 30 * 86400
+    if child_role == "dispatch" and parent_role in {"start", "presentation"}:
+        return 7 * 86400
+    if child_role == "end" and parent_role != "generic":
+        return 90 * 86400
+    return 90 * 86400
+
+
+def _infer_temporal_relationships(
+    variables: list[dict], rules: dict | None = None
+) -> list[tuple[str, str, int | None, int]]:
+    """Return authoritative/derived parent -> child datetime relationships.
+
+    Sources, in order of authority:
+      1. explicit SchemaAgent temporal_rules;
+      2. CSV depends_on edges between datetime fields.
+
+    A temporal rule can therefore protect a relationship even when the CSV expresses
+    it in its description/business semantics rather than as depends_on.
+    """
+    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    out: list[tuple[str, str, int | None, int]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for item in (rules or {}).get("temporal_rules", []) or []:
+        if not isinstance(item, dict):
+            continue
+        parent = str(item.get("before", ""))
+        child = str(item.get("after", ""))
+        if not parent or not child or parent == child:
+            continue
+        parent_var = by_name.get(parent)
+        child_var = by_name.get(child)
+        if not parent_var or not child_var:
+            continue
+        if str(parent_var.get("dtype", "")).strip().lower() != "datetime":
+            continue
+        if str(child_var.get("dtype", "")).strip().lower() != "datetime":
+            continue
+        max_gap = None
+        min_gap = 0
+        try:
+            if item.get("max_delay_seconds") is not None:
+                max_gap = max(0, int(float(item.get("max_delay_seconds"))))
+        except (TypeError, ValueError):
+            max_gap = None
+        try:
+            if item.get("min_delay_seconds") is not None:
+                min_gap = max(0, int(float(item.get("min_delay_seconds"))))
+        except (TypeError, ValueError):
+            min_gap = 0
+        key = (parent, child)
+        if key not in seen:
+            seen.add(key)
+            out.append((parent, child, max_gap, min_gap))
+
+    # CSV dependency edges are causal by construction for datetime dependencies.
+    for child_name, child in by_name.items():
+        if str(child.get("dtype", "")).strip().lower() != "datetime":
+            continue
+        for dep in child.get("depends_on", []) or []:
+            parent_name = str(dep)
+            parent = by_name.get(parent_name)
+            if not parent or str(parent.get("dtype", "")).strip().lower() != "datetime":
+                continue
+            key = (parent_name, child_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((parent_name, child_name, _temporal_delay_limit_seconds(child, parent), 0))
+
+    return out
+
+
+def _enforce_temporal_consistency(
+    rec: dict, variables: list[dict], rules: dict | None = None
+) -> tuple[dict, list[str]]:
+    """Repair causal timestamp contradictions deterministically.
+
+    The pass is intentionally iterative because chains such as
+    offer -> decision -> processing -> completion can require more than one repair.
+    Explicit min/max delay windows are respected; otherwise CSV datetime dependencies
+    receive conservative, domain-neutral ceilings to prevent absurd month/year gaps.
+    Unrelated timestamps are never reordered.
+    """
+    rec = dict(rec)
+    issues: list[str] = []
+    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    relations = _infer_temporal_relationships(variables, rules=rules)
+    if not relations:
+        return rec, issues
+
+    max_passes = max(2, len(relations) * 2)
+    for _ in range(max_passes):
+        changed = False
+        for parent_name, child_name, max_gap, min_gap in relations:
+            parent_dt = _qa_parse_dt(rec.get(parent_name))
+            child_dt = _qa_parse_dt(rec.get(child_name))
+            if parent_dt is None or child_dt is None:
+                continue
+
+            desired = child_dt
+            lower_bound = parent_dt + timedelta(seconds=min_gap)
+            upper_bound = parent_dt + timedelta(seconds=max_gap) if max_gap is not None else None
+
+            if desired < lower_bound:
+                desired = lower_bound
+                reason = f"{child_name} moved after {parent_name} by declared causal delay"
+            elif upper_bound is not None and desired > upper_bound:
+                desired = upper_bound
+                reason = f"{child_name} capped to declared/reasonable causal gap from {parent_name}"
+            else:
+                continue
+
+            child_var = by_name.get(child_name, {})
+            rec[child_name] = _format_datetime(desired, child_var.get("params") or {})
+            issues.append(reason)
+            changed = True
+        if not changed:
+            break
+    return rec, issues
 
 
 def _collect_formula_specs(variables: list[dict], rules: dict | None) -> list[tuple[str, str]]:
@@ -1430,6 +1620,15 @@ def _validate_record(
 
     # Final contract pass guarantees both raw-style deterministic generation and final QA
     # output satisfy the confirmed CSV params after formula corrections.
+    rec, final_contract_issues = _enforce_csv_contract(rec, variables, rules=rules)
+    issues.extend(final_contract_issues)
+
+    rec, temporal_issues = _enforce_temporal_consistency(rec, variables, rules=rules)
+    issues.extend(temporal_issues)
+    # Recalculate explicit formulas after temporal repair because a moved parent timestamp
+    # can legitimately change a dependent duration/formula field.
+    rec, temporal_formula_issues = _enforce_authoritative_formulas(rec, variables, rules=rules)
+    issues.extend(temporal_formula_issues)
     rec, final_contract_issues = _enforce_csv_contract(rec, variables, rules=rules)
     issues.extend(final_contract_issues)
 

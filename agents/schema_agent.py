@@ -190,6 +190,8 @@ Return a JSON object with:
       preferred_values: [str], buckets: [[number, number]], weights: [number], precision: number, currency: str}} — machine-readable constraints the generator should use
   - "formula_rules": [{"field": str, "expression": str}] — authoritative formulas to
       calculate and validate generated fields
+  - "temporal_rules": [{"before": str, "after": str, "min_delay_seconds": number, "max_delay_seconds": number, "reason": str}]
+    — causal timestamp ordering and bounded-delay relationships supported by the CSV schema
 
 SEMANTIC ACCURACY IS MANDATORY:
 - Every field and every categorical value must be relevant to the target industry,
@@ -203,6 +205,12 @@ SEMANTIC ACCURACY IS MANDATORY:
   generation_constraints reflect their actual business vocabulary.
 - Check cross-field semantics, not only individual fields. If two fields describe
   related business states, explicitly encode the dependency in cross_field_rules.
+- For every datetime field that depends_on another datetime field, preserve causal chronology:
+  the dependent event must not occur before its parent event. Do not invent huge delays between
+  causally related events. Use the field descriptions and scenario context to choose a realistic
+  maximum delay; for a customer decision/response after an offer/presentation, prefer hours or
+  a few days, not weeks/months, unless the schema explicitly says otherwise. Encode these in
+  temporal_rules when they are meaningful.
 - Perform a VALUE-BY-VALUE INDUSTRY AUDIT before returning rules: every categorical
   value must belong to the target industry's real vocabulary. Do not accept a value
   merely because it is syntactically valid or common in another industry.
@@ -337,7 +345,10 @@ class SchemaAgent:
             "datetime values, then serialized back using the field's declared timestamp format. "
             "A common requested format is DD/MM/YYYY hh:mm A, e.g. 18/08/2026 12:30 AM. "
             "For every meaningful relationship between business-state fields, add an explicit conditional rule "
-            "that the data generator can enforce.\n"
+            "that the data generator can enforce. For datetime dependencies, explicitly reason about "
+            "causal ordering and realistic delay windows; a child timestamp must not precede its parent, "
+            "and response/decision events should not be separated by absurd multi-week or multi-month gaps "
+            "unless the scenario explicitly calls for that.\n"
             f"Produce a complete rules document covering all {len(VARS)} variables, "
             f"consistent with this industry and country's real-world standards. "
             "For transactional output, validate that stable user-context fields stay consistent across each user history, "
@@ -419,6 +430,34 @@ class SchemaAgent:
                     continue
                 normalized_conditional.append({"when": {str(k): v for k, v in when.items()}, "then": {str(k): v for k, v in then.items()}})
         rules["conditional_rules"] = normalized_conditional
+
+        raw_temporal = rules.get("temporal_rules", [])
+        normalized_temporal = []
+        if isinstance(raw_temporal, list):
+            for item in raw_temporal:
+                if not isinstance(item, dict):
+                    continue
+                before = str(item.get("before", ""))
+                after = str(item.get("after", ""))
+                if before not in var_names or after not in var_names or before == after:
+                    continue
+                before_var = next((v for v in VARS if str(v.get("name")) == before), None)
+                after_var = next((v for v in VARS if str(v.get("name")) == after), None)
+                if not before_var or not after_var:
+                    continue
+                if str(before_var.get("dtype", "")).lower() != "datetime" or str(after_var.get("dtype", "")).lower() != "datetime":
+                    continue
+                cleaned = {"before": before, "after": after}
+                for key in ("min_delay_seconds", "max_delay_seconds"):
+                    try:
+                        if item.get(key) is not None:
+                            cleaned[key] = max(0, int(float(item.get(key))))
+                    except (TypeError, ValueError):
+                        pass
+                if item.get("reason"):
+                    cleaned["reason"] = str(item.get("reason"))[:500]
+                normalized_temporal.append(cleaned)
+        rules["temporal_rules"] = normalized_temporal
 
         # Deterministic scenario-type semantics complement the LLM output.
         semantics = _scenario_semantics(state, VARS)
