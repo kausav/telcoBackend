@@ -22,6 +22,7 @@ from core.dynamic_scenarios import (
     pop_draft,
     resolve_scenario_id_from_draft,
     resolve_scenario_meta,
+    scenario_exists,
     resolve_data_type,
     resolve_scenario_context,
     resolve_variables,

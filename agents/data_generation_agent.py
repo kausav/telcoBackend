@@ -557,10 +557,6 @@ _GENERATORS = {
 }
 
 
-def get_known_generator_types() -> set[str]:
-    """Return generator names accepted by both the CSV contract and runtime."""
-    return set(SUPPORTED_GENERATORS)
-
 
 def _rule_constraint_for(field_name: str, rules: dict | None) -> dict:
     """Return machine-readable generation constraints for a field.
