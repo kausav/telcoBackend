@@ -80,14 +80,16 @@ def _purge_expired_drafts(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM drafts WHERE created_at < ?", (cutoff,))
 
 
-def next_scenario_id() -> str:
-    """Return the next free legacy ``LB-N`` id with a write lock for concurrency."""
-    with _connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute("SELECT scenario_id FROM confirmed").fetchall()
-    existing = [r[0] for r in rows]
-    nums = [int(m.group(1)) for k in existing if (m := re.match(r"LB-(\d+)$", k))]
+def _next_scenario_id_conn(conn: sqlite3.Connection) -> str:
+    rows = conn.execute("SELECT scenario_id FROM confirmed").fetchall()
+    nums = [int(match.group(1)) for value, in rows if (match := re.match(r"LB-(\d+)$", str(value)))]
     return f"LB-{(max(nums) + 1) if nums else 1:02d}"
+
+
+def next_scenario_id() -> str:
+    """Return the next display id. Reservation is performed atomically by confirm_scenario()."""
+    with _connect() as conn:
+        return _next_scenario_id_conn(conn)
 
 
 def new_draft_id() -> str:
@@ -119,15 +121,36 @@ def pop_draft(draft_id: str) -> dict[str, Any] | None:
     return json.loads(row[0])
 
 
-def confirm_scenario(scenario_id: str, meta: dict[str, Any],
-                      variables: list[dict[str, Any]], field_order: list[str],
-                      draft_id: str | None = None) -> None:
+def confirm_scenario(
+    scenario_id: str | None,
+    meta: dict[str, Any],
+    variables: list[dict[str, Any]],
+    field_order: list[str],
+    draft_id: str | None = None,
+) -> tuple[str, bool]:
+    """Persist a confirmed scenario without allowing concurrent overwrites.
+
+    If the requested id already exists, a fresh display id is allocated inside the
+    same SQLite write transaction and the original id is recorded as requested metadata.
+    """
+    requested_id = str(scenario_id or "").strip() or None
     with _connect() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO confirmed (scenario_id, draft_id, meta, variables, field_order) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (scenario_id, draft_id, json.dumps(meta), json.dumps(variables), json.dumps(field_order)),
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        final_id = requested_id or _next_scenario_id_conn(conn)
+        reassigned = False
+        try:
+            conn.execute(
+                "INSERT INTO confirmed (scenario_id, draft_id, meta, variables, field_order) VALUES (?, ?, ?, ?, ?)",
+                (final_id, draft_id, json.dumps(meta), json.dumps(variables), json.dumps(field_order)),
+            )
+        except sqlite3.IntegrityError:
+            final_id = _next_scenario_id_conn(conn)
+            reassigned = True
+            conn.execute(
+                "INSERT INTO confirmed (scenario_id, draft_id, meta, variables, field_order) VALUES (?, ?, ?, ?, ?)",
+                (final_id, draft_id, json.dumps(meta), json.dumps(variables), json.dumps(field_order)),
+            )
+    return final_id, reassigned
 
 
 def resolve_scenario_id_from_draft(draft_id: str) -> str | None:
@@ -261,10 +284,3 @@ def add_feedback(domain: str, business_scenario: str, feedback: str) -> None:
     key = _feedback_key(domain, business_scenario)
     with _connect() as conn:
         conn.execute("INSERT INTO feedback (key, feedback) VALUES (?, ?)", (key, feedback))
-
-
-def get_feedback_history(domain: str, business_scenario: str) -> list[str]:
-    key = _feedback_key(domain, business_scenario)
-    with _connect() as conn:
-        rows = conn.execute("SELECT feedback FROM feedback WHERE key = ?", (key,)).fetchall()
-    return [r[0] for r in rows]

@@ -5,6 +5,8 @@ from core.agentic_models import GeneratedSchemaField, ResolvedConcept, ScenarioI
 from core.telecom_registry import EntityDef, TelecomRegistry
 from config.industry_profiles import get_profile
 import re
+from difflib import SequenceMatcher
+from core.scenario_semantics import classify_outcome_mode
 
 
 def _tokens(value: str) -> list[str]:
@@ -60,16 +62,26 @@ class SchemaCompiler:
                 resolved.append(entity)
                 seen.add(entity.canonical_id)
 
+        # Candidate variable names can identify the most relevant registry entities even
+        # when the LLM did not explicitly list those entities. This keeps semantic grounding
+        # dynamic while preventing a generic domain search from selecting an unrelated field
+        # owner when common attributes collide across telecom entities.
+        for idea in intent.candidate_variables:
+            idea_name = str(idea.name or "").strip()
+            if not idea_name:
+                continue
+            owners = self.registry.entities_with_attribute(idea_name)
+            for owner in owners:
+                if owner.canonical_id not in seen:
+                    resolved.append(owner)
+                    seen.add(owner.canonical_id)
+
         # Entity key is authoritative and should be present whenever the registry supports
         # it. Entity keys are field names, not entity IDs, so resolve them by inspecting
         # approved registry attributes rather than aliases/canonical entity IDs.
         if entity_key:
-            key_entity = None
-            for candidate in self.registry.catalog_summary(limit=1000):
-                entity = self.registry.resolve_entity(candidate["canonical_id"])
-                if entity and any(a.name.lower() == entity_key.lower() for a in entity.attributes):
-                    key_entity = entity
-                    break
+            key_entities = self.registry.entities_with_attribute(entity_key)
+            key_entity = key_entities[0] if key_entities else None
             if key_entity and key_entity.canonical_id not in seen:
                 resolved.insert(0, key_entity)
                 seen.add(key_entity.canonical_id)
@@ -96,80 +108,8 @@ class SchemaCompiler:
 
         return resolved, unresolved
 
-    @staticmethod
-    def _root_entity_for_key(entity_key: str | None, entities: list[EntityDef]) -> str | None:
-        if not entity_key:
-            return None
-        for entity in entities:
-            if any(attr.name.lower() == entity_key.lower() for attr in entity.attributes):
-                return entity.canonical_id
-        return None
-
-    def _eligible_field_count(self, entities: list[EntityDef], entity_ids: set[str], entity_key: str | None) -> int:
-        """Count fields that will actually be projected into the response schema."""
-        root_entity = self._root_entity_for_key(entity_key, entities)
-        names: set[str] = set()
-        for entity in entities:
-            for attr in entity.attributes:
-                params = dict(attr.params or {})
-                target = params.get("target")
-                if target and str(target) not in entity_ids:
-                    continue
-                if entity_key and entity_key.lower() == "subscriber_id" and attr.name == "customer_id":
-                    continue
-                if (
-                    entity_key
-                    and attr.name.lower() != entity_key.lower()
-                    and entity.canonical_id == root_entity
-                    and attr.name.endswith("_id")
-                    and attr.name not in {"account_id"}
-                ):
-                    continue
-                names.add(attr.name)
-        return len(names)
-
-    def _primary_key_for_entity(self, entity: EntityDef) -> str | None:
-        preferred = f"{entity.canonical_id}_id"
-        for attr in entity.attributes:
-            if attr.name.lower() == preferred.lower():
-                return attr.name
-        for attr in entity.attributes:
-            if attr.name.lower().endswith("_id"):
-                return attr.name
-        return None
-
-    def _normalize_dependencies(
-        self,
-        entity: EntityDef,
-        attr_name: str,
-        dependencies: tuple[str, ...],
-        entity_ids: set[str],
-        field_names: set[str],
-    ) -> list[str]:
-        """Convert registry-level entity dependencies into executable field dependencies."""
-        normalized: list[str] = []
-        for dependency in dependencies:
-            dep = str(dependency).strip()
-            if not dep:
-                continue
-            if dep in field_names:
-                normalized.append(dep)
-                continue
-            if dep in entity_ids:
-                target = self.registry.get_entity(dep)
-                target_key = self._primary_key_for_entity(target)
-                if target_key and target_key in field_names:
-                    normalized.append(target_key)
-                continue
-            # Unknown dependency text is not executable. Fail the proposal instead of
-            # persisting a dangling dependency that can break /scenario/generate later.
-            raise ValueError(
-                f"Registry field '{entity.canonical_id}.{attr_name}' has unresolved dependency '{dependency}'"
-            )
-        return list(dict.fromkeys(normalized))
-
-    @staticmethod
     def _runtime_generation_contract(
+        self,
         attr: object,
         params: dict,
         country: str | None,
@@ -183,13 +123,44 @@ class SchemaCompiler:
         if generator == "unique_id":
             return "prefixed_int", runtime_params
         if generator == "msisdn":
-            runtime_params["country_codes"] = [str(country or runtime_params.get("country") or "IN").upper()]
+            iso = str(country or runtime_params.get("country") or "IN").strip().upper()
+            dial_codes = {
+                "IN": "+91", "US": "+1", "CA": "+1", "GB": "+44", "AU": "+61",
+                "AE": "+971", "SG": "+65", "DE": "+49", "FR": "+33", "IT": "+39",
+            }
+            dial = dial_codes.get(iso, iso if iso.startswith("+") else "+" + iso)
+            runtime_params["country_codes"] = [dial]
+            runtime_params["country"] = iso
             return "e164_phone", runtime_params
         if generator == "timestamp":
             runtime_params.setdefault("days_back", 365)
             return "recent_datetime", runtime_params
         if generator == "range":
             return ("uniform_int" if dtype in {"int", "integer"} else "uniform"), runtime_params
+        if generator == "reference":
+            target = str(runtime_params.get("target") or "").strip()
+            target_entity = self.registry.resolve_entity(target) if target else None
+            target_attr = None
+            if target_entity is not None:
+                preferred_name = f"{target_entity.canonical_id}_id".lower()
+                target_attr = next((item for item in target_entity.attributes if item.name.lower() == preferred_name), None)
+                if target_attr is None:
+                    target_attr = next((item for item in target_entity.attributes if item.name.lower().endswith("_id")), None)
+            if target_attr is not None:
+                target_params = dict(target_attr.params or {})
+                if str(target_attr.generator or "").strip().lower() == "unique_id":
+                    return "prefixed_int", target_params
+                if target_attr.generator:
+                    generator_name, translated = self._runtime_generation_contract(target_attr, target_params, country)
+                    return generator_name, translated
+            # A reference in a flattened dataset may not have a separate target row.
+            # Generate a structurally valid target-style identifier rather than returning
+            # an unsupported runtime generator or an empty value.
+            if target:
+                clean_target = re.sub(r"[^A-Za-z0-9]+", "_", target).strip("_").upper()
+                runtime_params.setdefault("prefix", f"{clean_target or 'REF'}-")
+            runtime_params.setdefault("digits", 10)
+            return "prefixed_int", runtime_params
         if generator == "dependent_choice":
             if not runtime_params.get("mapping"):
                 raise ValueError(f"Dependent choice field '{name}' is missing its mapping")
@@ -241,11 +212,362 @@ class SchemaCompiler:
             score += 2 if not any(a.name.endswith("_id") for a in entity.attributes) else 0
         return score
 
+    @staticmethod
+    def _normalize_variable_name(name: str) -> str:
+        text = str(name or "").strip().lower()
+        text = re.sub(r"[^a-z0-9]+", "_", text)
+        text = re.sub(r"_+", "_", text).strip("_")
+        if not text:
+            text = "scenario_attribute"
+        if text[0].isdigit():
+            text = f"feature_{text}"
+        return text[:120]
+
+    @staticmethod
+    def _idea_tokens(idea: dict[str, object]) -> set[str]:
+        return set(_tokens(" ".join(str(idea.get(k, "")) for k in ("name", "description", "role", "grain"))))
+
+    def _choose_entity_for_idea(
+        self,
+        idea: dict[str, object],
+        entities: list[EntityDef],
+        matched_attr: tuple[EntityDef, object] | None,
+        entity_key: str | None,
+    ) -> EntityDef | None:
+        if matched_attr is not None:
+            return matched_attr[0]
+        tokens = self._idea_tokens(idea)
+        role = str(idea.get("role") or "other").lower()
+        grain = str(idea.get("grain") or "transaction").lower()
+        best: tuple[int, str, EntityDef] | None = None
+        for entity in entities:
+            text = " ".join([entity.canonical_id, entity.name, entity.description, *entity.aliases]).lower()
+            score = sum(3 for token in tokens if token in text)
+            if entity_key and entity_key.lower() in {a.name.lower() for a in entity.attributes}:
+                score += 20 if grain == "entity" else 4
+            if grain in {"event", "transaction"} and any("event" in a.name.lower() or "transaction" in a.description.lower() for a in entity.attributes):
+                score += 5
+            if role in {"status", "decision"} and any("status" in a.name.lower() or "decision" in a.description.lower() for a in entity.attributes):
+                score += 4
+            candidate = (score, entity.canonical_id, entity)
+            if score > 0 and (best is None or score > best[0] or (score == best[0] and entity.canonical_id < best[1])):
+                best = candidate
+        if best:
+            return best[2]
+        return entities[0] if entities else None
+
+    def _match_registry_attribute(
+        self,
+        idea: dict[str, object],
+        entities: list[EntityDef],
+        used_registry: set[tuple[str, str]],
+    ) -> tuple[EntityDef, object] | None:
+        """Find an approved registry attribute with similar semantics without replaying its name."""
+        idea_name = str(idea.get("name") or "").strip().lower()
+        idea_text = " ".join(str(idea.get(k, "")) for k in ("name", "description"))
+        idea_tokens = self._idea_tokens(idea)
+        role = str(idea.get("role") or "").lower()
+        normalized_idea_name = self._normalize_variable_name(idea_name)
+        candidates: list[tuple[float, str, str, EntityDef, object]] = []
+        for entity in entities:
+            entity_text = " ".join([entity.canonical_id, entity.name, entity.description, *entity.aliases]).lower()
+            entity_tokens = set(_tokens(entity_text))
+            entity_overlap = len(idea_tokens & entity_tokens)
+            for attr in entity.attributes:
+                key = (entity.canonical_id, attr.name)
+                if key in used_registry:
+                    continue
+                attr_dtype = str(getattr(attr, "dtype", "")).strip().lower()
+                requested_dtype = str(idea.get("dtype") or "string").strip().lower()
+                compatible = (
+                    (requested_dtype in {"float", "decimal"} and attr_dtype in {"float", "decimal", "number", "numeric"})
+                    or (requested_dtype == "integer" and attr_dtype in {"int", "integer", "bigint", "smallint"})
+                    or (requested_dtype == "datetime" and attr_dtype in {"datetime", "timestamp", "date"})
+                    or (requested_dtype == "date" and attr_dtype in {"date", "datetime", "timestamp"})
+                    or (requested_dtype == "boolean" and attr_dtype in {"bool", "boolean"})
+                    or (requested_dtype == "categorical" and (bool(getattr(attr, "enum_values", ())) or str(getattr(attr, "generator", "")).lower() in {"dependent_choice", "categorical", "weighted_choice"}))
+                    or (requested_dtype == "string" and attr_dtype in {"string", "str", "object", "uuid", "varchar", "text"})
+                )
+                if not compatible:
+                    continue
+                if role in {"measurement", "metric"} and attr_dtype not in {"float", "decimal", "number", "numeric", "int", "integer"}:
+                    continue
+                if role == "timing" and attr_dtype not in {"datetime", "timestamp", "date"}:
+                    continue
+                attr_text = " ".join([attr.name, attr.description]).lower()
+                attr_tokens = set(_tokens(attr_text))
+                attr_overlap = len(idea_tokens & attr_tokens)
+                exact_name_bonus = 8.0 if self._normalize_variable_name(attr.name) == normalized_idea_name else 0.0
+                ratio = SequenceMatcher(None, idea_text.lower(), attr_text).ratio()
+                role_bonus = 3.0 if (
+                    (role == "timing" and attr.dtype.lower() in {"datetime", "date"})
+                    or (role in {"measurement", "metric"} and attr.dtype.lower() in {"float", "integer", "decimal"})
+                    or (role in {"status", "decision"} and ("status" in attr.name.lower() or "status" in attr.description.lower()))
+                    or (role == "identity" and attr.name.lower().endswith("_id"))
+                ) else 0.0
+                # Entity context is deliberately strong for colliding attribute names such as
+                # subscriber_id, account_id and usage_event_id. Matching the field concept to the
+                # right registry entity is more important than a generic lexical match on the role.
+                score = exact_name_bonus + entity_overlap * 4.0 + attr_overlap * 2.5 + ratio * 2.0 + role_bonus
+                if score >= 3.0:
+                    candidates.append((score, entity.canonical_id, attr.name, entity, attr))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
+        return candidates[0][3], candidates[0][4]
+
+    def _fresh_name(
+        self,
+        requested: str,
+        description: str,
+        used: set[str],
+        registry_names: set[str],
+        entity_key: str | None,
+    ) -> str:
+        """Create a descriptive name without blindly replaying registry vocabulary.
+
+        The requested entity key is intentionally preserved because it is the public
+        grouping key. Other names that exactly collide with the approved registry are
+        given a descriptive semantic variant; no scenario-ID-specific mapping is used.
+        """
+        base = self._normalize_variable_name(requested)
+        entity_key_norm = self._normalize_variable_name(entity_key or "")
+        candidate_bases = [base]
+        if base in registry_names and base != entity_key_norm:
+            replacements = (
+                ("_status", "_state"),
+                ("_timestamp", "_event_time"),
+                ("_amount", "_value"),
+                ("_count", "_volume"),
+                ("_id", "_key"),
+            )
+            for suffix, replacement in replacements:
+                if base.endswith(suffix):
+                    candidate_bases.insert(0, f"{base[:-len(suffix)]}{replacement}")
+                    break
+            desc_tokens = [token for token in _tokens(description) if len(token) > 2]
+            if desc_tokens:
+                candidate_bases.insert(0, self._normalize_variable_name("_".join(desc_tokens[:4])))
+            candidate_bases.append(f"scenario_{base}")
+
+        for candidate in candidate_bases:
+            if candidate and candidate not in used:
+                return candidate
+        index = 2
+        while f"{base}_{index}" in used:
+            index += 1
+        return f"{base}_{index}"
+
+    def _generic_contract_for_idea(
+        self,
+        idea: dict[str, object],
+        country: str | None,
+        scenario_mode: str,
+    ) -> tuple[str, str, dict[str, object]]:
+        name = str(idea.get("name") or "scenario_attribute")
+        dtype = str(idea.get("dtype") or "string").lower()
+        role = str(idea.get("role") or "other").lower()
+        desc = str(idea.get("description") or "")
+        country_code = str(country or "IN").upper()
+
+        if role == "identity" or name.lower().endswith(("_id", "_key")):
+            return "prefixed_int", "string", {"prefix": f"{name[:-3].upper()}-" if name.lower().endswith("_id") else "ID-", "digits": 10}
+        if dtype in {"datetime", "timestamp"} or role == "timing":
+            return "recent_datetime", "datetime", {"timezone": "Asia/Kolkata" if country_code == "IN" else "UTC", "days_back": 365}
+        if dtype == "date":
+            return "recent_datetime", "date", {"timezone": "Asia/Kolkata" if country_code == "IN" else "UTC", "days_back": 365}
+        if dtype in {"integer", "int"} or role == "metric":
+            return "uniform_int", "integer", {"min": 0, "max": 100, "precision": 0}
+        if dtype in {"float", "decimal"} or role == "measurement":
+            return "uniform", "float", {"min": 0.0, "max": 1000.0, "precision": 2}
+        if dtype in {"boolean", "bool"}:
+            return "generic", "boolean", {}
+        if dtype == "categorical" or role in {"status", "decision", "configuration", "categorical"}:
+            lower = f"{name} {desc}".lower()
+            mode = scenario_mode or "mixed"
+            is_outcome_field = role in {"status", "decision"} or any(token in lower for token in ("status", "state", "outcome", "decision", "result"))
+            if is_outcome_field:
+                mode_values = {
+                    "positive": {
+                        "status": ["COMPLETED", "SUCCESS", "APPROVED"],
+                        "decision": ["ACCEPTED", "APPROVED", "COMPLETED"],
+                    },
+                    "negative": {
+                        "status": ["FAILED", "ERROR", "REJECTED"],
+                        "decision": ["REJECTED", "DENIED", "FAILED"],
+                    },
+                    "suppression": {
+                        "status": ["SUPPRESSED", "HELD", "SKIPPED"],
+                        "decision": ["SUPPRESSED", "HELD", "NOT_SENT"],
+                    },
+                    "decline_or_no_response": {
+                        "status": ["DECLINED", "NO_RESPONSE", "REJECTED"],
+                        "decision": ["DECLINED", "NO_RESPONSE", "REJECTED"],
+                    },
+                    "concurrent": {
+                        "status": ["NO_CLEAR_PRIORITY", "CONFLICT", "PENDING_PRIORITY"],
+                        "decision": ["NO_CLEAR_PRIORITY", "CONFLICT", "SELECTED"],
+                    },
+                    "mixed": {
+                        "status": ["COMPLETED", "FAILED", "PENDING"],
+                        "decision": ["ACCEPTED", "DECLINED", "PENDING"],
+                    },
+                }
+                mode_candidates = mode_values.get(mode, mode_values["mixed"])
+                candidates = mode_candidates.get("decision" if role == "decision" else "status", mode_candidates["status"])
+                choices = list(dict.fromkeys(candidates))
+                return "weighted_choice", "categorical", {"choices": choices, "weights": [1.0] * len(choices)}
+            if "channel" in lower or "method" in lower:
+                choices = ["APP", "SMS", "WEB", "USSD", "OTHER"]
+            elif "priority" in lower or "rank" in lower:
+                choices = ["HIGH", "MEDIUM", "LOW"]
+            elif "reason" in lower:
+                choices = ["THRESHOLD", "CUSTOMER_ACTION", "SYSTEM_RULE", "OTHER"]
+            else:
+                choices = ["OTHER"]
+            return "weighted_choice", "categorical", {"choices": choices, "weights": [1.0] * len(choices)}
+        return "generic", "string", {}
+
+    @staticmethod
+    def _merge_dependencies(
+        idea: dict[str, object],
+        name_map: dict[str, str],
+        grain: str,
+        entity_key: str | None,
+    ) -> list[str]:
+        deps: list[str] = []
+        for raw in idea.get("depends_on") or []:
+            key = SchemaCompiler._normalize_variable_name(str(raw))
+            mapped = name_map.get(key) or name_map.get(str(raw))
+            if mapped and mapped not in deps:
+                deps.append(mapped)
+        if grain in {"transaction", "event", "derived"} and entity_key and entity_key not in deps:
+            deps.insert(0, entity_key)
+        return deps
+
+    def _build_fresh_fields(
+        self,
+        intent: ScenarioIntent,
+        entities: list[EntityDef],
+        *,
+        entity_key: str | None,
+        country: str | None,
+        type_of_data: str | None,
+        scenario_mode: str,
+        max_variables: int,
+    ) -> list[GeneratedSchemaField]:
+        raw_ideas = [idea.model_dump() for idea in intent.candidate_variables]
+        ideas: list[dict[str, object]] = []
+        seen_idea_keys: set[str] = set()
+        for idea in raw_ideas:
+            key = self._normalize_variable_name(str(idea.get("name") or ""))
+            if not key or key in seen_idea_keys:
+                continue
+            seen_idea_keys.add(key)
+            ideas.append(idea)
+        if entity_key:
+            anchor_norm = self._normalize_variable_name(entity_key)
+            if anchor_norm not in seen_idea_keys:
+                ideas.insert(0, {"name": entity_key, "description": f"Stable identifier for the requested {intent.use_case or 'telecom'} entity.", "role": "identity", "grain": "entity", "dtype": "string", "depends_on": []})
+        # Respect a 30-35 target without turning it into a hard minimum. If the model
+        # proposes more than the public maximum, retain the most scenario-relevant ideas.
+        if len(ideas) > max_variables:
+            ideas = ideas[:max_variables]
+
+        fields: list[GeneratedSchemaField] = []
+        used_names: set[str] = set()
+        used_registry: set[tuple[str, str]] = set()
+        name_map: dict[str, str] = {}
+        registry_names = {
+            self._normalize_variable_name(attr.name)
+            for entity in entities
+            for attr in entity.attributes
+        }
+
+        # First assign names so later dependency references can be resolved to the fresh names.
+        for idea in ideas:
+            current_requested = str(idea.get("name") or "scenario_attribute")
+            fresh = self._fresh_name(
+                current_requested,
+                str(idea.get("description") or ""),
+                used_names,
+                registry_names,
+                entity_key,
+            )
+            used_names.add(fresh)
+            name_map[self._normalize_variable_name(str(idea.get("name") or ""))] = fresh
+
+        profile = get_profile((intent.industry_type or "telecom"), country)
+        country_currency = str(profile.get("currency") or "").upper()
+        for idea in ideas:
+            original_name = str(idea.get("name") or "scenario_attribute")
+            fresh = name_map[self._normalize_variable_name(original_name)]
+            matched = self._match_registry_attribute(idea, entities, used_registry)
+            role = str(idea.get("role") or "other").lower()
+            idea_text = f"{original_name} {idea.get('description', '')}".lower()
+            outcome_semantic = role in {"status", "decision"} or any(token in idea_text for token in ("status", "state", "outcome", "decision", "result"))
+            if matched is not None:
+                entity, attr = matched
+                used_registry.add((entity.canonical_id, attr.name))
+                # Registry provenance still anchors the concept, but lifecycle/outcome fields
+                # are compiled through the scenario-aware semantic contract. This prevents a
+                # Normal/Failure/Suppression/etc. request from inheriting an incompatible
+                # choice list simply because a registry attribute had a similar description.
+                if outcome_semantic and scenario_mode:
+                    runtime_generator, dtype, params = self._generic_contract_for_idea(idea, country, scenario_mode)
+                else:
+                    params = dict(attr.params or {})
+                    if attr.generator == "msisdn":
+                        params["country"] = str(country or params.get("country") or "IN").upper()
+                    if country_currency and (attr.name.lower() == "currency" or "currency" in params):
+                        params["currency"] = country_currency
+                    runtime_generator, params = self._runtime_generation_contract(attr, params, country)
+                    dtype = attr.dtype
+                    if attr.generator == "msisdn":
+                        dtype = "string"
+            else:
+                entity = self._choose_entity_for_idea(idea, entities, None, entity_key)
+                runtime_generator, dtype, params = self._generic_contract_for_idea(idea, country, scenario_mode)
+
+            role = str(idea.get("role") or "other")
+            grain = str(idea.get("grain") or ("entity" if original_name == entity_key else "transaction"))
+            deps = self._merge_dependencies(idea, name_map, grain, entity_key)
+            if original_name == entity_key:
+                grain = "entity"
+                deps = []
+            required = original_name == entity_key
+            nullable = False if required else True
+            description = str(idea.get("description") or "").strip() or f"Scenario-specific {role.replace('_', ' ')} attribute for {intent.domain}."
+            provenance = {
+                "generated_from": "semantic_variable_idea",
+                "canonical_entity": entity.canonical_id if entity else None,
+                "source_registry_attribute": getattr(attr, "name", None) if matched else None,
+                "grain": grain,
+            }
+            fields.append(GeneratedSchemaField(
+                name=fresh,
+                dtype=dtype,
+                description=description,
+                gen=runtime_generator,
+                params=params,
+                depends_on=deps,
+                nullable=nullable,
+                required=required,
+                # Registry formulas reference canonical registry field names. Because this
+                # proposal deliberately renames matched concepts into fresh names, do not carry
+                # an un-translated formula into the new schema. Derived formulas are synthesized
+                # later only when their dependencies are explicitly present in the fresh idea set.
+                formula=None,
+                provenance=provenance,
+                scope=grain,
+            ))
+        return fields
+
     def compile(
         self,
         intent: ScenarioIntent,
         selected_entities: list[str] | None = None,
-        min_variables: int = 35,
+        max_variables: int = 35,
         domain_query: str | None = None,
         entity_key: str | None = None,
         industry_type: str | None = None,
@@ -253,21 +575,25 @@ class SchemaCompiler:
         type_of_data: str | None = None,
         use_case: str | None = None,
         business_scenario: str | None = None,
+        business_response: str | None = None,
+        expected_outcome: str | None = None,
         country: str | None = None,
     ) -> ScenarioSchema:
         requested = intent
         normalized_industry = (industry_type or intent.industry_type or "telecom").strip().lower()
         if normalized_industry not in {"telecom", "telecommunications"}:
-            raise ValueError(f"Unsupported industryType '{industry_type or intent.industry_type}'. The telecom registry only supports Telecommunications/Telecom.")
+            raise ValueError(
+                f"Unsupported industryType '{industry_type or intent.industry_type}'. The telecom registry only supports Telecommunications/Telecom."
+            )
         if selected_entities is not None:
-            # HITL may select/add only entities already present in the authoritative registry.
             normalized: list[str] = []
             for value in selected_entities:
-                entity = self.registry.resolve_entity(value)
-                if entity is None:
+                ent = self.registry.resolve_entity(value)
+                if ent is None:
                     raise ValueError(f"HITL selected unknown registry entity '{value}'")
-                normalized.append(entity.canonical_id)
+                normalized.append(ent.canonical_id)
             requested = requested.model_copy(update={"requested_entities": normalized})
+
         entities, unresolved = self.resolve(
             requested,
             domain_query=domain_query,
@@ -278,211 +604,100 @@ class SchemaCompiler:
             entity_key=entity_key,
         )
         entity_ids = {e.canonical_id for e in entities}
-        domain_ids = {
-            item["canonical_id"]
-            for item in self.registry.search(domain_query or intent.domain, limit=50)
-        }
-        if domain_query and not domain_ids:
-            unresolved.append(
-                f"Business domain '{domain_query}' could not be mapped to an approved telecom registry domain"
-            )
-        selected_ids = set(entity_ids)
-        if selected_ids & {"internet_access_service", "ip_uni", "subscriber_ethernet_service", "subscriber_uni"}:
-            supporting_ids = {"subscriber_ethernet_service", "subscriber_uni", "subscriber", "product_offering", "customer_account"}
-        elif selected_ids & {"recharge", "prepaid_account", "bucket", "balance_action_history", "usage_event", "charging_event"} or intent.subdomain == "prepaid":
-            supporting_ids = {"subscriber", "customer_account", "usage_event", "charging_event", "online_charging_session", "cdr_record", "product_offering"}
-        else:
-            supporting_ids = {"subscriber", "product_offering", "customer_account", "customer"}
-        allowed_expansion_ids = domain_ids | entity_ids | supporting_ids
-
-        # Enforce the platform's minimum proposal width without allowing the LLM to
-        # invent fields. Expand only through entities already present in the approved
-        # registry graph, preferring nodes directly connected to the selected model.
-        if domain_ids and min_variables > 0:
-            frontier = list(entities)
-            visited = set(entity_ids)
-            while frontier and self._eligible_field_count(entities, entity_ids, entity_key) < min_variables:
-                next_frontier: list[EntityDef] = []
-                candidate_ids: list[str] = []
-                for entity in frontier:
-                    for rel in entity.relationships:
-                        if rel.target not in visited and rel.target in allowed_expansion_ids and self.registry.entity_exists(rel.target):
-                            candidate_ids.append(rel.target)
-                    for candidate in self.registry.related_entities(entity.canonical_id):
-                        if candidate.canonical_id not in visited and candidate.canonical_id in allowed_expansion_ids:
-                            candidate_ids.append(candidate.canonical_id)
-                # Stable de-duplication keeps schema generation reproducible. Rank only
-                # already-approved registry nodes using the remaining business inputs.
-                unique_candidate_ids = list(dict.fromkeys(candidate_ids))
-                unique_candidate_ids.sort(
-                    key=lambda cid: (
-                        -self._expansion_score(
-                            self.registry.get_entity(cid),
-                            scenario_type=scenario_type,
-                            type_of_data=type_of_data,
-                            use_case=use_case,
-                        ),
-                        cid,
-                    )
-                )
-                for candidate_id in unique_candidate_ids:
-                    if candidate_id in visited:
-                        continue
-                    candidate = self.registry.get_entity(candidate_id)
-                    visited.add(candidate_id)
-                    entity_ids.add(candidate_id)
-                    entities.append(candidate)
-                    next_frontier.append(candidate)
-                    if self._eligible_field_count(entities, entity_ids, entity_key) >= min_variables:
-                        break
-                frontier = next_frontier
-                if not next_frontier:
+        # Expand only as far as the request semantics and registry relationships justify.
+        # There is deliberately no minimum-width padding loop.
+        frontier = list(entities)
+        visited = set(entity_ids)
+        allowed_expansion_ids = {
+            item["canonical_id"] for item in self.registry.search(domain_query or intent.domain, limit=50)
+        } | entity_ids
+        for _ in range(2):
+            candidates: list[str] = []
+            for entity in frontier:
+                for rel in entity.relationships:
+                    if rel.target in allowed_expansion_ids and rel.target not in visited and self.registry.entity_exists(rel.target):
+                        candidates.append(rel.target)
+                for related in self.registry.related_entities(entity.canonical_id):
+                    if related.canonical_id in allowed_expansion_ids and related.canonical_id not in visited:
+                        candidates.append(related.canonical_id)
+            unique = list(dict.fromkeys(candidates))
+            unique.sort(key=lambda cid: (-self._expansion_score(self.registry.get_entity(cid), scenario_type=scenario_type, type_of_data=type_of_data, use_case=use_case), cid))
+            new_frontier: list[EntityDef] = []
+            for cid in unique:
+                visited.add(cid)
+                ent = self.registry.get_entity(cid)
+                entities.append(ent)
+                entity_ids.add(cid)
+                new_frontier.append(ent)
+                if len(entities) >= 10:
                     break
+            frontier = new_frontier
+            if not new_frontier:
+                break
 
-        # Some valid telecom domains contain fewer than the platform minimum of 35
-        # variables in the standards slice. Add only approved, domain-relevant
-        # supporting entities. This fallback is deterministic and registry-backed;
-        # it is never invented by the LLM.
-        fallback_used = False
-        if domain_ids and min_variables > 0 and self._eligible_field_count(entities, entity_ids, entity_key) < min_variables:
-            if selected_ids & {"internet_access_service", "ip_uni", "subscriber_ethernet_service", "subscriber_uni"}:
-                fallback_entities = (
-                    "subscriber_ethernet_service", "subscriber_uni", "subscriber", "product_offering", "customer_account",
-                )
-            elif selected_ids & {"recharge", "prepaid_account", "bucket", "balance_action_history", "usage_event", "charging_event"} or intent.subdomain == "prepaid":
-                fallback_entities = (
-                    "customer_account", "usage_event", "charging_event", "online_charging_session", "cdr_record", "product_offering",
-                )
-            else:
-                fallback_entities = (
-                    "subscriber", "product_offering", "customer_account", "customer",
-                    "prepaid_account", "usage_event", "charging_event",
-                )
-
-            for fallback_id in fallback_entities:
-                if self._eligible_field_count(entities, entity_ids, entity_key) >= min_variables:
-                    break
-                if fallback_id in entity_ids or not self.registry.entity_exists(fallback_id):
-                    continue
-                entity = self.registry.get_entity(fallback_id)
-                entities.append(entity)
-                entity_ids.add(entity.canonical_id)
-                fallback_used = True
+        scenario_mode = classify_outcome_mode(
+            scenario_type=scenario_type or requested.scenario_type,
+            expected_outcome=expected_outcome or "",
+            business_response=business_response or "",
+            business_scenario=business_scenario or "",
+        )
+        fields = self._build_fresh_fields(
+            requested,
+            entities,
+            entity_key=entity_key,
+            country=country,
+            type_of_data=type_of_data,
+            scenario_mode=scenario_mode,
+            max_variables=max(1, min(35, max_variables)),
+        )
+        field_names = [f.name for f in fields]
+        if not fields:
+            unresolved.append("The scenario did not yield any usable semantic variables.")
+        if entity_key and self._normalize_variable_name(entity_key) not in {self._normalize_variable_name(n) for n in field_names}:
+            unresolved.append(f"Requested entity key '{entity_key}' could not be represented by the proposed variables")
 
         relationships: list[SchemaRelationship] = []
         for entity in entities:
             for rel in entity.relationships:
                 if rel.target in entity_ids:
                     target = self.registry.get_entity(rel.target)
-                    source_refs = [s.get("reference", "") for s in entity.sources]
                     relationships.append(SchemaRelationship(
                         source_entity=entity.canonical_id,
                         target_entity=target.canonical_id,
                         relation=rel.relation,
                         cardinality=rel.cardinality,
                         required=rel.required,
-                        source_references=source_refs,
+                        source_references=[s.get("reference", "") for s in entity.sources],
                     ))
 
-        # Use only registry attributes. Scenario-specific fields can be added later as
-        # explicit internal extensions through the registry/HITL, never by the LLM.
-        profile = get_profile(normalized_industry, country)
-        country_currency = str(profile.get("currency") or "").upper()
-        fields: list[GeneratedSchemaField] = []
-        seen_fields: set[str] = set()
-        projected_field_names: set[str] = set()
-        for entity in entities:
-            for attr in entity.attributes:
-                target = dict(attr.params or {}).get("target")
-                if target and str(target) not in entity_ids:
-                    continue
-                if entity_key and entity_key.lower() == "subscriber_id" and attr.name == "customer_id":
-                    continue
-                if entity_key and attr.name != entity_key and entity.canonical_id == self._root_entity_for_key(entity_key, entities):
-                    if attr.name.endswith("_id") and attr.name not in {"account_id"}:
-                        continue
-                projected_field_names.add(attr.name)
-
-        for entity in entities:
-            for attr in entity.attributes:
-                if attr.name in seen_fields:
-                    continue
-                target = dict(attr.params or {}).get("target")
-                if target and str(target) not in entity_ids:
-                    continue
-                if entity_key and entity_key.lower() == "subscriber_id" and attr.name == "customer_id":
-                    continue
-                if entity_key and attr.name != entity_key and entity.canonical_id == self._root_entity_for_key(entity_key, entities):
-                    if attr.name.endswith("_id") and attr.name not in {"account_id"}:
-                        continue
-                params = dict(attr.params or {})
-                if attr.generator == "msisdn" and country:
-                    params["country"] = str(country).upper()
-                if country_currency and "currency" in params:
-                    params["currency"] = country_currency
-                if country_currency and attr.generator == "constant" and attr.name.lower() == "currency":
-                    params["value"] = country_currency
-                runtime_generator, params = self._runtime_generation_contract(attr, params, country)
-                if runtime_generator == "dependent_choice":
-                    params["depends_on_field"] = (attr.depends_on[0] if attr.depends_on else "")
-                dependencies = self._normalize_dependencies(
-                    entity, attr.name, attr.depends_on, entity_ids, projected_field_names
-                )
-                # At this point the field is known to be projected: its reference target,
-                # identity policy, generator contract and dependencies have all been checked.
-                seen_fields.add(attr.name)
-                fields.append(GeneratedSchemaField(
-                    name=attr.name,
-                    dtype=attr.dtype,
-                    description=attr.description,
-                    gen=runtime_generator,
-                    params=params,
-                    depends_on=dependencies,
-                    nullable=attr.nullable,
-                    required=attr.required,
-                    formula=attr.derived_formula,
-                    provenance={
-                        "canonical_entity": entity.canonical_id,
-                        "standards": [dict(s) for s in entity.sources],
-                        "required": attr.required,
-                    },
-                ))
-
-        hard_constraints = [
-            "Every entity must resolve to an approved registry entry.",
-            "Every field must resolve to an approved entity attribute.",
-            "Every relationship must come from an approved registry edge.",
-            "No LLM-created enum, formula, generator or field is executable.",
-            "Generated records must pass deterministic schema, reference, temporal and arithmetic validation.",
-            "Business domain selection is deterministic and registry-backed; industryType selects the supported model family.",
-            "Scenario type, data type, country, entity key and use case are backend-authoritative inputs to proposal compilation; scenarioId is identifier-only.",
-        ]
-        if not entities:
-            unresolved.append("No supported telecom concepts could be resolved from the request")
-
-        if "recharge" in entity_ids and "prepaid_account" in entity_ids:
-            hard_constraints.append("Successful recharge affects prepaid balance; failed/reversed recharge must not be applied as a completed top-up.")
-        if "usage_event" in entity_ids and "charging_event" in entity_ids:
-            hard_constraints.append("Charging event must reference an existing usage event and occur at or after the usage event timestamp.")
-        if type_of_data == "aggregational":
-            hard_constraints.append("Aggregational output is selected using the requested data type while retaining only registry-backed attributes.")
-        if type_of_data == "transactional":
-            hard_constraints.append("Transactional output is compiled around the requested entity key and registry-backed identifiers/events.")
-        if country:
-            hard_constraints.append(f"Country context '{country}' is applied to country-sensitive generation parameters only.")
-        if scenario_type:
-            hard_constraints.append(f"Scenario type '{scenario_type}' is treated as a backend-authoritative scenario context; no unregistered semantics are created from it.")
         applicable_standards = self.registry.standards_for_entities([e.canonical_id for e in entities])
-        warnings = []
-        if entities:
-            warnings.append("Runtime registry is built from versioned normalized standards artifacts plus an INGENII generation-policy overlay. Official source artifacts should be re-ingested before production certification.")
-        if fallback_used:
-            warnings.append("The requested domain did not contain enough registry-backed attributes to meet the 35-variable minimum; approved foundational telecom entities were added deterministically.")
+        hard_constraints = [
+            "scenarioId is identifier-only and does not select variables or business rules.",
+            "The proposal is a fresh semantic variable set derived from the current scenario context; it is not a replay of a fixed scenario template.",
+            "30-35 variables is a target range, not a validation minimum. A smaller semantically justified schema is valid.",
+            "Each semantic variable is compiled into a deterministic executable generator contract.",
+            "Transactional entity-grain variables are stable across the entity history; transaction/event/derived variables are regenerated per transaction/event.",
+            "Generated records must pass deterministic type, choice, dependency, temporal, formula and scenario-semantic validation.",
+            f"Scenario outcome mode is derived dynamically from the complete request context: {scenario_mode}.",
+        ]
+        if entity_key:
+            hard_constraints.append(f"'{entity_key}' is the authoritative entity key for transactional grouping.")
+        warnings = [
+            "Scenario IDs are identifiers only; variables and generation rules are derived from the current request, registry grounding, and scenario semantics.",
+        ]
         return ScenarioSchema(
-            domain=domain_query or intent.domain or intent.subdomain,
-            subdomain=intent.subdomain,
+            domain=domain_query or requested.domain or requested.subdomain,
+            subdomain=requested.subdomain,
             applicable_standards=applicable_standards,
-            entities=[ResolvedConcept(canonical_id=e.canonical_id, name=e.name, source_model="/".join(sorted({s['standard'] for s in e.sources})), source_references=[s.get("reference", "") for s in e.sources], selected_attributes=[a.name for a in e.attributes]) for e in entities],
+            entities=[
+                ResolvedConcept(
+                    canonical_id=e.canonical_id,
+                    name=e.name,
+                    source_model="/".join(sorted({s["standard"] for s in e.sources})),
+                    source_references=[s.get("reference", "") for s in e.sources],
+                    selected_attributes=[a.name for a in e.attributes],
+                ) for e in entities
+            ],
             relationships=relationships,
             fields=fields,
             hard_constraints=hard_constraints,

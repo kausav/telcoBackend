@@ -19,7 +19,7 @@ import json
 import re
 from typing import Any
 
-from agents.data_generation_agent import get_known_generator_types
+from core.generator_contracts import SUPPORTED_GENERATORS
 
 ALLOWED_DTYPES = {
     "string", "int", "integer", "float", "decimal", "categorical",
@@ -895,7 +895,7 @@ def _coerce_executable_generator(gen: str, params: dict[str, Any], dtype: str, f
     generator is still unknown to the backend, choose a deterministic fallback
     from dtype/params/formula semantics.
     """
-    known = get_known_generator_types()
+    known = SUPPORTED_GENERATORS
     if gen in known:
         return gen, params
 

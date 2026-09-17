@@ -20,11 +20,11 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
+from threading import RLock
 
 from config.runtime import TELECOM_STANDARDS_DIR, TELECOM_PROFILES_DIR, REGISTRY_DB_PATH
 
 
-ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STANDARDS_DIR = TELECOM_STANDARDS_DIR
 DEFAULT_PROFILES_DIR = TELECOM_PROFILES_DIR
 DEFAULT_DB_PATH = REGISTRY_DB_PATH
@@ -108,6 +108,10 @@ class TelecomRegistry:
         self.db_path = Path(db_path or os.getenv("REGISTRY_DB_PATH") or DEFAULT_DB_PATH)
         self.standards_dir = Path(standards_dir or os.getenv("REGISTRY_STANDARDS_DIR") or DEFAULT_STANDARDS_DIR).expanduser().resolve()
         self.profiles_dir = Path(profiles_dir or os.getenv("REGISTRY_PROFILES_DIR") or DEFAULT_PROFILES_DIR).expanduser().resolve()
+        self._cache_lock = RLock()
+        self._entity_cache: dict[str, EntityDef] = {}
+        self._catalog_cache: dict[tuple[str | None, int], list[dict[str, Any]]] = {}
+        self._search_cache: dict[tuple[str, str | None, int], list[dict[str, Any]]] = {}
         if auto_bootstrap:
             self.ensure_current()
 
@@ -166,8 +170,14 @@ class TelecomRegistry:
         if domain:
             sql += " WHERE domain = ?"
             args.append(domain)
+        effective_limit = max(1, min(int(limit), 1000))
+        cache_key = (domain, effective_limit)
+        with self._cache_lock:
+            cached = self._catalog_cache.get(cache_key)
+            if cached is not None:
+                return [dict(item) for item in cached]
         sql += " ORDER BY canonical_id LIMIT ?"
-        args.append(max(1, min(int(limit), 1000)))
+        args.append(effective_limit)
         with self._connect() as conn:
             rows = conn.execute(sql, args).fetchall()
             result = []
@@ -185,7 +195,21 @@ class TelecomRegistry:
                     "description": description,
                     "source_standards": [r[0] for r in source_rows],
                 })
+            with self._cache_lock:
+                self._catalog_cache[cache_key] = [dict(item) for item in result]
             return result
+
+    def entities_with_attribute(self, attribute_name: str) -> list[EntityDef]:
+        """Return registry entities exposing an exact attribute name, deterministically."""
+        normalized = str(attribute_name or "").strip().lower()
+        if not normalized:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT canonical_id FROM attributes WHERE lower(name)=? ORDER BY canonical_id",
+                (normalized,),
+            ).fetchall()
+        return [self.get_entity(row[0]) for row in rows]
 
     def related_entities(self, entity_id: str) -> list[EntityDef]:
         """Return entities connected to *entity_id* by approved registry relationships.
@@ -222,6 +246,10 @@ class TelecomRegistry:
 
     def get_entity(self, entity_id: str) -> EntityDef:
         key = _normalise(entity_id).replace(" ", "_")
+        with self._cache_lock:
+            cached = self._entity_cache.get(key)
+            if cached is not None:
+                return cached
         with self._connect() as conn:
             entity = conn.execute(
                 "SELECT canonical_id, name, domain, description FROM entities WHERE canonical_id=?", (key,)
@@ -241,24 +269,25 @@ class TelecomRegistry:
             attr_rows = conn.execute(
                 """SELECT name, dtype, required, nullable, description, enum_values_json,
                           generator, params_json, derived_formula, depends_on_json
-                   FROM attributes WHERE canonical_id=? ORDER BY ordinal""",
-                (canonical_id,),
+                   FROM attributes WHERE canonical_id=? ORDER BY ordinal""", (canonical_id,)
             ).fetchall()
             for row in attr_rows:
                 attrs.append(AttributeDef(
-                    name=row[0], dtype=row[1], required=bool(row[2]), nullable=bool(row[3]),
-                    description=row[4] or "", enum_values=tuple(json.loads(row[5] or "[]")),
-                    generator=row[6] or "", params=json.loads(row[7] or "{}"),
-                    derived_formula=row[8], depends_on=tuple(json.loads(row[9] or "[]")),
+                    name=row[0], dtype=row[1], required=bool(row[2]), nullable=bool(row[3]), description=row[4] or "",
+                    enum_values=tuple(json.loads(row[5] or "[]")), generator=row[6] or "",
+                    params=json.loads(row[7] or "{}"), derived_formula=row[8], depends_on=tuple(json.loads(row[9] or "[]")),
                 ))
-            rels = tuple(
+            relationships = tuple(
                 RelationshipDef(target=row[0], relation=row[1], cardinality=row[2], required=bool(row[3]), description=row[4] or "")
                 for row in conn.execute(
                     "SELECT target_entity, relation, cardinality, required, description FROM relationships WHERE source_entity=? ORDER BY ordinal",
                     (canonical_id,),
                 ).fetchall()
             )
-        return EntityDef(canonical_id, name, aliases, domain, description, sources, tuple(attrs), rels)
+        result = EntityDef(canonical_id, name, aliases, domain, description, sources, tuple(attrs), relationships)
+        with self._cache_lock:
+            self._entity_cache[key] = result
+        return result
 
     def entity_dict(self, entity_id: str) -> dict[str, Any]:
         e = self.get_entity(entity_id)
@@ -323,21 +352,15 @@ class TelecomRegistry:
         except KeyError:
             return False
 
-    def relationship_exists(self, source_entity: str, target_entity: str, relation: str, cardinality: str) -> bool:
-        source = self.resolve_entity(source_entity)
-        target = self.resolve_entity(target_entity)
-        if not source or not target:
-            return False
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM relationships WHERE source_entity=? AND target_entity=? AND relation=? AND cardinality=?",
-                (source.canonical_id, target.canonical_id, relation, cardinality),
-            ).fetchone()
-        return row is not None
-
     def search(self, query: str, domain: str | None = None, limit: int = 35) -> list[dict[str, Any]]:
         """Deterministic lexical search over names and aliases; one result per entity."""
         normalized = _normalise(query)
+        effective_limit = max(1, min(limit, 100))
+        cache_key = (normalized, domain, effective_limit)
+        with self._cache_lock:
+            cached = self._search_cache.get(cache_key)
+            if cached is not None:
+                return [dict(item) for item in cached]
         tokens = [token for token in normalized.split() if token]
         best_by_entity: dict[str, tuple[int, dict[str, Any]]] = {}
 
@@ -383,7 +406,10 @@ class TelecomRegistry:
 
         scored = list(best_by_entity.values())
         scored.sort(key=lambda item: (-item[0], item[1]["canonical_id"]))
-        return [item for _, item in scored[: max(1, min(limit, 100))]]
+        result = [item for _, item in scored[:effective_limit]]
+        with self._cache_lock:
+            self._search_cache[cache_key] = [dict(item) for item in result]
+        return result
 
 
 class RegistryBuilder:

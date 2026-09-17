@@ -1,0 +1,121 @@
+"""Deterministic generation rules for confirmed agentic scenarios.
+
+This module contains no LLM or scenario-ID-specific logic. It turns the confirmed
+variable contract plus request context into machine-readable generation guardrails.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from core.scenario_semantics import derive_scenario_semantics, temporal_delay_limit_seconds, temporal_role
+
+
+_RULE_PARAM_KEYS = (
+    "choices", "values", "min", "max", "buckets", "weights", "precision",
+    "currency", "target", "mapping", "country", "timezone", "prefix", "digits",
+)
+
+
+def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, Any]:
+    """Build deterministic rules from the confirmed schema and full scenario context."""
+    names = {str(v.get("name")) for v in variables if v.get("name")}
+    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    constraints: dict[str, dict[str, Any]] = {}
+    formulas: list[dict[str, str]] = []
+
+    for var in variables:
+        name = str(var.get("name") or "")
+        params = var.get("params") if isinstance(var.get("params"), dict) else {}
+        generation_constraint: dict[str, Any] = {}
+        for key in _RULE_PARAM_KEYS:
+            if key in params:
+                generation_constraint["valid_values" if key == "choices" else key] = params[key]
+        constraints[name] = generation_constraint
+        if var.get("formula"):
+            formulas.append({"field": name, "expression": str(var["formula"])})
+
+    temporal: list[dict[str, Any]] = []
+    seen_edges: set[tuple[str, str]] = set()
+
+    def add_edge(before: str, after: str, max_delay: int | None, reason: str) -> None:
+        if before not in names or after not in names or before == after:
+            return
+        key = (before, after)
+        if key in seen_edges:
+            return
+        seen_edges.add(key)
+        item: dict[str, Any] = {
+            "before": before,
+            "after": after,
+            "min_delay_seconds": 0,
+            "reason": reason,
+        }
+        if max_delay is not None:
+            item["max_delay_seconds"] = int(max_delay)
+        temporal.append(item)
+
+    for child_name, child in by_name.items():
+        if str(child.get("dtype", "")).lower() != "datetime":
+            continue
+        for dep in child.get("depends_on", []) or []:
+            parent_name = str(dep)
+            parent = by_name.get(parent_name)
+            if parent and str(parent.get("dtype", "")).lower() == "datetime":
+                add_edge(
+                    parent_name,
+                    child_name,
+                    temporal_delay_limit_seconds(child, parent),
+                    "Confirmed datetime dependency implies chronological causality.",
+                )
+
+    datetime_vars = [v for v in variables if str(v.get("dtype", "")).lower() == "datetime"]
+    lifecycle_pairs = {
+        ("presentation", "response"),
+        ("dispatch", "response"),
+        ("start", "completion"),
+        ("start", "end"),
+        ("presentation", "completion"),
+    }
+    for parent in datetime_vars:
+        for child in datetime_vars:
+            if parent is child:
+                continue
+            parent_role = temporal_role(parent)
+            child_role = temporal_role(child)
+            if (parent_role, child_role) in lifecycle_pairs and str(parent.get("scope", "transaction")) == str(child.get("scope", "transaction")):
+                add_edge(
+                    str(parent.get("name")),
+                    str(child.get("name")),
+                    temporal_delay_limit_seconds(child, parent),
+                    "Scenario lifecycle semantics imply chronological order.",
+                )
+
+    semantics = derive_scenario_semantics(state, variables)
+    for field, preferred in semantics.get("preferred_values", {}).items():
+        if field in constraints and preferred:
+            constraints[field]["preferred_values"] = preferred
+
+    return {
+        "scenario_summary": "Confirmed scenario schema with deterministic scenario-context semantics; no scenario-ID lookup.",
+        "business_rules": [
+            "Entity, field and relationship vocabulary is frozen to the approved compiled schema.",
+            "Unknown fields, values and relationships are non-executable.",
+        ],
+        "field_constraints": {
+            name: {
+                "description": str(var.get("description", "")),
+                "nullable": bool(var.get("nullable", False)),
+            }
+            for name, var in by_name.items()
+        },
+        "cross_field_rules": [
+            "Every declared field dependency must resolve to a field in the confirmed schema.",
+            "Causal timestamps must respect declared temporal order and bounded delays.",
+            "Scenario outcome/state fields must follow deterministic scenario semantic guardrails.",
+        ],
+        "conditional_rules": [],
+        "generation_constraints": constraints,
+        "formula_rules": formulas,
+        "temporal_rules": temporal,
+        "scenario_semantics": semantics,
+    }

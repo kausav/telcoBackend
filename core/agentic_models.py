@@ -9,6 +9,23 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class VariableIdea(BaseModel):
+    """LLM-created semantic variable idea. It is not executable until the compiler
+    assigns a deterministic generator/parameter contract.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=2, max_length=120)
+    description: str = Field(default="", max_length=500)
+    role: Literal[
+        "identity", "profile", "event", "transaction", "status",
+        "measurement", "metric", "timing", "decision", "configuration", "derived", "other"
+    ] = "other"
+    grain: Literal["entity", "transaction", "event", "derived"] = "transaction"
+    dtype: Literal["string", "integer", "float", "decimal", "boolean", "categorical", "datetime", "date"] = "string"
+    depends_on: list[str] = Field(default_factory=list, max_length=8)
+
 class ScenarioIntent(BaseModel):
     """LLM output: intent only, never executable schema semantics."""
 
@@ -24,12 +41,15 @@ class ScenarioIntent(BaseModel):
     use_case: str = ""
     requested_entities: list[str] = Field(default_factory=list, max_length=35)
     requested_relationships: list[str] = Field(default_factory=list, max_length=45)
+    candidate_variables: list[VariableIdea] = Field(default_factory=list, max_length=35)
     country: str | None = None
     currency: str | None = None
     record_count: int | None = Field(default=None, ge=1, le=5_000_000)
     time_window_days: int | None = Field(default=None, ge=1, le=3650)
     notes: list[str] = Field(default_factory=list, max_length=35)
     ambiguities: list[str] = Field(default_factory=list, max_length=35)
+
+
 
 
 class ResolvedConcept(BaseModel):
@@ -59,6 +79,7 @@ class GeneratedSchemaField(BaseModel):
     nullable: bool = False
     required: bool = False
     formula: str | None = None
+    scope: Literal["entity", "transaction", "event", "derived"] = "transaction"
     provenance: dict[str, Any] = Field(default_factory=dict)
 
 

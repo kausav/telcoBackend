@@ -28,6 +28,33 @@ def infer_history_field_sets(variables: list[dict[str, Any]], entity_key: str | 
     """
     by_name={str(v.get('name')):v for v in variables if v.get('name')}
     names=[str(v['name']) for v in variables if v.get('name')]
+
+    # Agentic proposals carry an explicit scope/grain assigned by the compiler.
+    # When present, trust it over positional heuristics so transactional status,
+    # amounts, decisions, timestamps, etc. are regenerated per transaction rather
+    # than being frozen at the user/entity level. CSV imports without scope retain
+    # the backwards-compatible timestamp-anchor heuristic below.
+    scoped = {
+        name: str(var.get("scope") or "").strip().lower()
+        for name, var in by_name.items()
+        if str(var.get("scope") or "").strip()
+    }
+    if scoped:
+        stable = {name for name, scope in scoped.items() if scope == "entity"}
+        if entity_key and entity_key in by_name:
+            stable.add(entity_key)
+        changed=True
+        while changed:
+            changed=False
+            for name in tuple(stable):
+                var=by_name.get(name)
+                for dep in (var.get("depends_on", []) if isinstance(var, dict) else []) or []:
+                    if dep in by_name and dep not in stable and scoped.get(dep) == "entity":
+                        stable.add(dep); changed=True
+        user_fields=tuple(n for n in names if n in stable)
+        record_fields=tuple(n for n in names if n not in stable)
+        return user_fields, record_fields
+
     timestamp_index=None
     preferred=("record_timestamp","transaction_timestamp","timestamp","created_at","updated_at")
     for preferred_name in preferred:
@@ -77,5 +104,3 @@ def compile_scenario(scenario_id: str, force: bool=False)->CompiledScenario:
 
 def invalidate_scenario(scenario_id:str)->None:
     with _LOCK: _CACHE.pop(scenario_id,None)
-def clear_cache()->None:
-    with _LOCK: _CACHE.clear()

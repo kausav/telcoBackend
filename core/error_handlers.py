@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 import re
 from typing import Any
-from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -56,16 +55,6 @@ def _safe_upstream_diagnostics(detail: Any) -> dict[str, Any]:
                 safe_details[key] = value
         diagnostics["upstream_details"] = safe_details
 
-    # Best-effort lookup of the deployed machine/container's public egress IP.
-    # This is deliberately time-limited and never makes the error response fail.
-    try:
-        req = UrlRequest("https://api.ipify.org", headers={"User-Agent": "telco-backend/1.0"})
-        with urlopen(req, timeout=2.0) as response:
-            public_ip = response.read(64).decode("ascii", errors="ignore").strip()
-        if re.fullmatch(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F:]+", public_ip):
-            diagnostics["public_ip"] = public_ip
-    except Exception:
-        logger.warning("Unable to determine public egress IP while handling upstream error", exc_info=True)
 
     return diagnostics
 
@@ -91,8 +80,7 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
     code = error_code_for_status(exc.status_code)
     message, details = _normalize_http_detail(exc.detail)
 
-    # Preserve safe diagnostics for upstream failures so deployment/network
-    # issues (for example an unwhitelisted egress IP) can be diagnosed.
+    # Preserve redacted provider diagnostics for upstream failures.
     if exc.status_code == 502:
         message = "An upstream service failed to complete the request"
         details = _safe_upstream_diagnostics(exc.detail)

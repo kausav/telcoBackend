@@ -70,11 +70,3 @@ def append_message(conversation_id: str, role: str, content: str) -> None:
         )
         conn.execute("UPDATE conversations SET updated_at=? WHERE conversation_id=?", (now, conversation_id))
 
-
-def get_messages(conversation_id: str, limit: int = 30) -> list[dict[str, str]]:
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT role, content FROM chat_messages WHERE conversation_id=? ORDER BY id DESC LIMIT ?",
-            (conversation_id, max(1, min(100, limit))),
-        ).fetchall()
-    return [{"role": row[0], "content": row[1]} for row in reversed(rows)]

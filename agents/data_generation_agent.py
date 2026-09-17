@@ -21,6 +21,9 @@ from langgraph.graph import StateGraph, END
 from core.dynamic_scenarios import resolve_variables
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
+from core.generator_contracts import SUPPORTED_GENERATORS
+from core.scenario_semantics import temporal_delay_limit_seconds as _temporal_delay_limit_seconds, temporal_role as _temporal_role
+from core.deterministic_rules import build_deterministic_rules
 
 logger = logging.getLogger(__name__)
 
@@ -555,9 +558,8 @@ _GENERATORS = {
 
 
 def get_known_generator_types() -> set[str]:
-    """Public accessor for the set of valid 'gen' type strings — used by
-    the scenario-definition layer to validate industry-supplied variable definitions."""
-    return set(_GENERATORS.keys())
+    """Return generator names accepted by both the CSV contract and runtime."""
+    return set(SUPPORTED_GENERATORS)
 
 
 def _rule_constraint_for(field_name: str, rules: dict | None) -> dict:
@@ -727,6 +729,9 @@ def _apply_scenario_semantics(rec: dict, rules: dict | None) -> dict:
     for field in semantics.get("force_false_fields", []) or []:
         if field in rec:
             rec[field] = False
+    for field, preferred in (semantics.get("preferred_values") or {}).items():
+        if field in rec and isinstance(preferred, list) and preferred:
+            rec[field] = preferred[0]
     return rec
 
 
@@ -1089,15 +1094,6 @@ def _qa_parse_dt(value: Any) -> datetime | None:
     return dt
 
 
-def _fill_missing(rec: dict, field_order: list, dtype_map: dict) -> tuple[dict, int]:
-    """Preserve the existing API behavior: fill missing/null fields with a safe default."""
-    filled = 0
-    for name in field_order:
-        if rec.get(name) is None:
-            rec[name] = _default_for_dtype(dtype_map.get(name, "string"))
-            filled += 1
-    return rec, filled
-
 
 def _safe_formula(expr: str, rec: dict):
     """Evaluate the same small arithmetic expression language used by the generator."""
@@ -1154,69 +1150,6 @@ def _normalize(v: Any) -> str:
 
 
 
-
-def _temporal_tokens(text: Any) -> set[str]:
-    """Normalize field/description text into temporal/business event tokens."""
-    raw = str(text or "").strip().lower().replace("-", "_")
-    return set(re.findall(r"[a-z]+", raw))
-
-
-def _temporal_role(var: dict) -> str:
-    """Classify a datetime field into a coarse causal event role.
-
-    This is deliberately conservative.  It is a safety net for obvious causal
-    timelines, not a substitute for an explicit scenario formula or business rule.
-    """
-    name = str(var.get("name", ""))
-    desc = str(var.get("description", ""))
-    text = f"{name} {desc}".lower()
-    if any(k in text for k in ("decision", "response", "reply", "decline", "acceptance", "customer response")):
-        return "response"
-    if any(k in text for k in ("completion", "completed", "finished", "settled", "processed", "fulfilled")):
-        return "completion"
-    if any(k in text for k in ("presented", "displayed", "shown", "offered", "offer presented")):
-        return "presentation"
-    if any(k in text for k in ("sent", "dispatch", "dispatched", "notification")):
-        return "dispatch"
-    if any(k in text for k in ("created", "creation", "initiated", "start", "started", "opened", "request", "requested")):
-        return "start"
-    if any(k in text for k in ("end", "ended", "closed", "closure", "expired", "expiry")):
-        return "end"
-    return "generic"
-
-
-def _temporal_delay_limit_seconds(child: dict, parent: dict) -> int | None:
-    """Choose a conservative maximum gap for a causal timestamp edge.
-
-    The confirmed contract rule wins. This fallback is deliberately used only for an
-    explicit datetime dependency when the schema has not supplied a bound.
-    """
-    text = f"{child.get('name','')} {child.get('description','')}".lower()
-    match = re.search(r"within\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days)", text)
-    if match:
-        amount = int(match.group(1))
-        unit = match.group(2)
-        multiplier = {
-            "second": 1, "seconds": 1,
-            "minute": 60, "minutes": 60,
-            "hour": 3600, "hours": 3600,
-            "day": 86400, "days": 86400,
-        }[unit]
-        return amount * multiplier
-    if "same day" in text or "same-day" in text:
-        return 86400
-
-    child_role = _temporal_role(child)
-    parent_role = _temporal_role(parent)
-    if child_role == "response" and parent_role == "presentation":
-        return 7 * 86400
-    if child_role == "completion" and parent_role in {"presentation", "dispatch", "response", "start"}:
-        return 30 * 86400
-    if child_role == "dispatch" and parent_role in {"start", "presentation"}:
-        return 7 * 86400
-    if child_role == "end" and parent_role != "generic":
-        return 90 * 86400
-    return 90 * 86400
 
 
 def _infer_temporal_relationships(
@@ -1666,6 +1599,97 @@ def _validate_record(
 
     allowed = set(field_order)
     return {k: v for k, v in rec.items() if k in allowed}, issues
+
+
+def run_deterministic_agentic_generation(
+    scenario: str,
+    count: int,
+    industry: str,
+    country: str | None,
+    type_of_data: str,
+    scenario_context: dict[str, Any],
+    records_per_user: int = 10,
+) -> WorkflowState:
+    """Fast path for confirmed agentic scenarios.
+
+    It deliberately avoids GeminiClient construction, Orchestrator/SchemaAgent/DataGeneration
+    LangGraph construction, and all LLM calls. The confirmed schema plus complete scenario
+    context are enough to build deterministic semantic guardrails and generate/QA the data.
+    """
+    from core.compiled_schema import compile_scenario
+
+    state = WorkflowState(
+        scenario=scenario,
+        count=max(1, int(count)),
+        industry=industry,
+        country=country,
+        type_of_data=type_of_data,
+        records_per_user=max(1, min(50, int(records_per_user or 10))),
+        domain=str(scenario_context.get("domain") or ""),
+        business_scenario=str(scenario_context.get("business_scenario") or ""),
+        business_response=scenario_context.get("business_response"),
+        expected_outcome=scenario_context.get("expected_outcome"),
+        scenario_type=scenario_context.get("scenario_type"),
+        use_case=scenario_context.get("use_case"),
+        entity_key=scenario_context.get("entity_key"),
+        scenario_context=dict(scenario_context),
+    )
+    dyn = resolve_variables(scenario)
+    if dyn is None:
+        state.errors.append(f"Unknown scenario '{scenario}'")
+        return state
+    variables, field_order = dyn
+    state.field_order = list(field_order)
+    state.rules = build_deterministic_rules(state, variables)
+
+    if type_of_data == "transactional":
+        compiled = compile_scenario(scenario)
+        state.raw_records = _transactional_records(
+            compiled,
+            state.count,
+            state.records_per_user,
+            rules=state.rules,
+            record_errors_out=state.record_errors,
+        )
+    else:
+        for index in range(state.count):
+            try:
+                state.raw_records.append(_generate_record(variables, rules=state.rules))
+            except Exception as exc:
+                state.record_errors.append({"record_index": index, "error": str(exc), "record": {}})
+
+    checked: list[dict] = []
+    fixes = 0
+    for record_index, record in enumerate(state.raw_records):
+        try:
+            repaired, issues = _validate_record(
+                record,
+                variables,
+                state.field_order,
+                type_of_data == "transactional",
+                rules=state.rules,
+            )
+            checked.append(repaired)
+            fixes += len(issues)
+        except Exception as exc:
+            state.record_errors.append({"record_index": record_index, "error": str(exc), "record": dict(record)})
+
+    state.final_records = checked
+    state.validation_report = {
+        "total_input": len(state.raw_records),
+        "total_valid": len(checked),
+        "total_dropped": len(state.record_errors),
+        "record_errors": len(state.record_errors),
+        "recovered": 0,
+        "algo_fixes": fixes,
+        "llm_fixes": 0,
+        "llm_issues": 0,
+        "deterministic_checks": [
+            "schema_and_type", "declared_ranges_and_choices", "formula_and_arithmetic",
+            "scenario_semantics", "timestamp_relationships", "user_history_consistency",
+        ],
+    }
+    return state
 
 
 class DataGenerationAgent:

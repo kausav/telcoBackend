@@ -7,11 +7,15 @@ from __future__ import annotations
 
 from typing import Any
 import json
+import logging
 
-from core.agentic_models import ScenarioImportResponse, ScenarioProposeRequest, ScenarioSchema
-from core.conversation_store import append_message, ensure_conversation, get_messages
+from core.agentic_models import ScenarioImportResponse, ScenarioProposeRequest, ScenarioSchema, ScenarioIntent
+from core.conversation_store import append_message, ensure_conversation
 from core.dynamic_scenarios import new_draft_id, save_draft
 from core.telecom_registry import TelecomRegistry, get_registry
+from core.runtime_cache import get_proposal, set_proposal
+
+logger = logging.getLogger(__name__)
 from agents.intent_agent import PydanticAIIntentAgent
 from agents.schema_compiler import SchemaCompiler
 from config.industry_profiles import match_industry_key
@@ -22,8 +26,14 @@ class AgenticSchemaWorkflow:
 
     def __init__(self, api_key: str | None = None, registry: TelecomRegistry | None = None):
         self.registry = registry or get_registry()
-        self.intent_agent = PydanticAIIntentAgent(api_key=api_key, registry=self.registry)
+        self._api_key = api_key
+        self._intent_agent: PydanticAIIntentAgent | None = None
         self.compiler = SchemaCompiler(self.registry)
+
+    def _get_intent_agent(self) -> PydanticAIIntentAgent:
+        if self._intent_agent is None:
+            self._intent_agent = PydanticAIIntentAgent(api_key=self._api_key, registry=self.registry)
+        return self._intent_agent
 
     @staticmethod
     def _infer_type_of_data(requested: str | None, schema: ScenarioSchema) -> str:
@@ -59,6 +69,20 @@ class AgenticSchemaWorkflow:
             field_order.append(field.name)
         return variables, field_order
 
+    @staticmethod
+    def _cache_key(req: ScenarioProposeRequest) -> tuple:
+        return (
+            "agentic_proposal_v3",
+            req.industry_type.strip().lower(),
+            req.country.strip().upper(),
+            req.domain.strip().lower(),
+            req.scenario_type.strip().lower(),
+            req.type_of_data,
+            req.use_case.strip().lower(),
+            req.entity_key.strip().lower(),
+            " ".join(req.business_scenario.split()).strip().lower(),
+        )
+
     def propose(self, req: ScenarioProposeRequest) -> ScenarioImportResponse:
         prompt = req.business_scenario.strip()
         industry_key = match_industry_key(req.industry_type)
@@ -67,9 +91,6 @@ class AgenticSchemaWorkflow:
                 "scenario/propose currently supports industryType values 'Telecommunications' or 'Telecom'"
             )
 
-        # industryType selects the telecom model family; domain selects the business-domain
-        # slice. The model still returns intent only; the registry/compiler remains the
-        # semantic authority for entities, attributes and relationships.
         agent_prompt = (
             f"Industry: {req.industry_type}\n"
             f"Business domain: {req.domain}\n"
@@ -78,65 +99,70 @@ class AgenticSchemaWorkflow:
             f"Data type: {req.type_of_data}\n"
             f"Country: {req.country}\n"
             f"Entity key: {req.entity_key}\n"
-            f"Business scenario: {prompt}"
+            f"Business scenario: {prompt}\n\n"
+            "Variable-design requirement: propose a fresh variable set, targeting 30-35 semantic variables when the scenario supports it. "
+            "Do not copy reference CSV variable names. Return fewer only when fewer variables are genuinely justified by the scenario."
         )
 
-        # scenarioId is an identifier only. It must never influence semantic proposal
-        # generation, including through prior conversation history. Persist the request
-        # for auditability, but use only the current business inputs for intent extraction.
         cid = ensure_conversation(req.scenario_id)
         append_message(cid, "user", agent_prompt)
-
-        intent = self.intent_agent.run(
-            agent_prompt,
-            [],
-            country=req.country,
-            industry_type=industry_key,
-            domain_query=req.domain,
-        )
-        # Backend-owned request values are authoritative; the LLM cannot change them.
-        intent.industry_type = industry_key
-        intent.domain = req.domain
-        intent.subdomain = req.use_case.strip().lower() if req.use_case.strip().lower() in {
-            "prepaid", "postpaid", "charging", "usage", "customer", "network"
-        } else "unknown"
-        if req.country:
-            intent.country = req.country
-        intent.scenario_type = req.scenario_type
-        intent.type_of_data = req.type_of_data
-        intent.entity_key = req.entity_key
-        intent.use_case = req.use_case
-        schema = self.compiler.compile(
-            intent,
-            min_variables=35,
-            domain_query=req.domain,
-            entity_key=req.entity_key,
-            industry_type=req.industry_type,
-            scenario_type=req.scenario_type,
-            type_of_data=req.type_of_data,
-            use_case=req.use_case,
-            business_scenario=req.business_scenario,
-            country=req.country,
-        )
+        cache_key = self._cache_key(req)
+        cached = get_proposal(cache_key)
+        if cached is not None:
+            intent = ScenarioIntent.model_validate(cached["intent"])
+            schema = ScenarioSchema.model_validate(cached["schema"])
+            logger.info("[AgenticSchemaWorkflow] Proposal cache hit; Gemini skipped.")
+        else:
+            intent = self._get_intent_agent().run(
+                agent_prompt,
+                country=req.country,
+                industry_type=industry_key,
+                domain_query=req.domain,
+            )
+            intent.industry_type = industry_key
+            intent.domain = req.domain
+            intent.subdomain = req.use_case.strip().lower() if req.use_case.strip().lower() in {
+                "prepaid", "postpaid", "charging", "usage", "customer", "network"
+            } else "unknown"
+            if req.country:
+                intent.country = req.country
+            intent.scenario_type = req.scenario_type
+            intent.type_of_data = req.type_of_data
+            intent.entity_key = req.entity_key
+            intent.use_case = req.use_case
+            schema = self.compiler.compile(
+                intent,
+                max_variables=35,
+                domain_query=req.domain,
+                entity_key=req.entity_key,
+                industry_type=req.industry_type,
+                scenario_type=req.scenario_type,
+                type_of_data=req.type_of_data,
+                use_case=req.use_case,
+                business_scenario=req.business_scenario,
+                business_response="",
+                expected_outcome="",
+                country=req.country,
+            )
+            set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
 
         unresolved_questions = self.compiler.approval_questions(intent, schema)
         variables, field_order = self._schema_to_variables(schema)
-        if len(variables) < 35:
-            raise ValueError(f"Agentic proposal must contain at least 35 variables; compiler produced {len(variables)}")
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
         entity_key = self._entity_key(req.entity_key, field_order, type_of_data)
 
         draft_id = new_draft_id()
-        label = req.scenario_id
         description = req.business_scenario
         draft = {
-            "label": label,
+            "label": req.scenario_id,
             "journey": req.domain,
             "description": description,
             "variables": variables,
             "field_order": field_order,
             "domain": req.domain,
             "business_scenario": req.business_scenario,
+            "business_response": None,
+            "expected_outcome": None,
             "use_case": req.use_case,
             "scenario_id": req.scenario_id,
             "scenario_type": req.scenario_type or "agentic",
@@ -152,9 +178,7 @@ class AgenticSchemaWorkflow:
             "approval_questions": unresolved_questions,
         }
         save_draft(draft_id, draft)
-
         append_message(cid, "assistant", json.dumps({"intent": intent.model_dump(), "action": "schema_proposed"}, sort_keys=True))
-
         return ScenarioImportResponse(
             success=True,
             draft_id=draft_id,
@@ -255,3 +279,19 @@ class AgenticSchemaWorkflow:
         if draft.get("type_of_data") == "transactional" and draft.get("entity_key") not in field_order:
             raise ValueError("HITL changes would remove the transactional entity key")
         return variables, field_order
+
+_WORKFLOW_SINGLETONS: dict[str, AgenticSchemaWorkflow] = {}
+
+
+def get_agentic_workflow(api_key: str | None = None, registry: TelecomRegistry | None = None) -> AgenticSchemaWorkflow:
+    """Reuse the PydanticAI model/registry objects across proposal requests.
+
+    The cache key is the explicit API key (or a process-local default), never scenarioId.
+    This removes repeated model/provider construction from /scenario/propose.
+    """
+    key = api_key or "__default__"
+    workflow = _WORKFLOW_SINGLETONS.get(key)
+    if workflow is None:
+        workflow = AgenticSchemaWorkflow(api_key=api_key, registry=registry)
+        _WORKFLOW_SINGLETONS[key] = workflow
+    return workflow

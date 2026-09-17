@@ -20,156 +20,12 @@ from core.dynamic_scenarios import resolve_scenario_meta, resolve_variables
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
 from core.runtime_cache import get_schema, set_schema
+from core.scenario_semantics import derive_scenario_semantics
+from core.deterministic_rules import build_deterministic_rules
 
 logger = logging.getLogger(__name__)
 
 
-def _scenario_semantics(state, variables: list[dict]) -> dict:
-    """Derive generic, deterministic semantic guardrails from the full scenario context.
-
-    This is intentionally not tied to any one scenario type or field name.  The
-    hierarchy is:
-      1) explicit confirmed-contract value/formula constraints remain authoritative;
-      2) explicit outcome language in expected_outcome/business_response/business_scenario
-         overrides generic scenario-type defaults;
-      3) scenario_type supplies a fallback intent (positive/negative/mixed);
-      4) field meaning comes from its name + description.
-
-    The LLM still supplies richer cross-field rules.  These deterministic directives
-    are a safety net so semantic contradictions cannot be introduced merely because
-    the field generator is stochastic or the LLM omitted a machine-readable rule.
-    """
-    import re
-
-    def clean(value: object) -> str:
-        return str(value or "").strip()
-
-    def norm(value: object) -> str:
-        return re.sub(r"\s+", " ", clean(value).lower())
-
-    scenario_type = clean(getattr(state, "scenario_type", ""))
-    context = getattr(state, "scenario_context", {}) or {}
-    pieces = {
-        "expected_outcome": clean(getattr(state, "expected_outcome", "") or context.get("expected_outcome")),
-        "business_response": clean(getattr(state, "business_response", "") or context.get("business_response")),
-        "business_scenario": clean(getattr(state, "business_scenario", "") or context.get("business_scenario")),
-        "use_case": clean(getattr(state, "use_case", "") or context.get("use_case")),
-        "domain": clean(getattr(state, "domain", "") or context.get("domain")),
-        "scenario_type": scenario_type,
-        "description": clean(context.get("description")),
-        "journey": clean(context.get("journey")),
-        "label": clean(context.get("label")),
-    }
-
-    positive_terms = {
-        "success", "successful", "succeed", "succeeded", "completed", "completion",
-        "approved", "approval", "accepted", "acceptance", "passed", "pass", "delivered",
-        "fulfilled", "settled", "authorized", "enabled", "active", "eligible", "retained",
-    }
-    negative_terms = {
-        "failure", "failed", "unsuccessful", "rejected", "rejection", "declined", "decline",
-        "error", "errored", "denied", "denial", "blocked", "expired", "cancelled", "canceled",
-        "abandoned", "churn", "churned", "ineligible", "unpaid", "unsatisfied",
-    }
-    mixed_terms = {
-        "mixed", "distribution", "rate", "ratio", "probability", "probabilities", "both",
-        "varied", "variation", "realistic", "real-world", "realistic mix", "success rate",
-        "failure rate", "exception rate", "conversion rate",
-    }
-
-    def term_score(text: str, terms: set[str]) -> int:
-        lowered = norm(text)
-        return sum(len(re.findall(rf"(?<![a-z]){re.escape(term)}(?![a-z])", lowered)) for term in terms)
-
-    # Outcome statements have higher authority than descriptive/context fields.
-    weighted = {
-        "expected_outcome": 6,
-        "business_response": 5,
-        "business_scenario": 4,
-        "use_case": 3,
-        "domain": 2,
-        "scenario_type": 2,
-        "description": 1,
-        "journey": 1,
-        "label": 1,
-    }
-    pos = neg = mixed = 0
-    for key, text in pieces.items():
-        w = weighted[key]
-        pos += w * term_score(text, positive_terms)
-        neg += w * term_score(text, negative_terms)
-        mixed += w * term_score(text, mixed_terms)
-
-    mode_norm = norm(scenario_type).replace("-", " ").replace("_", " ")
-    normal_modes = {"normal", "standard", "happy path", "success", "successful", "positive", "nominal"}
-    adverse_modes = {"failure", "failed", "negative", "adverse", "error", "exception"}
-    mixed_modes = {"mixed", "realistic", "distribution", "edge cases", "both"}
-
-    # Do not let words such as "success rate" by themselves force a single outcome.
-    outcome_mode = "mixed"
-    if mixed >= max(pos, neg) and mixed > 0:
-        outcome_mode = "mixed"
-    elif pos > 0 or neg > 0:
-        if pos > neg * 1.15:
-            outcome_mode = "positive"
-        elif neg > pos * 1.15:
-            outcome_mode = "negative"
-    elif mode_norm in normal_modes:
-        outcome_mode = "positive"
-    elif mode_norm in adverse_modes:
-        outcome_mode = "negative"
-    elif mode_norm in mixed_modes:
-        outcome_mode = "mixed"
-
-    force_true, force_false, preferred_values = [], [], {}
-    for var in variables:
-        name = clean(var.get("name"))
-        dtype = clean(var.get("dtype")).lower()
-        params = var.get("params") if isinstance(var.get("params"), dict) else {}
-        if not name or dtype not in {"boolean", "bool", "categorical", "string"}:
-            continue
-
-        # A literal CSV value is an explicit instruction and cannot be semantically overridden.
-        if params.get("value") is not None:
-            continue
-
-        field_text = norm(f"{name} {var.get('description', '')}")
-        success_like = any(t in field_text for t in positive_terms)
-        failure_like = any(t in field_text for t in negative_terms)
-        status_like = "status" in field_text or success_like or failure_like or "outcome" in field_text
-        if not status_like:
-            continue
-
-        choices = params.get("choices") if isinstance(params.get("choices"), list) else []
-        normalized_choices = {
-            re.sub(r"[^a-z0-9]+", "_", str(choice).strip().lower()).strip("_"): choice
-            for choice in choices
-        }
-
-        if dtype in {"boolean", "bool"} and success_like and not failure_like:
-            if outcome_mode == "positive":
-                force_true.append(name)
-            elif outcome_mode == "negative":
-                force_false.append(name)
-        elif dtype in {"categorical", "string"} and choices and outcome_mode in {"positive", "negative"}:
-            wanted = (
-                {"success", "successful", "completed", "complete", "approved", "accepted", "passed", "delivered", "fulfilled", "settled", "authorized", "active", "eligible", "retained"}
-                if outcome_mode == "positive"
-                else {"failure", "failed", "unsuccessful", "rejected", "declined", "error", "denied", "blocked", "expired", "cancelled", "canceled", "abandoned", "churned", "ineligible"}
-            )
-            for candidate in wanted:
-                if candidate in normalized_choices:
-                    preferred_values[name] = [normalized_choices[candidate]]
-                    break
-
-    return {
-        "mode": scenario_type or "unspecified",
-        "outcome_mode": outcome_mode,
-        "force_true_fields": force_true,
-        "force_false_fields": force_false,
-        "preferred_values": preferred_values,
-        "context_used": {k: v for k, v in pieces.items() if v},
-    }
 
 
 _SYSTEM = """
@@ -191,7 +47,7 @@ Return a JSON object with:
   - "formula_rules": [{"field": str, "expression": str}] — authoritative formulas to
       calculate and validate generated fields
   - "temporal_rules": [{"before": str, "after": str, "min_delay_seconds": number, "max_delay_seconds": number, "reason": str}]
-    — causal timestamp ordering and bounded-delay relationships supported by the CSV schema
+    — causal timestamp ordering and bounded-delay relationships supported by the confirmed schema
 
 SEMANTIC ACCURACY IS MANDATORY:
 - Every field and every categorical value must be relevant to the target industry,
@@ -300,7 +156,7 @@ class SchemaAgent:
                 state.rules = cached
                 logger.info("[SchemaAgent] Agentic cache hit; LLM skipped.")
                 return state
-            state.rules = self._deterministic_agentic_rules(VARS)
+            state.rules = build_deterministic_rules(state, VARS)
             set_schema(cache_key, state.rules)
             logger.info("[SchemaAgent] Agentic scenario: registry rules compiled deterministically; LLM skipped.")
             return state
@@ -474,7 +330,7 @@ class SchemaAgent:
         rules["temporal_rules"] = normalized_temporal
 
         # Deterministic scenario-type semantics complement the LLM output.
-        semantics = _scenario_semantics(state, VARS)
+        semantics = derive_scenario_semantics(state, VARS)
         rules["scenario_semantics"] = semantics
         for field, preferred in semantics.get("preferred_values", {}).items():
             gc = generation_constraints.get(field)
@@ -493,46 +349,8 @@ class SchemaAgent:
         return state
 
 
-    @staticmethod
-    def _deterministic_agentic_rules(variables: list[dict]) -> dict:
-        """Build generation rules solely from the approved canonical registry schema."""
-        names = {str(v.get("name")) for v in variables if v.get("name")}
-        constraints: dict[str, dict] = {}
-        formulas: list[dict] = []
-        for var in variables:
-            name = str(var.get("name") or "")
-            params = dict(var.get("params") or {}) if isinstance(var.get("params"), dict) else {}
-            gc = {}
-            for key in ("choices", "values", "min", "max", "buckets", "weights", "precision", "currency", "target", "mapping", "country", "timezone", "prefix", "digits"):
-                if key in params:
-                    gc["valid_values" if key == "choices" else key] = params[key]
-            constraints[name] = gc
-            if var.get("formula"):
-                formulas.append({"field": name, "expression": str(var["formula"])})
-
-        temporal = []
-        def edge(before: str, after: str, reason: str):
-            if before in names and after in names:
-                temporal.append({"before": before, "after": after, "min_delay_seconds": 0, "reason": reason})
-        edge("recharge_timestamp", "charge_timestamp", "Charging cannot precede a recharge event when the charge is the resulting balance action.")
-        edge("usage_timestamp", "charge_timestamp", "Charging must occur at or after the usage event it rates.")
-        return {
-            "scenario_summary": "HITL-approved registry schema; no LLM semantic augmentation.",
-            "business_rules": [
-                "Entity, field and relationship vocabulary is frozen to the approved registry snapshot.",
-                "Unknown fields, values and relationships are non-executable.",
-            ],
-            "field_constraints": {name: {"description": str(next((v.get("description", "") for v in variables if v.get("name") == name), "")), "nullable": bool(next((v.get("nullable", False) for v in variables if v.get("name") == name), False))} for name in names},
-            "cross_field_rules": [
-                "Successful recharge increases the prepaid balance; failed/reversed recharge does not apply as a completed top-up.",
-                "Charging timestamps must not precede their referenced usage timestamps.",
-            ],
-            "conditional_rules": [],
-            "generation_constraints": constraints,
-            "formula_rules": formulas,
-            "temporal_rules": temporal,
-            "scenario_semantics": {"mode": "agentic", "outcome_mode": "mixed"},
-        }
+    # Deterministic confirmed-scenario rules live in core.deterministic_rules so the
+    # fast generation path has no dependency on the LLM-backed SchemaAgent.
 
     def _validate_schema(self, state: WorkflowState) -> WorkflowState:
         """Schema validation layer: catch missing variables, missing rules, and

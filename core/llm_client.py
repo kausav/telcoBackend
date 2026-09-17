@@ -45,7 +45,7 @@ class GeminiClient:
 
         self.model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
         timeout_ms = max(1000, int(os.getenv("GEMINI_TIMEOUT_MS", "60000")))
-        retry_attempts = max(1, min(6, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "4"))))
+        retry_attempts = max(1, min(6, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "2"))))
         retry_options = types.HttpRetryOptions(
             attempts=retry_attempts,
             initial_delay=1.0,
@@ -90,22 +90,3 @@ class GeminiClient:
             return json.loads(text)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Gemini returned invalid JSON: {exc}") from exc
-
-    def generate_text(self, system_instruction: str, user_prompt: str, temperature: float = 0.4) -> str:
-        config_kwargs: dict[str, Any] = {"system_instruction": system_instruction}
-        if not self.model.startswith("gemini-3"):
-            config_kwargs["temperature"] = temperature
-        try:
-            response = self._client.models.generate_content(
-                model=self.model,
-                config=self._types.GenerateContentConfig(**config_kwargs),
-                contents=user_prompt,
-            )
-        except Exception as exc:
-            logger.exception("Gemini text request failed")
-            from fastapi import HTTPException
-            raise HTTPException(
-                status_code=502,
-                detail={"error": "LLM upstream request failed", "details": {"provider": "Google Gemini", "reason": _safe_provider_error(exc)}},
-            ) from exc
-        return (response.text or "").strip()

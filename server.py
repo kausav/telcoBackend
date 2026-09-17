@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -11,12 +12,12 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import Literal
 
 from core.pipeline import run_pipeline
+from agents.data_generation_agent import run_deterministic_agentic_generation
 from core.dynamic_scenarios import (
     add_feedback,
     confirm_scenario,
     get_draft,
     new_draft_id,
-    next_scenario_id,
     save_draft,
     pop_draft,
     resolve_scenario_id_from_draft,
@@ -24,7 +25,6 @@ from core.dynamic_scenarios import (
     resolve_data_type,
     resolve_scenario_context,
     resolve_variables,
-    scenario_exists,
 )
 from core.compiled_schema import invalidate_scenario, infer_history_field_sets
 from core.runtime_cache import clear_scenario
@@ -32,7 +32,7 @@ from core.agentic_models import ScenarioProposeRequest, ScenarioImportResponse
 from core.csv_scenario import infer_type_of_data, parse_definition_csv
 from config.industry_profiles import COUNTRY_BASE
 from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES
-from core.agentic_workflow import AgenticSchemaWorkflow
+from core.agentic_workflow import AgenticSchemaWorkflow, get_agentic_workflow
 from core.telecom_registry import RegistryError, get_registry
 
 
@@ -105,8 +105,9 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
-    """Assign one correlation id to every request and return it to the client."""
-    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    """Assign one bounded correlation id to every request and return it to the client."""
+    incoming = str(request.headers.get("X-Request-ID") or "").strip()
+    request_id = incoming if 1 <= len(incoming) <= 128 and re.fullmatch(r"[A-Za-z0-9._:-]+", incoming) else str(uuid.uuid4())
     request.state.request_id = request_id
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
@@ -115,7 +116,7 @@ async def request_id_middleware(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
 )
@@ -414,10 +415,6 @@ def confirm_scenario_route(req: ConfirmRequest):
             variables, field_order = AgenticSchemaWorkflow.validate_hitl_changes(
                 draft, req.add, req.edit, req.delete
             )
-            if len(variables) < 35:
-                raise ValueError(
-                    f"Agentic HITL confirmation requires at least 35 variables; {len(variables)} would remain"
-                )
         except (ValueError, KeyError) as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
     else:
@@ -440,11 +437,8 @@ def confirm_scenario_route(req: ConfirmRequest):
         preferred=("subscriber_id","customer_id","account_id","user_id","entity_id","customer_key","entity_key","id")
         names={str(v.get("name")) for v in variables if v.get("name")}
         entity_key=next((n for n in preferred if n in names),None) or (next(iter(names),None) if names else None)
-    scenario_id=draft.get("scenario_id") or next_scenario_id()
     requested_scenario_id=draft.get("scenario_id")
-    if scenario_exists(scenario_id) and resolve_scenario_id_from_draft(req.draft_id)!=scenario_id:
-        reassigned_from=scenario_id; scenario_id=next_scenario_id()
-        logger.warning("[confirm] scenarioId '%s' already exists; reassigned to '%s'",reassigned_from,scenario_id)
+    scenario_id=requested_scenario_id
     meta={
         "label":draft.get("label",scenario_id),"journey":draft.get("journey",draft.get("domain","")),"description":draft.get("description",""),
         "domain":draft.get("domain",""),"business_scenario":draft.get("business_scenario",""),"business_response":draft.get("business_response"),
@@ -453,11 +447,28 @@ def confirm_scenario_route(req: ConfirmRequest):
         "type_of_data":type_of_data,"entity_key":entity_key,"records_per_user":10,
         "agentic": bool(draft.get("agentic", False)),
     }
-    confirm_scenario(scenario_id,meta,variables,field_order,draft_id=req.draft_id)
-    invalidate_scenario(scenario_id); clear_scenario(scenario_id)
-    if not _is_placeholder(req.feedback): add_feedback(draft.get("domain",""),draft.get("business_scenario",""),req.feedback)
+    scenario_id, scenario_id_reassigned = confirm_scenario(
+        scenario_id, meta, variables, field_order, draft_id=req.draft_id
+    )
+    invalidate_scenario(scenario_id)
+    clear_scenario(scenario_id)
+    if not _is_placeholder(req.feedback):
+        add_feedback(draft.get("domain", ""), draft.get("business_scenario", ""), req.feedback)
     pop_draft(req.draft_id)
-    return ConfirmResponse(success=True,scenario_id=scenario_id,requested_scenario_id=requested_scenario_id,scenario_id_reassigned=requested_scenario_id is not None and scenario_id!=requested_scenario_id,draft_id=req.draft_id,label=meta["label"],journey=meta["journey"],description=meta["description"],variables=variables,field_order=field_order,typeOfData=type_of_data,entityKey=entity_key)
+    return ConfirmResponse(
+        success=True,
+        scenario_id=scenario_id,
+        requested_scenario_id=requested_scenario_id,
+        scenario_id_reassigned=scenario_id_reassigned,
+        draft_id=req.draft_id,
+        label=meta["label"],
+        journey=meta["journey"],
+        description=meta["description"],
+        variables=variables,
+        field_order=field_order,
+        typeOfData=type_of_data,
+        entityKey=entity_key,
+    )
 
 
 @app.post("/scenario/propose", response_model=ScenarioImportResponse)
@@ -468,11 +479,40 @@ def propose_scenario(req: ScenarioProposeRequest):
     can reuse the same HITL review screen and call /scenario/confirm unchanged.
     """
     try:
-        return AgenticSchemaWorkflow(registry=get_registry()).propose(req)
+        return get_agentic_workflow(registry=get_registry()).propose(req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
     except (RuntimeError, EnvironmentError) as exc:
         raise HTTPException(status_code=503, detail={"error": str(exc)}) from exc
+
+
+def _timestamp_sort_key(value):
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            dt = None
+            for fmt in (
+                "%d/%m/%Y %I:%M %p",
+                "%d/%m/%Y %I:%M:%S %p",
+                "%d/%m/%Y %H:%M",
+                "%d/%m/%Y %H:%M:%S",
+            ):
+                try:
+                    dt = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+            if dt is None:
+                return datetime.min.replace(tzinfo=timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 @app.post("/scenario/generate", response_model=GenerateResponse)
@@ -489,11 +529,24 @@ def generate_scenario(req: GenerateRequest):
     if not scenario_exists(scenario_id): raise HTTPException(400,detail={"error":f"Unknown scenario '{scenario_id}'"})
     scenario_context=resolve_scenario_context(scenario_id)
     try:
-        state=run_pipeline(
-            scenario=scenario_id,count=req.count,industry=scenario_context.get("industry","generic"),country=scenario_context.get("country"),
-            type_of_data=scenario_context.get("type_of_data",resolve_data_type(scenario_id)),scenario_context=scenario_context,
-            records_per_user=req.recordsPerUser,
-        )
+        # Confirmed agentic schemas are immutable after HITL approval. Use the fast deterministic
+        # path so /scenario/generate does not construct Gemini clients or invoke LLM stages.
+        if scenario_context.get("agentic"):
+            state = run_deterministic_agentic_generation(
+                scenario=scenario_id,
+                count=req.count,
+                industry=scenario_context.get("industry", "telecom"),
+                country=scenario_context.get("country"),
+                type_of_data=scenario_context.get("type_of_data", resolve_data_type(scenario_id)),
+                scenario_context=scenario_context,
+                records_per_user=req.recordsPerUser,
+            )
+        else:
+            state=run_pipeline(
+                scenario=scenario_id,count=req.count,industry=scenario_context.get("industry","generic"),country=scenario_context.get("country"),
+                type_of_data=scenario_context.get("type_of_data",resolve_data_type(scenario_id)),scenario_context=scenario_context,
+                records_per_user=req.recordsPerUser,
+            )
     except ValueError as exc:
         raise HTTPException(status_code=400,detail={"error":str(exc)}) from exc
     if state.errors and not state.final_records and not state.record_errors:
@@ -521,7 +574,7 @@ def generate_scenario(req: GenerateRequest):
             # Newest first, with the user-level context outside the history rows.
             timestamp_field=next((f for f in ("record_timestamp","transaction_timestamp","timestamp","created_at","updated_at") if f in rows[0]),None)
             if timestamp_field:
-                rows=sorted(rows,key=lambda r: str(r.get(timestamp_field,"")), reverse=True)
+                rows=sorted(rows,key=lambda r: _timestamp_sort_key(r.get(timestamp_field)), reverse=True)
             latest=rows[0] if rows else {}
             user_output={name: latest.get(name) for name in user_field_names if name in latest}
             user_output[entity_key]=entity_value
