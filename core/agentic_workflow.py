@@ -89,7 +89,8 @@ class AgenticSchemaWorkflow:
         industry_key = match_industry_key(req.industry_type)
         if industry_key != "telecom":
             raise ValueError(
-                "scenario/propose currently supports industryType values 'Telecommunications' or 'Telecom'"
+                "scenario/propose currently supports telecom industry aliases: "
+                "Telecom, Telecommunication, or Telecommunications (case-insensitive)"
             )
 
         agent_prompt = (

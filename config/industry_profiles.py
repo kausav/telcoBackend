@@ -165,7 +165,33 @@ _GENERIC_NOTES = {
 
 
 def match_industry_key(industry: str | None) -> str:
-    key = (industry or DEFAULT_INDUSTRY).strip().lower()
+    """Normalize user/LLM industry labels to the canonical registry key.
+
+    Accepted telecom aliases intentionally include common singular/plural and
+    casing variants such as ``Telecom``, ``TELECOM``, ``Telecommunication`` and
+    ``Telecommunications``. Unknown values fall back to the generic industry.
+    """
+    raw = (industry or DEFAULT_INDUSTRY).strip()
+    key = raw.lower()
+
+    aliases = {
+        "telecom": "telecom",
+        "telecommunication": "telecom",
+        "telecommunications": "telecom",
+    }
+    if key in aliases:
+        return aliases[key]
+
+    # Preserve compatibility with compound labels such as
+    # "Telecommunications industry" or "telecom sector" without making
+    # broad fuzzy matches the primary behavior.
+    normalized_words = {
+        word.strip("-_/,;:()[]{}")
+        for word in key.split()
+    }
+    if normalized_words & {"telecom", "telecommunication", "telecommunications"}:
+        return "telecom"
+
     if key in INDUSTRY_NOTES:
         return key
     for known in INDUSTRY_NOTES:
