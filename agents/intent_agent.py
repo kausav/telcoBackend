@@ -6,6 +6,17 @@ import os
 
 from core.agentic_models import ScenarioIntent
 from core.telecom_registry import TelecomRegistry
+from core.errors import LLMUpstreamError
+import logging
+import re
+
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_exception_text(exc: Exception) -> str:
+    text = str(exc)[:1600]
+    return re.sub(r"(?i)(api[_-]?key|token|authorization|bearer|password|secret)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", text)
 
 
 INSTRUCTIONS = """
@@ -52,7 +63,7 @@ class PydanticAIIntentAgent:
 
         model_name = os.getenv("PYDANTIC_AI_GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
         retry_options = HttpRetryOptions(
-            attempts=max(1, min(6, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "2")))),
+            attempts=max(1, min(6, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "1")))),
             initial_delay=1.0,
             max_delay=20.0,
             http_status_codes=[408, 429, 500, 502, 503, 504],
@@ -60,7 +71,7 @@ class PydanticAIIntentAgent:
         provider = GoogleProvider(api_key=key, retry_options=retry_options)
         model = GoogleModel(model_name, provider=provider)
         self.registry = registry or TelecomRegistry()
-        self.agent = Agent(model, output_type=ScenarioIntent, instructions=INSTRUCTIONS, retries=max(0, min(1, int(os.getenv("PYDANTIC_AI_RETRIES", "1")))))
+        self.agent = Agent(model, output_type=ScenarioIntent, instructions=INSTRUCTIONS, retries=max(0, min(1, int(os.getenv("PYDANTIC_AI_RETRIES", "0")))))
 
     def run(
         self,
@@ -84,5 +95,13 @@ class PydanticAIIntentAgent:
             "Make the set materially reflect scenarioType, businessScenario, domain, useCase and typeOfData. "
             "Return only the ScenarioIntent structure."
         )
-        result = self.agent.run_sync(prompt)
+        try:
+            result = self.agent.run_sync(prompt)
+        except Exception as exc:
+            logger.exception("PydanticAI/Gemini intent request failed", exc_info=exc)
+            raise LLMUpstreamError(
+                f"Gemini intent request failed: {type(exc).__name__}: {_safe_exception_text(exc)}",
+                provider="Google Gemini",
+                model=model_name,
+            ) from exc
         return result.output

@@ -61,8 +61,9 @@ from core.error_handlers import (
     http_exception_handler,
     request_validation_exception_handler,
     unhandled_exception_handler,
+    llm_upstream_exception_handler,
 )
-from core.errors import ErrorResponse
+from core.errors import ErrorResponse, LLMUpstreamError
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ app = FastAPI(
 )
 
 app.add_exception_handler(HTTPException, http_exception_handler)
+app.add_exception_handler(LLMUpstreamError, llm_upstream_exception_handler)
 app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
 app.add_exception_handler(Exception, unhandled_exception_handler)
 
@@ -484,6 +486,9 @@ def propose_scenario(req: ScenarioProposeRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
     except (RuntimeError, EnvironmentError) as exc:
+        # Configuration/dependency errors are service-unavailable errors. Unexpected
+        # runtime bugs must continue to reach the global 500 handler instead of being
+        # mislabeled as a provider outage.
         raise HTTPException(status_code=503, detail={"error": str(exc)}) from exc
 
 

@@ -13,6 +13,7 @@ from core.agentic_models import ScenarioImportResponse, ScenarioProposeRequest, 
 from core.conversation_store import append_message, ensure_conversation
 from core.dynamic_scenarios import new_draft_id, save_draft
 from core.telecom_registry import TelecomRegistry, get_registry
+from core.errors import LLMUpstreamError
 from core.runtime_cache import get_proposal, set_proposal
 
 logger = logging.getLogger(__name__)

@@ -9,7 +9,8 @@ from fastapi import HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from core.errors import ErrorCode, build_error_response, error_code_for_status
+from core.errors import ErrorCode, LLMUpstreamError, build_error_response, error_code_for_status
+from core.network_diagnostics import get_public_egress_ip
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,39 @@ def _json_response(request: Request, status_code: int, code: ErrorCode, message:
         status_code=status_code,
         content=payload.model_dump(mode="json"),
         headers={REQUEST_ID_HEADER: request_id},
+    )
+
+
+async def llm_upstream_exception_handler(request: Request, exc: LLMUpstreamError) -> JSONResponse:
+    """Return actionable LLM diagnostics, including the provider-visible public egress IP."""
+    public_ip = exc.public_egress_ip or get_public_egress_ip()
+    details: dict[str, Any] = {
+        "provider": exc.provider,
+        "reason": str(exc)[:2000],
+        "public_egress_ip": public_ip or "unknown",
+        "whitelist_hint": (
+            "If the provider or Google Cloud control requires source-IP allowlisting, "
+            "whitelist this public egress IP."
+            if public_ip
+            else "Public egress IP could not be detected. Set PUBLIC_EGRESS_IP in deployment configuration."
+        ),
+    }
+    if exc.model:
+        details["model"] = exc.model
+
+    logger.error(
+        "LLM upstream failure [request_id=%s provider=%s model=%s public_egress_ip=%s]",
+        get_request_id(request),
+        exc.provider,
+        exc.model or "unknown",
+        public_ip or "unknown",
+    )
+    return _json_response(
+        request,
+        502,
+        ErrorCode.UPSTREAM_ERROR,
+        "LLM upstream request failed",
+        details,
     )
 
 

@@ -25,6 +25,23 @@ class ErrorCode(str, Enum):
     HTTP_ERROR = "HTTP_ERROR"
 
 
+class LLMUpstreamError(Exception):
+    """Raised when an external LLM/provider call cannot complete."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str = "Google Gemini",
+        model: str | None = None,
+        public_egress_ip: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.model = model
+        self.public_egress_ip = public_egress_ip
+
+
 class ErrorDetail(BaseModel):
     code: ErrorCode
     message: str

@@ -1,7 +1,7 @@
 """Gemini client wrapper used by the legacy generation pipeline.
 
 The agentic schema proposal path uses PydanticAI directly; this client remains for
-legacy generation/QA stages. No secret or infrastructure detail is returned to API clients.
+legacy generation/QA stages. Provider failures are normalized into a stable application error contract.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from config.runtime import ROOT
+from core.errors import LLMUpstreamError
 
 load_dotenv(ROOT / ".env", override=False)
 
@@ -45,7 +46,7 @@ class GeminiClient:
 
         self.model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
         timeout_ms = max(1000, int(os.getenv("GEMINI_TIMEOUT_MS", "60000")))
-        retry_attempts = max(1, min(6, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "2"))))
+        retry_attempts = max(1, min(6, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "1"))))
         retry_options = types.HttpRetryOptions(
             attempts=retry_attempts,
             initial_delay=1.0,
@@ -77,10 +78,10 @@ class GeminiClient:
             )
         except Exception as exc:
             logger.exception("Gemini JSON request failed")
-            from fastapi import HTTPException
-            raise HTTPException(
-                status_code=502,
-                detail={"error": "LLM upstream request failed", "details": {"provider": "Google Gemini", "reason": _safe_provider_error(exc)}},
+            raise LLMUpstreamError(
+                f"Gemini JSON request failed: {type(exc).__name__}: {_safe_provider_error(exc)}",
+                provider="Google Gemini",
+                model=self.model,
             ) from exc
 
         text = (response.text or "").strip()
