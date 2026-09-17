@@ -115,7 +115,7 @@ async def request_id_middleware(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_origins=["*"],
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
 )
@@ -124,7 +124,7 @@ app.add_middleware(
 class GenerateRequest(BaseModel):
     scenario: str | None = Field(None, examples=["LB-01"])
     draftId: str | None = Field(None, description="Confirmed draft id; disambiguates when scenario ids collide across users")
-    count: int = Field(20, ge=1, le=5000, description="Number of users/entities to generate for a transactional scenario")
+    count: int = Field(35, ge=1, le=5000, description="Number of users/entities to generate for a transactional scenario")
     recordsPerUser: int = Field(10, ge=1, le=10, description="Number of most-recent historical records returned per user for a transactional scenario")
 
 
@@ -414,9 +414,9 @@ def confirm_scenario_route(req: ConfirmRequest):
             variables, field_order = AgenticSchemaWorkflow.validate_hitl_changes(
                 draft, req.add, req.edit, req.delete
             )
-            if len(variables) < 20:
+            if len(variables) < 35:
                 raise ValueError(
-                    f"Agentic HITL confirmation requires at least 20 variables; {len(variables)} would remain"
+                    f"Agentic HITL confirmation requires at least 35 variables; {len(variables)} would remain"
                 )
         except (ValueError, KeyError) as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
@@ -539,4 +539,3 @@ def generate_scenario(req: GenerateRequest):
         draft_id=req.draftId,scenario_label=meta.get("label",scenario_id),fields=state.field_order or ((resolve_variables(scenario_id) or ([],[]))[1]),
         total_records=total_records,validation_report=state.validation_report,records=response_records,errors=state.errors,record_errors=state.record_errors,
     )
-

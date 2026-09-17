@@ -81,13 +81,15 @@ class AgenticSchemaWorkflow:
             f"Business scenario: {prompt}"
         )
 
+        # scenarioId is an identifier only. It must never influence semantic proposal
+        # generation, including through prior conversation history. Persist the request
+        # for auditability, but use only the current business inputs for intent extraction.
         cid = ensure_conversation(req.scenario_id)
-        history = get_messages(cid, limit=30)
         append_message(cid, "user", agent_prompt)
 
         intent = self.intent_agent.run(
             agent_prompt,
-            history,
+            [],
             country=req.country,
             industry_type=industry_key,
             domain_query=req.domain,
@@ -100,17 +102,27 @@ class AgenticSchemaWorkflow:
         } else "unknown"
         if req.country:
             intent.country = req.country
+        intent.scenario_type = req.scenario_type
+        intent.type_of_data = req.type_of_data
+        intent.entity_key = req.entity_key
+        intent.use_case = req.use_case
         schema = self.compiler.compile(
             intent,
-            min_variables=20,
+            min_variables=35,
             domain_query=req.domain,
             entity_key=req.entity_key,
+            industry_type=req.industry_type,
+            scenario_type=req.scenario_type,
+            type_of_data=req.type_of_data,
+            use_case=req.use_case,
+            business_scenario=req.business_scenario,
+            country=req.country,
         )
 
         unresolved_questions = self.compiler.approval_questions(intent, schema)
         variables, field_order = self._schema_to_variables(schema)
-        if len(variables) < 20:
-            raise ValueError(f"Agentic proposal must contain at least 20 variables; compiler produced {len(variables)}")
+        if len(variables) < 35:
+            raise ValueError(f"Agentic proposal must contain at least 35 variables; compiler produced {len(variables)}")
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
         entity_key = self._entity_key(req.entity_key, field_order, type_of_data)
 

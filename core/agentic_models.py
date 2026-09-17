@@ -18,14 +18,18 @@ class ScenarioIntent(BaseModel):
     industry_type: Literal["telecom"] = "telecom"
     domain: str = "prepaid"
     subdomain: Literal["prepaid", "postpaid", "charging", "usage", "customer", "network", "unknown"] = "prepaid"
-    requested_entities: list[str] = Field(default_factory=list, max_length=20)
-    requested_relationships: list[str] = Field(default_factory=list, max_length=30)
+    scenario_type: str = ""
+    type_of_data: Literal["transactional", "aggregational"] = "transactional"
+    entity_key: str = ""
+    use_case: str = ""
+    requested_entities: list[str] = Field(default_factory=list, max_length=35)
+    requested_relationships: list[str] = Field(default_factory=list, max_length=45)
     country: str | None = None
     currency: str | None = None
     record_count: int | None = Field(default=None, ge=1, le=5_000_000)
     time_window_days: int | None = Field(default=None, ge=1, le=3650)
-    notes: list[str] = Field(default_factory=list, max_length=20)
-    ambiguities: list[str] = Field(default_factory=list, max_length=20)
+    notes: list[str] = Field(default_factory=list, max_length=35)
+    ambiguities: list[str] = Field(default_factory=list, max_length=35)
 
 
 class ResolvedConcept(BaseModel):

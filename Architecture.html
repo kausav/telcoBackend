@@ -120,7 +120,7 @@ flowchart LR
   H --> G[Deterministic Generation]
       </div>
     </div>
-    <div class="note"><strong>Anti-hallucination boundary:</strong> Gemini receives a domain-scoped approved catalog and returns intent only. The LLM never selects an authoritative standard, creates a field, creates a relationship, or changes a generator. Industry selection is backend-controlled; domain selection is registry-controlled.</div>
+    <div class="note"><strong>Anti-hallucination boundary:</strong> Gemini receives a constrained telecom catalog and returns intent only. The backend treats <code>industryType</code>, <code>domain</code>, <code>scenarioType</code>, <code>typeOfData</code>, <code>country</code>, <code>entityKey</code>, <code>useCase</code>, and <code>businessScenario</code> as authoritative proposal inputs. <code>scenarioId</code> is identifier/audit metadata only and is excluded from semantic selection. The LLM never creates executable entities, fields, relationships, formulas, generators or enums.</div>
   </section>
 
   <section id="overview">
@@ -132,8 +132,12 @@ flowchart LR
   API --> P[POST /scenario/propose]
   API --> CSV[POST /scenario/import-csv]
   P --> IA[PydanticAI Intent Agent]
-  IA -->|ScenarioIntent only| R[Telecom Runtime Registry]
+  IA -->|Intent only; backend request fields remain authoritative| R[Telecom Runtime Registry]
+  P -. industryType .-> R
+  P -. domain .-> R
+  P -. useCase .-> R
   R --> C[Deterministic Schema Compiler]
+  P -. scenarioType / typeOfData / country / entityKey / businessScenario .-> C
   C --> D[(Draft / HITL state)]
   CSV --> D2[Imported CSV Draft]
   D2 --> H
@@ -258,14 +262,13 @@ sequenceDiagram
   participant DB as Scenario DB
 
   UI->>API: POST /scenario/propose
-  API->>CHAT: load prior messages
-  API->>CHAT: append current user message
-  API->>LLM: catalog + history + current request
+  API->>CHAT: append current proposal request for audit
+  API->>LLM: approved catalog + current request fields (scenarioId excluded)
   LLM-->>API: ScenarioIntent
-  API->>REG: resolve requested concepts
+  API->>REG: resolve concepts within industry + domain/useCase
   REG-->>API: canonical entities / attrs / relationships / provenance
-  API->>COMP: compile intent against registry
-  COMP-->>API: ScenarioSchema
+  API->>COMP: compile using all request fields except scenarioId
+  COMP-->>API: executable ScenarioSchema
   API->>DB: persist draft + schema + intent + conversation id
   DB-->>API: draft_id
   API-->>UI: ScenarioImportResponse
@@ -275,8 +278,12 @@ sequenceDiagram
     <h3>LLM output contract</h3>
     <p>The PydanticAI agent returns only <code>ScenarioIntent</code>. It can identify concepts, country/currency, approximate record count, time window and ambiguities. It cannot return an executable field definition.</p>
     <pre>ScenarioIntent
+  industry_type
   domain
-  subdomain
+  subdomain / use_case
+  scenario_type
+  type_of_data
+  entity_key
   requested_entities[]
   requested_relationships[]
   country
@@ -287,7 +294,7 @@ sequenceDiagram
   ambiguities[]</pre>
 
     <h3>Follow-up conversation</h3>
-    <p>The proposal request intentionally contains only business-facing fields. The backend derives conversation context from <code>scenarioId</code>, loads prior messages before interpretation, and keeps the four-API contract unchanged. Follow-up instructions can therefore reuse the same <code>scenarioId</code> without exposing technical chat/session fields in the request body.</p>
+    <p>The proposal request intentionally contains only business-facing fields. <code>scenarioId</code> is persisted for audit/draft correlation only and is excluded from semantic intent and schema selection. Every other request field is forwarded into the controlled intent/compilation context; no hidden client-side technical schema fields are required.</p>
 
     <div class="good"><strong>Important boundary:</strong> even if the model names an unsupported concept, the proposal is not executable. Registry resolution records the concept as unresolved and <code>/scenario/confirm</code> refuses promotion until the issue is resolved.</div>
   </section>

@@ -335,7 +335,7 @@ class TelecomRegistry:
             ).fetchone()
         return row is not None
 
-    def search(self, query: str, domain: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    def search(self, query: str, domain: str | None = None, limit: int = 35) -> list[dict[str, Any]]:
         """Deterministic lexical search over names and aliases; one result per entity."""
         normalized = _normalise(query)
         tokens = [token for token in normalized.split() if token]

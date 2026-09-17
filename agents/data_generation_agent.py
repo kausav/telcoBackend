@@ -190,6 +190,19 @@ def _constant(params: dict, _rec: dict):
     return params["value"]
 
 
+def _dependent_choice(params: dict, rec: dict):
+    """Choose a value from a mapping keyed by another generated field."""
+    mapping = params.get("mapping") or {}
+    depends_on = str(params.get("depends_on_field") or "").strip()
+    if not isinstance(mapping, dict) or not mapping:
+        return None
+    if depends_on and rec.get(depends_on) in mapping:
+        return mapping[rec[depends_on]]
+    # Deterministic fallback for a malformed/missing dependency while still staying
+    # inside the registry-declared mapping.
+    return next(iter(mapping.values()))
+
+
 def _weighted_choice(params: dict, _rec: dict):
     choices = list(params.get("choices", []))
     raw_weights = params.get("weights", [])
@@ -519,6 +532,7 @@ _GENERATORS = {
     "e164_phone":     lambda v, rec: _e164_phone(v["params"], rec),
     "constant":       lambda v, rec: _constant(v["params"], rec),
     "weighted_choice":lambda v, rec: _weighted_choice(v["params"], rec),
+    "dependent_choice":lambda v, rec: _dependent_choice(v["params"], rec),
     "weighted_bucket":lambda v, rec: _weighted_bucket(v["params"], rec),
     "uniform":        lambda v, rec: _uniform(v["params"], rec),
     "uniform_int":    lambda v, rec: _uniform_int(v["params"], rec),
