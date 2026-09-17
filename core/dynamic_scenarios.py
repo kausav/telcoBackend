@@ -223,6 +223,7 @@ def resolve_scenario_context(scenario_id: str) -> dict[str, Any]:
         "type_of_data": meta.get("type_of_data", "aggregational"),
         "entity_key": meta.get("entity_key"),
         "records_per_user": int(meta.get("records_per_user", 10) or 10),
+        "agentic": bool(meta.get("agentic", False)),
     }
 
 

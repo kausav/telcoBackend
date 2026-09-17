@@ -1,7 +1,6 @@
 """Deterministic schema compiler and HITL proposal builder."""
 from __future__ import annotations
 
-
 from core.agentic_models import GeneratedSchemaField, ResolvedConcept, ScenarioIntent, ScenarioSchema, SchemaRelationship
 from core.telecom_registry import EntityDef, TelecomRegistry
 
@@ -12,34 +11,82 @@ class SchemaCompiler:
     def __init__(self, registry: TelecomRegistry | None = None):
         self.registry = registry or TelecomRegistry()
 
-    def resolve(self, intent: ScenarioIntent) -> tuple[list[EntityDef], list[str]]:
+    def resolve(self, intent: ScenarioIntent, domain_query: str | None = None) -> tuple[list[EntityDef], list[str]]:
         resolved: list[EntityDef] = []
         unresolved: list[str] = []
         seen: set[str] = set()
+
+        # `domain` is the primary selector inside the chosen industry. The registry
+        # deterministically retrieves entities whose names/aliases match the business domain.
+        domain_candidates = self.registry.search(domain_query or intent.domain, limit=12)
+        domain_ids = {candidate["canonical_id"] for candidate in domain_candidates}
+        for candidate in domain_candidates:
+            entity = self.registry.resolve_entity(candidate["canonical_id"])
+            if entity and entity.canonical_id not in seen:
+                resolved.append(entity)
+                seen.add(entity.canonical_id)
+
+        # The LLM may refine the request, but only concepts already present in the
+        # approved domain catalog are eligible. This keeps domain selection deterministic.
         for requested in intent.requested_entities:
             entity = self.registry.resolve_entity(requested)
             if entity is None:
                 unresolved.append(f"Unknown concept '{requested}' is not in the approved telecom registry")
                 continue
+            if entity.canonical_id not in domain_ids:
+                continue
             if entity.canonical_id not in seen:
                 resolved.append(entity)
                 seen.add(entity.canonical_id)
-        # Prepaid scenarios need a minimal anchor graph. Add anchors only when the
-        # runtime registry contains them; never manufacture missing model concepts.
-        if intent.subdomain == "prepaid":
-            needs_anchors = not resolved or any(
-                entity.canonical_id in {"recharge", "usage_event", "charging_event"}
-                for entity in resolved
-            )
-            if needs_anchors:
-                for anchor in ("subscriber", "customer_account", "prepaid_account"):
-                    if anchor not in seen and self.registry.entity_exists(anchor):
-                        resolved.append(self.registry.get_entity(anchor))
-                        seen.add(anchor)
+
+        # Prepaid is subscriber-centric in the platform contract. Add the requested
+        # entity key anchor only from the approved registry; do not automatically pull
+        # customer/account master-data entities just because a standards relationship is required.
+        if intent.subdomain == "prepaid" and self.registry.entity_exists("subscriber"):
+            if "subscriber" not in seen:
+                resolved.append(self.registry.get_entity("subscriber"))
+                seen.add("subscriber")
 
         return resolved, unresolved
 
-    def compile(self, intent: ScenarioIntent, selected_entities: list[str] | None = None) -> ScenarioSchema:
+    @staticmethod
+    def _root_entity_for_key(entity_key: str | None, entities: list[EntityDef]) -> str | None:
+        if not entity_key:
+            return None
+        for entity in entities:
+            if any(attr.name.lower() == entity_key.lower() for attr in entity.attributes):
+                return entity.canonical_id
+        return None
+
+    def _eligible_field_count(self, entities: list[EntityDef], entity_ids: set[str], entity_key: str | None) -> int:
+        """Count fields that will actually be projected into the response schema."""
+        root_entity = self._root_entity_for_key(entity_key, entities)
+        names: set[str] = set()
+        for entity in entities:
+            for attr in entity.attributes:
+                params = dict(attr.params or {})
+                target = params.get("target")
+                if target and str(target) not in entity_ids:
+                    continue
+                if (
+                    entity_key
+                    and attr.name.lower() != entity_key.lower()
+                    and entity.canonical_id == root_entity
+                    and attr.name.endswith("_id")
+                    and (target or attr.name in {"customer_id", "account_id", "user_id", "entity_id"})
+                ):
+                    continue
+                names.add(attr.name)
+        return len(names)
+
+    def compile(
+        self,
+        intent: ScenarioIntent,
+        selected_entities: list[str] | None = None,
+        min_variables: int = 20,
+        domain_query: str | None = None,
+        entity_key: str | None = None,
+    ) -> ScenarioSchema:
         requested = intent
         if selected_entities is not None:
             # HITL may select/add only entities already present in the authoritative registry.
@@ -50,19 +97,82 @@ class SchemaCompiler:
                     raise ValueError(f"HITL selected unknown registry entity '{value}'")
                 normalized.append(entity.canonical_id)
             requested = requested.model_copy(update={"requested_entities": normalized})
-        entities, unresolved = self.resolve(requested)
+        entities, unresolved = self.resolve(requested, domain_query=domain_query)
         entity_ids = {e.canonical_id for e in entities}
+        domain_ids = {item["canonical_id"] for item in self.registry.search(domain_query or intent.domain, limit=12)}
+        if domain_query and not domain_ids:
+            unresolved.append(
+                f"Business domain '{domain_query}' could not be mapped to an approved telecom registry domain"
+            )
+        selected_ids = set(entity_ids)
+        if selected_ids & {"internet_access_service", "ip_uni", "subscriber_ethernet_service", "subscriber_uni"}:
+            supporting_ids = {"subscriber_ethernet_service", "subscriber_uni", "subscriber", "product_offering", "customer_account"}
+        elif selected_ids & {"recharge", "prepaid_account", "bucket", "balance_action_history", "usage_event", "charging_event"} or intent.subdomain == "prepaid":
+            supporting_ids = {"subscriber", "usage_event", "charging_event", "online_charging_session", "cdr_record", "product_offering"}
+        else:
+            supporting_ids = {"subscriber", "product_offering", "customer_account", "customer"}
+        allowed_expansion_ids = domain_ids | supporting_ids
 
-        # Add relationship endpoints needed by selected entities, but only from registry edges.
-        changed = True
-        while changed:
-            changed = False
-            for entity in list(entities):
-                for rel in entity.relationships:
-                    if rel.required and rel.target not in entity_ids and self.registry.entity_exists(rel.target):
-                        entities.append(self.registry.get_entity(rel.target))
-                        entity_ids.add(rel.target)
-                        changed = True
+        # Enforce the platform's minimum proposal width without allowing the LLM to
+        # invent fields. Expand only through entities already present in the approved
+        # registry graph, preferring nodes directly connected to the selected model.
+        if domain_ids and min_variables > 0:
+            frontier = list(entities)
+            visited = set(entity_ids)
+            while frontier and self._eligible_field_count(entities, entity_ids, entity_key) < min_variables:
+                next_frontier: list[EntityDef] = []
+                candidate_ids: list[str] = []
+                for entity in frontier:
+                    for rel in entity.relationships:
+                        if rel.target not in visited and rel.target in allowed_expansion_ids and self.registry.entity_exists(rel.target):
+                            candidate_ids.append(rel.target)
+                    for candidate in self.registry.related_entities(entity.canonical_id):
+                        if candidate.canonical_id not in visited and candidate.canonical_id in allowed_expansion_ids:
+                            candidate_ids.append(candidate.canonical_id)
+                # Stable de-duplication keeps schema generation reproducible.
+                for candidate_id in dict.fromkeys(candidate_ids):
+                    if candidate_id in visited:
+                        continue
+                    candidate = self.registry.get_entity(candidate_id)
+                    visited.add(candidate_id)
+                    entity_ids.add(candidate_id)
+                    entities.append(candidate)
+                    next_frontier.append(candidate)
+                    if self._eligible_field_count(entities, entity_ids, entity_key) >= min_variables:
+                        break
+                frontier = next_frontier
+                if not next_frontier:
+                    break
+
+        # Some valid telecom domains contain fewer than the platform minimum of 20
+        # variables in the standards slice. Add only approved, domain-relevant
+        # supporting entities. This fallback is deterministic and registry-backed;
+        # it is never invented by the LLM.
+        fallback_used = False
+        if domain_ids and min_variables > 0 and self._eligible_field_count(entities, entity_ids, entity_key) < min_variables:
+            if selected_ids & {"internet_access_service", "ip_uni", "subscriber_ethernet_service", "subscriber_uni"}:
+                fallback_entities = (
+                    "subscriber_ethernet_service", "subscriber_uni", "subscriber", "product_offering", "customer_account",
+                )
+            elif selected_ids & {"recharge", "prepaid_account", "bucket", "balance_action_history", "usage_event", "charging_event"} or intent.subdomain == "prepaid":
+                fallback_entities = (
+                    "usage_event", "charging_event", "online_charging_session", "cdr_record", "product_offering",
+                )
+            else:
+                fallback_entities = (
+                    "subscriber", "product_offering", "customer_account", "customer",
+                    "prepaid_account", "usage_event", "charging_event",
+                )
+
+            for fallback_id in fallback_entities:
+                if self._eligible_field_count(entities, entity_ids, entity_key) >= min_variables:
+                    break
+                if fallback_id in entity_ids or not self.registry.entity_exists(fallback_id):
+                    continue
+                entity = self.registry.get_entity(fallback_id)
+                entities.append(entity)
+                entity_ids.add(entity.canonical_id)
+                fallback_used = True
 
         relationships: list[SchemaRelationship] = []
         for entity in entities:
@@ -87,13 +197,28 @@ class SchemaCompiler:
             for attr in entity.attributes:
                 if attr.name in seen_fields:
                     continue
+                params = dict(attr.params or {})
+                # Do not expose dangling foreign-key/reference fields when the referenced
+                # master entity is not part of the selected scenario. This prevents a
+                # subscriber-level scenario from unnecessarily producing both subscriber_id
+                # and unrelated customer/account identity columns.
+                target = params.get("target")
+                if target and str(target) not in entity_ids:
+                    continue
+                # For the scenario's root entity, keep the requested entity key as the
+                # single root identifier. Other master-account/customer foreign-key IDs
+                # are redundant in the projected response unless they are independently
+                # requested as the entity key.
+                if entity_key and attr.name != entity_key and entity.canonical_id == self._root_entity_for_key(entity_key, entities):
+                    if attr.name.endswith("_id") and (target or attr.name in {"customer_id", "account_id", "user_id", "entity_id"}):
+                        continue
                 seen_fields.add(attr.name)
                 fields.append(GeneratedSchemaField(
                     name=attr.name,
                     dtype=attr.dtype,
                     description=attr.description,
                     gen=attr.generator,
-                    params=dict(attr.params or {}),
+                    params=params,
                     depends_on=list(attr.depends_on),
                     nullable=attr.nullable,
                     required=attr.required,
@@ -111,6 +236,7 @@ class SchemaCompiler:
             "Every relationship must come from an approved registry edge.",
             "No LLM-created enum, formula, generator or field is executable.",
             "Generated records must pass deterministic schema, reference, temporal and arithmetic validation.",
+            "Business domain selection is deterministic and registry-backed; industryType selects the supported model family.",
         ]
         if not entities:
             unresolved.append("No supported telecom concepts could be resolved from the request")
@@ -120,8 +246,13 @@ class SchemaCompiler:
         if "usage_event" in entity_ids and "charging_event" in entity_ids:
             hard_constraints.append("Charging event must reference an existing usage event and occur at or after the usage event timestamp.")
         applicable_standards = self.registry.standards_for_entities([e.canonical_id for e in entities])
+        warnings = []
+        if entities:
+            warnings.append("Runtime registry is built from versioned normalized standards artifacts plus an INGENII generation-policy overlay. Official source artifacts should be re-ingested before production certification.")
+        if fallback_used:
+            warnings.append("The requested domain did not contain enough registry-backed attributes to meet the 20-variable minimum; approved foundational telecom entities were added deterministically.")
         return ScenarioSchema(
-            domain="telecom",
+            domain=domain_query or intent.domain or intent.subdomain,
             subdomain=intent.subdomain,
             applicable_standards=applicable_standards,
             entities=[ResolvedConcept(canonical_id=e.canonical_id, name=e.name, source_model="/".join(sorted({s['standard'] for s in e.sources})), source_references=[s.get("reference", "") for s in e.sources], selected_attributes=[a.name for a in e.attributes]) for e in entities],
@@ -129,7 +260,7 @@ class SchemaCompiler:
             fields=fields,
             hard_constraints=hard_constraints,
             unresolved_items=unresolved,
-            warnings=["Runtime registry is built from versioned normalized standards artifacts plus an INGENII generation-policy overlay. Official source artifacts should be re-ingested before production certification."] if entities else [],
+            warnings=warnings,
         )
 
     def approval_questions(self, intent: ScenarioIntent, schema: ScenarioSchema) -> list[str]:

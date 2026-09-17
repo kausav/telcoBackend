@@ -86,7 +86,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.3.0",
+    version="2.4.0",
     lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse},
@@ -381,7 +381,7 @@ def import_scenario_csv(
         success=True,
         draft_id=draft_id,
         scenario_id=scenarioId,
-        label=draft["label"],
+        requested_scenario_id=scenarioId,
         journey=draft["journey"],
         description=draft["description"],
         variables=variables,
@@ -404,6 +404,10 @@ def confirm_scenario_route(req: ConfirmRequest):
             variables, field_order = AgenticSchemaWorkflow.validate_hitl_changes(
                 draft, req.add, req.edit, req.delete
             )
+            if len(variables) < 20:
+                raise ValueError(
+                    f"Agentic HITL confirmation requires at least 20 variables; {len(variables)} would remain"
+                )
         except (ValueError, KeyError) as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
     else:
@@ -437,6 +441,7 @@ def confirm_scenario_route(req: ConfirmRequest):
         "expected_outcome":draft.get("expected_outcome"),"scenario_type":draft.get("scenario_type"),"use_case":draft.get("use_case"),
         "industry":draft.get("industry_type","generic"),"country":draft.get("country"),"requested_scenario_id":requested_scenario_id,
         "type_of_data":type_of_data,"entity_key":entity_key,"records_per_user":10,
+        "agentic": bool(draft.get("agentic", False)),
     }
     confirm_scenario(scenario_id,meta,variables,field_order,draft_id=req.draft_id)
     invalidate_scenario(scenario_id); clear_scenario(scenario_id)

@@ -14,7 +14,9 @@ class ScenarioIntent(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    domain: Literal["telecom"] = "telecom"
+    # `industry_type` selects the model family; `domain` selects the business/domain slice within it.
+    industry_type: Literal["telecom"] = "telecom"
+    domain: str = "prepaid"
     subdomain: Literal["prepaid", "postpaid", "charging", "usage", "customer", "network", "unknown"] = "prepaid"
     requested_entities: list[str] = Field(default_factory=list, max_length=20)
     requested_relationships: list[str] = Field(default_factory=list, max_length=30)
@@ -69,36 +71,31 @@ class ScenarioSchema(BaseModel):
 
 
 class ScenarioProposeRequest(BaseModel):
-    """JSON body equivalent of the former scenario-import metadata, without the file.
+    """Business-facing JSON contract for agentic scenario proposal.
 
-    businessScenario is the natural-language request used by the intent agent.
-    conversationId is optional so follow-up requests can reuse prior chat context.
+    The client sends scenario/business metadata only. Technical schema details,
+    telecom entities, relationships, generators and constraints are resolved by the backend.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     scenario_id: str = Field(alias="scenarioId", min_length=1, max_length=200)
-    domain: str = Field(min_length=1, max_length=100)
-    type_of_data: Literal["transactional", "aggregational"] | None = Field(default=None, alias="typeOfData")
-    industry_type: str = Field(default="generic", alias="industryType", max_length=100)
-    country: str | None = Field(default=None, max_length=20)
-    business_scenario: str = Field(default="", alias="businessScenario", max_length=12000)
-    business_response: str | None = Field(default=None, alias="businessResponse", max_length=5000)
-    expected_outcome: str | None = Field(default=None, alias="expectedOutcome", max_length=5000)
-    scenario_type: str = Field(default="agentic", alias="scenarioType", max_length=100)
-    use_case: str | None = Field(default=None, alias="useCase", max_length=200)
-    label: str = Field(default="", max_length=200)
-    entity_key: str | None = Field(default=None, alias="entityKey", max_length=200)
-
-    conversation_id: str | None = Field(default=None, alias="conversationId", max_length=200)
+    scenario_type: str = Field(alias="scenarioType", min_length=1, max_length=100)
+    industry_type: str = Field(alias="industryType", min_length=1, max_length=100)
+    domain: str = Field(min_length=1, max_length=200)
+    business_scenario: str = Field(alias="businessScenario", min_length=1, max_length=12000)
+    type_of_data: Literal["transactional", "aggregational"] = Field(alias="typeOfData")
+    country: str = Field(min_length=1, max_length=20)
+    entity_key: str = Field(alias="entityKey", min_length=1, max_length=200)
+    use_case: str = Field(alias="useCase", min_length=1, max_length=200)
 
 
 class ScenarioImportResponse(BaseModel):
-    """Compatibility response contract used by the scenario proposal workflow."""
+    """Shared draft response contract for CSV import and agentic proposal."""
     success: bool = True
     draft_id: str
     scenario_id: str
-    label: str
+    requested_scenario_id: str
     journey: str
     description: str
     variables: list[dict]

@@ -72,17 +72,18 @@
     <h2>Contents</h2>
     <p>
       <a href="#principles">1. Architecture principles</a> ·
-      <a href="#overview">2. End-to-end architecture</a> ·
-      <a href="#api">3. Public API contract</a> ·
-      <a href="#agent">4. Agentic schema proposal</a> ·
-      <a href="#registry">5. Standards-backed runtime registry</a> ·
-      <a href="#hitl">6. HITL / confirmation</a> ·
-      <a href="#generation">7. Deterministic generation</a> ·
-      <a href="#qa">8. Validation & repair</a> ·
-      <a href="#persistence">9. Persistence & lifecycle</a> ·
-      <a href="#security">10. Trust & security boundaries</a> ·
-      <a href="#files">11. Code map</a> ·
-      <a href="#runbook">12. Run / test / operate</a>
+      <a href="#selection-model">2. Industry and Domain Selection</a> ·
+      <a href="#overview">3. End-to-end architecture</a> ·
+      <a href="#api">4. Public API contract</a> ·
+      <a href="#agent">5. Agentic schema proposal</a> ·
+      <a href="#registry">6. Standards-backed runtime registry</a> ·
+      <a href="#hitl">7. HITL / confirmation</a> ·
+      <a href="#generation">8. Deterministic generation</a> ·
+      <a href="#qa">9. Validation & repair</a> ·
+      <a href="#persistence">10. Persistence & lifecycle</a> ·
+      <a href="#security">11. Trust & security boundaries</a> ·
+      <a href="#files">12. Code map</a> ·
+      <a href="#runbook">13. Run / test / operate</a>
     </p>
   </section>
 
@@ -99,8 +100,31 @@
     <div class="danger"><strong>Anti-hallucination rule:</strong> structured LLM output alone is not sufficient. Pydantic validates shape; registry resolution validates telecom vocabulary; deterministic compilation validates executable semantics.</div>
   </section>
 
+  <section id="selection-model">
+    <h2>2. Industry and Domain Selection</h2>
+    <div class="two">
+      <div class="card"><h3>IndustryType = model-family selector</h3><p><code>industryType</code> is the authoritative industry selector. For the current release, <code>Telecommunications</code>, <code>Telecom</code> and their normalized forms select the telecom model family. Unsupported industries are rejected before proposal compilation.</p></div>
+      <div class="card"><h3>Domain = variable selector</h3><p><code>domain</code> is the authoritative business-domain selector inside the chosen industry. It is passed to the standards-backed runtime registry as the deterministic search query used to retrieve suitable entities and variables.</p></div>
+    </div>
+    <div class="diagram">
+      <div class="mermaid">
+flowchart LR
+  I[industryType] --> N[Normalize Industry]
+  N --> T[Telecom Model Family]
+  D[domain] --> R[Deterministic Domain Search]
+  T --> R
+  R --> C[TM Forum / 3GPP / MEF Runtime Registry]
+  C --> S[Registry-backed entities, attributes, relationships]
+  S --> SC[Deterministic Schema Compiler]
+  SC --> H[HITL Confirmation]
+  H --> G[Deterministic Generation]
+      </div>
+    </div>
+    <div class="note"><strong>Anti-hallucination boundary:</strong> Gemini receives a domain-scoped approved catalog and returns intent only. The LLM never selects an authoritative standard, creates a field, creates a relationship, or changes a generator. Industry selection is backend-controlled; domain selection is registry-controlled.</div>
+  </section>
+
   <section id="overview">
-    <h2>2. End-to-end architecture</h2>
+    <h2>3. End-to-end architecture</h2>
     <div class="diagram">
       <div class="mermaid">
 flowchart LR
@@ -133,7 +157,7 @@ flowchart LR
     </div>
 
     <div class="two">
-      <div class="card"><h3>Agentic path</h3><p><span class="flow-step">Intent → Registry → Compiler → HITL</span>. Used by <code>/scenario/propose</code>.</p></div>
+      <div class="card"><h3>Agentic path</h3><p><span class="flow-step">Intent → Standards Registry → Compiler → HITL</span>. Used by <code>/scenario/propose</code>; the deterministic compiler expands the approved registry graph to at least 20 distinct variables.</p></div>
       <div class="card"><h3>CSV path</h3><p><span class="flow-step">CSV → deterministic parser → HITL</span>. Used by <code>/scenario/import-csv</code> when the client already owns the schema definition.</p></div>
     </div>
     <div class="card"><h3>Common execution path</h3><p><span class="flow-step">Confirmed contract → Generator → Validation</span>. Both proposal paths converge on <code>/scenario/confirm</code> and then <code>/scenario/generate</code>.</p></div>
@@ -155,7 +179,7 @@ Deterministic QA / reconciliation</pre>
   </section>
 
   <section id="api">
-    <h2>3. Public API contract</h2>
+    <h2>4. Public API contract</h2>
     <p>The scenario workflow exposes four APIs. Clients may choose either the agentic JSON proposal path or the explicit CSV definition path; both converge on the same HITL confirmation and generation APIs. Liveness and health endpoints remain operational endpoints.</p>
     <table>
       <tr><th>Method</th><th>Path</th><th>Purpose</th><th>LLM</th><th>Input</th><th>Output</th></tr>
@@ -166,23 +190,19 @@ Deterministic QA / reconciliation</pre>
     </table>
 
     <h3>3.1 <code>POST /scenario/propose</code></h3>
-    <p>The request body is the JSON equivalent of the former CSV import metadata. The response keeps the same scenario-review contract so the existing frontend can reuse its HITL screen.</p>
+    <p>The request body is the business-facing JSON contract. The backend derives technical schema details, resolves concepts against the TM Forum / 3GPP / MEF runtime registry, and deterministically builds an approved-registry schema containing at least 20 variables before HITL confirmation.</p>
     <pre>{
-  "scenarioId": "PREPAID-01",
-  "domain": "telecom",
+  "scenarioId": "LB-01",
+  "scenarioType": "Normal",
+  "industryType": "Telecommunications",
+  "domain": "Low Balance & Top-up",
+  "businessScenario": "Generate a high-fidelity synthetic dataset to model subscriber recharge behavior, analyze top-up trigger sensitivity, and evaluate proactive retention interventions without exposing sensitive customer PII.",
   "typeOfData": "transactional",
-  "industryType": "telecom",
   "country": "IN",
-  "businessScenario": "Generate prepaid subscribers with recharge, balance, data usage and charging history",
-  "businessResponse": "Synthetic records",
-  "expectedOutcome": "Realistic internally consistent telecom data",
-  "scenarioType": "agentic",
-  "useCase": "prepaid",
-  "label": "Prepaid Telecom",
   "entityKey": "subscriber_id",
-  "conversationId": "optional-conversation-id"
+  "useCase": "prepaid"
 }</pre>
-    <div class="note"><strong>Response compatibility:</strong> the frontend receives <code>draft_id</code>, <code>scenario_id</code>, <code>variables</code>, <code>field_order</code>, <code>typeOfData</code>, and <code>entityKey</code> in the same response shape it already understands.</div>
+    <div class="note"><strong>Response contract:</strong> <code>ScenarioImportResponse</code> is shared with CSV import and exposes <code>requested_scenario_id</code>, <code>draft_id</code>, <code>scenario_id</code>, <code>variables</code>, <code>field_order</code>, <code>typeOfData</code>, and <code>entityKey</code>. Agentic proposals must contain at least 20 distinct registry-backed variables.</div>
 
     <h3>3.2 <code>POST /scenario/import-csv</code></h3>
     <p>This path remains available for clients that already have a complete variable-level CSV definition. It accepts the same scenario metadata as before as multipart form fields plus a UTF-8 CSV file, parses and normalizes the CSV deterministically, and creates a non-agentic draft.</p>
@@ -198,7 +218,7 @@ Deterministic QA / reconciliation</pre>
   useCase: prepaid
   label: Prepaid CSV
   entityKey: subscriber_id</pre>
-    <p>The parser supports the existing client CSV conventions for types, generators, dependency aliases, timestamp formats, numeric buckets, weights, precision, currency and related deterministic parameters. The resulting response is the same <code>ScenarioImportResponse</code> used by <code>/scenario/propose</code>.</p>
+    <p>The parser supports the existing client CSV conventions for types, generators, dependency aliases, timestamp formats, numeric buckets, weights, precision, currency and related deterministic parameters. The resulting response is the same <code>ScenarioImportResponse</code> used by <code>/scenario/propose</code>, including <code>requested_scenario_id</code>.</p>
 
     <h3>3.3 <code>POST /scenario/confirm</code></h3>
     <p>This is the only HITL action API. It accepts <code>draft_id</code>, optional safe field edits, deletions, and feedback.</p>
@@ -224,7 +244,7 @@ Deterministic QA / reconciliation</pre>
   </section>
 
   <section id="agent">
-    <h2>4. Agentic schema proposal</h2>
+    <h2>5. Agentic schema proposal</h2>
     <div class="diagram">
       <div class="mermaid">
 sequenceDiagram
@@ -266,7 +286,7 @@ sequenceDiagram
   ambiguities[]</pre>
 
     <h3>Follow-up conversation</h3>
-    <p><code>conversationId</code> is optional. When omitted, the proposal workflow derives a stable conversation key from <code>scenarioId</code>. Existing messages are loaded before the new message is interpreted, allowing follow-up instructions such as “make recharge behavior more frequent for high-value users” without changing the four-API contract.</p>
+    <p>The proposal request intentionally contains only business-facing fields. The backend derives conversation context from <code>scenarioId</code>, loads prior messages before interpretation, and keeps the four-API contract unchanged. Follow-up instructions can therefore reuse the same <code>scenarioId</code> without exposing technical chat/session fields in the request body.</p>
 
     <div class="good"><strong>Important boundary:</strong> even if the model names an unsupported concept, the proposal is not executable. Registry resolution records the concept as unresolved and <code>/scenario/confirm</code> refuses promotion until the issue is resolved.</div>
   </section>
@@ -451,14 +471,14 @@ Subscriber
   </section>
 
   <section id="runbook">
-    <h2>11. Production Deployment</h2>
+    <h2>12. Production Deployment</h2>
     <div class="grid">
       <div class="card"><h3>Immutable resources</h3><p><code>resources/telecom/</code> contains model artifacts and generation profiles shipped with the build. They are read-only inputs to registry construction.</p></div>
       <div class="card"><h3>Mutable runtime state</h3><p><code>runtime_data/</code> is created automatically at startup for the registry, scenarios and conversations. Mount it on durable storage in production.</p></div>
       <div class="card"><h3>Configuration</h3><p>Secrets and deployment-specific values are supplied through environment variables. CORS is explicit by default; production deployments should set approved origins.</p></div>
       <div class="card"><h3>Container</h3><p>The supplied Dockerfile runs the service as a non-root user and copies only application source and immutable resources into the image.</p></div>
     </div>
-    <h2>12. Run and operate</h2>
+    <h2>13. Run and operate</h2>
     <h3>Install</h3>
     <pre>pip install -r requirements.txt</pre>
 
@@ -489,5 +509,7 @@ GEMINI_MODEL=gemini-3.8-flash</pre>
 <footer>
   INGENII architecture snapshot — aligned with the current four-API MVP implementation and standards-backed runtime registry.
 </footer>
+
+
 </body>
 </html>

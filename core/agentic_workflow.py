@@ -14,6 +14,7 @@ from core.dynamic_scenarios import new_draft_id, save_draft
 from core.telecom_registry import TelecomRegistry, get_registry
 from agents.intent_agent import PydanticAIIntentAgent
 from agents.schema_compiler import SchemaCompiler
+from config.industry_profiles import match_industry_key
 
 
 class AgenticSchemaWorkflow:
@@ -59,29 +60,63 @@ class AgenticSchemaWorkflow:
         return variables, field_order
 
     def propose(self, req: ScenarioProposeRequest) -> ScenarioImportResponse:
-        prompt = (req.business_scenario or req.use_case or req.label or req.domain).strip()
-        if not prompt:
-            raise ValueError("businessScenario, useCase, label or domain must provide the agentic request")
-        if req.domain.strip().lower() != "telecom":
-            raise ValueError("scenario/propose currently supports domain='telecom' only")
+        prompt = req.business_scenario.strip()
+        industry_key = match_industry_key(req.industry_type)
+        if industry_key != "telecom":
+            raise ValueError(
+                "scenario/propose currently supports industryType values 'Telecommunications' or 'Telecom'"
+            )
 
-        cid = ensure_conversation(req.conversation_id)
+        # industryType selects the telecom model family; domain selects the business-domain
+        # slice. The model still returns intent only; the registry/compiler remains the
+        # semantic authority for entities, attributes and relationships.
+        agent_prompt = (
+            f"Industry: {req.industry_type}\n"
+            f"Business domain: {req.domain}\n"
+            f"Use case: {req.use_case}\n"
+            f"Scenario type: {req.scenario_type}\n"
+            f"Data type: {req.type_of_data}\n"
+            f"Country: {req.country}\n"
+            f"Entity key: {req.entity_key}\n"
+            f"Business scenario: {prompt}"
+        )
+
+        cid = ensure_conversation(req.scenario_id)
         history = get_messages(cid, limit=30)
-        append_message(cid, "user", prompt)
+        append_message(cid, "user", agent_prompt)
 
-        intent = self.intent_agent.run(prompt, history, country=req.country)
+        intent = self.intent_agent.run(
+            agent_prompt,
+            history,
+            country=req.country,
+            industry_type=industry_key,
+            domain_query=req.domain,
+        )
+        # Backend-owned request values are authoritative; the LLM cannot change them.
+        intent.industry_type = industry_key
+        intent.domain = req.domain
+        intent.subdomain = req.use_case.strip().lower() if req.use_case.strip().lower() in {
+            "prepaid", "postpaid", "charging", "usage", "customer", "network"
+        } else "unknown"
         if req.country:
             intent.country = req.country
-        schema = self.compiler.compile(intent)
+        schema = self.compiler.compile(
+            intent,
+            min_variables=20,
+            domain_query=req.domain,
+            entity_key=req.entity_key,
+        )
 
         unresolved_questions = self.compiler.approval_questions(intent, schema)
         variables, field_order = self._schema_to_variables(schema)
+        if len(variables) < 20:
+            raise ValueError(f"Agentic proposal must contain at least 20 variables; compiler produced {len(variables)}")
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
         entity_key = self._entity_key(req.entity_key, field_order, type_of_data)
 
         draft_id = new_draft_id()
-        label = req.label or req.scenario_id
-        description = req.business_scenario or f"Agentic scenario for {req.domain}"
+        label = req.scenario_id
+        description = req.business_scenario
         draft = {
             "label": label,
             "journey": req.domain,
@@ -90,12 +125,10 @@ class AgenticSchemaWorkflow:
             "field_order": field_order,
             "domain": req.domain,
             "business_scenario": req.business_scenario,
-            "business_response": req.business_response,
-            "expected_outcome": req.expected_outcome,
             "use_case": req.use_case,
             "scenario_id": req.scenario_id,
             "scenario_type": req.scenario_type or "agentic",
-            "industry_type": req.industry_type,
+            "industry_type": industry_key,
             "country": intent.country or req.country,
             "type_of_data": type_of_data,
             "entity_key": entity_key,
@@ -114,7 +147,7 @@ class AgenticSchemaWorkflow:
             success=True,
             draft_id=draft_id,
             scenario_id=req.scenario_id,
-            label=label,
+            requested_scenario_id=req.scenario_id,
             journey=req.domain,
             description=description,
             variables=variables,

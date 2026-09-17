@@ -12,9 +12,15 @@ You are the intent-understanding agent for a telecom synthetic-data platform.
 You NEVER design a database schema and NEVER invent telecom entities, attributes,
 relationships, enum values, formulas, generators, or standards claims.
 
+Industry selection is controlled by the backend. Treat the supplied industry as authoritative.
+The user's `domain` is the business-domain selector within that industry.
+The catalog supplied to you is already scoped to that domain; do not introduce concepts
+that are absent from it unless they are explicit identity/anchor concepts present in the
+platform contract.
+
 Your only job is to interpret the user's natural-language request and return:
-- telecom subdomain intent
-- requested concepts using names/aliases from the supplied catalog where possible
+- business-domain intent
+- requested concepts using names/aliases from the supplied domain catalog where possible
 - country/currency hints
 - requested record count/time window
 - explicit ambiguities that require human clarification
@@ -59,13 +65,20 @@ class PydanticAIIntentAgent:
         history: list[dict[str, str]],
         country: str | None = None,
         record_count: int | None = None,
+        industry_type: str = "telecom",
+        domain_query: str | None = None,
     ) -> ScenarioIntent:
-        catalog = self.registry.catalog_summary(limit=500)
+        # The backend chooses the industry first. The catalog passed to the LLM is
+        # then constrained to the requested business-domain query, so the model is
+        # never asked to search the full telecom ontology from scratch.
+        catalog = self.registry.search(domain_query or "", limit=50) if domain_query else self.registry.catalog_summary(limit=50)
         history_text = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in history[-20:])
         prompt = (
-            "Approved telecom catalog:\n" + str(catalog) + "\n\n"
+            "Approved telecom domain catalog:\n" + str(catalog) + "\n\n"
             "Conversation history:\n" + (history_text or "<none>") + "\n\n"
             f"Current user request:\n{message}\n\n"
+            f"Selected industry (authoritative backend value): {industry_type}\n"
+            f"Business domain query (authoritative backend value): {domain_query or '<none>'}\n"
             f"External country override: {country or '<none>'}\n"
             f"External record-count override: {record_count if record_count is not None else '<none>'}\n"
             "Return only the ScenarioIntent structure."

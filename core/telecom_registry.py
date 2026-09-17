@@ -187,6 +187,29 @@ class TelecomRegistry:
                 })
             return result
 
+    def related_entities(self, entity_id: str) -> list[EntityDef]:
+        """Return entities connected to *entity_id* by approved registry relationships.
+
+        Both outgoing and incoming edges are considered. Results are deterministic and
+        remain fully registry-backed; this method never creates or infers entities.
+        """
+        key = _normalise(entity_id).replace(" ", "_")
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT target_entity FROM relationships WHERE source_entity = ?
+                   UNION
+                   SELECT DISTINCT source_entity FROM relationships WHERE target_entity = ?
+                   ORDER BY 1""",
+                (key, key),
+            ).fetchall()
+        result = []
+        for (candidate,) in rows:
+            try:
+                result.append(self.get_entity(candidate))
+            except KeyError:
+                continue
+        return result
+
     def resolve_entity(self, value: str) -> EntityDef | None:
         key = _normalise(value)
         with self._connect() as conn:
