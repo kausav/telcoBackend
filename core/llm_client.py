@@ -30,6 +30,16 @@ def _safe_provider_error(exc: Exception) -> str:
     )
 
 
+def _extract_status_code(exc: Exception) -> int | None:
+    for attr in ("status_code", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    text = str(exc)
+    match = re.search(r"\b([45]\d{2})\b", text)
+    return int(match.group(1)) if match else None
+
+
 class GeminiClient:
     """Thin, synchronous wrapper around the supported ``google-genai`` SDK."""
 
@@ -57,6 +67,32 @@ class GeminiClient:
         self._types = types
         self._client = genai.Client(api_key=key, http_options=http_options)
 
+    def generate_text(
+        self,
+        system_instruction: str,
+        user_prompt: str,
+        temperature: float = 0.2,
+    ) -> str:
+        """Generate plain text without response-schema/JSON-mode constraints."""
+        config_kwargs: dict[str, Any] = {"system_instruction": system_instruction}
+        if not self.model.startswith("gemini-3"):
+            config_kwargs["temperature"] = temperature
+        try:
+            response = self._client.models.generate_content(
+                model=self.model,
+                config=self._types.GenerateContentConfig(**config_kwargs),
+                contents=user_prompt,
+            )
+        except Exception as exc:
+            logger.exception("Gemini text request failed")
+            raise LLMUpstreamError(
+                f"Gemini text request failed: {type(exc).__name__}: {_safe_provider_error(exc)}",
+                provider="Google Gemini",
+                model=self.model,
+                status_code=_extract_status_code(exc),
+            ) from exc
+        return (response.text or "").strip()
+
     def generate_json(
         self,
         system_instruction: str,
@@ -82,6 +118,7 @@ class GeminiClient:
                 f"Gemini JSON request failed: {type(exc).__name__}: {_safe_provider_error(exc)}",
                 provider="Google Gemini",
                 model=self.model,
+                status_code=_extract_status_code(exc),
             ) from exc
 
         text = (response.text or "").strip()

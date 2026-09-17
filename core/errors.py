@@ -35,11 +35,13 @@ class LLMUpstreamError(Exception):
         provider: str = "Google Gemini",
         model: str | None = None,
         public_egress_ip: str | None = None,
+        status_code: int | None = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
         self.model = model
         self.public_egress_ip = public_egress_ip
+        self.status_code = status_code
 
 
 class ErrorDetail(BaseModel):

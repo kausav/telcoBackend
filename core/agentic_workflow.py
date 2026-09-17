@@ -17,7 +17,7 @@ from core.errors import LLMUpstreamError
 from core.runtime_cache import get_proposal, set_proposal
 
 logger = logging.getLogger(__name__)
-from agents.intent_agent import PydanticAIIntentAgent
+from agents.intent_agent import GeminiIntentAgent
 from agents.schema_compiler import SchemaCompiler
 from config.industry_profiles import match_industry_key
 
@@ -28,12 +28,12 @@ class AgenticSchemaWorkflow:
     def __init__(self, api_key: str | None = None, registry: TelecomRegistry | None = None):
         self.registry = registry or get_registry()
         self._api_key = api_key
-        self._intent_agent: PydanticAIIntentAgent | None = None
+        self._intent_agent: GeminiIntentAgent | None = None
         self.compiler = SchemaCompiler(self.registry)
 
-    def _get_intent_agent(self) -> PydanticAIIntentAgent:
+    def _get_intent_agent(self) -> GeminiIntentAgent:
         if self._intent_agent is None:
-            self._intent_agent = PydanticAIIntentAgent(api_key=self._api_key, registry=self.registry)
+            self._intent_agent = GeminiIntentAgent(api_key=self._api_key, registry=self.registry)
         return self._intent_agent
 
     @staticmethod
@@ -286,10 +286,10 @@ _WORKFLOW_SINGLETONS: dict[str, AgenticSchemaWorkflow] = {}
 
 
 def get_agentic_workflow(api_key: str | None = None, registry: TelecomRegistry | None = None) -> AgenticSchemaWorkflow:
-    """Reuse the PydanticAI model/registry objects across proposal requests.
+    """Reuse the Gemini intent client/registry objects across proposal requests.
 
     The cache key is the explicit API key (or a process-local default), never scenarioId.
-    This removes repeated model/provider construction from /scenario/propose.
+    This removes repeated Gemini client/provider construction from /scenario/propose.
     """
     key = api_key or "__default__"
     workflow = _WORKFLOW_SINGLETONS.get(key)

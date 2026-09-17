@@ -1,77 +1,220 @@
-"""PydanticAI intent agent: natural language in, no schema authority out."""
+"""Gemini intent agent: natural-language scenario in, validated semantic intent out.
+
+The proposal path deliberately does not use provider-native structured-output schemas.
+Gemini's structured-schema surface accepts only a subset of JSON Schema, and complex
+Pydantic schemas can be rejected with 400 INVALID_ARGUMENT before the model returns an
+answer. We therefore request plain JSON and validate it locally with Pydantic.
+"""
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
+from typing import Any
 
 from core.agentic_models import ScenarioIntent
-from core.telecom_registry import TelecomRegistry
 from core.errors import LLMUpstreamError
-import logging
-import re
-
+from core.llm_client import GeminiClient
+from core.telecom_registry import TelecomRegistry
 
 logger = logging.getLogger(__name__)
 
 
-def _safe_exception_text(exc: Exception) -> str:
-    text = str(exc)[:1600]
-    return re.sub(r"(?i)(api[_-]?key|token|authorization|bearer|password|secret)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", text)
-
-
 INSTRUCTIONS = """
 You are the intent-understanding and variable-ideation agent for a telecom synthetic-data platform.
-You must interpret the COMPLETE business request and propose a FRESH semantic variable set.
+Interpret the COMPLETE business request and propose a FRESH semantic variable set.
 
 IMPORTANT BOUNDARIES:
-- Do not output executable generators, params, formulas, enum values, SQL, or schema implementation details.
-- Candidate variables are semantic ideas only. The deterministic compiler assigns the executable generator contract.
-- `scenarioId` is an identifier only and MUST NOT influence what variables are proposed.
-- Use `scenarioType`, `domain`, `businessScenario`, `useCase`, `country`, `typeOfData`, and `entityKey` together.
-- Aim for 30-35 candidate variables when the scenario naturally supports that breadth. If the scenario genuinely needs fewer variables, return fewer; never pad with irrelevant variables.
-- Candidate variable names should be scenario-specific and avoid generic template replay.
+- Return JSON only. Do not wrap the JSON in markdown fences.
+- Do not output executable generators, generator parameters, formulas, SQL, or schema implementation details.
+- Candidate variables are semantic ideas only. The deterministic compiler assigns executable generator contracts.
+- scenarioId is an identifier only and MUST NOT influence what variables are proposed.
+- Use scenarioType, domain, businessScenario, useCase, country, typeOfData, and entityKey together.
+- Aim for 30-35 candidate variables when the scenario naturally supports that breadth.
+- Fewer variables are valid when the scenario genuinely needs fewer; NEVER pad with irrelevant variables.
+- Candidate variable names must be FRESH and should not simply copy a template or reference list.
 - Always include the requested entity key when it is meaningful for the requested grain.
-- For transactional data, distinguish stable entity/profile fields from repeated transaction/event/decision fields using `grain`.
-- Prefer variables that explain triggers, state transitions, outcomes, timing, monetary/usage measures, decisions, and cross-journey behavior when those concepts fit the scenario.
-- Treat scenarioType as a behavioral mode and make the variable set materially different across modes; do not reuse a generic prepaid template.
-- Cover only concepts justified by the current businessScenario/domain/useCase. Prefer scenario-specific trigger, decision, outcome, timing, recovery, suppression, contention, or retention concepts over generic profile fields when relevant.
-- Use the requested entityKey as the one allowed canonical identity field; otherwise prefer descriptive, scenario-specific names.
-- The registry/catalog provided by the backend is authoritative for telecom entities and standards. Use it to stay grounded, but do not simply dump registry attributes.
+- For transactional data, distinguish stable entity/profile fields from repeated transaction/event/decision fields using grain.
+- Prefer variables that explain triggers, states, transitions, outcomes, timing, monetary/usage measures,
+  decisions, contention, suppression, recovery, or retention when those concepts fit the scenario.
+- Treat scenarioType as a behavioral mode and make the variable set materially reflect it.
+- Cover only concepts justified by the current business scenario and domain.
+- The telecom catalog is grounding information, not a variable template. Do not dump catalog attributes.
 
-Return a ScenarioIntent containing:
-1. intent metadata;
-2. a fresh `candidate_variables` list of semantic variable ideas with `name`, `description`, `role`, `grain`, and `dtype`;
-3. requested entities/relationships that genuinely help the scenario.
-"""
+Return this JSON shape:
+{
+  "industry_type": "telecom",
+  "domain": "...",
+  "subdomain": "prepaid|postpaid|charging|usage|customer|network|unknown",
+  "scenario_type": "...",
+  "type_of_data": "transactional|aggregational",
+  "entity_key": "...",
+  "use_case": "...",
+  "requested_entities": ["..."],
+  "requested_relationships": ["..."],
+  "candidate_variables": [
+    {
+      "name": "fresh_variable_name",
+      "description": "...",
+      "role": "identity|profile|event|transaction|status|measurement|metric|timing|decision|configuration|derived|other",
+      "grain": "entity|transaction|event|derived",
+      "dtype": "string|integer|float|decimal|boolean|categorical|datetime|date",
+      "depends_on": ["existing_candidate_variable_name"]
+    }
+  ],
+  "country": "...",
+  "currency": "...",
+  "record_count": null,
+  "time_window_days": null,
+  "notes": ["..."],
+  "ambiguities": ["..."]
+}
+""".strip()
 
 
-class PydanticAIIntentAgent:
+def _safe_exception_text(exc: Exception) -> str:
+    text = str(exc)[:2000]
+    return re.sub(
+        r"(?i)(api[_-]?key|token|authorization|bearer|password|secret)\s*[:=]\s*[^\s,;]+",
+        r"\1=[REDACTED]",
+        text,
+    )
+
+
+def _extract_json_payload(payload: dict | list) -> dict[str, Any]:
+    """Normalize Gemini JSON-mode output to one object suitable for validation."""
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
+        return payload[0]
+    raise ValueError("Gemini returned JSON, but the intent payload was not a single object")
+
+
+def _parse_text_json(text: str) -> dict[str, Any]:
+    """Parse JSON from a plain-text Gemini response, tolerating markdown fences."""
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        parsed = json.loads(cleaned[start : end + 1])
+    return _extract_json_payload(parsed)
+
+
+def _as_list(value: Any, limit: int) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    return value[:limit]
+
+
+def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Make common model-output deviations harmless before strict app validation."""
+    normalized = dict(payload)
+
+    for key, limit in (("requested_entities", 35), ("requested_relationships", 45), ("notes", 35), ("ambiguities", 35)):
+        normalized[key] = [str(item).strip() for item in _as_list(normalized.get(key), limit) if str(item).strip()]
+
+    variables: list[dict[str, Any]] = []
+    allowed_roles = {
+        "identity", "profile", "event", "transaction", "status", "measurement",
+        "metric", "timing", "decision", "configuration", "derived", "other",
+    }
+    allowed_grains = {"entity", "transaction", "event", "derived"}
+    allowed_dtypes = {"string", "integer", "float", "decimal", "boolean", "categorical", "datetime", "date"}
+
+    for raw in _as_list(normalized.get("candidate_variables"), 35):
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if len(name) < 2:
+            continue
+        item = {
+            "name": name[:120],
+            "description": str(raw.get("description") or "")[:500],
+            "role": str(raw.get("role") or "other").strip().lower(),
+            "grain": str(raw.get("grain") or "transaction").strip().lower(),
+            "dtype": str(raw.get("dtype") or "string").strip().lower(),
+            "depends_on": [
+                str(dep).strip()
+                for dep in _as_list(raw.get("depends_on"), 8)
+                if str(dep).strip()
+            ],
+        }
+        if item["role"] not in allowed_roles:
+            item["role"] = "other"
+        if item["grain"] not in allowed_grains:
+            item["grain"] = "transaction"
+        if item["dtype"] not in allowed_dtypes:
+            item["dtype"] = "string"
+        variables.append(item)
+
+    # Preserve first occurrence and keep the hard application limit at 35.
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in variables:
+        key = item["name"].casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    normalized["candidate_variables"] = deduped[:35]
+
+    # These are backend-owned and are overwritten after validation, so invalid model
+    # guesses here should never make the provider request or application response fail.
+    if not isinstance(normalized.get("industry_type"), str):
+        normalized["industry_type"] = "telecom"
+    if not isinstance(normalized.get("domain"), str):
+        normalized["domain"] = ""
+    if not isinstance(normalized.get("scenario_type"), str):
+        normalized["scenario_type"] = ""
+    if not isinstance(normalized.get("type_of_data"), str):
+        normalized["type_of_data"] = "transactional"
+    if normalized.get("subdomain") not in {"prepaid", "postpaid", "charging", "usage", "customer", "network", "unknown"}:
+        normalized["subdomain"] = "unknown"
+    if not isinstance(normalized.get("entity_key"), str):
+        normalized["entity_key"] = ""
+    if not isinstance(normalized.get("use_case"), str):
+        normalized["use_case"] = ""
+    for key in ("country", "currency"):
+        value = normalized.get(key)
+        if value is not None and not isinstance(value, str):
+            normalized[key] = str(value)
+    for key in ("record_count", "time_window_days"):
+        value = normalized.get(key)
+        if isinstance(value, bool):
+            normalized[key] = None
+        elif value is not None:
+            try:
+                normalized[key] = int(value)
+            except (TypeError, ValueError):
+                normalized[key] = None
+
+    return normalized
+
+
+class GeminiIntentAgent:
+    """Compatibility-named intent agent using Gemini JSON mode + local Pydantic validation.
+
+    The intent path intentionally uses the official Google GenAI SDK in JSON mode.
+    PydanticAI is intentionally not used here because provider-native structured
+    output was the source of the observed Gemini 400 INVALID_ARGUMENT failures.
+    """
+
     def __init__(self, api_key: str | None = None, registry: TelecomRegistry | None = None):
-        try:
-            from google.genai.types import HttpRetryOptions
-            from pydantic_ai import Agent
-            from pydantic_ai.models.google import GoogleModel
-            from pydantic_ai.providers.google import GoogleProvider
-        except ImportError as exc:
-            raise RuntimeError(
-                "PydanticAI Google integration is not installed. Install 'pydantic-ai-slim[google]'."
-            ) from exc
-
-        key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-        if not key:
-            raise RuntimeError("Set GOOGLE_API_KEY or GEMINI_API_KEY for the PydanticAI agent.")
-
-        self.model_name = os.getenv("PYDANTIC_AI_GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
-        retry_options = HttpRetryOptions(
-            attempts=max(1, min(6, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "1")))),
-            initial_delay=1.0,
-            max_delay=20.0,
-            http_status_codes=[408, 429, 500, 502, 503, 504],
-        )
-        provider = GoogleProvider(api_key=key, retry_options=retry_options)
-        model = GoogleModel(self.model_name, provider=provider)
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
         self.registry = registry or TelecomRegistry()
-        self.agent = Agent(model, output_type=ScenarioIntent, instructions=INSTRUCTIONS, retries=max(0, min(1, int(os.getenv("PYDANTIC_AI_RETRIES", "0")))))
+        self._api_key = api_key
+        self._client: GeminiClient | None = None
+
+    def _get_client(self) -> GeminiClient:
+        if self._client is None:
+            self._client = GeminiClient(api_key=self._api_key)
+        return self._client
 
     def run(
         self,
@@ -80,28 +223,72 @@ class PydanticAIIntentAgent:
         industry_type: str = "telecom",
         domain_query: str | None = None,
     ) -> ScenarioIntent:
-        # The backend chooses the industry first. The catalog passed to the LLM is
-        # then constrained to the requested business-domain query, so the model is
-        # never asked to search the full telecom ontology from scratch.
-        catalog = self.registry.search(domain_query or "", limit=30) if domain_query else self.registry.catalog_summary(limit=30)
+        catalog = (
+            self.registry.search(domain_query or "", limit=18)
+            if domain_query
+            else self.registry.catalog_summary(limit=18)
+        )
         catalog_text = json.dumps(catalog, separators=(",", ":"), sort_keys=True)
         prompt = (
-            "Approved telecom domain catalog:\n" + catalog_text + "\n\n"
-            f"Current user request:\n{message}\n\n"
-            f"Selected industry (authoritative backend value): {industry_type}\n"
-            f"Business domain query (authoritative backend value): {domain_query or '<none>'}\n"
-            f"External country override: {country or '<none>'}\n"
-            "Create a fresh candidate variable set. Aim for 30-35 only when justified by the business scenario; fewer is valid when semantically sufficient. "
-            "Make the set materially reflect scenarioType, businessScenario, domain, useCase and typeOfData. "
-            "Return only the ScenarioIntent structure."
+            "Approved telecom domain catalog (grounding only; do not copy it as a template):\n"
+            f"{catalog_text}\n\n"
+            "Authoritative request context:\n"
+            f"{message}\n\n"
+            f"Selected industry: {industry_type}\n"
+            f"Business domain: {domain_query or '<none>'}\n"
+            f"Country: {country or '<none>'}\n\n"
+            "Create a fresh scenario intent. Aim for 30-35 candidate variables when justified; "
+            "fewer is valid when semantically sufficient. Never pad for a count target and never "
+            "copy catalog/reference variable names as a template. Return JSON only."
         )
+
         try:
-            result = self.agent.run_sync(prompt)
+            client = self._get_client()
+            try:
+                raw = client.generate_json(
+                    system_instruction=INSTRUCTIONS,
+                    user_prompt=prompt,
+                    temperature=0.2,
+                )
+                payload = _extract_json_payload(raw)
+            except LLMUpstreamError as exc:
+                # Google can reject provider-native JSON configuration with a 400 even
+                # though the model and credentials are valid. Retry once with plain text
+                # JSON instructions, which avoids response_mime_type/response-schema validation.
+                if exc.status_code != 400:
+                    raise
+                logger.warning("Gemini JSON mode rejected with 400; retrying intent request in plain-text mode")
+                text = client.generate_text(
+                    system_instruction=INSTRUCTIONS,
+                    user_prompt=(
+                        prompt
+                        + "\n\nJSON MODE FALLBACK: output exactly one JSON object matching the requested shape. "
+                        + "Do not add markdown, commentary, or code fences."
+                    ),
+                    temperature=0.2,
+                )
+                payload = _parse_text_json(text)
+
+            payload = _normalize_payload(payload)
+            intent = ScenarioIntent.model_validate(payload)
+        except LLMUpstreamError:
+            raise
         except Exception as exc:
-            logger.exception("PydanticAI/Gemini intent request failed", exc_info=exc)
+            logger.exception("Gemini intent request returned unusable JSON")
             raise LLMUpstreamError(
-                f"Gemini intent request failed: {type(exc).__name__}: {_safe_exception_text(exc)}",
+                f"Gemini intent response validation failed: {type(exc).__name__}: {_safe_exception_text(exc)}",
                 provider="Google Gemini",
                 model=self.model_name,
             ) from exc
-        return result.output
+
+        # Backend-owned values always win over model guesses.
+        intent.industry_type = industry_type
+        if country:
+            intent.country = country
+        if domain_query:
+            intent.domain = domain_query
+        return intent
+
+
+# Backward-compatible internal alias for older imports.
+PydanticAIIntentAgent = GeminiIntentAgent

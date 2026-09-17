@@ -92,6 +92,8 @@ async def llm_upstream_exception_handler(request: Request, exc: LLMUpstreamError
     }
     if exc.model:
         details["model"] = exc.model
+    if exc.status_code:
+        details["upstream_status_code"] = exc.status_code
 
     logger.error(
         "LLM upstream failure [request_id=%s provider=%s model=%s public_egress_ip=%s]",
