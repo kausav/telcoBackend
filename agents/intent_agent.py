@@ -61,7 +61,7 @@ class PydanticAIIntentAgent:
         if not key:
             raise RuntimeError("Set GOOGLE_API_KEY or GEMINI_API_KEY for the PydanticAI agent.")
 
-        model_name = os.getenv("PYDANTIC_AI_GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
+        self.model_name = os.getenv("PYDANTIC_AI_GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
         retry_options = HttpRetryOptions(
             attempts=max(1, min(6, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "1")))),
             initial_delay=1.0,
@@ -69,7 +69,7 @@ class PydanticAIIntentAgent:
             http_status_codes=[408, 429, 500, 502, 503, 504],
         )
         provider = GoogleProvider(api_key=key, retry_options=retry_options)
-        model = GoogleModel(model_name, provider=provider)
+        model = GoogleModel(self.model_name, provider=provider)
         self.registry = registry or TelecomRegistry()
         self.agent = Agent(model, output_type=ScenarioIntent, instructions=INSTRUCTIONS, retries=max(0, min(1, int(os.getenv("PYDANTIC_AI_RETRIES", "0")))))
 
@@ -102,6 +102,6 @@ class PydanticAIIntentAgent:
             raise LLMUpstreamError(
                 f"Gemini intent request failed: {type(exc).__name__}: {_safe_exception_text(exc)}",
                 provider="Google Gemini",
-                model=model_name,
+                model=self.model_name,
             ) from exc
         return result.output
