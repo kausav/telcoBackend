@@ -1177,7 +1177,7 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
         raise ValueError("typeOfData must be 'transactional' or 'aggregational'")
     detected_type=requested or infer_type_of_data(csv_text)
 
-    known_gens=get_known_generator_types() | {
+    known_gens=set(SUPPORTED_GENERATORS) | {
         "unique_id","indian_msisdn","uuid","timestamp","recent_timestamp","choice","range",
         "dependent_range","derived_distribution","derived_timestamp","derived","datetime",
         "synthetic_event","configuration","derived_state","derived_event","categorical","category",
