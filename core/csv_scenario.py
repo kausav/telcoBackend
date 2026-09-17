@@ -1,7 +1,6 @@
 """CSV scenario-definition parser.
 
-The CSV is the source of truth for the schema.  A row is treated as an
-The CSV is a variable-level schema. Transactional history is derived from the
+The CSV is the source of truth for the variable-level schema. Transactional history is derived from the
 entity key and the first history timestamp field; no user-facing scope metadata is required.
 ``record_type`` is optional metadata rather than the mechanism used to distinguish
 transactional from aggregational input.

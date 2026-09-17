@@ -24,8 +24,8 @@ from core.state import WorkflowState
 
 logger = logging.getLogger(__name__)
 
-# Canonical numeric dtypes used by the CSV schema/generation QA layer.
-# csv_scenario.py normalizes integer/decimal/uuid client types before they
+# Canonical numeric dtypes used by the scenario contract and generation QA layer.
+# Scenario-definition normalization canonicalizes integer/decimal/uuid types before they
 # reach the generation agent, but keeping the aliases here makes the helper
 # safe for both normalized and direct callers.
 _NUMERIC_DTYPES = {"int", "integer", "float", "decimal", "number", "numeric"}
@@ -34,7 +34,7 @@ _NUMERIC_DTYPES = {"int", "integer", "float", "decimal", "number", "numeric"}
 # constants are only used when QA_LLM_MODE=full is explicitly enabled.
 _CHUNK = max(1, int(os.getenv("QA_LLM_CHUNK_SIZE", "10")))
 _QA_SYSTEM = """You are the final QA validator for generated synthetic data.
-Validate each supplied record against the FULL confirmed CSV contract and supplied
+Validate each supplied record against the FULL confirmed scenario contract and supplied
 business/cross-field rules. The CSV is authoritative. Preserve every declared literal
 choice/value, numeric min/max, bucket interval, weight distribution, precision, currency,
 date/time semantics, dependency, and formula. Never invent a category or normalize a value
@@ -308,7 +308,7 @@ def _segment_range(params: dict, rec: dict) -> float:
 def _to_finite_float(value, default: float | None = None) -> float | None:
     """Coerce numeric-looking values safely for dependent generators.
 
-    Scenario definitions can come from an LLM or CSV, so numeric params may be
+    Scenario definitions are persisted as confirmed contracts, so numeric params may be
     strings. Dependent fields can also be represented as strings (for example
     ``"20.0"``). Never pass a raw string into random.uniform/max.
     """
@@ -483,7 +483,7 @@ def _format_datetime(dt: datetime, params: dict | None = None) -> str:
         return dt.strftime(DEFAULT_TIMESTAMP_FORMAT)
 
 def _format_datetime_fields(rec: dict, variables: list[dict]) -> dict:
-    """Serialize all datetime fields according to their CSV-declared format.
+    """Serialize all datetime fields according to their confirmed contract format.
 
     Generation and formula evaluation may use real datetime objects internally;
     this helper is the single deterministic boundary that converts them to the
@@ -542,7 +542,7 @@ _GENERATORS = {
 
 def get_known_generator_types() -> set[str]:
     """Public accessor for the set of valid 'gen' type strings — used by
-    core/csv_scenario.py to validate industry-supplied CSV variable definitions."""
+    the scenario-definition layer to validate industry-supplied variable definitions."""
     return set(_GENERATORS.keys())
 
 
@@ -643,7 +643,7 @@ def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None
         for opt in declared_options:
             if _matches_declared_option(value, opt):
                 return opt
-        # CSV choices are authoritative as the allowed set, while scenario-derived
+        # Confirmed choices are authoritative as the allowed set, while scenario-derived
         # preferred_values select the semantically appropriate member of that set.
         preferred = _coerce_rule_values(constraint.get("preferred_values")) if constraint else []
         if _event_like_field(var):
@@ -820,7 +820,7 @@ def _variable_dependency_order(
 ) -> tuple[list[dict], set[str]]:
     """Return variables in dependency order and identify dependency cycles.
 
-    CSV dependencies may point forward.  A topological pass makes those definitions
+    Scenario dependencies may point forward.  A topological pass makes those definitions
     executable regardless of row order.  Cycles cannot be solved deterministically;
     callers can generate a seed value for cyclic formula fields and let downstream
     formulas derive from it.
@@ -890,7 +890,7 @@ def _generate_record(variables: list[dict], rules: dict | None = None) -> dict:
             available = known_fields | set(rec.keys())
             if deps and any(dep not in available for dep in deps):
                 # Keep the declared generator when formula text references symbolic
-                # tokens that are not schema fields (common in human-readable CSVs).
+                # tokens that are not schema fields (common in human-readable scenario definitions).
                 rule_formula = None
         if rule_formula:
             effective_var = dict(var)
@@ -1151,7 +1151,7 @@ def _temporal_role(var: dict) -> str:
     """Classify a datetime field into a coarse causal event role.
 
     This is deliberately conservative.  It is a safety net for obvious causal
-    timelines, not a substitute for an explicit CSV formula or business rule.
+    timelines, not a substitute for an explicit scenario formula or business rule.
     """
     name = str(var.get("name", ""))
     desc = str(var.get("description", ""))
@@ -1174,7 +1174,7 @@ def _temporal_role(var: dict) -> str:
 def _temporal_delay_limit_seconds(child: dict, parent: dict) -> int | None:
     """Choose a conservative maximum gap for a causal timestamp edge.
 
-    The CSV/LLM-declared rule wins. This fallback is deliberately used only for an
+    The confirmed contract rule wins. This fallback is deliberately used only for an
     explicit datetime dependency when the schema has not supplied a bound.
     """
     text = f"{child.get('name','')} {child.get('description','')}".lower()
@@ -1212,7 +1212,7 @@ def _infer_temporal_relationships(
 
     Sources, in order of authority:
       1. explicit SchemaAgent temporal_rules;
-      2. CSV depends_on edges between datetime fields.
+      2. confirmed-contract depends_on edges between datetime fields.
 
     A temporal rule can therefore protect a relationship even when the CSV expresses
     it in its description/business semantics rather than as depends_on.
@@ -1394,7 +1394,7 @@ def _enforce_csv_contract(
 ) -> tuple[dict, list[str]]:
     """Apply the confirmed CSV contract after *all* semantic mutations.
 
-    CSV params are hard constraints. Gemini/business rules can only select among
+    Confirmed contract params are hard constraints. Gemini/business rules can only select among
     declared values; they can never introduce a new categorical value, leave a
     numeric field outside declared bounds/buckets, or change declared precision.
     """
@@ -1564,7 +1564,7 @@ def _validate_record(
     for field, expr in _collect_formula_specs(variables, rules):
         if field not in active_fields:
             continue
-        # A derived timestamp formula can be descriptive in the CSV. The executable
+        # A derived timestamp formula can be descriptive in the confirmed contract. The executable
         # source of truth is its delay_seconds range plus the declared base dependency.
         field_def = variable_by_name.get(field) or {}
         if str(field_def.get("gen", "")).strip().lower() in {"derived_timestamp", "ts_offset"}:
@@ -1592,7 +1592,7 @@ def _validate_record(
         if name in before_semantics and rec.get(name) != before_semantics.get(name):
             issues.append(f"{name} corrected to scenario semantics")
 
-    # CSV is the final authority after every semantic mutation. This prevents an
+    # Confirmed scenario contract is the final authority after every semantic mutation. This prevents an
     # LLM-derived conditional rule from reintroducing a value not declared by params.
     rec, contract_issues = _enforce_csv_contract(rec, variables, rules=rules)
     issues.extend(contract_issues)
@@ -1741,7 +1741,7 @@ class DataGenerationAgent:
             system_prompt = _QA_SYSTEM.format(
                 rules="\n".join(f"- {r}" for r in state.rules.get("business_rules", [])) or "Apply the supplied CSV schema and deterministic checks.",
                 cross_field_rules="\n".join(f"- {r}" for r in state.rules.get("cross_field_rules", [])) or "Validate declared mathematical, temporal, and business relationships.",
-            ) + f"\n\nFULL CSV SCHEMA CONTRACT (authoritative):\n{schema_contract}\n"
+            ) + f"\n\nFULL SCENARIO SCHEMA CONTRACT (authoritative):\n{schema_contract}\n"
             for i in range(0, len(checked), _CHUNK):
                 chunk = checked[i:i + _CHUNK]
                 try:

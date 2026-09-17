@@ -23,7 +23,7 @@ _SYSTEM = """
 You are the Orchestrator Agent for a synthetic data generation pipeline covering
 any business industry (telecom, banking, retail, healthcare, etc.).
 You run AFTER the CSV scenario definition has been imported and confirmed. Gatekeep the
-CSV-defined variable data against the target industry's and country's real-world conventions
+confirmed scenario variable data against the target industry's and country's real-world conventions
 and the full CSV contract. The CSV fields, descriptions, params, dependencies, and formulas
 Include any declared timestamp_format/format exactly; timestamps are presentation constraints as well as semantic fields.
 are authoritative. Do not recommend or imply values outside explicit params choices/values,
@@ -70,7 +70,7 @@ class OrchestratorAgent:
         return "hit" if self._cache_hit else "miss"
 
     def _check_existence(self, state: WorkflowState) -> WorkflowState:
-        """Gatekeeper: confirm the scenario exists and contains usable CSV-defined variables."""
+        """Gatekeeper: confirm the scenario exists and contains usable confirmed variables."""
         if not scenario_exists(state.scenario):
             valid = [s["id"] for s in list_scenarios()]
             state.errors.append(f"Unknown scenario '{state.scenario}'. Valid: {valid}")
@@ -79,7 +79,7 @@ class OrchestratorAgent:
         dyn = resolve_variables(state.scenario)
         if dyn is None or not dyn[0]:
             state.errors.append(
-                f"Scenario '{state.scenario}' has no variable data to gatekeep. The CSV definition "
+                f"Scenario '{state.scenario}' has no variable data to gatekeep. The confirmed scenario definition "
                 "must be confirmed via /scenario/confirm before generation can run."
             )
             return state
@@ -106,6 +106,16 @@ class OrchestratorAgent:
         return state
 
     def _validate(self, state: WorkflowState) -> WorkflowState:
+        # Agentic scenarios have already passed registry resolution + HITL approval.
+        # Never re-ask an LLM to reinterpret an approved schema.
+        if (state.scenario_context or {}).get("agentic"):
+            set_orchestrator(self._cache_key_value, {
+                "valid": True,
+                "reason": "Approved agentic scenario; deterministic registry gate used.",
+                "execution_notes": "LLM stages bypassed after HITL approval.",
+            })
+            logger.info("[Orchestrator] Agentic scenario: deterministic registry gate passed; LLM skipped.")
+            return state
         sc = resolve_scenario_meta(state.scenario)
         profile = get_profile(state.industry, state.country)
         variable_summary = [
@@ -132,7 +142,7 @@ class OrchestratorAgent:
             f"Use case: {state.use_case or sc.get('use_case', '')}\n"
             f"Scenario type: {state.scenario_type or sc.get('scenario_type', '')}\n"
             f"Records requested: {state.count}\n"
-            f"CSV-defined variable data ({len(variable_summary)} fields): {variable_summary}\n"
+            f"confirmed scenario variable data ({len(variable_summary)} fields): {variable_summary}\n"
             f"Complete confirmed scenario context (source of truth): {json.dumps(state.scenario_context, default=str, sort_keys=True)}\n"
             f"Target industry: {profile['industry']}; country: {profile['country_name']} ({state.country}) — "
             f"regulator {profile['regulator']}, market character: {profile['market_character']}\n"

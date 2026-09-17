@@ -1,0 +1,461 @@
+{
+  "artifact": {
+    "artifact_id": "tmforum_telecom_mvp",
+    "organization": "TM Forum",
+    "title": "TM Forum Telecom Information and Prepay Balance Normalized Model",
+    "artifact_version": "26.0+TMF654-4.0",
+    "status": "mvp-bootstrap",
+    "source_kind": "normalized-standards-subset",
+    "description": "INGENII normalized MVP subset grounded in the TM Forum Information Framework and TMF654 Prepay Balance Management. This is not a verbatim copy of TM Forum artifacts.",
+    "sources": [
+      {
+        "standard": "TM Forum",
+        "artifact": "GB922 Information Framework",
+        "version": "26.0",
+        "url": "https://www.tmforum.org/resources/model/gb922-information-framework-models-suite-v26-0/"
+      },
+      {
+        "standard": "TM Forum",
+        "artifact": "TMF654 Prepay Balance Management API",
+        "version": "4.0",
+        "url": "https://www.tmforum.org/open-digital-architecture/open-apis/prepay-balance-management-api-TMF654/v4.0"
+      }
+    ]
+  },
+  "entities": [
+    {
+      "canonical_id": "customer",
+      "name": "Customer",
+      "aliases": [
+        "subscriber customer",
+        "customer profile",
+        "party customer"
+      ],
+      "domain": "customer",
+      "description": "Party that obtains products/services from a communications service provider.",
+      "sources": [
+        {
+          "standard": "TM Forum",
+          "reference": "Information Framework / Customer domain",
+          "version": "26.0",
+          "url": "https://www.tmforum.org/resources/model/gb922-information-framework-models-suite-v26-0/",
+          "source_role": "semantic-source"
+        }
+      ],
+      "attributes": [
+        {
+          "name": "customer_id",
+          "dtype": "string",
+          "required": true,
+          "nullable": false,
+          "description": "Stable customer identifier"
+        },
+        {
+          "name": "customer_segment",
+          "dtype": "categorical",
+          "required": false,
+          "nullable": false,
+          "description": "Customer segment"
+        }
+      ],
+      "relationships": [
+        {
+          "target": "customer_account",
+          "relation": "owns",
+          "cardinality": "1:N",
+          "required": false,
+          "description": ""
+        }
+      ]
+    },
+    {
+      "canonical_id": "customer_account",
+      "name": "CustomerAccount",
+      "aliases": [
+        "account",
+        "customer account",
+        "billing account"
+      ],
+      "domain": "customer",
+      "description": "Account-level commercial/financial context associated with a customer.",
+      "sources": [
+        {
+          "standard": "TM Forum",
+          "reference": "Information Framework / Customer domain",
+          "version": "26.0",
+          "url": "https://www.tmforum.org/resources/model/gb922-information-framework-models-suite-v26-0/",
+          "source_role": "semantic-source"
+        }
+      ],
+      "attributes": [
+        {
+          "name": "account_id",
+          "dtype": "string",
+          "required": true,
+          "nullable": false,
+          "description": "Stable account identifier"
+        },
+        {
+          "name": "account_status",
+          "dtype": "categorical",
+          "required": false,
+          "nullable": false,
+          "description": ""
+        }
+      ],
+      "relationships": [
+        {
+          "target": "customer",
+          "relation": "belongs_to",
+          "cardinality": "N:1",
+          "required": true,
+          "description": ""
+        },
+        {
+          "target": "prepaid_account",
+          "relation": "contains",
+          "cardinality": "1:N",
+          "required": false,
+          "description": ""
+        }
+      ]
+    },
+    {
+      "canonical_id": "prepaid_account",
+      "name": "PrepaidAccount",
+      "aliases": [
+        "prepaid wallet",
+        "prepay account",
+        "prepaid balance account"
+      ],
+      "domain": "prepaid",
+      "description": "Canonical INGENII prepaid account abstraction composed from the standards-backed balance model.",
+      "sources": [
+        {
+          "standard": "TM Forum",
+          "reference": "TMF654 Prepay Balance Management",
+          "version": "4.0",
+          "url": "https://www.tmforum.org/open-digital-architecture/open-apis/prepay-balance-management-api-TMF654/v4.0",
+          "source_role": "semantic-source"
+        },
+        {
+          "standard": "3GPP",
+          "reference": "TS 32.240 / charging architecture",
+          "version": null,
+          "url": "https://portal.3gpp.org/Specifications.aspx?WiUid=510029&q=1",
+          "source_role": "semantic-source"
+        }
+      ],
+      "attributes": [
+        {
+          "name": "prepaid_account_id",
+          "dtype": "string",
+          "required": true,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "currency",
+          "dtype": "string",
+          "required": true,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "current_balance",
+          "dtype": "float",
+          "required": false,
+          "nullable": false,
+          "description": ""
+        }
+      ],
+      "relationships": [
+        {
+          "target": "customer_account",
+          "relation": "belongs_to",
+          "cardinality": "N:1",
+          "required": true,
+          "description": ""
+        },
+        {
+          "target": "bucket",
+          "relation": "has",
+          "cardinality": "1:N",
+          "required": false,
+          "description": ""
+        },
+        {
+          "target": "recharge",
+          "relation": "receives",
+          "cardinality": "1:N",
+          "required": false,
+          "description": ""
+        }
+      ]
+    },
+    {
+      "canonical_id": "product_offering",
+      "name": "ProductOffering",
+      "aliases": [
+        "plan",
+        "prepaid plan",
+        "tariff plan",
+        "offer"
+      ],
+      "domain": "product",
+      "description": "Commercial product/offer selected by a customer or subscriber.",
+      "sources": [
+        {
+          "standard": "TM Forum",
+          "reference": "Information Framework / Product domain",
+          "version": "26.0",
+          "url": "https://www.tmforum.org/resources/model/gb922-information-framework-models-suite-v26-0/",
+          "source_role": "semantic-source"
+        }
+      ],
+      "attributes": [
+        {
+          "name": "product_offering_id",
+          "dtype": "string",
+          "required": true,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "offering_name",
+          "dtype": "categorical",
+          "required": false,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "validity_days",
+          "dtype": "integer",
+          "required": false,
+          "nullable": false,
+          "description": ""
+        }
+      ],
+      "relationships": [
+        {
+          "target": "subscriber",
+          "relation": "selected_by",
+          "cardinality": "1:N",
+          "required": false,
+          "description": ""
+        }
+      ]
+    },
+    {
+      "canonical_id": "bucket",
+      "name": "Bucket",
+      "aliases": [
+        "balance bucket",
+        "quota bucket",
+        "data bucket",
+        "voice bucket",
+        "cash bucket"
+      ],
+      "domain": "prepaid",
+      "description": "Balance bucket; TMF654 describes a bucket as tracking balance available to use services.",
+      "sources": [
+        {
+          "standard": "TM Forum",
+          "reference": "TMF654 Prepay Balance Management",
+          "version": "4.0",
+          "url": "https://www.tmforum.org/open-digital-architecture/open-apis/prepay-balance-management-api-TMF654/v4.0",
+          "source_role": "semantic-source"
+        }
+      ],
+      "attributes": [
+        {
+          "name": "bucket_id",
+          "dtype": "string",
+          "required": true,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "bucket_type",
+          "dtype": "categorical",
+          "required": true,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "unit",
+          "dtype": "categorical",
+          "required": true,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "balance",
+          "dtype": "float",
+          "required": false,
+          "nullable": false,
+          "description": ""
+        }
+      ],
+      "relationships": [
+        {
+          "target": "prepaid_account",
+          "relation": "belongs_to",
+          "cardinality": "N:1",
+          "required": true,
+          "description": ""
+        }
+      ]
+    },
+    {
+      "canonical_id": "recharge",
+      "name": "TopupBalance",
+      "aliases": [
+        "recharge",
+        "top up",
+        "topup",
+        "recharge transaction"
+      ],
+      "domain": "charging",
+      "description": "A prepaid balance top-up operation.",
+      "sources": [
+        {
+          "standard": "TM Forum",
+          "reference": "TMF654 Prepay Balance Management / TopupBalance",
+          "version": "4.0",
+          "url": "https://www.tmforum.org/open-digital-architecture/open-apis/prepay-balance-management-api-TMF654/v4.0",
+          "source_role": "semantic-source"
+        }
+      ],
+      "attributes": [
+        {
+          "name": "recharge_id",
+          "dtype": "string",
+          "required": true,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "prepaid_account_id",
+          "dtype": "string",
+          "required": true,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "recharge_timestamp",
+          "dtype": "datetime",
+          "required": true,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "recharge_amount",
+          "dtype": "float",
+          "required": true,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "recharge_status",
+          "dtype": "categorical",
+          "required": true,
+          "nullable": false,
+          "description": ""
+        },
+        {
+          "name": "recharge_channel",
+          "dtype": "categorical",
+          "required": false,
+          "nullable": false,
+          "description": ""
+        }
+      ],
+      "relationships": [
+        {
+          "target": "prepaid_account",
+          "relation": "topups",
+          "cardinality": "N:1",
+          "required": true,
+          "description": ""
+        },
+        {
+          "target": "balance_action_history",
+          "relation": "creates",
+          "cardinality": "1:N",
+          "required": false,
+          "description": ""
+        }
+      ]
+    },
+    {
+      "canonical_id": "balance_action_history",
+      "name": "BalanceActionHistory",
+      "aliases": [
+        "balance action history",
+        "balance history"
+      ],
+      "domain": "prepaid",
+      "description": "History of balance-related operations associated with prepaid balance management.",
+      "sources": [
+        {
+          "standard": "TM Forum",
+          "artifact": "TMF654 Prepay Balance Management API",
+          "version": "4.0",
+          "reference": "TMF654 / BalanceActionHistory",
+          "url": "https://www.tmforum.org/open-digital-architecture/open-apis/prepay-balance-management-api-TMF654/v4.0",
+          "source_role": "semantic-source"
+        }
+      ],
+      "attributes": [
+        {
+          "name": "balance_action_history_id",
+          "dtype": "string",
+          "required": true,
+          "nullable": false,
+          "description": "Identifier for a balance action history record.",
+          "enum_values": []
+        },
+        {
+          "name": "action_type",
+          "dtype": "string",
+          "required": true,
+          "nullable": false,
+          "description": "Type of balance action recorded.",
+          "enum_values": [
+            "TOP_UP",
+            "ADJUST",
+            "TRANSFER",
+            "RESERVE",
+            "UNRESERVE",
+            "DEDUCT"
+          ]
+        },
+        {
+          "name": "action_timestamp",
+          "dtype": "datetime",
+          "required": true,
+          "nullable": false,
+          "description": "Timestamp of the recorded balance action.",
+          "enum_values": []
+        }
+      ],
+      "relationships": [
+        {
+          "target": "prepaid_account",
+          "relation": "records_action_for",
+          "cardinality": "N:1",
+          "required": true,
+          "description": "The prepaid account whose balance was affected."
+        },
+        {
+          "target": "recharge",
+          "relation": "may_reference",
+          "cardinality": "N:1",
+          "required": false,
+          "description": "Optional recharge operation associated with the history entry."
+        }
+      ]
+    }
+  ]
+}

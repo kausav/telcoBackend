@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Telco Agentic Synthetic Data Generator — Architecture & Code Walkthrough</title>
+  <title>INGENII — Telecom Agentic Synthetic Data Platform Architecture</title>
   <script type="module">
     import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
     mermaid.initialize({
@@ -14,9 +14,9 @@
         primaryColor: '#eef6ff',
         primaryTextColor: '#17202a',
         primaryBorderColor: '#1769aa',
-        lineColor: '#6a7783',
-        secondaryColor: '#f6f8fa',
-        tertiaryColor: '#fff'
+        lineColor: '#687684',
+        secondaryColor: '#f7f9fb',
+        tertiaryColor: '#ffffff'
       },
       flowchart: { htmlLabels: true, curve: 'basis' },
       sequence: { useMaxWidth: true }
@@ -24,614 +24,470 @@
   </script>
   <style>
     :root {
-      --bg:#f5f7fa; --card:#fff; --text:#17202a; --muted:#5f6b76; --border:#dfe4e8;
-      --accent:#1769aa; --accent-soft:#eef6ff; --code:#101418; --codeText:#e9eef2;
-      --good:#2e7d32; --good-soft:#eef8ef; --warn:#9a6700; --warn-soft:#fff8e6;
+      --bg:#f4f7fa; --card:#fff; --text:#17202a; --muted:#5c6873; --border:#dce3e8;
+      --accent:#1769aa; --accent-soft:#eef6ff; --good:#2e7d32; --good-soft:#eef8ef;
+      --warn:#996a00; --warn-soft:#fff8e5; --danger:#b3261e; --danger-soft:#fff0ef;
+      --code:#10151a; --code-text:#e9eef2; --shadow:0 4px 18px rgba(20,30,40,.05);
     }
-    * { box-sizing:border-box; }
-    body { margin:0; font-family:Arial,Helvetica,sans-serif; background:var(--bg); color:var(--text); line-height:1.6; }
-    header { background:linear-gradient(135deg,#17202a,#25384a); color:#fff; padding:46px 7%; }
-    header h1 { margin:0 0 10px; font-size:34px; }
-    header p { margin:0; color:#d7dde2; max-width:1050px; font-size:16px; }
-    main { max-width:1280px; margin:30px auto 80px; padding:0 24px; }
-    section { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:26px; margin:22px 0; box-shadow:0 3px 14px rgba(20,30,40,.04); }
-    h2 { margin-top:0; color:var(--accent); font-size:25px; }
-    h3 { margin:0 0 8px; font-size:18px; }
-    h4 { margin:18px 0 8px; font-size:16px; }
-    p { margin:9px 0; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }
-    .card { border:1px solid var(--border); border-radius:11px; padding:16px; background:#fff; }
-    .card code { font-size:.92em; }
-    .badge { display:inline-block; padding:4px 9px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; margin-right:6px; }
-    .good { background:var(--good-soft); border-left:4px solid var(--good); padding:13px 16px; }
-    .note { border-left:4px solid var(--accent); padding:13px 16px; background:var(--accent-soft); }
-    .warn { border-left:4px solid var(--warn); padding:13px 16px; background:var(--warn-soft); }
-    .diagram { border:1px solid var(--border); border-radius:11px; padding:14px; margin:16px 0; background:#fcfdff; overflow:auto; }
-    .mermaid { min-width:700px; }
-    table { width:100%; border-collapse:collapse; }
-    th,td { text-align:left; padding:10px 11px; border-bottom:1px solid var(--border); vertical-align:top; }
-    th { background:#f1f4f6; }
-    tr:last-child td { border-bottom:0; }
-    code { background:#f1f3f5; padding:2px 6px; border-radius:5px; }
-    pre { background:var(--code); color:var(--codeText); padding:16px; border-radius:9px; overflow:auto; }
-    .small { color:var(--muted); font-size:13px; }
-    .toc a { color:var(--accent); text-decoration:none; }
-    .toc a:hover { text-decoration:underline; }
-    .two-col { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
-    ul { margin-top:8px; }
-    @media (max-width:900px) { .two-col { grid-template-columns:1fr; } .mermaid { min-width:600px; } }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Arial,Helvetica,sans-serif;line-height:1.62}
+    header{padding:48px 7%;background:linear-gradient(135deg,#17202a,#29455e);color:#fff}
+    header h1{margin:0 0 10px;font-size:36px;letter-spacing:-.4px}
+    header p{margin:0;max-width:1120px;color:#d9e1e7;font-size:16px}
+    header .meta{margin-top:16px;font-size:13px;color:#c4d0d9}
+    main{max-width:1320px;margin:28px auto 80px;padding:0 24px}
+    section{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:27px;margin:22px 0;box-shadow:var(--shadow)}
+    h2{margin:0 0 12px;color:var(--accent);font-size:26px}
+    h3{margin:20px 0 8px;font-size:19px} h4{margin:18px 0 8px;font-size:16px}
+    p{margin:9px 0}.small{font-size:13px;color:var(--muted)}
+    .toc a{color:var(--accent);text-decoration:none}.toc a:hover{text-decoration:underline}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(255px,1fr));gap:16px}
+    .card{border:1px solid var(--border);border-radius:11px;padding:16px;background:#fff}
+    .badge{display:inline-block;padding:3px 8px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:11px;font-weight:700;margin-right:6px}
+    .good,.warn,.danger,.note{padding:13px 16px;border-left:4px solid;margin:14px 0;border-radius:4px}
+    .good{background:var(--good-soft);border-color:var(--good)} .warn{background:var(--warn-soft);border-color:var(--warn)}
+    .danger{background:var(--danger-soft);border-color:var(--danger)} .note{background:var(--accent-soft);border-color:var(--accent)}
+    .diagram{border:1px solid var(--border);border-radius:11px;padding:14px;margin:16px 0;background:#fcfdff;overflow:auto}
+    .mermaid{min-width:720px}
+    table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 11px;border-bottom:1px solid var(--border);vertical-align:top}
+    th{background:#f1f4f6}tr:last-child td{border-bottom:0}
+    code{background:#eef1f4;padding:2px 6px;border-radius:5px;font-size:.92em}
+    pre{background:var(--code);color:var(--code-text);padding:16px;border-radius:9px;overflow:auto}
+    .two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+    .pill{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;background:#f2f5f7;border:1px solid var(--border);padding:4px 7px;border-radius:6px;display:inline-block;margin:3px 4px 3px 0}
+    .flow-step{font-weight:700;color:var(--accent)}
+    footer{max-width:1320px;margin:0 auto 50px;padding:0 24px;color:var(--muted);font-size:13px}
+    @media(max-width:900px){.two{grid-template-columns:1fr}.mermaid{min-width:620px}header h1{font-size:30px}}
   </style>
 </head>
 <body>
 <header>
-  <h1>Telco Agentic Synthetic Data Generator</h1>
-  <p>A code-level architecture guide for the current <code>telcoBackend-newBranch</code> backend. This page explains how the FastAPI API, CSV schema compiler, SQLite persistence, LangGraph agents, deterministic generators, formula engine, transactional grouping, validation/repair, and caches fit together.</p>
+  <h1>INGENII — Telecom Agentic Synthetic Data Platform</h1>
+  <p>Architecture and code-level walkthrough for the MVP scenario workflow: <strong>propose OR import-csv → confirm → generate</strong>. The design uses PydanticAI for constrained natural-language intent extraction, a standards-backed runtime registry for telecom semantics, a deterministic schema compiler, persisted HITL approval, and deterministic generation/validation.</p>
+  <div class="meta">MVP baseline: FastAPI · Pydantic / PydanticAI · Gemini · LangGraph · SQLite runtime stores · deterministic generators</div>
 </header>
 
 <main>
   <section class="toc">
     <h2>Contents</h2>
-    <p><a href="#overview">1. System overview</a> · <a href="#api">2. API lifecycle</a> · <a href="#csv">3. CSV parsing</a> · <a href="#pipeline">4. LangGraph pipeline</a> · <a href="#generation">5. Generation engine</a> · <a href="#transactional">6. Transactional vs aggregational</a> · <a href="#persistence">7. Persistence & caching</a> · <a href="#qa">8. QA / repair</a> · <a href="#files">9. File responsibilities</a> · <a href="#design">10. Design rules & likely discussion points</a></p>
+    <p>
+      <a href="#principles">1. Architecture principles</a> ·
+      <a href="#overview">2. End-to-end architecture</a> ·
+      <a href="#api">3. Public API contract</a> ·
+      <a href="#agent">4. Agentic schema proposal</a> ·
+      <a href="#registry">5. Standards-backed runtime registry</a> ·
+      <a href="#hitl">6. HITL / confirmation</a> ·
+      <a href="#generation">7. Deterministic generation</a> ·
+      <a href="#qa">8. Validation & repair</a> ·
+      <a href="#persistence">9. Persistence & lifecycle</a> ·
+      <a href="#security">10. Trust & security boundaries</a> ·
+      <a href="#files">11. Code map</a> ·
+      <a href="#runbook">12. Run / test / operate</a>
+    </p>
+  </section>
+
+  <section id="principles">
+    <h2>1. Architecture principles</h2>
+    <div class="grid">
+      <div class="card"><span class="badge">P0</span><h3>LLM is not the telecom authority</h3><p>Gemini extracts intent and resolves user language to candidate concepts. It does not create executable entities, fields, relationships, formulas, generators or enums.</p></div>
+      <div class="card"><span class="badge">P1</span><h3>Standards define semantics</h3><p>TM Forum, 3GPP and selectively MEF provide provenance-backed source semantics. INGENII normalizes these artifacts into a runtime registry.</p></div>
+      <div class="card"><span class="badge">P2</span><h3>Compiler creates the schema</h3><p>The scenario schema is built deterministically from the runtime registry plus approved generation-policy overlays. The LLM does not directly author the schema.</p></div>
+      <div class="card"><span class="badge">P3</span><h3>HITL approves ambiguity</h3><p>The human reviews the proposed schema and may apply safe edits. Unknown concepts and executable semantics remain blocked.</p></div>
+      <div class="card"><span class="badge">P4</span><h3>Generation is deterministic</h3><p>The approved contract is passed to the existing deterministic generation pipeline. Agentic scenarios do not get silently reinterpreted by later LLM stages.</p></div>
+      <div class="card"><span class="badge">P5</span><h3>Every run is reproducible</h3><p>Scenario metadata, schema, registry provenance, generation policy and validation results are persisted so a run can be audited and recreated.</p></div>
+    </div>
+    <div class="danger"><strong>Anti-hallucination rule:</strong> structured LLM output alone is not sufficient. Pydantic validates shape; registry resolution validates telecom vocabulary; deterministic compilation validates executable semantics.</div>
   </section>
 
   <section id="overview">
-    <h2>1. System overview</h2>
-    <p>The current architecture is <strong>CSV-first</strong>. The imported CSV defines the actual variable catalog. The agents add semantic validation and business rules around that schema; they do not replace the CSV with a newly invented LLM schema.</p>
-
+    <h2>2. End-to-end architecture</h2>
     <div class="diagram">
       <div class="mermaid">
 flowchart LR
-  A[Client / UI] --> B[FastAPI: server.py]
-  B --> C[CSV Parser: core/csv_scenario.py]
-  C --> D[(SQLite: core/dynamic_scenarios.py)]
-  B -->|confirm| D
-  D --> E[WorkflowState: core/state.py]
-  E --> F[LangGraph: core/pipeline.py]
-  F --> G[OrchestratorAgent]
-  G --> H[SchemaAgent]
-  H --> I[DataGenerationAgent]
-  I --> J[Validated Records]
-  J --> B
-  H -. LLM reasoning .-> K[Gemini Client: core/llm_client.py]
-  I -. optional LLM QA .-> K
-  I --> L[Compiled Scenario Cache]
-  L --> I
-  D --> L
+  U[User / Flutter / Web UI] --> API[FastAPI]
+  API --> P[POST /scenario/propose]
+  API --> CSV[POST /scenario/import-csv]
+  P --> IA[PydanticAI Intent Agent]
+  IA -->|ScenarioIntent only| R[Telecom Runtime Registry]
+  R --> C[Deterministic Schema Compiler]
+  C --> D[(Draft / HITL state)]
+  CSV --> D2[Imported CSV Draft]
+  D2 --> H
+  D --> H[Human Review]
+  H -->|POST /scenario/confirm| F[Confirmed Scenario]
+  F --> G[POST /scenario/generate]
+  G --> LG[LangGraph Generation Workflow]
+  LG --> O[Orchestrator]
+  O --> S[Schema / Rules Agent]
+  S --> DG[Deterministic Data Generation]
+  DG --> QA[Validation + Repair]
+  QA --> OUT[Validated Dataset + Report]
+  OUT --> API
+
+  R --> ST[(SQLite Runtime Registry)]
+  R --> SA[/Versioned standards artifacts/]
+  IA -. chat context .-> CHAT[(SQLite Conversation Store)]
+  F --> DS[(Confirmed Scenarios)]
+  DG --> CACHE[(Compiled / Runtime Cache)]
       </div>
     </div>
 
-    <div class="grid">
-      <div class="card"><span class="badge">Source of truth</span><h3>Confirmed CSV schema</h3><p>Variable names, datatypes, generators, parameters, dependencies, formulas, descriptions, and related metadata originate in the imported definition CSV and are persisted into the confirmed scenario.</p></div>
-      <div class="card"><span class="badge">Agentic</span><h3>LLM as semantic layer</h3><p>Gemini is used to validate/interpret business context and derive machine-readable rules. This is intentionally different from letting the LLM invent the field catalog.</p></div>
-      <div class="card"><span class="badge">Deterministic</span><h3>Python generation engine</h3><p>Actual record values are primarily produced by explicit generator functions and dependency-aware execution in <code>data_generation_agent.py</code>.</p></div>
-      <div class="card"><span class="badge">Stateful</span><h3>SQLite + caches</h3><p>Drafts, confirmed scenarios, feedback, compiled schemas, and runtime artifacts provide persistence and reduce repeated work across requests.</p></div>
+    <div class="two">
+      <div class="card"><h3>Agentic path</h3><p><span class="flow-step">Intent → Registry → Compiler → HITL</span>. Used by <code>/scenario/propose</code>.</p></div>
+      <div class="card"><h3>CSV path</h3><p><span class="flow-step">CSV → deterministic parser → HITL</span>. Used by <code>/scenario/import-csv</code> when the client already owns the schema definition.</p></div>
     </div>
+    <div class="card"><h3>Common execution path</h3><p><span class="flow-step">Confirmed contract → Generator → Validation</span>. Both proposal paths converge on <code>/scenario/confirm</code> and then <code>/scenario/generate</code>.</p></div>
+
+    <h3>Runtime trust hierarchy</h3>
+    <pre>Industry standards artifacts
+        ↓
+Normalized standards model
+        ↓
+INGENII runtime registry
+        ↓
+Scenario schema compiler
+        ↓
+HITL-approved scenario contract
+        ↓
+Deterministic generator
+        ↓
+Deterministic QA / reconciliation</pre>
   </section>
 
   <section id="api">
-    <h2>2. API lifecycle: from CSV upload to generated data</h2>
-    <p>The public request path is intentionally simple: <code>import-csv → confirm → generate</code>. The old proposal-style scenario design endpoint is no longer part of the active path.</p>
+    <h2>3. Public API contract</h2>
+    <p>The scenario workflow exposes four APIs. Clients may choose either the agentic JSON proposal path or the explicit CSV definition path; both converge on the same HITL confirmation and generation APIs. Liveness and health endpoints remain operational endpoints.</p>
+    <table>
+      <tr><th>Method</th><th>Path</th><th>Purpose</th><th>LLM</th><th>Input</th><th>Output</th></tr>
+      <tr><td>POST</td><td><code>/scenario/propose</code></td><td>Interpret JSON request metadata + natural-language businessScenario, resolve concepts against the standards-backed registry, and create an agentic schema draft.</td><td>Yes — intent only</td><td>JSON body</td><td><code>ScenarioImportResponse</code></td></tr>
+      <tr><td>POST</td><td><code>/scenario/import-csv</code></td><td>Parse an explicit CSV variable definition and create a draft using the explicit CSV schema contract.</td><td>No</td><td>multipart/form-data + CSV</td><td><code>ScenarioImportResponse</code></td></tr>
+      <tr><td>POST</td><td><code>/scenario/confirm</code></td><td>HITL boundary. Apply safe edits to either kind of draft and promote it to an executable scenario.</td><td>No</td><td>JSON body</td><td><code>ConfirmResponse</code></td></tr>
+      <tr><td>POST</td><td><code>/scenario/generate</code></td><td>Execute the confirmed scenario and return validated synthetic records.</td><td>Existing non-agentic pipeline only; approved agentic scenarios bypass additional semantic LLM passes</td><td>JSON body</td><td><code>GenerateResponse</code></td></tr>
+    </table>
 
+    <h3>3.1 <code>POST /scenario/propose</code></h3>
+    <p>The request body is the JSON equivalent of the former CSV import metadata. The response keeps the same scenario-review contract so the existing frontend can reuse its HITL screen.</p>
+    <pre>{
+  "scenarioId": "PREPAID-01",
+  "domain": "telecom",
+  "typeOfData": "transactional",
+  "industryType": "telecom",
+  "country": "IN",
+  "businessScenario": "Generate prepaid subscribers with recharge, balance, data usage and charging history",
+  "businessResponse": "Synthetic records",
+  "expectedOutcome": "Realistic internally consistent telecom data",
+  "scenarioType": "agentic",
+  "useCase": "prepaid",
+  "label": "Prepaid Telecom",
+  "entityKey": "subscriber_id",
+  "conversationId": "optional-conversation-id"
+}</pre>
+    <div class="note"><strong>Response compatibility:</strong> the frontend receives <code>draft_id</code>, <code>scenario_id</code>, <code>variables</code>, <code>field_order</code>, <code>typeOfData</code>, and <code>entityKey</code> in the same response shape it already understands.</div>
+
+    <h3>3.2 <code>POST /scenario/import-csv</code></h3>
+    <p>This path remains available for clients that already have a complete variable-level CSV definition. It accepts the same scenario metadata as before as multipart form fields plus a UTF-8 CSV file, parses and normalizes the CSV deterministically, and creates a non-agentic draft.</p>
+    <pre>multipart/form-data
+  file: definition.csv
+  scenarioId: PREPAID-CSV-01
+  domain: telecom
+  typeOfData: transactional
+  industryType: telecom
+  country: IN
+  businessScenario: Prepaid recharge and usage
+  scenarioType: csv
+  useCase: prepaid
+  label: Prepaid CSV
+  entityKey: subscriber_id</pre>
+    <p>The parser supports the existing client CSV conventions for types, generators, dependency aliases, timestamp formats, numeric buckets, weights, precision, currency and related deterministic parameters. The resulting response is the same <code>ScenarioImportResponse</code> used by <code>/scenario/propose</code>.</p>
+
+    <h3>3.3 <code>POST /scenario/confirm</code></h3>
+    <p>This is the only HITL action API. It accepts <code>draft_id</code>, optional safe field edits, deletions, and feedback.</p>
+    <pre>{
+  "draft_id": "draft-...",
+  "add": [],
+  "edit": [
+    {"name": "recharge_amount", "changes": {"description": "Recharge amount in INR"}}
+  ],
+  "delete": [],
+  "feedback": "Use realistic Indian prepaid behavior"
+}</pre>
+    <p>For agentic drafts, confirmation rejects unknown fields and executable semantic changes. Generator names, formulas, dependency contracts and new parameters cannot be invented through HITL.</p>
+
+    <h3>3.4 <code>POST /scenario/generate</code></h3>
+    <pre>{
+  "scenario": "PREPAID-01",
+  "draftId": "draft-...",
+  "count": 1000,
+  "recordsPerUser": 10
+}</pre>
+    <p>An agentic scenario is resolved from the confirmed scenario record and executed from its persisted contract. The API is deliberately separated from schema proposal so generation cannot silently change the approved semantics.</p>
+  </section>
+
+  <section id="agent">
+    <h2>4. Agentic schema proposal</h2>
     <div class="diagram">
       <div class="mermaid">
 sequenceDiagram
-  autonumber
-  participant C as Client
-  participant S as server.py
-  participant P as csv_scenario.py
-  participant DB as dynamic_scenarios.py / SQLite
-  participant G as pipeline.py
-  participant O as OrchestratorAgent
-  participant SA as SchemaAgent
-  participant DG as DataGenerationAgent
+  participant UI as UI
+  participant API as FastAPI
+  participant CHAT as Conversation Store
+  participant LLM as PydanticAI + Gemini
+  participant REG as Runtime Registry
+  participant COMP as Schema Compiler
+  participant DB as Scenario DB
 
-  C->>S: POST /scenario/import-csv (multipart CSV)
-  S->>P: parse_definition_csv(csv_text)
-  P-->>S: variables + field_order
-  S->>DB: save_draft(draft_id, normalized_definition)
-  DB-->>S: draft stored
-  S-->>C: draft_id + parsed schema
-
-  C->>S: POST /scenario/confirm
-  S->>DB: get_draft(draft_id)
-  S->>DB: confirm_scenario(...)
-  S->>DB: invalidate / clear caches
-  DB-->>S: scenario_id
-  S-->>C: scenario_id + confirmed schema
-
-  C->>S: POST /scenario/generate
-  S->>DB: resolve confirmed scenario
-  S->>G: run_pipeline(...)
-  G->>O: validate scenario
-  O-->>G: validation / halt-on-error
-  G->>SA: derive rules
-  SA-->>G: structured rules
-  G->>DG: generate + validate + repair
-  DG-->>G: final_records + report
-  G-->>S: WorkflowState
-  S-->>C: generated records + validation report
+  UI->>API: POST /scenario/propose
+  API->>CHAT: load prior messages
+  API->>CHAT: append current user message
+  API->>LLM: catalog + history + current request
+  LLM-->>API: ScenarioIntent
+  API->>REG: resolve requested concepts
+  REG-->>API: canonical entities / attrs / relationships / provenance
+  API->>COMP: compile intent against registry
+  COMP-->>API: ScenarioSchema
+  API->>DB: persist draft + schema + intent + conversation id
+  DB-->>API: draft_id
+  API-->>UI: ScenarioImportResponse
       </div>
     </div>
 
-    <h3>2.1 API reference</h3>
-    <p>This section documents the API contract exposed by <code>server.py</code>. The OpenAPI models are defined with Pydantic, while the application also installs a common error envelope and an <code>X-Request-ID</code> correlation header on every response.</p>
+    <h3>LLM output contract</h3>
+    <p>The PydanticAI agent returns only <code>ScenarioIntent</code>. It can identify concepts, country/currency, approximate record count, time window and ambiguities. It cannot return an executable field definition.</p>
+    <pre>ScenarioIntent
+  domain
+  subdomain
+  requested_entities[]
+  requested_relationships[]
+  country
+  currency
+  record_count
+  time_window_days
+  notes[]
+  ambiguities[]</pre>
+
+    <h3>Follow-up conversation</h3>
+    <p><code>conversationId</code> is optional. When omitted, the proposal workflow derives a stable conversation key from <code>scenarioId</code>. Existing messages are loaded before the new message is interpreted, allowing follow-up instructions such as “make recharge behavior more frequent for high-value users” without changing the four-API contract.</p>
+
+    <div class="good"><strong>Important boundary:</strong> even if the model names an unsupported concept, the proposal is not executable. Registry resolution records the concept as unresolved and <code>/scenario/confirm</code> refuses promotion until the issue is resolved.</div>
+  </section>
+
+  <section id="registry">
+    <h2>5. Standards-backed runtime registry</h2>
+    <p>The application contains no hard-coded Python telecom catalog; <code>core/telecom_registry.py</code> is an implementation of a read-only runtime registry over SQLite; the source material lives under versioned normalized artifacts and generation-policy overlays.</p>
 
     <div class="diagram">
       <div class="mermaid">
 flowchart LR
-  C[Client] --> H[HTTP request]
-  H --> MW[request_id_middleware]
-  MW --> R{Endpoint}
-  R --> I[POST /scenario/import-csv]
-  R --> F[POST /scenario/confirm]
-  R --> G[POST /scenario/generate]
-  R --> L[GET / or /health]
-  I --> E1[ScenarioImportResponse]
-  F --> E2[ConfirmResponse]
-  G --> E3[GenerateResponse]
-  I --> X[ErrorResponse on failure]
-  F --> X
-  G --> X
-  L --> X
-  E1 --> Z[HTTP response + X-Request-ID]
-  E2 --> Z
-  E3 --> Z
-  X --> Z
+  TMF[TM Forum artifacts] --> N[Normalized JSON artifacts]
+  GPP[3GPP artifacts] --> N
+  MEF[MEF artifacts when applicable] --> N
+  N --> B[RegistryBuilder]
+  GP[INGENII generation profiles] --> B
+  B --> DB[(SQLite runtime registry)]
+  DB --> API[TelecomRegistry]
+  API --> C[SchemaCompiler]
       </div>
     </div>
 
-    <h4>Endpoint matrix</h4>
+    <h3>5.1 Separation of concerns</h3>
     <table>
-      <tr><th>Method</th><th>Path</th><th>Input</th><th>Success</th><th>Primary backend work</th></tr>
-      <tr><td><span class="badge">GET</span></td><td><code>/</code></td><td>None</td><td><code>200</code> JSON liveness payload</td><td><code>root()</code></td></tr>
-      <tr><td><span class="badge">GET</span></td><td><code>/health</code></td><td>None</td><td><code>200</code> JSON health payload</td><td><code>health()</code></td></tr>
-      <tr><td><span class="badge">POST</span></td><td><code>/scenario/import-csv</code></td><td><code>multipart/form-data</code>: CSV + scenario metadata</td><td><code>200</code> <code>ScenarioImportResponse</code></td><td>Decode CSV → infer type → parse/normalize → infer country/entity key → save draft</td></tr>
-      <tr><td><span class="badge">POST</span></td><td><code>/scenario/confirm</code></td><td>JSON <code>ConfirmRequest</code></td><td><code>200</code> <code>ConfirmResponse</code></td><td>Load draft → add/edit/delete variables → confirm scenario → invalidate caches → consume draft</td></tr>
-      <tr><td><span class="badge">POST</span></td><td><code>/scenario/generate</code></td><td>JSON <code>GenerateRequest</code></td><td><code>200</code> <code>GenerateResponse</code></td><td>Resolve scenario → run LangGraph → generate/repair → group transactional histories when needed</td></tr>
+      <tr><th>Layer</th><th>Owns</th><th>Must not own</th></tr>
+      <tr><td>Standards artifacts</td><td>Telecom semantics, source terminology, provenance</td><td>INGENII-specific synthetic generation behavior</td></tr>
+      <tr><td>Generation profiles</td><td>Generator, params, dependencies and scenario-specific deterministic behavior</td><td>Inventing new standards entities or attributes</td></tr>
+      <tr><td>Runtime registry</td><td>Executable view, lookup, aliases, relationships, attributes and provenance</td><td>LLM-generated semantics</td></tr>
+      <tr><td>Schema compiler</td><td>Scenario-specific subset and contract assembly</td><td>External standards discovery at runtime</td></tr>
     </table>
 
-    <h4>2.1.1 <code>POST /scenario/import-csv</code></h4>
-    <p><strong>Content-Type:</strong> <code>multipart/form-data</code>. The endpoint is intentionally a form upload rather than JSON because the variable-definition CSV is the source artifact.</p>
-    <table>
-      <tr><th>Field</th><th>Type</th><th>Required</th><th>Default</th><th>Notes</th></tr>
-      <tr><td><code>file</code></td><td>file / CSV</td><td>Yes</td><td>—</td><td>Decoded as UTF-8 with optional BOM.</td></tr>
-      <tr><td><code>scenarioId</code></td><td>string</td><td>Yes</td><td>—</td><td>Requested scenario identifier; may be reassigned during confirmation if already occupied.</td></tr>
-      <tr><td><code>domain</code></td><td>string</td><td>Yes</td><td>—</td><td>Journey/domain label stored in draft metadata.</td></tr>
-      <tr><td><code>typeOfData</code></td><td><code>transactional | aggregational</code></td><td>No</td><td>auto-detected</td><td>When omitted, <code>infer_type_of_data()</code> inspects the CSV.</td></tr>
-      <tr><td><code>industryType</code></td><td>string</td><td>No</td><td><code>generic</code></td><td>Used later by semantic rule generation.</td></tr>
-      <tr><td><code>country</code></td><td>string</td><td>No</td><td>null</td><td>May be overridden by country signals discovered in CSV params.</td></tr>
-      <tr><td><code>businessScenario</code></td><td>string</td><td>No</td><td>empty</td><td>Scenario description/context.</td></tr>
-      <tr><td><code>businessResponse</code></td><td>string</td><td>No</td><td>null</td><td>Business response/context stored in draft.</td></tr>
-      <tr><td><code>expectedOutcome</code></td><td>string</td><td>No</td><td>null</td><td>Expected outcome stored in draft.</td></tr>
-      <tr><td><code>scenarioType</code></td><td>string</td><td>No</td><td>empty</td><td>Scenario classification metadata.</td></tr>
-      <tr><td><code>useCase</code></td><td>string</td><td>No</td><td>null</td><td>Use-case metadata for the agents.</td></tr>
-      <tr><td><code>label</code></td><td>string</td><td>No</td><td>empty</td><td>Falls back to <code>scenarioId</code>.</td></tr>
-      <tr><td><code>entityKey</code></td><td>string</td><td>No</td><td>auto-selected</td><td>Relevant only to transactional data; endpoint selects a preferred identifier if omitted.</td></tr>
-    </table>
-
-    <pre>curl -X POST http://localhost:8000/scenario/import-csv \
-  -H "X-Request-ID: demo-import-001" \
-  -F "file=@samples/definition_sample.csv" \
-  -F "scenarioId=LB-01" \
-  -F "domain=Recharge" \
-  -F "typeOfData=transactional" \
-  -F "industryType=telecom" \
-  -F "country=IN" \
-  -F "businessScenario=Generate telecom recharge history" \
-  -F "label=Recharge History"</pre>
-
-    <p><strong>Importer behavior:</strong> the CSV is decoded, parsed by <code>parse_definition_csv()</code>, and normalized into <code>variables</code> plus <code>field_order</code>. For transactional scenarios, <code>entityKey</code> is either matched case-insensitively to a supplied name or inferred from preferred identifiers such as <code>subscriber_id</code>, <code>customer_id</code>, <code>account_id</code>, <code>user_id</code>, and <code>entity_id</code>.</p>
-
-    <h4>2.1.2 <code>POST /scenario/confirm</code></h4>
-    <p><strong>Content-Type:</strong> <code>application/json</code>. This is the schema-edit and commit boundary: the temporary draft becomes the confirmed scenario used by generation.</p>
-    <pre>{
-  "draft_id": "DR-abc123",
-  "add": [
-    {
-      "name": "customer_tier",
-      "dtype": "categorical",
-      "gen": "choice",
-      "params": {"values": ["prepaid", "postpaid"]}
-    }
-  ],
-  "edit": [
-    {
-      "name": "recharge_amount",
-      "changes": {"params": {"min": 10, "max": 5000}}
-    }
-  ],
-  "delete": ["obsolete_field"],
-  "feedback": "Prefer INR amounts and Indian telecom context"
-}</pre>
-
-    <p>The route applies operations in this order: <code>delete</code> → <code>edit</code> → <code>add</code>. It then rebuilds <code>field_order</code>, re-evaluates the transactional <code>entity_key</code>, persists metadata + variables, invalidates the compiled/runtime caches, optionally stores feedback, and removes the draft with <code>pop_draft()</code>.</p>
-
-    <h4>2.1.3 <code>POST /scenario/generate</code></h4>
-    <p><strong>Content-Type:</strong> <code>application/json</code>. The request can resolve a scenario using either <code>scenario</code> or <code>draftId</code>. When both are supplied, the backend verifies that they resolve to the same scenario.</p>
-    <table>
-      <tr><th>Field</th><th>Type</th><th>Required</th><th>Constraint / default</th><th>Meaning</th></tr>
-      <tr><td><code>scenario</code></td><td>string | null</td><td>Conditionally</td><td>Example: <code>LB-01</code></td><td>Confirmed scenario identifier.</td></tr>
-      <tr><td><code>draftId</code></td><td>string | null</td><td>Conditionally</td><td>null</td><td>Confirmed draft reference; resolves to scenario ID.</td></tr>
-      <tr><td><code>count</code></td><td>integer</td><td>No</td><td>1–5000, default 20</td><td>Number of users/entities for transactional generation, or requested record count for aggregational generation.</td></tr>
-      <tr><td><code>recordsPerUser</code></td><td>integer</td><td>No</td><td>1–10, default 10</td><td>Maximum number of recent history records returned per transactional entity.</td></tr>
-    </table>
-
-    <pre>curl -X POST http://localhost:8000/scenario/generate \
-  -H "Content-Type: application/json" \
-  -H "X-Request-ID: demo-generate-001" \
-  -d '{"scenario":"LB-01","count":20,"recordsPerUser":5}'</pre>
-
-    <h4>2.1.4 Generate response shape</h4>
-    <pre>{
-  "success": true,
-  "scenario_id": "LB-01",
-  "typeOfData": "transactional",
-  "draft_id": null,
-  "scenario_label": "Recharge History",
-  "fields": ["subscriber_id", "record_timestamp", "recharge_amount"],
-  "total_records": 100,
-  "totalCount": 20,
-  "recordsPerUser": 5,
-  "entityKey": "subscriber_id",
-  "validation_report": {},
-  "records": [
-    {
-      "subscriber_id": "SUB-000001",
-      "records": [
-        {"record_timestamp": "2026-09-14T10:15:00", "recharge_amount": 399}
-      ]
-    }
-  ],
-  "errors": [],
-  "record_errors": []
-}</pre>
-    <p>For <strong>aggregational</strong> scenarios, <code>records</code> is a flat list of dictionaries. For <strong>transactional</strong> scenarios, the backend groups the generated flat rows by <code>entityKey</code>, extracts stable user-level fields, sorts by the first recognized timestamp field, and returns a nested <code>records</code> history per entity.</p>
-
-    <h4>2.1.5 Liveness and health endpoints</h4>
-    <pre>GET /
-→ {"success": true, "status": "ok"}
-
-GET /health
-→ {"status": "ok"}</pre>
-
-    <h4>2.1.6 Error contract</h4>
-    <p>Errors are normalized by <code>core/error_handlers.py</code> into the public <code>ErrorResponse</code> shape. Clients should branch on the stable <code>error.code</code>, not the human-readable message.</p>
-    <pre>{
-  "success": false,
-  "error": {
-    "code": "NOT_FOUND",
-    "message": "Unknown or expired draft_id 'DR-abc123'",
-    "details": null,
-    "request_id": "demo-request-001"
-  }
-}</pre>
-    <table>
-      <tr><th>Status</th><th>Typical trigger in current code</th><th>Public error code</th></tr>
-      <tr><td><code>400</code></td><td>Malformed CSV, missing scenario selector, scenario mismatch, invalid scenario</td><td><code>BAD_REQUEST</code></td></tr>
-      <tr><td><code>404</code></td><td>Unknown/expired draft</td><td><code>NOT_FOUND</code></td></tr>
-      <tr><td><code>409</code></td><td>Conflict cases handled by shared exception layer</td><td><code>CONFLICT</code></td></tr>
-      <tr><td><code>422</code></td><td>Pydantic/FastAPI request validation failure</td><td><code>VALIDATION_ERROR</code></td></tr>
-      <tr><td><code>500</code></td><td>Generation failed with no usable output; unexpected server failures</td><td><code>INTERNAL_SERVER_ERROR</code> / mapped HTTP error</td></tr>
-      <tr><td><code>502</code></td><td>Upstream/LLM integration errors handled by the common exception layer</td><td><code>UPSTREAM_ERROR</code></td></tr>
-    </table>
-    <div class="note"><strong>Request tracing:</strong> clients can send <code>X-Request-ID</code>. When omitted, the middleware creates a UUID. The same ID is returned in the response header and is also included in normalized error bodies.</div>
-
-    <table>
-      <tr><th>Endpoint</th><th>Code path</th><th>What it really does</th></tr>
-      <tr><td><code>POST /scenario/import-csv</code></td><td><code>server.py: import_scenario_csv()</code></td><td>Reads the uploaded CSV, infers data type, parses and normalizes variables, validates the schema, and stores a draft in SQLite.</td></tr>
-      <tr><td><code>POST /scenario/confirm</code></td><td><code>server.py: confirm_scenario_route()</code></td><td>Loads the draft, optionally applies variable edits, persists the final confirmed scenario, and invalidates scenario-related caches.</td></tr>
-      <tr><td><code>POST /scenario/generate</code></td><td><code>server.py: generate_scenario()</code></td><td>Resolves the confirmed scenario and invokes the LangGraph pipeline to produce validated synthetic records.</td></tr>
-      <tr><td><code>GET /</code></td><td><code>server.py: root()</code></td><td>Simple liveness/root endpoint.</td></tr>
-      <tr><td><code>GET /health</code></td><td><code>server.py: health()</code></td><td>Health endpoint for service-level checks.</td></tr>
-    </table>
-  </section>
-
-  <section id="csv">
-    <h2>3. CSV parsing and schema compilation</h2>
-    <p><code>core/csv_scenario.py</code> is effectively a domain-specific parser/compiler. It transforms loosely formatted CSV rows into a normalized internal variable representation that the rest of the application can execute.</p>
-
-    <div class="diagram">
-      <div class="mermaid">
-flowchart TD
-  A[Raw CSV text] --> B[infer_type_of_data]
-  A --> C[parse_definition_csv]
-  C --> D[Parse scalar / list values]
-  D --> E[Parse params: JSON or compact syntax]
-  E --> F[Normalize dtype]
-  F --> G[Normalize generator]
-  G --> H[Normalize formula]
-  H --> I[Resolve dependency aliases]
-  I --> J[Align id_mirror sources]
-  J --> K[Merge / validate duplicate variables]
-  K --> L[Global dependency validation]
-  L --> M[field_order + variables]
-  B --> M
-      </div>
-    </div>
-
+    <h3>5.2 Standards roles for telecom</h3>
     <div class="grid">
-      <div class="card"><h3>Parameter formats</h3><p>The parser supports structured JSON as well as compact forms such as <code>prefix=SUB-;digits=7</code>, <code>min=50;max=1000</code>, and range-like values.</p></div>
-      <div class="card"><h3>Generator normalization</h3><p>Aliases and context-sensitive generator forms are normalized before execution, so the runtime sees a consistent generator contract.</p></div>
-      <div class="card"><h3>Formula normalization</h3><p><code>_coerce_formula_text()</code> converts CSV-friendly expression syntax into executable expressions that the deterministic formula engine can evaluate later.</p></div>
-      <div class="card"><h3>Dependency validation</h3><p>The importer resolves references against the full field set, allowing rows to be supplied in a non-topological order while still rejecting unknown dependencies.</p></div>
-      <div class="card"><h3>Type-of-data inference</h3><p><code>infer_type_of_data()</code> uses CSV structure. Non-empty <code>fields</code> values indicate transactional/history-style input; otherwise the scenario is treated as aggregational.</p></div>
-      <div class="card"><h3>Duplicate and legacy handling</h3><p>The parser contains compatibility logic for duplicate variables, generator aliases, legacy formats, and <code>id_mirror</code> source alignment.</p></div>
+      <div class="card"><h3>TM Forum</h3><p>Useful for CSP business/customer/product/service/account semantics. The current source model lineage is based on the Information Framework and relevant TM Forum APIs such as TMF654 Prepay Balance Management.</p><p class="small"><a href="https://www.tmforum.org/open-digital-architecture/information-framework-sid/">Information Framework</a> · <a href="https://www.tmforum.org/open-digital-architecture/open-apis/prepay-balance-management-api-TMF654/v4.0">TMF654</a></p></div>
+      <div class="card"><h3>3GPP</h3><p>Useful for mobile-network and charging semantics, especially the 32.xxx management/charging family. Prepaid charging should use the relevant 3GPP release/specification rather than generic LLM assumptions.</p><p class="small"><a href="https://portal.3gpp.org/">3GPP portal</a></p></div>
+      <div class="card"><h3>MEF</h3><p>MEF is loaded as a first-class telecom standards pack. The MVP includes Subscriber Ethernet and Internet Access model subsets. It is selected automatically only when the requested concepts resolve to MEF-backed entities; it is not artificially injected into a mobile-prepaid schema where it is not semantically relevant.</p><p class="small"><a href="https://www.mef.net/learn/mef-technical-standards-sdks/standard-type-view/">MEF Information &amp; Data Models</a> · <a href="https://www.mef.net/resources/mef-139-lso-sonata-internet-access-product-schemas-and-developer-guide/">MEF 139</a></p></div>
     </div>
 
-    <div class="note"><strong>Important:</strong> the parser is not a thin CSV reader. It performs normalization and semantic validation before anything reaches the agents. This is why debugging an “LLM problem” should often start by inspecting the parsed variable object first.</div>
+    <div class="note"><strong>Deterministic standard applicability:</strong> the platform does not ask Gemini to choose TM Forum, 3GPP or MEF. It resolves the requested concepts first, then groups source provenance from the runtime registry. A prepaid request may therefore resolve primarily to TM Forum + 3GPP, while a connectivity request can resolve to MEF + TM Forum, with 3GPP added only when mobile charging/network semantics are actually requested.</div>
 
-    <h4>Representative normalized variable shape</h4>
-    <pre>{
-  "name": "subscriber_id",
-  "dtype": "string",
-  "gen": "prefixed_int",
-  "params": {"prefix": "SUB-", "digits": 7},
-  "depends_on": [],
-  "formula": "",
-  "nullable": false,
-  "description": "Stable subscriber identifier"
-}</pre>
+    <h3>5.3 Registry provenance</h3>
+    <pre>canonical entity
+  → source organization
+  → source artifact
+  → source version / release
+  → source reference / URL
+  → source role
+  → INGENII policy overlay</pre>
+
+    <div class="warn"><strong>MVP qualification:</strong> the repository contains three normalized standards packs with provenance—TM Forum, 3GPP and MEF—but they are curated MVP subsets, not the complete standards corpora. Before production certification, pin the required releases and ingest the authoritative machine-readable/model artifacts for the supported domains.</div>
   </section>
 
-  <section id="pipeline">
-    <h2>4. LangGraph pipeline and agent responsibilities</h2>
-    <p><code>core/pipeline.py</code> builds a three-node LangGraph. Each node is wrapped so the graph can stop when the shared <code>WorkflowState</code> contains fatal errors.</p>
-
+  <section id="hitl">
+    <h2>6. HITL / confirmation workflow</h2>
     <div class="diagram">
       <div class="mermaid">
 flowchart LR
-  S[WorkflowState] --> O[1. OrchestratorAgent]
-  O -->|ok| SC[2. SchemaAgent]
-  O -->|fatal errors| X[Stop]
-  SC -->|rules| DG[3. DataGenerationAgent]
-  SC -->|fatal errors| X
-  DG --> R[final_records + validation_report]
-  DG --> E[errors / record_errors]
-
-  O -. reads .-> DB[(SQLite scenario)]
-  SC -. context + variables .-> LLM[Gemini]
-  DG -. optional QA .-> LLM
+  D[Draft schema] --> V[Deterministic validation]
+  V --> H[Human review]
+  H -->|Approve| C[Confirmed scenario]
+  H -->|Safe edit| V2[Revalidate edit]
+  V2 --> H
+  H -->|Reject| X[Rejected / discarded]
+  V -->|Unresolved concept| Q[Resolve before confirm]
+  Q --> H
       </div>
     </div>
 
-    <div class="two-col">
-      <div class="card">
-        <h3>OrchestratorAgent</h3>
-        <p><strong>Purpose:</strong> gate the request before expensive downstream work.</p>
-        <ul>
-          <li>Checks that the confirmed scenario exists.</li>
-          <li>Checks that the scenario has usable CSV-defined variables.</li>
-          <li>May use cached validation or an LLM validation pass for scenario/business coherence.</li>
-          <li>Produces state/errors that can halt the graph.</li>
-        </ul>
-      </div>
-      <div class="card">
-        <h3>SchemaAgent</h3>
-        <p><strong>Purpose:</strong> translate business context into machine-readable rules around the confirmed schema.</p>
-        <ul>
-          <li>Receives industry, country, business scenario, use case, outcome, and variables.</li>
-          <li>Derives constraints, conditional relationships, semantic rules, and formula-related rules.</li>
-          <li>Returns structured rules rather than generating the final records.</li>
-        </ul>
-      </div>
-    </div>
+    <h3>Allowed HITL changes</h3>
+    <p>For agentic drafts, HITL can make presentation-level or safe contract-level changes that remain within the approved registry-backed definition: descriptions, nullability where allowed, existing parameter values, and field deletion where dependencies and required fields remain valid.</p>
 
-    <div class="card" style="margin-top:16px;">
-      <h3>DataGenerationAgent</h3>
-      <p><strong>Purpose:</strong> execute the actual schema deterministically.</p>
-      <p>It contains the generic generator registry, dependency ordering, record construction, transactional history generation, formula evaluation, deterministic validation/repair, and optional LLM QA.</p>
-    </div>
-
-    <div class="warn"><strong>Boundary that matters:</strong> the LLM is upstream of deterministic generation. If generated values violate an explicit CSV formula or parameter constraint, the deterministic layer has authority to repair them. That makes the final result more reproducible than an LLM-only generator.</div>
+    <h3>Blocked HITL changes</h3>
+    <div class="danger"><span class="pill">new_entity</span><span class="pill">new_field</span><span class="pill">new_relationship</span><span class="pill">new_generator</span><span class="pill">new_formula</span><span class="pill">new_enum</span><span class="pill">unknown_parameter</span></div>
+    <p>A human can request a model extension, but that extension belongs in a new standards artifact or approved INGENII model extension, followed by registry rebuild and a new proposal.</p>
   </section>
 
   <section id="generation">
-    <h2>5. Generation engine: dependency-aware execution</h2>
-    <p>The core record builder is <code>_generate_record()</code>. It does not simply loop over the CSV rows. It first determines a dependency-safe execution order.</p>
-
-    <div class="diagram">
-      <div class="mermaid">
-flowchart TD
-  A[Variables] --> B[Extract explicit depends_on]
-  A --> C[Extract formula dependencies]
-  B --> D[Build dependency graph]
-  C --> D
-  D --> E{Cycle?}
-  E -->|yes| F[Raise / report dependency error]
-  E -->|no| G[Topological order]
-  G --> H[Generate field value]
-  H --> I[Apply generation constraints]
-  I --> J[Apply conditional rules / scenario semantics]
-  J --> K[Evaluate formulas]
-  K --> L[Record]
-      </div>
-    </div>
-
-    <h4>Generator registry</h4>
-    <div class="grid">
-      <div class="card"><h3>Identity / telecom</h3><p><code>prefixed_int</code>, <code>prefixed_uuid</code>, <code>tx_id</code>, <code>id_mirror</code>, <code>e164_phone</code></p></div>
-      <div class="card"><h3>Simple distributions</h3><p><code>constant</code>, <code>weighted_choice</code>, <code>uniform</code>, <code>lognormal</code>, <code>lognormal_int</code>, <code>beta</code></p></div>
-      <div class="card"><h3>Bounded / segment aware</h3><p><code>segment_range</code>, <code>uniform_bounded</code></p></div>
-      <div class="card"><h3>Temporal</h3><p><code>recent_datetime</code>, <code>ts_offset</code>, <code>ts_add_field</code>, <code>date_offset</code></p></div>
-      <div class="card"><h3>Derived</h3><p><code>formula</code> plus rule-based formula sources and dependency extraction.</p></div>
-    </div>
-
-    <h4>Why dependency order matters</h4>
-    <pre>Example:
-
-subscriber_id       -> generated first
-segment              -> generated second
-monthly_spend       -> generated from segment
-recharge_amount     -> generated from monthly_spend
-balance_after       -> formula(monthly_spend, recharge_amount)
-
-Even if the CSV places balance_after above the other fields, the dependency graph can place it last.</pre>
-  </section>
-
-  <section id="transactional">
-    <h2>6. Transactional vs aggregational generation</h2>
-    <p><code>core/compiled_schema.py</code> compiles confirmed scenarios into two logical field sets: stable entity/user context and history fields. The transactional generator uses that compiled representation.</p>
-
-    <div class="diagram">
-      <div class="mermaid">
-flowchart TD
-  A[Confirmed variables] --> B[compile_scenario]
-  B --> C[infer_history_field_sets]
-  C --> D[Stable entity fields]
-  C --> E[History fields]
-
-  D --> F[Generate entity once]
-  E --> G[Generate N history rows per entity]
-  F --> H[Combine entity + history]
-  G --> H
-  H --> I[Latest configured response window]
-
-  J[Aggregational scenario] --> K[Generate requested records directly]
-      </div>
-    </div>
-
-    <table>
-      <tr><th>Aspect</th><th>Transactional</th><th>Aggregational</th></tr>
-      <tr><td>Purpose</td><td>Represent entities/users plus recent historical events/measurements.</td><td>Represent independent records at the requested grain.</td></tr>
-      <tr><td>Stable fields</td><td>Generated once per entity/user.</td><td>Generated per record.</td></tr>
-      <tr><td>History fields</td><td>Regenerated for each history row.</td><td>Not split into a separate history phase.</td></tr>
-      <tr><td>Detection</td><td>Based on CSV structure and transactional metadata/field grouping.</td><td>Empty <code>fields</code> structure indicates the aggregational path.</td></tr>
-      <tr><td>Key implementation</td><td><code>compile_scenario()</code>, <code>infer_history_field_sets()</code>, <code>_transactional_records()</code></td><td><code>_generate_record()</code> repeated for requested count.</td></tr>
-    </table>
-
-    <div class="note"><strong>Timestamp boundary:</strong> the compiled-schema logic uses the first appropriate history timestamp field as a practical boundary when separating stable entity context from historical fields. That makes timestamp naming/ordering a meaningful part of transactional CSV design.</div>
-  </section>
-
-  <section id="persistence">
-    <h2>7. Persistence, cache layers, and invalidation</h2>
-
-    <div class="diagram">
-      <div class="mermaid">
-flowchart TB
-  API[FastAPI requests] --> DB[(SQLite)]
-  DB --> D[Draft scenarios]
-  DB --> C[Confirmed scenarios]
-  DB --> F[Feedback history]
-
-  C --> CS[Compiled schema cache]
-  C --> RC[Runtime/schema cache]
-
-  CS --> GEN[Data generation]
-  RC --> AG[Agent orchestration]
-
-  CONF[Scenario confirmation] --> INV[Invalidate scenario caches]
-  INV --> CS
-  INV --> RC
-      </div>
-    </div>
-
-    <div class="grid">
-      <div class="card"><h3>SQLite: dynamic_scenarios.py</h3><p>Initializes/migrates the DB, stores drafts, confirms scenarios, resolves metadata/variables/type/entity key, and stores feedback history.</p></div>
-      <div class="card"><h3>Compiled schema cache</h3><p><code>compile_scenario()</code> produces an immutable compiled representation optimized for transactional lookup and repeated generation calls.</p></div>
-      <div class="card"><h3>Runtime cache</h3><p><code>core/runtime_cache.py</code> keeps process-local runtime artifacts such as schema/agent results so repeated calls can avoid recomputation.</p></div>
-      <div class="card"><h3>Invalidation</h3><p>Scenario confirmation explicitly clears scenario-dependent cached artifacts so generated data is not based on an older schema.</p></div>
-    </div>
-  </section>
-
-  <section id="qa">
-    <h2>8. Validation and repair: why generation is more than random sampling</h2>
-    <p>The QA path in <code>data_generation_agent.py</code> is a deterministic repair loop. The system can fix values instead of merely rejecting an entire record.</p>
-
+    <h2>7. Deterministic generation</h2>
+    <p>The confirmed scenario is passed into the existing generation pipeline. The generator layer is responsible for record production; the LLM does not generate rows.</p>
     <div class="diagram">
       <div class="mermaid">
 flowchart LR
-  A[Generated record] --> B[Fill missing fields]
-  B --> C[Coerce datatypes]
-  C --> D[Check declared params]
-  D --> E[Check ranges / categories]
-  E --> F[Check timestamps]
-  F --> G[Evaluate authoritative formulas]
-  G --> H[Apply conditional / semantic rules]
-  H --> I{Valid?}
-  I -->|yes| J[Final record]
-  I -->|no, repairable| B
-  I -->|no, fatal| K[Record error / pipeline error]
+  C[Confirmed Scenario] --> P[core/pipeline.py]
+  P --> LG[LangGraph]
+  LG --> O[Orchestrator]
+  O --> S[SchemaAgent / rules]
+  S --> D[DataGenerationAgent]
+  D --> X[Dependency-aware generation]
+  X --> T[Transactional grouping or flat aggregate]
+  T --> Q[QA / Repair]
+  Q --> R[GenerateResponse]
       </div>
     </div>
 
-    <h4>Deterministic formula safety</h4>
-    <p><code>_safe_formula()</code> evaluates normalized expressions through a restricted AST rather than calling unrestricted <code>eval()</code>. The formula layer also extracts dependencies so formulas can participate in generation ordering.</p>
+    <h3>Agentic scenario exception</h3>
+    <p>For confirmed agentic scenarios, the orchestrator and schema stage use the persisted registry-backed contract as authoritative input and skip additional semantic reinterpretation. This prevents a second LLM pass from mutating the approved schema.</p>
 
-    <div class="good"><strong>Authority order:</strong> explicit CSV formulas and declared generator constraints are the strongest constraints; Schema Agent rules add business semantics; optional LLM QA can audit the output but does not replace the deterministic validation path.</div>
+    <h3>Prepaid telecom generation example</h3>
+    <pre>Customer
+  ↓
+CustomerAccount
+  ↓
+PrepaidAccount
+  ├── Bucket
+  └── Recharge
+          ↓
+Subscriber
+  ├── UsageEvent
+  └── ChargingEvent</pre>
+    <p>The generation profile supplies deterministic behavior such as INR currency, Indian MSISDN generation, recharge denominations, subscriber status weights and relationship dependencies. Those are INGENII generation policies, not additional claims about the standards themselves.</p>
+  </section>
+
+  <section id="qa">
+    <h2>8. Validation, reconciliation and repair</h2>
+    <p>Quality is handled in multiple layers. A dataset is not considered valid merely because its columns match a Pydantic model.</p>
+    <table>
+      <tr><th>Layer</th><th>Question answered</th></tr>
+      <tr><td>Schema validation</td><td>Are required fields present and typed correctly?</td></tr>
+      <tr><td>Registry validation</td><td>Do entities, attributes and relationships exist in the approved model?</td></tr>
+      <tr><td>Reference validation</td><td>Do foreign/reference values resolve to generated records?</td></tr>
+      <tr><td>Temporal validation</td><td>Do causal timestamps occur in the correct order and within bounded delays?</td></tr>
+      <tr><td>Arithmetic validation</td><td>Do derived values reconcile with their inputs?</td></tr>
+      <tr><td>Distribution validation</td><td>Do generated records respect declared weights/buckets/precision?</td></tr>
+      <tr><td>Repair</td><td>Can a bad record be deterministically corrected without changing the approved contract?</td></tr>
+    </table>
+
+    <div class="good"><strong>Example:</strong> if <code>charge_timestamp</code> is causally downstream of <code>usage_timestamp</code>, the validator checks <code>charge_timestamp &gt;= usage_timestamp</code>. A failed row is repaired or rejected deterministically; the LLM is not permitted to change the relationship definition during generation.</div>
+  </section>
+
+  <section id="persistence">
+    <h2>9. Persistence and lifecycle</h2>
+    <div class="grid">
+      <div class="card"><h3>Conversation store</h3><p><code>core/conversation_store.py</code> persists user/assistant messages so proposal follow-ups can use chat context across requests and workers.</p></div>
+      <div class="card"><h3>Scenario store</h3><p><code>core/dynamic_scenarios.py</code> persists drafts and confirmed scenarios. Runtime databases are ignored by Git and recreated on a clean environment.</p></div>
+      <div class="card"><h3>Runtime registry</h3><p><code>runtime_data/registry.db</code> is mutable runtime state created automatically from the immutable resources under <code>resources/telecom/</code>. It is not source-of-truth model data and should live on a persistent deployment volume.</p></div>
+      <div class="card"><h3>Cache invalidation</h3><p>Scenario confirmation clears scenario-dependent cached artifacts so generation cannot accidentally use a stale schema.</p></div>
+    </div>
+
+    <h3>Draft lifecycle</h3>
+    <pre>proposed → pending HITL → confirmed → generated
+                     │
+                     ├→ rejected
+                     └→ revised → pending HITL</pre>
+  </section>
+
+  <section id="security">
+    <h2>10. Trust and security boundaries</h2>
+    <table>
+      <tr><th>Component</th><th>Trust level</th><th>Allowed authority</th></tr>
+      <tr><td>Gemini / PydanticAI</td><td>Advisory</td><td>Interpretation and candidate concepts only</td></tr>
+      <tr><td>Runtime registry</td><td>Authoritative</td><td>Entity/attribute/relationship vocabulary and provenance</td></tr>
+      <tr><td>Schema compiler</td><td>Authoritative</td><td>Executable schema construction</td></tr>
+      <tr><td>HITL</td><td>Authoritative for ambiguity</td><td>Approve/revise/reject within registry constraints</td></tr>
+      <tr><td>Generator</td><td>Authoritative for execution</td><td>Record creation according to approved contract</td></tr>
+      <tr><td>QA</td><td>Authoritative for acceptance</td><td>Validation, repair, rejection</td></tr>
+    </table>
+
+    <h3>External LLM boundary</h3>
+    <p>The proposal prompt includes a compact approved telecom catalog and relevant conversation history. No generated schema is sent back to the model as an executable tool definition. The model receives the semantic vocabulary; the compiler remains the gate.</p>
   </section>
 
   <section id="files">
-    <h2>9. File-by-file responsibility map</h2>
+    <h2>11. Code map</h2>
     <table>
-      <tr><th>File</th><th>Main responsibility</th><th>Key functions / objects</th></tr>
-      <tr><td><code>server.py</code></td><td>FastAPI application, request models, endpoints, response shaping.</td><td><code>import_scenario_csv()</code>, <code>confirm_scenario_route()</code>, <code>generate_scenario()</code></td></tr>
-      <tr><td><code>core/csv_scenario.py</code></td><td>CSV parsing, normalization, type inference, generator/formula/dependency normalization.</td><td><code>infer_type_of_data()</code>, <code>parse_definition_csv()</code></td></tr>
-      <tr><td><code>core/dynamic_scenarios.py</code></td><td>SQLite persistence and scenario resolution.</td><td><code>save_draft()</code>, <code>confirm_scenario()</code>, <code>resolve_variables()</code>, <code>resolve_scenario_context()</code></td></tr>
-      <tr><td><code>core/state.py</code></td><td>Shared LangGraph workflow state definition.</td><td><code>WorkflowState</code></td></tr>
-      <tr><td><code>core/pipeline.py</code></td><td>Builds and executes the three-agent LangGraph pipeline.</td><td><code>_build_graph()</code>, <code>run_pipeline()</code>, <code>_halt_if_errors()</code></td></tr>
-      <tr><td><code>core/compiled_schema.py</code></td><td>Precomputes stable/history field sets and related transactional structure.</td><td><code>CompiledScenario</code>, <code>compile_scenario()</code>, <code>infer_history_field_sets()</code></td></tr>
-      <tr><td><code>core/runtime_cache.py</code></td><td>In-process cache for runtime artifacts.</td><td>cache/clear helpers</td></tr>
-      <tr><td><code>core/llm_client.py</code></td><td>Gemini client wrapper and LLM interaction boundary.</td><td><code>GeminiClient</code></td></tr>
-      <tr><td><code>agents/orchestrator.py</code></td><td>Pre-generation scenario gate.</td><td><code>OrchestratorAgent</code></td></tr>
-      <tr><td><code>agents/schema_agent.py</code></td><td>Semantic rule derivation from the confirmed CSV schema + scenario context.</td><td><code>SchemaAgent</code>, <code>_scenario_semantics()</code></td></tr>
-      <tr><td><code>agents/data_generation_agent.py</code></td><td>Generic generator implementations, dependency execution, transactional generation, formulas, validation/repair, optional QA.</td><td><code>_generate_record()</code>, <code>_transactional_records()</code>, <code>_validate_record()</code>, <code>DataGenerationAgent</code></td></tr>
-      <tr><td><code>config/industry_profiles.py</code></td><td>Industry/country grounding information for contextual reasoning.</td><td>industry profile definitions</td></tr>
+      <tr><th>File</th><th>Responsibility</th></tr>
+      <tr><td><code>server.py</code></td><td>Four public scenario APIs, request/response models, errors, request correlation.</td></tr>
+      <tr><td><code>core/agentic_models.py</code></td><td>Pydantic contracts for intent, resolved concepts, compiled schema and propose request/response.</td></tr>
+      <tr><td><code>core/agentic_workflow.py</code></td><td>Proposal lifecycle, conversation integration, deterministic schema compilation and HITL safety checks.</td></tr>
+      <tr><td><code>agents/intent_agent.py</code></td><td>PydanticAI + Gemini intent extraction only.</td></tr>
+      <tr><td><code>agents/schema_compiler.py</code></td><td>Deterministic registry-to-schema compiler.</td></tr>
+      <tr><td><code>core/telecom_registry.py</code></td><td>Runtime SQLite registry, provenance, aliases, graph validation and generation-policy application.</td></tr>
+      <tr><td><code>core/standards_ingestion.py</code></td><td>Normalizer for machine-readable standards artifacts; currently provides Swagger/OpenAPI ingestion.</td></tr>
+      <tr><td><code>scripts/ingest_standards.py</code></td><td>Rebuild command for the runtime registry.</td></tr>
+      <tr><td><code>core/conversation_store.py</code></td><td>Persistent chat context.</td></tr>
+      <tr><td><code>core/dynamic_scenarios.py</code></td><td>Drafts, confirmed scenarios, scenario metadata and feedback.</td></tr>
+      <tr><td><code>core/pipeline.py</code></td><td>LangGraph generation workflow.</td></tr>
+      <tr><td><code>agents/orchestrator.py</code></td><td>Scenario validation/routing and agent-stage orchestration.</td></tr>
+      <tr><td><code>agents/schema_agent.py</code></td><td>Existing rules/semantic stage for non-agentic execution; approved agentic scenarios use persisted contract semantics.</td></tr>
+      <tr><td><code>agents/data_generation_agent.py</code></td><td>Deterministic generation, dependency ordering, grouping, formulas and repair.</td></tr>
+      <tr><td><code>core/runtime_cache.py</code></td><td>Process-local runtime artifact cache and invalidation.</td></tr>
     </table>
   </section>
 
-  <section id="design">
-    <h2>10. Design rules and useful debugging checkpoints</h2>
-
+  <section id="runbook">
+    <h2>11. Production Deployment</h2>
     <div class="grid">
-      <div class="card"><h3>Rule 1 — CSV before LLM</h3><p>When a generated field is wrong, first inspect the normalized variable produced by <code>parse_definition_csv()</code>. A malformed generator, dtype, params, dependency, or formula can propagate all the way into generation.</p></div>
-      <div class="card"><h3>Rule 2 — dependencies are executable semantics</h3><p><code>depends_on</code> and formula references are not documentation only; they affect generation order and can create cycle failures.</p></div>
-      <div class="card"><h3>Rule 3 — transactional shape matters</h3><p>The split between stable and history fields influences output structure. Timestamp placement and entity-key behavior can therefore change how a scenario is generated.</p></div>
-      <div class="card"><h3>Rule 4 — LLM rules are advisory relative to explicit CSV contracts</h3><p>Business semantics can be enriched by Gemini, but explicit CSV formulas and generator parameters remain deterministic constraints.</p></div>
-      <div class="card"><h3>Rule 5 — cache state matters</h3><p>When changing a confirmed scenario, stale compiled or runtime artifacts can cause confusing “old behavior.” The confirmation path explicitly invalidates the relevant caches for this reason.</p></div>
-      <div class="card"><h3>Rule 6 — QA can mask generator defects</h3><p>Because validation repairs values, the final output can look correct even when an earlier generator/rule is producing the wrong initial value. Debugging may require inspecting the pre-repair path.</p></div>
+      <div class="card"><h3>Immutable resources</h3><p><code>resources/telecom/</code> contains model artifacts and generation profiles shipped with the build. They are read-only inputs to registry construction.</p></div>
+      <div class="card"><h3>Mutable runtime state</h3><p><code>runtime_data/</code> is created automatically at startup for the registry, scenarios and conversations. Mount it on durable storage in production.</p></div>
+      <div class="card"><h3>Configuration</h3><p>Secrets and deployment-specific values are supplied through environment variables. CORS is explicit by default; production deployments should set approved origins.</p></div>
+      <div class="card"><h3>Container</h3><p>The supplied Dockerfile runs the service as a non-root user and copies only application source and immutable resources into the image.</p></div>
+    </div>
+    <h2>12. Run and operate</h2>
+    <h3>Install</h3>
+    <pre>pip install -r requirements.txt</pre>
+
+    <h3>Environment</h3>
+    <pre>GOOGLE_API_KEY=...
+GEMINI_API_KEY=...
+PYDANTIC_AI_GEMINI_MODEL=gemini-3.8-flash
+GEMINI_MODEL=gemini-3.8-flash</pre>
+    <p class="small">Pydantic AI's current Google integration uses <code>GoogleModel</code>/<code>GoogleProvider</code> backed by the <code>google-genai</code> SDK. Google's current SDK documentation likewise recommends the unified <code>google-genai</code> client for Gemini integrations.</p>
+
+    <h3>Run</h3>
+    <pre>uvicorn server:app --reload</pre>
+
+    <h3>Rebuild runtime registry</h3>
+    <pre>python scripts/ingest_standards.py</pre>
+
+    <h3>MVP-to-production evolution</h3>
+    <div class="grid">
+      <div class="card"><h3>Now</h3><p>Three standards packs (TM Forum, 3GPP, MEF), SQLite runtime registry, PydanticAI intent agent, four scenario APIs, persisted HITL through scenario confirmation, and deterministic generation.</p></div>
+      <div class="card"><h3>Next</h3><p>Replace curated MVP subsets with pinned official TM Forum, 3GPP and MEF machine-readable artifacts, preserve model/release lineage, and add graph search with formal evidence.</p></div>
+      <div class="card"><h3>Later</h3><p>Multi-domain standards packs, tenant-scoped registries, asynchronous generation jobs, richer provenance, large-scale data sinks and production observability.</p></div>
     </div>
 
-    <h4>Typical debugging sequence</h4>
-    <pre>1. Inspect request payload / uploaded CSV
-2. Inspect parse_definition_csv() output
-3. Inspect confirmed scenario in SQLite
-4. Inspect WorkflowState entering the graph
-5. Inspect SchemaAgent rules
-6. Inspect dependency order in _generate_record()
-7. Inspect raw generated values before _validate_record()
-8. Inspect repairs + validation_report
-9. Inspect final response shaping in server.py</pre>
-
-    <div class="note"><strong>Architecture in one sentence:</strong> FastAPI accepts a CSV-defined schema, SQLite persists the normalized scenario, LangGraph coordinates semantic validation and rule derivation, deterministic Python generators execute the schema in dependency order, and a repair/validation layer produces the final records.</div>
-  </section>
-
-  <section>
-    <h2>11. Key execution path to keep in mind</h2>
-    <div class="diagram">
-      <div class="mermaid">
-flowchart TD
-  U[User uploads CSV] --> P[parse_definition_csv]
-  P --> N[Normalized variables + field_order]
-  N --> SD[save_draft]
-  SD --> CF[confirm_scenario]
-  CF --> DB[(Confirmed SQLite scenario)]
-  DB --> RS[resolve scenario]
-  RS --> WP[run_pipeline]
-  WP --> OA[Orchestrator]
-  OA --> SA[Schema Agent / Gemini]
-  SA --> RULES[Machine-readable rules]
-  RULES --> DG[Data Generation Agent]
-  DG --> ORDER[Dependency order]
-  ORDER --> GEN[Generic generators]
-  GEN --> SEM[Conditional / semantic constraints]
-  SEM --> FORM[Authoritative formula evaluation]
-  FORM --> QA[Deterministic validation + repair]
-  QA --> OUT[final_records + validation_report]
-  OUT --> API[FastAPI response]
-      </div>
-    </div>
-    <p class="small">This diagram is intentionally aligned with the current branch rather than an earlier proposal-based architecture.</p>
+    <div class="note"><strong>Engineering invariant:</strong> a user request can be ambiguous; a proposal can be incomplete; generation cannot proceed from an unresolved or unconfirmed schema.</div>
   </section>
 </main>
+
+<footer>
+  INGENII architecture snapshot — aligned with the current four-API MVP implementation and standards-backed runtime registry.
+</footer>
 </body>
 </html>

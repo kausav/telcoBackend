@@ -1,6 +1,10 @@
 .env
+.venv/
+venv/
 __pycache__/
-*.pyc
-output_*.csv
-.venv*
-/data/*
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+runtime_data/
+*.db

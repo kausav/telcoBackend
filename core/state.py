@@ -15,7 +15,7 @@ class WorkflowState(BaseModel):
     records_per_user: int = 10
 
     # Complete confirmed scenario context.  The generator pipeline receives the
-    # Full context persisted by the CSV import/confirm flow.
+    # Full context persisted by the propose/confirm flow.
     # use case and business intent, rather than only industry/country/type.
     domain: str = ""
     business_scenario: str = ""

@@ -1,6 +1,6 @@
 """
 Generation pipeline (Gemini-powered), orchestrated as a LangGraph StateGraph.
-The CSV import is the source of truth for scenario variables and user-history generation settings.
+The confirmed scenario contract is the source of truth for generation variables and user-history settings.
 """
 from __future__ import annotations
 import logging

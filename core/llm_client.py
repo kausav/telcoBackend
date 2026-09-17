@@ -1,63 +1,60 @@
-from __future__ import annotations
-import json
-import os
-import logging
-import re
-from urllib.request import Request as UrlRequest, urlopen
+"""Gemini client wrapper used by the legacy generation pipeline.
 
-from fastapi import HTTPException
+The agentic schema proposal path uses PydanticAI directly; this client remains for
+legacy generation/QA stages. No secret or infrastructure detail is returned to API clients.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from typing import Any
+
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+
+from config.runtime import ROOT
+
+load_dotenv(ROOT / ".env", override=False)
 
 logger = logging.getLogger(__name__)
 
 
-def _public_egress_ip() -> str | None:
-    """Best-effort public egress address used by the deployed service."""
-    try:
-        req = UrlRequest("https://api.ipify.org", headers={"User-Agent": "telco-backend/1.0"})
-        with urlopen(req, timeout=2.0) as response:
-            value = response.read(64).decode("ascii", errors="ignore").strip()
-        if re.fullmatch(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F:]+", value):
-            return value
-    except Exception:
-        logger.warning("Unable to determine public egress IP", exc_info=True)
-    return None
-
-
-def _raise_llm_upstream_error(exc: Exception) -> None:
-    """Turn Gemini/network failures into a diagnosable HTTP 502."""
-    public_ip = _public_egress_ip()
-    raw = str(exc)[:3000]
-    safe = re.sub(
+def _safe_provider_error(exc: Exception) -> str:
+    raw = str(exc)[:2000]
+    return re.sub(
         r"(?i)(api[_-]?key|token|authorization|bearer|password|secret)\s*[:=]\s*[^\s,;]+",
         r"\1=[REDACTED]",
         raw,
     )
-    details = {
-        "provider": "Google Gemini",
-        "provider_error": safe,
-        "action": "If this is an IP allowlist/network restriction, whitelist the reported public_egress_ip for the deployed service.",
-        "public_egress_ip": public_ip or "Unable to determine automatically; check the deployment's outbound/NAT public IP.",
-    }
-    raise HTTPException(502, detail={"error": "LLM upstream request failed", "details": details}) from exc
-
-load_dotenv()  # loads .env from the project root
 
 
 class GeminiClient:
-    """Thin wrapper around google-genai for structured JSON generation."""
-
-    MODEL = "gemini-3.6-flash"
+    """Thin, synchronous wrapper around the supported ``google-genai`` SDK."""
 
     def __init__(self, api_key: str | None = None) -> None:
-        key = api_key or os.getenv("GEMINI_API_KEY")
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:
+            raise RuntimeError("google-genai is required. Install requirements.txt.") from exc
+
+        key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not key:
-            raise EnvironmentError(
-                "Set the GEMINI_API_KEY environment variable before running."
-            )
-        self._client = genai.Client(api_key=key)
+            raise EnvironmentError("Set GEMINI_API_KEY or GOOGLE_API_KEY before starting the service.")
+
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+        timeout_ms = max(1000, int(os.getenv("GEMINI_TIMEOUT_MS", "60000")))
+        retry_attempts = max(1, min(6, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "4"))))
+        retry_options = types.HttpRetryOptions(
+            attempts=retry_attempts,
+            initial_delay=1.0,
+            max_delay=20.0,
+            http_status_codes=[408, 429, 500, 502, 503, 504],
+        )
+        http_options = types.HttpOptions(timeout=timeout_ms, retry_options=retry_options)
+        self._types = types
+        self._client = genai.Client(api_key=key, http_options=http_options)
 
     def generate_json(
         self,
@@ -65,55 +62,50 @@ class GeminiClient:
         user_prompt: str,
         temperature: float = 0.7,
     ) -> dict | list:
-        """Call Gemini and parse the response as JSON."""
-        # Gemini 3.x is optimized around its default sampling configuration.
-        # Keep the public method signature unchanged for all agents, but do not send
-        # legacy sampling knobs to Gemini 3.x. This is especially important on the
-        # generation path, where the orchestrator/schema agents can otherwise fail
-        # before any records are produced.
-        config_kwargs = {
+        config_kwargs: dict[str, Any] = {
             "system_instruction": system_instruction,
             "response_mime_type": "application/json",
         }
-        if not self.MODEL.startswith("gemini-3"):
+        if not self.model.startswith("gemini-3"):
             config_kwargs["temperature"] = temperature
+
         try:
             response = self._client.models.generate_content(
-                model=self.MODEL,
-                config=types.GenerateContentConfig(**config_kwargs),
+                model=self.model,
+                config=self._types.GenerateContentConfig(**config_kwargs),
                 contents=user_prompt,
             )
         except Exception as exc:
-            _raise_llm_upstream_error(exc)
+            logger.exception("Gemini JSON request failed")
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=502,
+                detail={"error": "LLM upstream request failed", "details": {"provider": "Google Gemini", "reason": _safe_provider_error(exc)}},
+            ) from exc
+
         text = (response.text or "").strip()
-        # Gemini occasionally wraps JSON in ```json ... ``` fences despite response_mime_type.
         if text.startswith("```"):
-            text = text.strip("`")
-            text = text[4:] if text.startswith("json") else text
-            text = text.strip()
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Gemini returned invalid JSON: {exc}") from exc
 
-    def generate_text(
-        self,
-        system_instruction: str,
-        user_prompt: str,
-        temperature: float = 0.4,
-    ) -> str:
-        """Call Gemini and return plain text."""
-        config_kwargs = {"system_instruction": system_instruction}
-        if not self.MODEL.startswith("gemini-3"):
+    def generate_text(self, system_instruction: str, user_prompt: str, temperature: float = 0.4) -> str:
+        config_kwargs: dict[str, Any] = {"system_instruction": system_instruction}
+        if not self.model.startswith("gemini-3"):
             config_kwargs["temperature"] = temperature
         try:
             response = self._client.models.generate_content(
-                model=self.MODEL,
-                config=types.GenerateContentConfig(**config_kwargs),
+                model=self.model,
+                config=self._types.GenerateContentConfig(**config_kwargs),
                 contents=user_prompt,
             )
         except Exception as exc:
-            _raise_llm_upstream_error(exc)
-        return response.text.strip()
-    
-    
+            logger.exception("Gemini text request failed")
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=502,
+                detail={"error": "LLM upstream request failed", "details": {"provider": "Google Gemini", "reason": _safe_provider_error(exc)}},
+            ) from exc
+        return (response.text or "").strip()

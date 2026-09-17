@@ -1,0 +1,31 @@
+{
+  "profile": {
+    "profile_id": "ingenii-telecom-standards-generation-v1",
+    "profile_version": "1.0.0",
+    "owner": "INGENII",
+    "description": "Deterministic generation overlay for the telecom standards-backed MVP. This file defines generation behavior only; it does not define industry semantics.",
+    "applies_to": ["telecom", "prepaid", "charging", "usage", "network"]
+  },
+  "fields": {
+    "online_charging_session.charging_session_id": {"generator":"unique_id","params":{"prefix":"OCS-","digits":10},"derived_formula":null,"depends_on":[]},
+    "online_charging_session.session_start_timestamp": {"generator":"timestamp","params":{"lookback_days":365},"derived_formula":null,"depends_on":[]},
+    "online_charging_session.session_status": {"generator":"weighted_choice","params":{"choices":["STARTED","ACTIVE","ENDED"],"weights":[0.05,0.15,0.80]},"derived_formula":null,"depends_on":[]},
+    "cdr_record.cdr_record_id": {"generator":"unique_id","params":{"prefix":"CDR-","digits":10},"derived_formula":null,"depends_on":[]},
+    "cdr_record.record_timestamp": {"generator":"timestamp","params":{"lookback_days":365},"derived_formula":null,"depends_on":[]},
+    "cdr_record.record_status": {"generator":"weighted_choice","params":{"choices":["OPEN","CLOSED"],"weights":[0.05,0.95]},"derived_formula":null,"depends_on":[]},
+    "subscriber_ethernet_service.service_id": {"generator":"unique_id","params":{"prefix":"MEF-ETH-","digits":9},"derived_formula":null,"depends_on":[]},
+    "subscriber_ethernet_service.service_type": {"generator":"weighted_choice","params":{"choices":["POINT_TO_POINT","MULTIPOINT_TO_MULTIPOINT","ROOTED_MULTIPOINT"],"weights":[0.60,0.25,0.15]},"derived_formula":null,"depends_on":[]},
+    "subscriber_ethernet_service.service_status": {"generator":"weighted_choice","params":{"choices":["ACTIVE","SUSPENDED","TERMINATED"],"weights":[0.94,0.04,0.02]},"derived_formula":null,"depends_on":[]},
+    "subscriber_ethernet_service.committed_information_rate_mbps": {"generator":"range","params":{"min":10,"max":10000,"precision":0},"derived_formula":null,"depends_on":[]},
+    "subscriber_uni.uni_id": {"generator":"unique_id","params":{"prefix":"UNI-","digits":9},"derived_formula":null,"depends_on":[]},
+    "subscriber_uni.port_speed_mbps": {"generator":"weighted_choice","params":{"choices":[100,1000,10000],"weights":[0.30,0.55,0.15]},"derived_formula":null,"depends_on":[]},
+    "subscriber_uni.encapsulation": {"generator":"weighted_choice","params":{"choices":["VLAN","UNTAGGED"],"weights":[0.80,0.20]},"derived_formula":null,"depends_on":[]},
+    "internet_access_service.internet_access_service_id": {"generator":"unique_id","params":{"prefix":"MEF-IA-","digits":9},"derived_formula":null,"depends_on":[]},
+    "internet_access_service.service_type": {"generator":"weighted_choice","params":{"choices":["BASIC","ADVANCED"],"weights":[0.70,0.30]},"derived_formula":null,"depends_on":[]},
+    "internet_access_service.service_status": {"generator":"weighted_choice","params":{"choices":["ACTIVE","SUSPENDED","TERMINATED"],"weights":[0.95,0.03,0.02]},"derived_formula":null,"depends_on":[]},
+    "internet_access_service.access_speed_mbps": {"generator":"weighted_choice","params":{"choices":[100,300,500,1000,2000,5000,10000],"weights":[0.08,0.12,0.22,0.32,0.12,0.08,0.06]},"derived_formula":null,"depends_on":[]},
+    "ip_uni.ip_uni_id": {"generator":"unique_id","params":{"prefix":"IPUNI-","digits":9},"derived_formula":null,"depends_on":[]},
+    "ip_uni.access_link_speed_mbps": {"generator":"weighted_choice","params":{"choices":[100,1000,10000],"weights":[0.30,0.55,0.15]},"derived_formula":null,"depends_on":[]},
+    "ip_uni.vlan_id": {"generator":"range","params":{"min":1,"max":4094,"precision":0},"derived_formula":null,"depends_on":[]}
+  }
+}

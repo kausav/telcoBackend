@@ -29,7 +29,7 @@ def _scenario_semantics(state, variables: list[dict]) -> dict:
 
     This is intentionally not tied to any one scenario type or field name.  The
     hierarchy is:
-      1) explicit CSV value/formula constraints remain authoritative;
+      1) explicit confirmed-contract value/formula constraints remain authoritative;
       2) explicit outcome language in expected_outcome/business_response/business_scenario
          overrides generic scenario-type defaults;
       3) scenario_type supplies a fallback intent (positive/negative/mixed);
@@ -238,9 +238,9 @@ SEMANTIC ACCURACY IS MANDATORY:
   success/completion/approval/acceptance, corresponding outcome booleans should be true; if it
   clearly requires failure/rejection/decline/error, they should be false. For mixed/distribution
   scenarios, preserve the declared distribution instead of forcing one outcome.
-- CSV literal values/formulas remain authoritative. CSV categorical choices define the allowed set;
+- Confirmed literal values/formulas remain authoritative. Confirmed categorical choices define the allowed set;
   semantic rules may choose the appropriate value from that set, but may never invent values outside it.
-- CSV params are hard constraints, not hints. Preserve every explicit choice/value, numeric min/max,
+- Confirmed scenario params are hard constraints, not hints. Preserve every explicit choice/value, numeric min/max,
   bucket distribution, weight list, precision, currency, timezone, delay/range, and dependency.
 - When params contain buckets=[...];weights=[...], the buckets are inclusive numeric intervals and the
   corresponding weights define the sampling distribution. Never replace bucket sampling with a generic
@@ -291,6 +291,20 @@ class SchemaAgent:
         VARS, _ = dyn
         self._variables = VARS
 
+        # Approved agentic schemas are registry-compiled and HITL-approved.
+        # Do not let a downstream LLM rewrite or augment their semantic rules.
+        if (state.scenario_context or {}).get("agentic"):
+            cache_key = self._cache_key(state)
+            cached = get_schema(cache_key)
+            if cached is not None:
+                state.rules = cached
+                logger.info("[SchemaAgent] Agentic cache hit; LLM skipped.")
+                return state
+            state.rules = self._deterministic_agentic_rules(VARS)
+            set_schema(cache_key, state.rules)
+            logger.info("[SchemaAgent] Agentic scenario: registry rules compiled deterministically; LLM skipped.")
+            return state
+
         cache_key = self._cache_key(state)
         cached = get_schema(cache_key)
         if cached is not None:
@@ -339,7 +353,7 @@ class SchemaAgent:
             "Before returning, audit every field AND every categorical value for industry/country relevance. "
             "A syntactically valid value from another industry is still invalid and must be replaced. "
             "Do not use telecom entities as generic providers for non-telecom industries. "
-            "Timestamp rules are also part of the confirmed CSV contract. If a datetime field declares "
+            "Timestamp rules are also part of the confirmed scenario contract. If a datetime field declares "
             "params.timestamp_format (or params.format), treat that exact format as presentation authority. "
             "Do not invent or change timestamp formats. Timestamp arithmetic/formulas must be evaluated using real "
             "datetime values, then serialized back using the field's declared timestamp format. "
@@ -478,6 +492,48 @@ class SchemaAgent:
                     len(rules.get("cross_field_rules", [])))
         return state
 
+
+    @staticmethod
+    def _deterministic_agentic_rules(variables: list[dict]) -> dict:
+        """Build generation rules solely from the approved canonical registry schema."""
+        names = {str(v.get("name")) for v in variables if v.get("name")}
+        constraints: dict[str, dict] = {}
+        formulas: list[dict] = []
+        for var in variables:
+            name = str(var.get("name") or "")
+            params = dict(var.get("params") or {}) if isinstance(var.get("params"), dict) else {}
+            gc = {}
+            for key in ("choices", "values", "min", "max", "buckets", "weights", "precision", "currency", "target", "mapping", "country", "timezone", "prefix", "digits"):
+                if key in params:
+                    gc["valid_values" if key == "choices" else key] = params[key]
+            constraints[name] = gc
+            if var.get("formula"):
+                formulas.append({"field": name, "expression": str(var["formula"])})
+
+        temporal = []
+        def edge(before: str, after: str, reason: str):
+            if before in names and after in names:
+                temporal.append({"before": before, "after": after, "min_delay_seconds": 0, "reason": reason})
+        edge("recharge_timestamp", "charge_timestamp", "Charging cannot precede a recharge event when the charge is the resulting balance action.")
+        edge("usage_timestamp", "charge_timestamp", "Charging must occur at or after the usage event it rates.")
+        return {
+            "scenario_summary": "HITL-approved registry schema; no LLM semantic augmentation.",
+            "business_rules": [
+                "Entity, field and relationship vocabulary is frozen to the approved registry snapshot.",
+                "Unknown fields, values and relationships are non-executable.",
+            ],
+            "field_constraints": {name: {"description": str(next((v.get("description", "") for v in variables if v.get("name") == name), "")), "nullable": bool(next((v.get("nullable", False) for v in variables if v.get("name") == name), False))} for name in names},
+            "cross_field_rules": [
+                "Successful recharge increases the prepaid balance; failed/reversed recharge does not apply as a completed top-up.",
+                "Charging timestamps must not precede their referenced usage timestamps.",
+            ],
+            "conditional_rules": [],
+            "generation_constraints": constraints,
+            "formula_rules": formulas,
+            "temporal_rules": temporal,
+            "scenario_semantics": {"mode": "agentic", "outcome_mode": "mixed"},
+        }
+
     def _validate_schema(self, state: WorkflowState) -> WorkflowState:
         """Schema validation layer: catch missing variables, missing rules, and
         incomplete logic (formulas referencing undefined fields) before any
@@ -503,7 +559,7 @@ class SchemaAgent:
                 problems.append(f"variable '{v.get('name')}' has a formula but no formula_rules entry")
 
         # Incomplete logic: malformed or drifting formula references should not halt
-        # CSV-first pipelines. Keep only parseable, schema-safe authoritative formulas.
+        # Scenario-contract pipelines. Keep only parseable, schema-safe authoritative formulas.
         authoritative_fields = {str(v.get("name")) for v in variables if v.get("formula")}
         valid_formula_rules: list[dict] = []
         skipped_formula_messages: list[str] = []

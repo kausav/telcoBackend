@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,25 +11,29 @@ from pydantic import BaseModel, Field
 from typing import Literal
 
 from core.pipeline import run_pipeline
-from core.csv_scenario import infer_type_of_data, parse_definition_csv
 from core.dynamic_scenarios import (
     add_feedback,
     confirm_scenario,
     get_draft,
     new_draft_id,
     next_scenario_id,
+    save_draft,
     pop_draft,
     resolve_scenario_id_from_draft,
     resolve_scenario_meta,
     resolve_data_type,
     resolve_scenario_context,
     resolve_variables,
-    save_draft,
     scenario_exists,
 )
 from core.compiled_schema import invalidate_scenario, infer_history_field_sets
 from core.runtime_cache import clear_scenario
+from core.agentic_models import ScenarioProposeRequest, ScenarioImportResponse
+from core.csv_scenario import infer_type_of_data, parse_definition_csv
 from config.industry_profiles import COUNTRY_BASE
+from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES
+from core.agentic_workflow import AgenticSchemaWorkflow
+from core.telecom_registry import RegistryError, get_registry
 
 
 
@@ -59,9 +64,30 @@ from core.error_handlers import (
 from core.errors import ErrorResponse
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Validate immutable model inputs and initialize mutable runtime state once per process."""
+    try:
+        registry = get_registry()
+        health = registry.health()
+        if not health["healthy"]:
+            raise RegistryError("Telecom standards registry is empty")
+        logger.info(
+            "Standards registry ready: standards=%s entities=%s attributes=%s relationships=%s",
+            health["standards"], health["entities"], health["attributes"], health["relationships"],
+        )
+    except Exception:
+        logger.exception("Application startup validation failed")
+        raise
+    yield
+
+
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.0.0",
+    version="2.3.0",
+    lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
@@ -89,9 +115,9 @@ async def request_id_middleware(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
 )
 
 
@@ -119,18 +145,6 @@ class GenerateResponse(BaseModel):
     record_errors: list[dict] = Field(default_factory=list)
 
 
-class ScenarioImportResponse(BaseModel):
-    success: bool = True
-    draft_id: str
-    scenario_id: str
-    label: str
-    journey: str
-    description: str
-    variables: list[dict]
-    field_order: list[str]
-    typeOfData: Literal["transactional", "aggregational"]
-    entityKey: str | None = None
-
 
 class VariableEdit(BaseModel):
     name: str
@@ -139,9 +153,9 @@ class VariableEdit(BaseModel):
 
 class ConfirmRequest(BaseModel):
     draft_id: str
-    add: list[dict] = Field(default_factory=list, description="New variable definitions to add")
-    edit: list[VariableEdit] = Field(default_factory=list, description="Existing variables to edit by name")
-    delete: list[str] = Field(default_factory=list, description="Variable names to delete")
+    add: list[dict] = Field(default_factory=list, description="New variable definitions for legacy/imported drafts; agentic drafts reject new semantics")
+    edit: list[VariableEdit] = Field(default_factory=list, description="HITL edits to existing variables")
+    delete: list[str] = Field(default_factory=list, description="HITL deletion of existing variables")
     feedback: str | None = None
 
 
@@ -168,16 +182,42 @@ def root():
 
 @app.get("/health")
 def health():
-    """Health check."""
+    """Liveness check; does not depend on external providers."""
     return {"status": "ok"}
 
 
-def _country_from_csv_params(variables: list[dict]) -> str | None:
-    """Infer country code/name from CSV variable params when present.
+@app.get("/ready")
+def ready():
+    """Readiness check for deployment probes."""
+    registry_health = get_registry().health()
+    if not registry_health.get("healthy"):
+        raise HTTPException(status_code=503, detail={"error": "Telecom standards registry is not ready"})
+    return {"status": "ready", "registry": {
+        "standards": registry_health["standards"],
+        "entities": registry_health["entities"],
+    }}
 
-    This lets CSV definitions be self-contained. If country is declared in params,
-    the importer prefers that over payload country.
-    """
+
+def _read_csv_upload(file: UploadFile) -> str:
+    """Read a UTF-8 CSV with an explicit size ceiling."""
+    filename = (file.filename or "").strip().lower()
+    if filename and not filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail={"error": "Only .csv files are accepted"})
+
+    raw = file.file.read(MAX_CSV_BYTES + 1)
+    if len(raw) > MAX_CSV_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": f"CSV exceeds the configured size limit of {MAX_CSV_BYTES} bytes"},
+        )
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail={"error": f"CSV must be UTF-8 encoded: {exc}"}) from exc
+
+
+def _country_from_csv_params(variables: list[dict]) -> str | None:
+    """Infer country code/name from CSV variable params when present."""
     currency_to_country: dict[str, str] = {}
     phone_to_country: dict[str, str] = {}
     country_name_to_code: dict[str, str] = {}
@@ -214,25 +254,20 @@ def _country_from_csv_params(variables: list[dict]) -> str | None:
         return None
 
     def _scan_text_hints(text: str) -> list[str]:
-        """Extract country signals from free text (description/examples/params strings)."""
         hits: list[str] = []
         if not text:
             return hits
-        normalized_text = str(text)
-        # Tokenize while keeping + for phone country codes.
-        tokens = [t for t in re.split(r"[^A-Za-z0-9+]+", normalized_text) if t]
+        tokens = [t for t in re.split(r"[^A-Za-z0-9+]+", str(text)) if t]
         for token in tokens:
             mapped = _normalize_country_hint(token)
             if mapped:
                 hits.append(mapped)
-        # Country names can include spaces, so also scan full lowercase text.
-        lower_text = normalized_text.lower()
+        lower_text = str(text).lower()
         for name, code in country_name_to_code.items():
             if name in lower_text:
                 hits.append(code)
-        # Prefer currency signals in textual phrases like "amount in INR".
         for currency in known_currency_codes:
-            if re.search(rf"\b{re.escape(currency)}\b", normalized_text, flags=re.IGNORECASE):
+            if re.search(rf"\b{re.escape(currency)}\b", str(text), flags=re.IGNORECASE):
                 hits.append(currency_to_country[currency])
         return hits
 
@@ -240,37 +275,16 @@ def _country_from_csv_params(variables: list[dict]) -> str | None:
     for var in variables:
         if not isinstance(var, dict):
             continue
-        # Free-text hints outside params.
         for text_key in ("description", "name"):
             candidates.extend(_scan_text_hints(str(var.get(text_key, ""))))
-
         params = var.get("params")
         if not isinstance(params, dict):
             continue
-
-        # Direct explicit keys.
         for key in ("country", "country_code", "countryCode"):
             value = params.get(key)
-            if value is None:
-                continue
             normalized = _normalize_country_hint(value)
             if normalized:
                 candidates.append(normalized)
-        currency_value = params.get("currency")
-        if currency_value is not None:
-            normalized = _normalize_country_hint(currency_value)
-            if normalized:
-                candidates.append(normalized)
-
-        # List-style country hints.
-        country_codes = params.get("country_codes")
-        if isinstance(country_codes, list):
-            for entry in country_codes:
-                normalized = _normalize_country_hint(entry)
-                if normalized:
-                    candidates.append(normalized)
-
-        # Generic scan across all string/list params for hints embedded in arbitrary keys.
         for value in params.values():
             if isinstance(value, str):
                 candidates.extend(_scan_text_hints(value))
@@ -278,14 +292,12 @@ def _country_from_csv_params(variables: list[dict]) -> str | None:
                 for item in value:
                     if isinstance(item, str):
                         candidates.extend(_scan_text_hints(item))
-
     if not candidates:
         return None
-    # Most frequent normalized token wins for deterministic behavior.
     counts: dict[str, int] = {}
-    for c in candidates:
-        counts[c] = counts.get(c, 0) + 1
-    return sorted(counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
+    for candidate in candidates:
+        counts[candidate] = counts.get(candidate, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
 
 
 @app.post("/scenario/import-csv", response_model=ScenarioImportResponse)
@@ -304,75 +316,109 @@ def import_scenario_csv(
     label: str = Form(""),
     entityKey: str | None = Form(None),
 ):
-    """Import a CSV variable definition and create a draft for confirmation/generation."""
-    raw=file.file.read()
-    try:
-        csv_text=raw.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(400,detail={"error":f"CSV must be UTF-8 encoded: {exc}"}) from exc
-    try:
-        requested_type=(str(typeOfData).strip().lower() if typeOfData else None)
-        detected_type=requested_type or infer_type_of_data(csv_text)
-        variables,field_order=parse_definition_csv(csv_text,type_of_data=detected_type)
-    except ValueError as exc:
-        raise HTTPException(400,detail={"error":str(exc)}) from exc
-    typeOfData=detected_type
-    csv_country=_country_from_csv_params(variables)
-    effective_country=csv_country or country
-    variable_names={v["name"] for v in variables}
-    if typeOfData=="transactional":
-        if entityKey:
-            token=str(entityKey).strip(); entityKey=next((n for n in variable_names if n.lower()==token.lower()),None)
-        if not entityKey:
-            preferred=("subscriber_id","customer_id","account_id","user_id","entity_id","customer_key","entity_key","id")
-            entityKey=next((n for n in preferred if n in variable_names),None) or next(iter(variable_names),None)
-        if not entityKey:
-            raise HTTPException(400,detail={"error":"Transactional CSV must contain at least one user/entity identifier field"})
-    else:
-        entityKey=None
+    """Import a CSV scenario definition and create an explicit CSV/HITL draft.
 
-    draft_id=new_draft_id()
-    draft={
-        "label":label or scenarioId,
-        "journey":domain,
-        "description":businessScenario or f"Scenario imported from CSV for {domain}",
-        "variables":variables,
-        "field_order":field_order,
-        "domain":domain,
-        "business_scenario":businessScenario,
-        "business_response":businessResponse,
-        "expected_outcome":expectedOutcome,
-        "use_case":useCase,
-        "scenario_id":scenarioId,
-        "scenario_type":scenarioType,
-        "industry_type":industryType,
-        "country":effective_country,
-        "type_of_data":typeOfData,
-        "entity_key":entityKey,
-        "records_per_user":10,
+    This path remains intentionally separate from /scenario/propose so clients can
+    choose between an explicit CSV schema definition and agentic schema proposal.
+    """
+    csv_text = _read_csv_upload(file)
+
+    try:
+        requested_type = str(typeOfData).strip().lower() if typeOfData else None
+        detected_type = requested_type or infer_type_of_data(csv_text)
+        variables, field_order = parse_definition_csv(csv_text, type_of_data=detected_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    csv_country = _country_from_csv_params(variables)
+    effective_country = csv_country or country
+    variable_names = {str(v.get("name")) for v in variables if isinstance(v, dict) and v.get("name")}
+
+    if detected_type == "transactional":
+        if entityKey:
+            token = str(entityKey).strip()
+            entityKey = next((name for name in variable_names if name.lower() == token.lower()), None)
+        if not entityKey:
+            preferred = (
+                "subscriber_id", "customer_id", "account_id", "user_id",
+                "entity_id", "customer_key", "entity_key", "id",
+            )
+            entityKey = next((name for name in preferred if name in variable_names), None)
+            entityKey = entityKey or next(iter(variable_names), None)
+        if not entityKey:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "Transactional CSV must contain at least one user/entity identifier field"},
+            )
+    else:
+        entityKey = None
+
+    draft_id = new_draft_id()
+    draft = {
+        "label": label or scenarioId,
+        "journey": domain,
+        "description": businessScenario or f"Scenario imported from CSV for {domain}",
+        "variables": variables,
+        "field_order": field_order,
+        "domain": domain,
+        "business_scenario": businessScenario,
+        "business_response": businessResponse,
+        "expected_outcome": expectedOutcome,
+        "use_case": useCase,
+        "scenario_id": scenarioId,
+        "scenario_type": scenarioType,
+        "industry_type": industryType,
+        "country": effective_country,
+        "type_of_data": detected_type,
+        "entity_key": entityKey,
+        "records_per_user": 10,
+        "agentic": False,
+        "source": "csv_import",
     }
-    save_draft(draft_id,draft)
-    return ScenarioImportResponse(success=True,draft_id=draft_id,scenario_id=scenarioId,label=draft["label"],journey=draft["journey"],description=draft["description"],variables=variables,field_order=field_order,typeOfData=typeOfData,entityKey=entityKey)
+    save_draft(draft_id, draft)
+
+    return ScenarioImportResponse(
+        success=True,
+        draft_id=draft_id,
+        scenario_id=scenarioId,
+        label=draft["label"],
+        journey=draft["journey"],
+        description=draft["description"],
+        variables=variables,
+        field_order=field_order,
+        typeOfData=detected_type,
+        entityKey=entityKey,
+    )
+
 
 
 @app.post("/scenario/confirm", response_model=ConfirmResponse)
 def confirm_scenario_route(req: ConfirmRequest):
-    """Finalize an imported CSV draft, applying optional variable edits."""
+    """HITL approval boundary: approve/edit the draft and persist it for /scenario/generate."""
     draft=get_draft(req.draft_id)
     if draft is None:
         raise HTTPException(404,detail={"error":f"Unknown or expired draft_id '{req.draft_id}'"})
-    variables=[dict(v) for v in draft.get("variables",[]) if isinstance(v,dict)]
-    by_name={str(v.get("name")):v for v in variables if v.get("name")}
-    for name in req.delete:
-        if not _is_placeholder(name): by_name.pop(name,None)
-    for edit in req.edit:
-        if _is_placeholder(edit.name): continue
-        changes=_clean_dict(edit.changes or {})
-        if edit.name in by_name and changes: by_name[edit.name].update(changes)
-    for new_var in req.add:
-        cleaned=_clean_dict(new_var); name=cleaned.get("name")
-        if not _is_placeholder(name): by_name[str(name)]=cleaned
-    variables=list(by_name.values()); field_order=[str(v["name"]) for v in variables if v.get("name")]
+
+    if draft.get("agentic"):
+        try:
+            variables, field_order = AgenticSchemaWorkflow.validate_hitl_changes(
+                draft, req.add, req.edit, req.delete
+            )
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    else:
+        variables=[dict(v) for v in draft.get("variables",[]) if isinstance(v,dict)]
+        by_name={str(v.get("name")):v for v in variables if v.get("name")}
+        for name in req.delete:
+            if not _is_placeholder(name): by_name.pop(name,None)
+        for edit in req.edit:
+            if _is_placeholder(edit.name): continue
+            changes=_clean_dict(edit.changes or {})
+            if edit.name in by_name and changes: by_name[edit.name].update(changes)
+        for new_var in req.add:
+            cleaned=_clean_dict(new_var); name=cleaned.get("name")
+            if not _is_placeholder(name): by_name[str(name)]=cleaned
+        variables=list(by_name.values()); field_order=[str(v["name"]) for v in variables if v.get("name")]
     type_of_data=draft.get("type_of_data","aggregational")
 
     entity_key=draft.get("entity_key") if type_of_data=="transactional" else None
@@ -397,6 +443,21 @@ def confirm_scenario_route(req: ConfirmRequest):
     if not _is_placeholder(req.feedback): add_feedback(draft.get("domain",""),draft.get("business_scenario",""),req.feedback)
     pop_draft(req.draft_id)
     return ConfirmResponse(success=True,scenario_id=scenario_id,requested_scenario_id=requested_scenario_id,scenario_id_reassigned=requested_scenario_id is not None and scenario_id!=requested_scenario_id,draft_id=req.draft_id,label=meta["label"],journey=meta["journey"],description=meta["description"],variables=variables,field_order=field_order,typeOfData=type_of_data,entityKey=entity_key)
+
+
+@app.post("/scenario/propose", response_model=ScenarioImportResponse)
+def propose_scenario(req: ScenarioProposeRequest):
+    """Create a standards-backed dynamic schema draft from the JSON request body.
+
+    The response intentionally preserves the former scenario-import response contract so the existing frontend
+    can reuse the same HITL review screen and call /scenario/confirm unchanged.
+    """
+    try:
+        return AgenticSchemaWorkflow(registry=get_registry()).propose(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    except (RuntimeError, EnvironmentError) as exc:
+        raise HTTPException(status_code=503, detail={"error": str(exc)}) from exc
 
 
 @app.post("/scenario/generate", response_model=GenerateResponse)

@@ -1,10 +1,10 @@
 """
-Shared store for imported and confirmed CSV variable definitions.
+Shared store for proposed drafts and confirmed scenario definitions.
 
 Imported scenario drafts and confirmed scenarios are persisted in SQLite.
 (not plain process-memory dicts) so that they are visible across all uvicorn
-worker processes, not just the one that happened to handle the
-/scenario/import-csv or /scenario/confirm call. They are still wiped if the DB
+worker processes, not just the one that happened to handle a
+/scenario/propose or /scenario/confirm call. They are still wiped if the DB
 file is deleted / the volume is reset.
 """
 from __future__ import annotations
@@ -17,10 +17,9 @@ import uuid
 from contextlib import contextmanager
 from typing import Any
 
-_DB_PATH = os.environ.get(
-    "DYNAMIC_SCENARIOS_DB",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dynamic_scenarios.db"),
-)
+from config.runtime import DYNAMIC_SCENARIOS_DB
+
+_DB_PATH = str(DYNAMIC_SCENARIOS_DB)
 
 _DRAFT_TTL_SECONDS = int(os.environ.get("DRAFT_TTL_SECONDS", 24 * 3600))
 
@@ -82,8 +81,9 @@ def _purge_expired_drafts(conn: sqlite3.Connection) -> None:
 
 
 def next_scenario_id() -> str:
-    """Next free LB-0N id, considering all confirmed dynamic scenarios."""
+    """Return the next free legacy ``LB-N`` id with a write lock for concurrency."""
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute("SELECT scenario_id FROM confirmed").fetchall()
     existing = [r[0] for r in rows]
     nums = [int(m.group(1)) for k in existing if (m := re.match(r"LB-(\d+)$", k))]
