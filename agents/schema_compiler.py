@@ -68,12 +68,14 @@ class SchemaCompiler:
                 target = params.get("target")
                 if target and str(target) not in entity_ids:
                     continue
+                if entity_key and entity_key.lower() == "subscriber_id" and attr.name == "customer_id":
+                    continue
                 if (
                     entity_key
                     and attr.name.lower() != entity_key.lower()
                     and entity.canonical_id == root_entity
                     and attr.name.endswith("_id")
-                    and (target or attr.name in {"customer_id", "account_id", "user_id", "entity_id"})
+                    and attr.name not in {"account_id"}
                 ):
                     continue
                 names.add(attr.name)
@@ -108,7 +110,7 @@ class SchemaCompiler:
         if selected_ids & {"internet_access_service", "ip_uni", "subscriber_ethernet_service", "subscriber_uni"}:
             supporting_ids = {"subscriber_ethernet_service", "subscriber_uni", "subscriber", "product_offering", "customer_account"}
         elif selected_ids & {"recharge", "prepaid_account", "bucket", "balance_action_history", "usage_event", "charging_event"} or intent.subdomain == "prepaid":
-            supporting_ids = {"subscriber", "usage_event", "charging_event", "online_charging_session", "cdr_record", "product_offering"}
+            supporting_ids = {"subscriber", "customer_account", "usage_event", "charging_event", "online_charging_session", "cdr_record", "product_offering"}
         else:
             supporting_ids = {"subscriber", "product_offering", "customer_account", "customer"}
         allowed_expansion_ids = domain_ids | supporting_ids
@@ -156,7 +158,7 @@ class SchemaCompiler:
                 )
             elif selected_ids & {"recharge", "prepaid_account", "bucket", "balance_action_history", "usage_event", "charging_event"} or intent.subdomain == "prepaid":
                 fallback_entities = (
-                    "usage_event", "charging_event", "online_charging_session", "cdr_record", "product_offering",
+                    "customer_account", "usage_event", "charging_event", "online_charging_session", "cdr_record", "product_offering",
                 )
             else:
                 fallback_entities = (
@@ -205,12 +207,13 @@ class SchemaCompiler:
                 target = params.get("target")
                 if target and str(target) not in entity_ids:
                     continue
-                # For the scenario's root entity, keep the requested entity key as the
-                # single root identifier. Other master-account/customer foreign-key IDs
-                # are redundant in the projected response unless they are independently
-                # requested as the entity key.
+                # Subscriber-centric prepaid responses keep subscriber_id and account_id
+                # as the two logical identity fields. customer_id is intentionally omitted
+                # because it is not required by the requested subscriber-level contract.
+                if entity_key and entity_key.lower() == "subscriber_id" and attr.name == "customer_id":
+                    continue
                 if entity_key and attr.name != entity_key and entity.canonical_id == self._root_entity_for_key(entity_key, entities):
-                    if attr.name.endswith("_id") and (target or attr.name in {"customer_id", "account_id", "user_id", "entity_id"}):
+                    if attr.name.endswith("_id") and attr.name not in {"account_id"}:
                         continue
                 seen_fields.add(attr.name)
                 fields.append(GeneratedSchemaField(

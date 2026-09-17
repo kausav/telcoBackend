@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Literal
 
 from core.pipeline import run_pipeline
@@ -152,10 +152,20 @@ class VariableEdit(BaseModel):
 
 
 class ConfirmRequest(BaseModel):
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "draft_id": "draft-169b76e5e0854c868c4110ada99afc7a",
+            "add": [],
+            "edit": [],
+            "delete": [],
+            "feedback": None,
+        }
+    })
+
     draft_id: str
-    add: list[dict] = Field(default_factory=list, description="New variable definitions for legacy/imported drafts; agentic drafts reject new semantics")
-    edit: list[VariableEdit] = Field(default_factory=list, description="HITL edits to existing variables")
-    delete: list[str] = Field(default_factory=list, description="HITL deletion of existing variables")
+    add: list[dict] = Field(default_factory=list, description="Optional new variable definitions for legacy/imported drafts; leave empty for agentic proposals")
+    edit: list[VariableEdit] = Field(default_factory=list, description="Optional HITL edits to existing variables")
+    delete: list[str] = Field(default_factory=list, description="Optional variable names to delete")
     feedback: str | None = None
 
 

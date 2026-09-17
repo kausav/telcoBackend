@@ -108,14 +108,13 @@
       ]
     },
     "subscriber.account_id": {
-      "generator": "reference",
+      "generator": "unique_id",
       "params": {
-        "target": "customer_account"
+        "prefix": "ACC-",
+        "digits": 9
       },
       "derived_formula": null,
-      "depends_on": [
-        "customer_account"
-      ]
+      "depends_on": []
     },
     "subscriber.msisdn": {
       "generator": "msisdn",

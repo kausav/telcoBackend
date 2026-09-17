@@ -175,6 +175,8 @@ class AgenticSchemaWorkflow:
         for name in delete:
             if name not in fields_by_name:
                 raise ValueError(f"HITL cannot delete unknown agentic field '{name}'")
+            if name == "account_id" and draft.get("entity_key") == "subscriber_id":
+                raise ValueError("HITL cannot delete required prepaid account_id for subscriber-centric agentic scenarios")
             if fields_by_name[name].required:
                 raise ValueError(f"HITL cannot delete required field '{name}'")
 

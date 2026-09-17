@@ -191,6 +191,7 @@ Deterministic QA / reconciliation</pre>
 
     <h3>3.1 <code>POST /scenario/propose</code></h3>
     <p>The request body is the business-facing JSON contract. The backend derives technical schema details, resolves concepts against the TM Forum / 3GPP / MEF runtime registry, and deterministically builds an approved-registry schema containing at least 20 variables before HITL confirmation.</p>
+    <p>For subscriber-centric prepaid scenarios, the flat response contract uses <code>subscriber_id</code> as the entity key and retains <code>account_id</code> as the subscriber's prepaid account reference. <code>customer_id</code> is intentionally not projected into this response.</p>
     <pre>{
   "scenarioId": "LB-01",
   "scenarioType": "Normal",
@@ -221,7 +222,7 @@ Deterministic QA / reconciliation</pre>
     <p>The parser supports the existing client CSV conventions for types, generators, dependency aliases, timestamp formats, numeric buckets, weights, precision, currency and related deterministic parameters. The resulting response is the same <code>ScenarioImportResponse</code> used by <code>/scenario/propose</code>, including <code>requested_scenario_id</code>.</p>
 
     <h3>3.3 <code>POST /scenario/confirm</code></h3>
-    <p>This is the only HITL action API. It accepts <code>draft_id</code>, optional safe field edits, deletions, and feedback.</p>
+    <p>This is the only HITL action API. It accepts <code>draft_id</code>, optional safe field edits, deletions, and feedback. For an unchanged agentic proposal, send empty <code>add</code>, <code>edit</code>, and <code>delete</code> arrays; Swagger's placeholder values such as <code>"string"</code> are not valid field names.</p>
     <pre>{
   "draft_id": "draft-...",
   "add": [],
