@@ -15,7 +15,7 @@ from typing import Any, Iterable
 import json
 import re
 
-ASN1_NORMALIZER_VERSION = "2.1"
+ASN1_NORMALIZER_VERSION = "2.6"
 
 try:
     import yaml
@@ -93,6 +93,28 @@ def _definitions_from_openapi(document: dict[str, Any]) -> dict[str, Any]:
     return document.get("definitions") or document.get("components", {}).get("schemas", {}) or {}
 
 
+def _openapi_resolve_ref(ref: str, definitions: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve a local OpenAPI/Swagger component reference.
+
+    OpenAPI models frequently reference both object models and scalar value/enumeration
+    definitions. Only object definitions represent registry entities; scalar references
+    remain attributes and must not become broken entity relationships.
+    """
+    target = _ref_fragment_name(ref)
+    if not target:
+        return None
+    value = definitions.get(target)
+    if not isinstance(value, dict):
+        return None
+    return value
+
+
+def _schema_is_object(schema: dict[str, Any] | None) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    return bool(schema.get("type") == "object" or schema.get("properties") or schema.get("allOf"))
+
+
 def _merge_all_of(schema: dict[str, Any], definitions: dict[str, Any]) -> dict[str, Any]:
     merged = dict(schema)
     properties = dict(merged.get("properties") or {})
@@ -131,7 +153,8 @@ def _build_entity(
     definitions: dict[str, Any] | None = None,
     ref_entity_resolver: Any | None = None,
 ) -> dict[str, Any]:
-    schema = _merge_all_of(schema, definitions or {}) if definitions is not None else schema
+    definitions = definitions or {}
+    schema = _merge_all_of(schema, definitions) if definitions else schema
     cid = _namespaced(source_id, schema_name)
     required = set(schema.get("required") or [])
     attributes: list[dict[str, Any]] = []
@@ -141,25 +164,39 @@ def _build_entity(
     for field_name, prop in properties.items():
         if not isinstance(prop, dict):
             continue
-        enum_values = prop.get("enum") or []
-        dtype = _type_from_schema(prop)
+
+        # A property may be a $ref to either an object model or a scalar/enumeration
+        # definition. Resolve scalar references to their actual dtype/enum and only
+        # create a relationship when the referenced schema is an object model.
+        resolved_ref = _openapi_resolve_ref(str(prop.get("$ref") or ""), definitions) if prop.get("$ref") else None
+        effective_schema = dict(resolved_ref or {})
+        effective_schema.update({k: v for k, v in prop.items() if k != "$ref"})
+
+        enum_values = list(prop.get("enum") or (resolved_ref or {}).get("enum") or [])
+        dtype = _type_from_schema(effective_schema if effective_schema else prop)
         attr = {
             "name": str(field_name),
             "dtype": dtype,
             "required": field_name in required,
-            "nullable": bool(prop.get("nullable", False) or (isinstance(prop.get("type"), list) and "null" in prop.get("type", []))),
-            "description": prop.get("description", ""),
+            "nullable": bool(
+                effective_schema.get("nullable", False)
+                or (isinstance(effective_schema.get("type"), list) and "null" in effective_schema.get("type", []))
+            ),
+            "description": prop.get("description") or (resolved_ref or {}).get("description", ""),
             "enum_values": enum_values,
             "params": {
-                key: prop[key]
-                for key in ("format", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems")
-                if key in prop
+                key: effective_schema[key]
+                for key in (
+                    "format", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+                    "minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems"
+                )
+                if key in effective_schema
             },
         }
         attributes.append(attr)
 
         ref = prop.get("$ref")
-        if ref:
+        if ref and _schema_is_object(resolved_ref):
             target = ref_entity_resolver(ref) if ref_entity_resolver else _ref_target(ref)
             if target:
                 relationships.append({
@@ -169,17 +206,20 @@ def _build_entity(
                     "required": field_name in required,
                     "description": f"Reference from {schema_name}.{field_name} to {target}",
                 })
+
         items = prop.get("items") or {}
         if isinstance(items, dict) and items.get("$ref"):
-            target = ref_entity_resolver(items["$ref"]) if ref_entity_resolver else _ref_target(items["$ref"])
-            if target:
-                relationships.append({
-                    "target": _namespaced(source_id, target),
-                    "relation": "contains",
-                    "cardinality": "1:N",
-                    "required": field_name in required,
-                    "description": f"Collection reference from {schema_name}.{field_name} to {target}",
-                })
+            resolved_item = _openapi_resolve_ref(str(items["$ref"]), definitions)
+            if _schema_is_object(resolved_item):
+                target = ref_entity_resolver(items["$ref"]) if ref_entity_resolver else _ref_target(items["$ref"])
+                if target:
+                    relationships.append({
+                        "target": _namespaced(source_id, target),
+                        "relation": "contains",
+                        "cardinality": "1:N",
+                        "required": field_name in required,
+                        "description": f"Collection reference from {schema_name}.{field_name} to {target}",
+                    })
 
     return {
         "canonical_id": cid,
@@ -392,23 +432,28 @@ def normalize_json_schema_documents(
         for field_name, prop in (merged.get("properties") or {}).items():
             if not isinstance(prop, dict):
                 continue
-            enum_values = prop.get("enum") or []
-            dtype = _type_from_schema(prop)
+            resolved_ref = None
+            ref = prop.get("$ref")
+            if ref:
+                resolved_ref, _, _ = resolver(ref)
+            effective_schema = dict(resolved_ref or {})
+            effective_schema.update({k: v for k, v in prop.items() if k != "$ref"})
+            enum_values = list(prop.get("enum") or (resolved_ref or {}).get("enum") or [])
+            dtype = _type_from_schema(effective_schema if effective_schema else prop)
             attributes.append({
                 "name": str(field_name),
                 "dtype": dtype,
                 "required": field_name in required,
-                "nullable": bool(prop.get("nullable", False) or (isinstance(prop.get("type"), list) and "null" in prop.get("type", []))),
-                "description": prop.get("description", ""),
+                "nullable": bool(effective_schema.get("nullable", False) or (isinstance(effective_schema.get("type"), list) and "null" in effective_schema.get("type", []))),
+                "description": prop.get("description") or (resolved_ref or {}).get("description", ""),
                 "enum_values": enum_values,
                 "params": {
-                    key: prop[key]
+                    key: effective_schema[key]
                     for key in ("format", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems")
-                    if key in prop
+                    if key in effective_schema
                 },
             })
-            ref = prop.get("$ref")
-            if ref:
+            if ref and _schema_is_object(resolved_ref):
                 target = _resolve_schema_target_name(ref, path, source_root, entity_by_file, entity_by_name)
                 if target:
                     relationships.append({
@@ -420,15 +465,17 @@ def normalize_json_schema_documents(
                     })
             items = prop.get("items") or {}
             if isinstance(items, dict) and items.get("$ref"):
-                target = _resolve_schema_target_name(items["$ref"], path, source_root, entity_by_file, entity_by_name)
-                if target:
-                    relationships.append({
-                        "target": _namespaced(source_id, target),
-                        "relation": "contains",
-                        "cardinality": "1:N",
-                        "required": field_name in required,
-                        "description": f"Collection reference from {logical_name}.{field_name} to {target}",
-                    })
+                item_schema, _, _ = resolver(items["$ref"])
+                if _schema_is_object(item_schema):
+                    target = _resolve_schema_target_name(items["$ref"], path, source_root, entity_by_file, entity_by_name)
+                    if target:
+                        relationships.append({
+                            "target": _namespaced(source_id, target),
+                            "relation": "contains",
+                            "cardinality": "1:N",
+                            "required": field_name in required,
+                            "description": f"Collection reference from {logical_name}.{field_name} to {target}",
+                        })
         for ref, target_name in inherited_relations:
             target = _resolve_schema_target_name(ref, path, source_root, entity_by_file, entity_by_name) or target_name
             if target:
@@ -489,14 +536,20 @@ def _resolve_schema_target_name(ref: str, current_path: Path, source_root: Path,
 
 def _asn1_field_type(type_expr: str) -> str:
     lowered = type_expr.strip().lower()
-    if lowered.startswith("integer") or lowered in {"integer32", "integer64"}:
+    if lowered.startswith("sequence of") or lowered.startswith("set of"):
+        return "array"
+    if lowered.startswith("integer") or lowered in {"integer32", "integer64", "callduration", "duration", "countervalue"}:
         return "integer"
     if "real" in lowered or "double" in lowered:
         return "float"
     if lowered in {"boolean", "bool"}:
         return "boolean"
-    if "generalizedtime" in lowered or "utctime" in lowered or "timestamp" in lowered:
+    if lowered in {"null"}:
+        return "null"
+    if lowered in {"timestamp", "timestamptype", "datetime", "datetime-type"} or "generalizedtime" in lowered or "utctime" in lowered:
         return "datetime"
+    if lowered in {"msisdn", "imsi", "imei", "imeisv"}:
+        return "string"
     if "octet string" in lowered or "ia5string" in lowered or "utf8string" in lowered or "printablestring" in lowered:
         return "string"
     return "reference"
@@ -514,11 +567,24 @@ def normalize_asn1_documents(
 ) -> dict[str, Any]:
     """Index the composite ASN.1 model in a pinned 3GPP package."""
     combined = "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in files)
+    # 3GPP ASN.1 uses ``--`` comments heavily between a type declaration and
+    # its opening brace. Strip comments before structural parsing so forms such
+    # as ``PGWRecord ::= SET`` followed by explanatory comment lines and then
+    # ``{`` are parsed exactly like the compact form. Keep line breaks intact so
+    # field parsing and diagnostics remain stable.
+    combined = re.sub(r"--[^\n]*(?:\n|$)", "\n", combined)
     entity_pattern = re.compile(
         r"(?ms)^\s*([A-Za-z][A-Za-z0-9-]*)\s*::=\s*(SEQUENCE|SET|CHOICE)\s*\{(.*?)^\s*\}\s*;?"
     )
     enum_pattern = re.compile(
         r"(?ms)^\s*([A-Za-z][A-Za-z0-9-]*)\s*::=\s*ENUMERATED\s*\{(.*?)\}\s*;?"
+    )
+    # Named primitive aliases are common in 3GPP ASN.1 (for example
+    # ``CallDuration ::= INTEGER ...``). Resolve them so fields retain a useful
+    # concrete dtype rather than being incorrectly classified as generic
+    # references.
+    primitive_alias_pattern = re.compile(
+        r"(?ms)^\s*([A-Za-z][A-Za-z0-9-]*)\s*::=\s*(INTEGER|BOOLEAN|REAL|OCTET\s+STRING|UTF8String|IA5String|PrintableString|GeneralizedTime|UTCTime)\b"
     )
     # 3GPP ASN.1 record fields commonly look like either
     # ``[7] recordOpeningTime TimeStamp`` or, in the released 32.298 sources,
@@ -533,6 +599,18 @@ def normalize_asn1_documents(
     )
     entity_names = {m.group(1) for m in entity_pattern.finditer(combined)}
     named_enums: dict[str, list[str]] = {}
+    named_types: dict[str, str] = {}
+    for primitive_match in primitive_alias_pattern.finditer(combined):
+        alias_name = primitive_match.group(1)
+        alias_lower = alias_name.lower()
+        if alias_lower in {"timestamp", "timestamptype"}:
+            named_types[alias_name] = "datetime"
+        elif alias_lower in {"msisdn", "imsi", "imei", "imeisv"}:
+            named_types[alias_name] = "string"
+        elif alias_lower in {"callduration", "duration"}:
+            named_types[alias_name] = "integer"
+        else:
+            named_types[alias_name] = _asn1_field_type(primitive_match.group(2))
     for enum_match in enum_pattern.finditer(combined):
         values = [item.strip().split("(")[0].strip() for item in enum_match.group(2).split(",") if item.strip()]
         if values:
@@ -554,6 +632,8 @@ def normalize_asn1_documents(
             if named_type and named_type.group(1) in named_enums:
                 enum_values = list(named_enums[named_type.group(1)])
                 dtype = "string"
+            elif named_type and named_type.group(1) in named_types:
+                dtype = named_types[named_type.group(1)]
             inline = re.search(r"ENUMERATED\s*\{([^}]*)\}", cleaned_type, re.I | re.S)
             if inline:
                 enum_values = [item.strip().split("(")[0].strip() for item in inline.group(1).split(",") if item.strip()]

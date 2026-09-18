@@ -330,32 +330,59 @@ def sync_official_standards(
             shutil.rmtree(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        if source.kind == "archive":
-            extracted_root = source_dir / "extracted"
-            if extracted_root.exists():
-                shutil.rmtree(extracted_root)
-            extracted = _extract_archive(effective_downloaded, extracted_root, source.include, source.exclude)
-            if source.parser in {"asn1", "asn1_zip"} or source.format == "asn1":
-                files = [p for p in extracted if p.suffix.lower() in {".asn", ".asn1", ".asn1p"}]
-            elif source.parser in {"json_schema", "mef_schema"} or source.format in {"yaml", "json_schema"}:
-                files = [p for p in extracted if p.suffix.lower() in {".yaml", ".yml", ".json"}]
-            else:
-                files = [p for p in extracted if p.is_file()]
-        else:
-            files = [effective_downloaded]
-
         try:
-            generated = normalize_official_file(
-                files,
-                output_dir,
-                organization=source.organization,
-                artifact=source.artifact,
-                version=source.version,
-                source_url=source.url,
-                source_page=source.source_page,
-                source_id=source.source_id,
-                parser=source.parser,
-            )
+            if source.kind == "archive":
+                # Extract archives into the operating-system temp directory instead of
+                # runtime_data. On Windows, especially when the project lives under
+                # OneDrive, file/indexing sync can race newly-created directories/files
+                # and cause WinError 32 / FileNotFoundError during extraction. The
+                # extracted tree is only needed during normalization and is disposable.
+                with tempfile.TemporaryDirectory(
+                    prefix=f"ingenii-standards-{_safe_name(source.source_id)}-"
+                ) as extraction_tmp:
+                    extracted_root = Path(extraction_tmp) / "extracted"
+                    extracted = _extract_archive(
+                        effective_downloaded,
+                        extracted_root,
+                        source.include,
+                        source.exclude,
+                    )
+                    if source.parser in {"asn1", "asn1_zip"} or source.format == "asn1":
+                        files = [p for p in extracted if p.suffix.lower() in {".asn", ".asn1", ".asn1p"}]
+                        if not files:
+                            raise OfficialStandardsError(
+                                f"Official 3GPP archive {source.source_id} contained no ASN.1 files after extraction"
+                            )
+                    elif source.parser in {"json_schema", "mef_schema"} or source.format in {"yaml", "json_schema"}:
+                        files = [p for p in extracted if p.suffix.lower() in {".yaml", ".yml", ".json"}]
+                    else:
+                        files = [p for p in extracted if p.is_file()]
+
+                    generated = normalize_official_file(
+                        files,
+                        output_dir,
+                        organization=source.organization,
+                        artifact=source.artifact,
+                        version=source.version,
+                        source_url=source.url,
+                        source_page=source.source_page,
+                        source_id=source.source_id,
+                        parser=source.parser,
+                    )
+            else:
+                files = [effective_downloaded]
+                generated = normalize_official_file(
+                    files,
+                    output_dir,
+                    organization=source.organization,
+                    artifact=source.artifact,
+                    version=source.version,
+                    source_url=source.url,
+                    source_page=source.source_page,
+                    source_id=source.source_id,
+                    parser=source.parser,
+                )
+
             normalized_outputs.extend(generated)
             source_results.append({**metadata, "normalized_files": [str(p.relative_to(normalized_root)) for p in generated]})
         finally:

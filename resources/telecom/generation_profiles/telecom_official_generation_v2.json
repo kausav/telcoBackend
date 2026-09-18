@@ -1,9 +1,9 @@
 {
   "profile": {
     "profile_id": "ingenii-telecom-official-model-generation-v2",
-    "profile_version": "2.0.0",
+    "profile_version": "2.1.0",
     "owner": "INGENII",
-    "description": "INGENII synthetic-data generation policy overlay. Targets reference exact official model artifacts by source_id + model + field. This file controls generation behavior only; it does not define telecom semantics, types, enums, or relationships.",
+    "description": "Optional INGENII synthetic-data generation policy overlay. Targets reference exact official model artifacts by source_id + model + field. This file controls generation behavior only; it does not define telecom semantics, types, enums, or relationships. A target is advisory by default: if an official artifact/version does not contain the requested field, the registry logs a warning and continues. Set required=true on a target only when that overlay is mandatory for a deployment.",
     "applies_to": [
       "telecom",
       "prepaid",
@@ -24,7 +24,8 @@
         "min": 0,
         "max": 86400,
         "precision": 0
-      }
+      },
+      "required": false
     },
     {
       "source_id": "3gpp_32298_r19_v194",
@@ -33,7 +34,8 @@
       "generator": "timestamp",
       "params": {
         "lookback_days": 365
-      }
+      },
+      "required": false
     },
     {
       "source_id": "3gpp_32298_r19_v194",
@@ -42,7 +44,8 @@
       "generator": "msisdn",
       "params": {
         "country": "IN"
-      }
+      },
+      "required": false
     },
     {
       "source_id": "mef125_commit_c9c742a",
@@ -52,7 +55,8 @@
       "params": {
         "prefix": "MEF-",
         "digits": 10
-      }
+      },
+      "required": false
     },
     {
       "source_id": "mef139_commit_e89a376",
@@ -62,7 +66,8 @@
       "params": {
         "prefix": "MEF-",
         "digits": 10
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf620_v4",
@@ -72,7 +77,8 @@
       "params": {
         "prefix": "PO-",
         "digits": 8
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf620_v4",
@@ -88,7 +94,8 @@
           0.8,
           0.2
         ]
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf620_v4",
@@ -104,7 +111,8 @@
           0.97,
           0.03
         ]
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf620_v4",
@@ -113,7 +121,8 @@
       "generator": "timestamp",
       "params": {
         "lookback_days": 365
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf620_v4",
@@ -131,7 +140,8 @@
           0.1,
           0.05
         ]
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf629_v4",
@@ -141,7 +151,8 @@
       "params": {
         "prefix": "CUS-",
         "digits": 10
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf629_v4",
@@ -159,7 +170,8 @@
           0.12,
           0.03
         ]
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf629_v4",
@@ -177,7 +189,8 @@
           0.04,
           0.01
         ]
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf654_v4",
@@ -186,7 +199,8 @@
       "generator": "timestamp",
       "params": {
         "lookback_days": 365
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf654_v4",
@@ -196,7 +210,8 @@
       "params": {
         "prefix": "BKT-",
         "digits": 9
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf654_v4",
@@ -212,7 +227,8 @@
           0.9,
           0.1
         ]
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf654_v4",
@@ -221,7 +237,8 @@
       "generator": "timestamp",
       "params": {
         "lookback_days": 365
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf654_v4",
@@ -230,7 +247,8 @@
       "generator": "timestamp",
       "params": {
         "lookback_days": 365
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf654_v4",
@@ -240,7 +258,8 @@
       "params": {
         "prefix": "RCH-",
         "digits": 10
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf654_v4",
@@ -256,7 +275,8 @@
           0.92,
           0.08
         ]
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf654_v4",
@@ -267,7 +287,8 @@
         "min": 1,
         "max": 12,
         "precision": 0
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf654_v4",
@@ -276,7 +297,8 @@
       "generator": "timestamp",
       "params": {
         "lookback_days": 365
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf654_v4",
@@ -286,7 +308,8 @@
       "params": {
         "prefix": "VCH-",
         "digits": 12
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf666_v4",
@@ -304,7 +327,8 @@
           0.25,
           0.05
         ]
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf666_v4",
@@ -314,7 +338,8 @@
       "params": {
         "prefix": "ACC-",
         "digits": 10
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf666_v4",
@@ -323,7 +348,8 @@
       "generator": "timestamp",
       "params": {
         "lookback_days": 365
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf666_v4",
@@ -341,7 +367,8 @@
           0.06,
           0.02
         ]
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf666_v4",
@@ -359,7 +386,8 @@
           0.04,
           0.01
         ]
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf676_v4",
@@ -369,7 +397,8 @@
       "params": {
         "prefix": "AUTH-",
         "digits": 8
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf676_v4",
@@ -379,7 +408,8 @@
       "params": {
         "prefix": "CORR-",
         "digits": 10
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf676_v4",
@@ -389,7 +419,8 @@
       "params": {
         "prefix": "PAY-",
         "digits": 10
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf676_v4",
@@ -398,7 +429,8 @@
       "generator": "timestamp",
       "params": {
         "lookback_days": 365
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf676_v4",
@@ -418,7 +450,8 @@
           0.02,
           0.01
         ]
-      }
+      },
+      "required": false
     },
     {
       "source_id": "tmf676_v4",
@@ -427,7 +460,8 @@
       "generator": "timestamp",
       "params": {
         "lookback_days": 365
-      }
+      },
+      "required": false
     }
   ]
 }

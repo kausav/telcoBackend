@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -40,7 +41,9 @@ from core.official_standards import sync_official_standards, OfficialStandardsEr
 DEFAULT_STANDARDS_DIR = TELECOM_STANDARDS_DIR
 DEFAULT_PROFILES_DIR = TELECOM_PROFILES_DIR
 DEFAULT_DB_PATH = REGISTRY_DB_PATH
-REGISTRY_SCHEMA_VERSION = "4"
+REGISTRY_SCHEMA_VERSION = "7"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -862,10 +865,14 @@ class RegistryBuilder:
                 ).fetchall()
 
             if not entity_rows:
-                raise RegistryError(
+                message = (
                     f"Generation profile '{profile_id}' target does not exist in the official registry: "
                     f"{source_id}:{model}.{field}"
                 )
+                if bool(target.get("required", False)):
+                    raise RegistryError(message)
+                logger.warning(message + "; skipping optional generation policy target")
+                continue
 
             matched_fields = []
             for (canonical_id,) in entity_rows:
@@ -877,10 +884,14 @@ class RegistryBuilder:
                     matched_fields.append(canonical_id)
 
             if not matched_fields:
-                raise RegistryError(
+                message = (
                     f"Generation profile '{profile_id}' targets an attribute that is not present in the official registry: "
                     f"{source_id}:{model}.{field}"
                 )
+                if bool(target.get("required", False)):
+                    raise RegistryError(message)
+                logger.warning(message + "; skipping optional generation policy target")
+                continue
 
             for canonical_id in matched_fields:
                 conn.execute(
