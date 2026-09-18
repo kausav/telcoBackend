@@ -24,7 +24,7 @@ import urllib.request
 import zipfile
 from typing import Any, Iterable
 
-from core.standards_ingestion import normalize_official_file
+from core.standards_ingestion import ASN1_NORMALIZER_VERSION, normalize_official_file
 
 
 @dataclass(frozen=True)
@@ -242,7 +242,10 @@ def sync_official_standards(
 
         source_file_name = _safe_name(source.url.rsplit("/", 1)[-1] or source.source_id)
         downloaded = source_dir / source_file_name
-        cached_ok = (
+        # Raw-source validity is independent from the normalizer implementation.
+        # A parser/normalizer upgrade should re-index an already cached official
+        # artifact without forcing another network download.
+        raw_cached_ok = (
             downloaded.exists()
             and downloaded.stat().st_size > 0
             and source_meta.get("url") == source.url
@@ -250,7 +253,7 @@ def sync_official_standards(
         )
         effective_downloaded = downloaded
         temp: Path | None = None
-        if force or not cached_ok:
+        if force or not raw_cached_ok:
             # Clean only stale downloader artifacts. Never remove the canonical cache file.
             for stale in source_dir.glob("*.download"):
                 _best_effort_unlink(stale)
@@ -284,6 +287,7 @@ def sync_official_standards(
             "kind": source.kind,
             "format": source.format,
             "parser": source.parser,
+            "normalizer_version": ASN1_NORMALIZER_VERSION,
             "include": list(source.include),
             "exclude": list(source.exclude),
             "sha256": checksum,
@@ -307,6 +311,7 @@ def sync_official_standards(
                     and old_meta.get("version") == source.version
                     and old_meta.get("sha256") == checksum
                     and old_meta.get("parser") == source.parser
+                    and old_meta.get("normalizer_version") == ASN1_NORMALIZER_VERSION
                     and old_meta.get("include") == list(source.include)
                     and old_meta.get("exclude") == list(source.exclude)
                 )

@@ -15,6 +15,8 @@ from typing import Any, Iterable
 import json
 import re
 
+ASN1_NORMALIZER_VERSION = "2.1"
+
 try:
     import yaml
 except ImportError:  # pragma: no cover
@@ -518,7 +520,17 @@ def normalize_asn1_documents(
     enum_pattern = re.compile(
         r"(?ms)^\s*([A-Za-z][A-Za-z0-9-]*)\s*::=\s*ENUMERATED\s*\{(.*?)\}\s*;?"
     )
-    field_pattern = re.compile(r"(?m)^\s*([A-Za-z][A-Za-z0-9-]*)\s+([A-Za-z][A-Za-z0-9-]*(?:\s+(?:OPTIONAL|DEFAULT|SIZE|\{[^\n]*\}))*|[^,\n]+?)(?:\s+OPTIONAL|\s+DEFAULT\s+[^,\n]+)?\s*(?:,|$)")
+    # 3GPP ASN.1 record fields commonly look like either
+    # ``[7] recordOpeningTime TimeStamp`` or, in the released 32.298 sources,
+    # ``recordOpeningTime [7] TimeStamp``. Accept tags on either side of the
+    # official field name so the runtime index does not silently lose fields.
+    field_pattern = re.compile(
+        r"(?m)^\s*(?:\[[^\]]+\]\s*)*"
+        r"([A-Za-z][A-Za-z0-9-]*)\s*"
+        r"(?:\[[^\]]+\]\s*)*"
+        r"([^,\n]+?)"
+        r"(?:\s+OPTIONAL|\s+DEFAULT\s+[^,\n]+)?\s*(?:,|$)"
+    )
     entity_names = {m.group(1) for m in entity_pattern.finditer(combined)}
     named_enums: dict[str, list[str]] = {}
     for enum_match in enum_pattern.finditer(combined):
@@ -592,6 +604,7 @@ def normalize_asn1_documents(
             "artifact_version": version,
             "status": "official-source-sync",
             "source_kind": "official-asn1-model",
+            "normalizer_version": ASN1_NORMALIZER_VERSION,
             "source_url": source_url,
             "source_page": source_page,
         },
