@@ -56,7 +56,14 @@ class SchemaCompiler:
         for requested in intent.requested_entities:
             entity = self.registry.resolve_entity(requested)
             if entity is None:
-                unresolved.append(f"Unknown concept '{requested}' is not in the approved telecom registry")
+                # Requested entities are semantic hints from the LLM, not executable
+                # registry IDs. A business concept can legitimately have no one-to-one
+                # registry entity (for example ``retention_intervention``). Never guess a
+                # registry entity from a fuzzy match here: an incorrect entity silently
+                # changes the generated schema. Candidate variables, the requested entity
+                # key, domain grounding, and approved relationship expansion are the safe
+                # sources for executable registry entities. Unknown hints are therefore
+                # ignored rather than treated as confirmation-blocking errors.
                 continue
             if entity.canonical_id not in seen:
                 resolved.append(entity)

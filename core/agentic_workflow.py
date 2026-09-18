@@ -203,10 +203,20 @@ class AgenticSchemaWorkflow:
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Apply safe HITL changes to an agentic draft. No new semantics can be introduced."""
         schema = ScenarioSchema.model_validate(draft["schema"])
-        if schema.unresolved_items:
+        # Concept names extracted by the LLM are soft semantic hints. They may not have
+        # one-to-one registry entities and must never block HITL confirmation. Only hard
+        # executable failures (no usable fields / requested entity key not represented)
+        # block confirmation. This also makes older drafts containing legacy
+        # ``Unknown concept ...`` items confirmable without requiring a re-proposal.
+        blocking_unresolved = [
+            item for item in schema.unresolved_items
+            if not str(item).lower().startswith("unknown concept ")
+            and not str(item).lower().startswith("unknown requested concept ")
+        ]
+        if blocking_unresolved:
             raise ValueError(
-                "Cannot confirm an agentic draft with unresolved concepts: "
-                + "; ".join(schema.unresolved_items)
+                "Cannot confirm an agentic draft with unresolved executable requirements: "
+                + "; ".join(blocking_unresolved)
             )
         fields_by_name = {field.name: field for field in schema.fields}
 
