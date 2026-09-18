@@ -222,11 +222,12 @@ class AgenticSchemaWorkflow:
             )
         fields_by_name = {field.name: field for field in schema.fields}
 
+        mandatory_telecom = {"subscriber_id", "account_id", "msisdn"}
         for name in delete:
             if name not in fields_by_name:
                 raise ValueError(f"HITL cannot delete unknown agentic field '{name}'")
-            if name == "account_id" and draft.get("entity_key") == "subscriber_id":
-                raise ValueError("HITL cannot delete required prepaid account_id for subscriber-centric agentic scenarios")
+            if name in mandatory_telecom:
+                raise ValueError(f"HITL cannot delete mandatory telecom field '{name}'")
             if fields_by_name[name].required:
                 raise ValueError(f"HITL cannot delete required field '{name}'")
 

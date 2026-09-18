@@ -31,9 +31,12 @@ IMPORTANT BOUNDARIES:
 - Candidate variables are semantic ideas only. The deterministic compiler assigns executable generator contracts.
 - scenarioId is an identifier only and MUST NOT influence what variables are proposed.
 - Use scenarioType, domain, businessScenario, useCase, country, typeOfData, and entityKey together.
-- There is NO variable-count target and NO variable-count maximum. Return every semantically
-  justified candidate variable needed to satisfactorily represent the scenario. A smaller or
-  larger set is valid; NEVER pad with irrelevant variables and NEVER truncate for count.
+- There is NO variable-count target and NO variable-count maximum. Be COMPREHENSIVE: return as many
+  semantically relevant variables as the full registry supports for this scenario. Prefer high coverage
+  over minimality. NEVER truncate for count, but do not invent variables that have no plausible scenario
+  purpose. The compiler will additionally include all attributes from resolved registry entities.
+- For telecom transactional data, subscriber_id, account_id and msisdn are mandatory and must always be
+  present as stable entity-level fields.
 - Candidate variable names must be FRESH and should not simply copy a template or reference list.
 - Always include the requested entity key when it is meaningful for the requested grain.
 - For transactional data, distinguish stable entity/profile fields from repeated transaction/event/decision fields using grain.
@@ -242,10 +245,11 @@ class GeminiIntentAgent:
             f"Selected industry: {industry_type}\n"
             f"Business domain: {domain_query or '<none>'}\n"
             f"Country: {country or '<none>'}\n\n"
-            "Create a fresh scenario intent with NO artificial variable-count target or maximum. "
-            "Return every semantically justified variable needed to represent the requested scenario. "
-            "Fewer or more variables are valid. Never pad irrelevant fields, never truncate for count, "
-            "and never copy catalog/reference variable names as a template. Return JSON only."
+            "Create a comprehensive fresh scenario intent. There is NO artificial variable-count target or maximum. "
+            "Prefer the maximum set of relevant variables supported by the complete approved registry and the scenario semantics. "
+            "Never truncate for count. For transactional telecom scenarios, ALWAYS include subscriber_id, account_id, and msisdn. "
+            "Do not invent unsupported telecom entities or fields; the compiler will add all attributes from resolved registry entities. "
+            "Return JSON only."
         )
 
         try:

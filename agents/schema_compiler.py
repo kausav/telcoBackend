@@ -16,6 +16,11 @@ def _tokens(value: str) -> list[str]:
 class SchemaCompiler:
     """Compiles a scenario schema only from the runtime standards registry."""
 
+    # These fields are part of the public telecom row contract. Keep their exact
+    # names even when the rest of the schema uses fresh
+    # scenario-specific names. They are stable subscriber/account contact anchors.
+    REQUIRED_TELECOM_FIELDS = ("subscriber_id", "account_id", "msisdn")
+
     def __init__(self, registry: TelecomRegistry | None = None):
         self.registry = registry or TelecomRegistry()
 
@@ -106,8 +111,39 @@ class SchemaCompiler:
                     resolved.append(entity)
                     seen.add(entity.canonical_id)
 
-        # Prepaid is subscriber-centric in the platform contract. Add only the approved
-        # anchor; supporting account/event entities are added later by the graph expansion.
+        # Subscriber/account/MSISDN are mandatory for telecom proposals. Bring their
+        # authoritative registry entities into the compile set even when the LLM does not
+        # explicitly mention them. This guarantees a stable subscriber/account/contact
+        # context and allows the mandatory fields to use their real registry generators.
+        if (intent.industry_type or "telecom").strip().lower() in {"telecom", "telecommunications"}:
+            for anchor_id in ("subscriber", "customer_account", "customer"):
+                if self.registry.entity_exists(anchor_id) and anchor_id not in seen:
+                    resolved.append(self.registry.get_entity(anchor_id))
+                    seen.add(anchor_id)
+
+        # Maximize scenario coverage without dumping an unrelated universal catalog.
+        # Lexically match the complete business request/domain/use-case against every
+        # registry entity; every matching entity then participates in graph expansion.
+        # This is deliberately unbounded because the registry itself is the source of truth.
+        context_terms = " ".join(
+            str(value or "") for value in (
+                domain_query or intent.domain,
+                business_scenario or "",
+                use_case or intent.use_case,
+                scenario_type or intent.scenario_type,
+                *list(intent.requested_entities),
+            )
+        ).strip()
+        if context_terms:
+            for candidate in self.registry.search(context_terms, limit=None):
+                entity = self.registry.resolve_entity(candidate["canonical_id"])
+                if entity and entity.canonical_id not in seen:
+                    resolved.append(entity)
+                    seen.add(entity.canonical_id)
+
+        # Prepaid is subscriber-centric in the platform contract; graph expansion will add
+        # the connected prepaid/account/recharge/bucket/charging concepts when the registry
+        # relationships support them.
         if normalized_use_case == "prepaid" and self.registry.entity_exists("subscriber"):
             if "subscriber" not in seen:
                 resolved.append(self.registry.get_entity("subscriber"))
@@ -466,19 +502,86 @@ class SchemaCompiler:
         raw_ideas = [idea.model_dump() for idea in intent.candidate_variables]
         ideas: list[dict[str, object]] = []
         seen_idea_keys: set[str] = set()
-        for idea in raw_ideas:
-            key = self._normalize_variable_name(str(idea.get("name") or ""))
+
+        def add_idea(
+            idea: dict[str, object],
+            *,
+            force_name: str | None = None,
+            preserve_name: bool = False,
+        ) -> None:
+            item = dict(idea)
+            if force_name:
+                item["name"] = force_name
+            if preserve_name:
+                item["_preserve_name"] = True
+            key = self._normalize_variable_name(str(item.get("name") or ""))
             if not key or key in seen_idea_keys:
-                continue
+                return
             seen_idea_keys.add(key)
-            ideas.append(idea)
+            ideas.append(item)
+
+        # Mandatory telecom anchors first so they keep their exact public names and stable
+        # entity grain. They are always registry-backed.
+        if (intent.industry_type or "telecom").strip().lower() in {"telecom", "telecommunications"}:
+            mandatory_defs = {
+                "subscriber_id": ("subscriber", "subscriber_id", "Stable subscriber identifier."),
+                "account_id": ("subscriber", "account_id", "Stable subscriber account identifier."),
+                "msisdn": ("subscriber", "msisdn", "Subscriber MSISDN / mobile telephone number."),
+            }
+            for field_name in self.REQUIRED_TELECOM_FIELDS:
+                _, _, desc = mandatory_defs[field_name]
+                add_idea({
+                    "name": field_name,
+                    "description": desc,
+                    "role": "identity" if field_name.endswith("_id") else "profile",
+                    "grain": "entity",
+                    "dtype": "string",
+                    "depends_on": [],
+                })
+
+        for idea in raw_ideas:
+            add_idea(idea)
         if entity_key:
-            anchor_norm = self._normalize_variable_name(entity_key)
-            if anchor_norm not in seen_idea_keys:
-                ideas.insert(0, {"name": entity_key, "description": f"Stable identifier for the requested {intent.use_case or 'telecom'} entity.", "role": "identity", "grain": "entity", "dtype": "string", "depends_on": []})
-        # Intentionally do not truncate candidate variables. The scenario, LLM intent, and
-        # standards registry determine the appropriate width. ``max_variables`` is retained
-        # only for backward-compatible callers and is deliberately ignored.
+            add_idea({
+                "name": entity_key,
+                "description": f"Stable identifier for the requested {intent.use_case or 'telecom'} entity.",
+                "role": "identity",
+                "grain": "entity",
+                "dtype": "string",
+                "depends_on": [],
+            }, force_name=entity_key)
+
+        # Comprehensive mode: every attribute on every entity that survived scenario/entity
+        # resolution becomes a candidate unless the LLM already represented that concept.
+        # This is the mechanism that actually maximizes schema width; it is not limited by a
+        # fixed count. Exact registry attributes remain provenance-backed and deterministic.
+        for entity in entities:
+            for attr in entity.attributes:
+                add_idea({
+                    "name": attr.name,
+                    "description": attr.description or f"{entity.name} {attr.name} attribute.",
+                    "role": (
+                        "timing" if str(attr.dtype).lower() in {"datetime", "timestamp", "date"}
+                        else "measurement" if str(attr.dtype).lower() in {"float", "decimal", "number", "numeric", "int", "integer"}
+                        else "status" if "status" in attr.name.lower() or "state" in attr.name.lower()
+                        else "identity" if attr.name.lower().endswith("_id")
+                        else "other"
+                    ),
+                    "grain": "entity" if entity.canonical_id in {"subscriber", "customer", "customer_account", "prepaid_account"} else "transaction",
+                    "dtype": ("integer" if str(attr.dtype).lower() in {"int", "integer", "bigint", "smallint"} else
+                              "float" if str(attr.dtype).lower() in {"float", "decimal", "number", "numeric"} else
+                              "datetime" if str(attr.dtype).lower() in {"datetime", "timestamp"} else
+                              "date" if str(attr.dtype).lower() == "date" else
+                              "categorical" if attr.enum_values or str(attr.generator).lower() in {"weighted_choice", "dependent_choice", "categorical"} else
+                              "boolean" if str(attr.dtype).lower() in {"bool", "boolean"} else "string"),
+                    "depends_on": list(attr.depends_on),
+                    "_registry_entity": entity.canonical_id,
+                    "_registry_required": bool(attr.required),
+                    "_registry_nullable": bool(attr.nullable),
+                }, preserve_name=True)
+
+        # Intentionally do not truncate candidate variables. ``max_variables`` remains only
+        # for backward compatibility with older callers and is deliberately ignored.
 
         fields: list[GeneratedSchemaField] = []
         used_names: set[str] = set()
@@ -493,13 +596,22 @@ class SchemaCompiler:
         # First assign names so later dependency references can be resolved to the fresh names.
         for idea in ideas:
             current_requested = str(idea.get("name") or "scenario_attribute")
-            fresh = self._fresh_name(
-                current_requested,
-                str(idea.get("description") or ""),
-                used_names,
-                registry_names,
-                entity_key,
-            )
+            if current_requested in self.REQUIRED_TELECOM_FIELDS:
+                fresh = current_requested
+            elif bool(idea.get("_preserve_name")):
+                fresh = current_requested
+                if fresh in used_names:
+                    owner = str(idea.get("_registry_entity") or "registry").strip().lower().replace(" ", "_")
+                    scoped = f"{owner}_{current_requested}"
+                    fresh = scoped if scoped not in used_names else self._fresh_name(scoped, str(idea.get("description") or ""), used_names, set(), entity_key)
+            else:
+                fresh = self._fresh_name(
+                    current_requested,
+                    str(idea.get("description") or ""),
+                    used_names,
+                    registry_names,
+                    entity_key,
+                )
             used_names.add(fresh)
             name_map[self._normalize_variable_name(str(idea.get("name") or ""))] = fresh
 
@@ -508,7 +620,18 @@ class SchemaCompiler:
         for idea in ideas:
             original_name = str(idea.get("name") or "scenario_attribute")
             fresh = name_map[self._normalize_variable_name(original_name)]
-            matched = self._match_registry_attribute(idea, entities, used_registry)
+            matched = None
+            # Mandatory public telecom anchors use authoritative subscriber attributes
+            # directly, rather than allowing a generic account_id match to resolve to a
+            # different entity.
+            if original_name in self.REQUIRED_TELECOM_FIELDS:
+                subscriber = next((e for e in entities if e.canonical_id == "subscriber"), None)
+                if subscriber is not None:
+                    attr = next((a for a in subscriber.attributes if a.name == original_name), None)
+                    if attr is not None:
+                        matched = (subscriber, attr)
+            if matched is None:
+                matched = self._match_registry_attribute(idea, entities, used_registry)
             role = str(idea.get("role") or "other").lower()
             idea_text = f"{original_name} {idea.get('description', '')}".lower()
             outcome_semantic = role in {"status", "decision"} or any(token in idea_text for token in ("status", "state", "outcome", "decision", "result"))
@@ -538,14 +661,16 @@ class SchemaCompiler:
             role = str(idea.get("role") or "other")
             grain = str(idea.get("grain") or ("entity" if original_name == entity_key else "transaction"))
             deps = self._merge_dependencies(idea, name_map, grain, entity_key)
-            if original_name == entity_key:
+            if original_name == entity_key or original_name in self.REQUIRED_TELECOM_FIELDS:
                 grain = "entity"
                 deps = []
-            required = original_name == entity_key
-            nullable = False if required else True
+            registry_required = bool(idea.get("_registry_required")) if idea.get("_registry_required") is not None else False
+            registry_nullable = bool(idea.get("_registry_nullable")) if idea.get("_registry_nullable") is not None else True
+            required = original_name == entity_key or original_name in self.REQUIRED_TELECOM_FIELDS or registry_required
+            nullable = False if required else registry_nullable
             description = str(idea.get("description") or "").strip() or f"Scenario-specific {role.replace('_', ' ')} attribute for {intent.domain}."
             provenance = {
-                "generated_from": "semantic_variable_idea",
+                "generated_from": "registry_attribute" if idea.get("_preserve_name") else "semantic_variable_idea",
                 "canonical_entity": entity.canonical_id if entity else None,
                 "source_registry_attribute": getattr(attr, "name", None) if matched else None,
                 "grain": grain,
@@ -687,6 +812,9 @@ class SchemaCompiler:
         ]
         if entity_key:
             hard_constraints.append(f"'{entity_key}' is the authoritative entity key for transactional grouping.")
+        if (requested.industry_type or "telecom").strip().lower() in {"telecom", "telecommunications"}:
+            hard_constraints.append("subscriber_id, account_id and msisdn are mandatory non-null entity-level fields in telecom scenario schemas.")
+            hard_constraints.append("Schema width is comprehensive by default: every attribute exposed by scenario-relevant registry entities is considered, with no variable-count cap.")
         warnings = [
             "Scenario IDs are identifiers only; variables and generation rules are derived from the current request, registry grounding, and scenario semantics.",
         ]
