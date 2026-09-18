@@ -686,7 +686,39 @@ class SchemaCompiler:
                         dtype = "string"
             else:
                 entity = self._choose_entity_for_idea(idea, entities, None, entity_key)
-                runtime_generator, dtype, params = self._generic_contract_for_idea(idea, country, scenario_mode)
+                # Mandatory telecom anchors are application-level contract fields. They must
+                # always have real generators even when the official model uses a different
+                # identifier name or represents the identifier inside another object.
+                if original_name == "subscriber_id":
+                    runtime_generator, dtype, params = (
+                        "prefixed_int",
+                        "string",
+                        {"prefix": "SUB-", "digits": 10},
+                    )
+                elif original_name == "account_id":
+                    runtime_generator, dtype, params = (
+                        "id_mirror",
+                        "string",
+                        {
+                            "prefix": "ACC-",
+                            "source_field": "subscriber_id",
+                            "source_prefix": "SUB-",
+                        },
+                    )
+                elif original_name == "msisdn":
+                    iso = str(country or "IN").strip().upper()
+                    dial_codes = {
+                        "IN": "+91", "US": "+1", "CA": "+1", "GB": "+44", "AU": "+61",
+                        "AE": "+971", "SG": "+65", "DE": "+49", "FR": "+33", "IT": "+39",
+                    }
+                    dial = dial_codes.get(iso, iso if iso.startswith("+") else "+" + iso)
+                    runtime_generator, dtype, params = (
+                        "e164_phone",
+                        "string",
+                        {"country_codes": [dial], "country": iso},
+                    )
+                else:
+                    runtime_generator, dtype, params = self._generic_contract_for_idea(idea, country, scenario_mode)
 
             role = str(idea.get("role") or "other")
             grain = str(idea.get("grain") or ("entity" if original_name == entity_key else "transaction"))

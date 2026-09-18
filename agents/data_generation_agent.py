@@ -1006,8 +1006,79 @@ def _pick_timestamp_field(variables: list[dict]) -> str | None:
     return None
 
 
+def _enforce_mandatory_telecom_identity(
+    user_context: dict,
+    variables: list[dict],
+    *,
+    country: str | None = None,
+    used_values: dict[str, set[str]] | None = None,
+) -> dict:
+    """Repair mandatory telecom identity anchors before transactional grouping.
+
+    Confirmed scenarios can outlive compiler changes and may still contain legacy generic
+    generators that emit placeholders such as ``SUBSCRIBER_ID``, ``MSISDN`` or ``{}``.
+    These fields are part of the API contract, so generation must normalize them regardless
+    of the generator stored in the older confirmed draft.
+    """
+    out=dict(user_context)
+    names={str(v.get("name")) for v in variables if v.get("name")}
+    used_values = used_values if used_values is not None else {
+        "subscriber_id": set(), "account_id": set(), "msisdn": set()
+    }
+
+    def unique_prefixed(prefix: str, digits: int, field: str) -> str:
+        for _ in range(1000):
+            candidate=_prefixed_int({"prefix":prefix, "digits":digits}, out)
+            if candidate not in used_values[field]:
+                used_values[field].add(candidate)
+                return candidate
+        raise RuntimeError(f"Unable to generate a unique {field}")
+
+    if "subscriber_id" in names:
+        current=str(out.get("subscriber_id") or "")
+        if not re.fullmatch(r"SUB-[0-9]+", current) or current in used_values["subscriber_id"]:
+            current=unique_prefixed("SUB-", 10, "subscriber_id")
+        else:
+            used_values["subscriber_id"].add(current)
+        out["subscriber_id"]=current
+
+    if "account_id" in names:
+        subscriber=str(out.get("subscriber_id") or "")
+        suffix=re.search(r"([0-9]+)$", subscriber)
+        current=f"ACC-{suffix.group(1)}" if suffix else ""
+        if (not current) or current in used_values["account_id"]:
+            current=unique_prefixed("ACC-", 10, "account_id")
+        else:
+            used_values["account_id"].add(current)
+        out["account_id"]=current
+
+    if "msisdn" in names:
+        iso=str(country or "IN").strip().upper()
+        dial_codes={
+            "IN":"+91","US":"+1","CA":"+1","GB":"+44","AU":"+61",
+            "AE":"+971","SG":"+65","DE":"+49","FR":"+33","IT":"+39",
+        }
+        dial=dial_codes.get(iso, iso if iso.startswith("+") else "+"+iso)
+        current=str(out.get("msisdn") or "")
+        # Require an E.164-like value for the public MSISDN contract.
+        valid=bool(re.fullmatch(r"\+[1-9][0-9]{6,14}", current))
+        if (not valid) or current in used_values["msisdn"]:
+            for _ in range(1000):
+                candidate=_e164_phone({"country_codes":[dial], "country":iso}, out)
+                if candidate not in used_values["msisdn"]:
+                    current=candidate
+                    break
+            else:
+                raise RuntimeError("Unable to generate a unique msisdn")
+        used_values["msisdn"].add(current)
+        out["msisdn"]=current
+
+    return out
+
+
 def _transactional_records(compiled, user_count: int, records_per_user: int = 10,
-                            rules: dict | None = None, record_errors_out: list[dict] | None = None) -> list[dict]:
+                            rules: dict | None = None, record_errors_out: list[dict] | None = None,
+                            country: str | None = None) -> list[dict]:
     """Generate a fixed-length recent history for each user/entity.
 
     Stable user-context variables are generated once and copied into each row.
@@ -1018,7 +1089,9 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
     variables=list(compiled.variables); entity_key=compiled.entity_key
     records_per_user=max(1,min(50,int(records_per_user or 10)))
     timestamp_field=_pick_timestamp_field(variables)
-    generated=[]; used_entity_keys=set()
+    generated=[]
+    used_entity_keys=set()
+    used_identity_values={name:set() for name in ("subscriber_id", "account_id", "msisdn")}
 
     for user_index in range(user_count):
         try:
@@ -1028,14 +1101,47 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                 key_var=compiled.variable_by_name.get(entity_key)
                 if key_var:
                     user_context=_generate_selected_record(variables,{entity_key},base=user_context,rules=rules)
+            # Repair application-level telecom identity anchors before grouping. This is
+            # intentionally independent of the confirmed draft's stored generators so old
+            # scenarios cannot collapse all requested users into a single subscriber.
+            user_context=_enforce_mandatory_telecom_identity(
+                user_context,
+                variables,
+                country=country,
+                used_values=used_identity_values,
+            )
+
             if entity_key and entity_key in user_context:
                 attempts=0
-                while str(user_context[entity_key]) in used_entity_keys and attempts < 10:
+                while str(user_context[entity_key]) in used_entity_keys and attempts < 100:
                     key_var=compiled.variable_by_name.get(entity_key)
                     if key_var:
                         user_context=_generate_selected_record(variables,{entity_key},base=user_context,rules=rules)
                     attempts+=1
                 used_entity_keys.add(str(user_context.get(entity_key)))
+
+            # Enforce unique stable telecom identity anchors at the user/entity level.
+            # This prevents response grouping from collapsing multiple requested users into
+            # one object when a legacy/edited draft contains constant placeholder generators.
+            variable_names={str(v.get("name")) for v in variables if v.get("name")}
+            for identity_name in ("subscriber_id", "account_id", "msisdn"):
+                if identity_name not in variable_names:
+                    continue
+                identity_value=str(user_context.get(identity_name) or "")
+                attempts=0
+                while identity_value in used_identity_values[identity_name] and attempts < 100:
+                    if identity_name == "account_id":
+                        user_context=_generate_selected_record(
+                            variables,{"subscriber_id","account_id"},base=user_context,rules=rules
+                        )
+                    else:
+                        user_context=_generate_selected_record(
+                            variables,{identity_name},base=user_context,rules=rules
+                        )
+                    identity_value=str(user_context.get(identity_name) or "")
+                    attempts+=1
+                if identity_value:
+                    used_identity_values[identity_name].add(identity_value)
         except Exception as exc:
             err={"user_index":user_index,"error":str(exc),"record":{}}
             if record_errors_out is not None: record_errors_out.append(err)
@@ -1654,6 +1760,7 @@ def run_deterministic_agentic_generation(
             state.records_per_user,
             rules=state.rules,
             record_errors_out=state.record_errors,
+            country=state.country,
         )
     else:
         for index in range(state.count):

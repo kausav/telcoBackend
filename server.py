@@ -582,7 +582,13 @@ def generate_scenario(req: GenerateRequest):
             if timestamp_field:
                 rows=sorted(rows,key=lambda r: _timestamp_sort_key(r.get(timestamp_field)), reverse=True)
             latest=rows[0] if rows else {}
-            user_output={name: latest.get(name) for name in user_field_names if name in latest}
+            ordered_user_fields=[]
+            for name in user_fields:
+                if name in latest and name not in ordered_user_fields:
+                    ordered_user_fields.append(name)
+            if entity_key and entity_key in latest and entity_key not in ordered_user_fields:
+                ordered_user_fields.append(entity_key)
+            user_output={name: latest.get(name) for name in ordered_user_fields}
             user_output[entity_key]=entity_value
             clean_history=[]
             for row in rows[:records_per_user]:
