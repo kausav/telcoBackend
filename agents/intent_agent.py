@@ -31,8 +31,9 @@ IMPORTANT BOUNDARIES:
 - Candidate variables are semantic ideas only. The deterministic compiler assigns executable generator contracts.
 - scenarioId is an identifier only and MUST NOT influence what variables are proposed.
 - Use scenarioType, domain, businessScenario, useCase, country, typeOfData, and entityKey together.
-- Aim for 30-35 candidate variables when the scenario naturally supports that breadth.
-- Fewer variables are valid when the scenario genuinely needs fewer; NEVER pad with irrelevant variables.
+- There is NO variable-count target and NO variable-count maximum. Return every semantically
+  justified candidate variable needed to satisfactorily represent the scenario. A smaller or
+  larger set is valid; NEVER pad with irrelevant variables and NEVER truncate for count.
 - Candidate variable names must be FRESH and should not simply copy a template or reference list.
 - Always include the requested entity key when it is meaningful for the requested grain.
 - For transactional data, distinguish stable entity/profile fields from repeated transaction/event/decision fields using grain.
@@ -127,7 +128,9 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     allowed_grains = {"entity", "transaction", "event", "derived"}
     allowed_dtypes = {"string", "integer", "float", "decimal", "boolean", "categorical", "datetime", "date"}
 
-    for raw in _as_list(normalized.get("candidate_variables"), 35):
+    # Candidate variables are intentionally unbounded. We preserve every model-proposed
+    # variable and only normalize/deduplicate it; scenario semantics determine the final count.
+    for raw in _as_list(normalized.get("candidate_variables"), len(normalized.get("candidate_variables") or [])):
         if not isinstance(raw, dict):
             continue
         name = str(raw.get("name") or "").strip()
@@ -153,7 +156,7 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
             item["dtype"] = "string"
         variables.append(item)
 
-    # Preserve first occurrence and keep the hard application limit at 35.
+    # Preserve first occurrence. There is intentionally no hard application limit.
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in variables:
@@ -162,7 +165,7 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         seen.add(key)
         deduped.append(item)
-    normalized["candidate_variables"] = deduped[:35]
+    normalized["candidate_variables"] = deduped
 
     # These are backend-owned and are overwritten after validation, so invalid model
     # guesses here should never make the provider request or application response fail.
@@ -224,22 +227,25 @@ class GeminiIntentAgent:
         domain_query: str | None = None,
     ) -> ScenarioIntent:
         catalog = (
-            self.registry.search(domain_query or "", limit=18)
-            if domain_query
-            else self.registry.catalog_summary(limit=18)
+            self.registry.llm_catalog_context()
         )
         catalog_text = json.dumps(catalog, separators=(",", ":"), sort_keys=True)
         prompt = (
-            "Approved telecom domain catalog (grounding only; do not copy it as a template):\n"
+            "APPROVED TELECOM STANDARDS REGISTRY (authoritative grounding only):\n"
+            "The context below contains ALL standards/artifact source URLs currently registered by the application, "
+            "plus every normalized entity, attribute, relationship, and provenance record in the runtime registry. "
+            "Use the complete context to select the concepts needed by the business scenario; do not treat one source "
+            "family as automatically sufficient when the scenario spans multiple telecom standards.\n\n"
             f"{catalog_text}\n\n"
             "Authoritative request context:\n"
             f"{message}\n\n"
             f"Selected industry: {industry_type}\n"
             f"Business domain: {domain_query or '<none>'}\n"
             f"Country: {country or '<none>'}\n\n"
-            "Create a fresh scenario intent. Aim for 30-35 candidate variables when justified; "
-            "fewer is valid when semantically sufficient. Never pad for a count target and never "
-            "copy catalog/reference variable names as a template. Return JSON only."
+            "Create a fresh scenario intent with NO artificial variable-count target or maximum. "
+            "Return every semantically justified variable needed to represent the requested scenario. "
+            "Fewer or more variables are valid. Never pad irrelevant fields, never truncate for count, "
+            "and never copy catalog/reference variable names as a template. Return JSON only."
         )
 
         try:

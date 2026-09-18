@@ -43,7 +43,7 @@ class SchemaCompiler:
         # Domain is the primary selector. Only these registry results establish the
         # initial domain boundary; this prevents a long natural-language request from
         # accidentally matching unrelated telecom entities.
-        domain_candidates = self.registry.search(domain_query or intent.domain, limit=35)
+        domain_candidates = self.registry.search(domain_query or intent.domain, limit=None)
         for candidate in domain_candidates:
             entity = self.registry.resolve_entity(candidate["canonical_id"])
             if entity and entity.canonical_id not in seen:
@@ -99,7 +99,7 @@ class SchemaCompiler:
         # concepts whose registry domain matches the use case; no LLM invention occurs here.
         normalized_use_case = (use_case or intent.use_case or intent.subdomain or "").strip().lower()
         if normalized_use_case and normalized_use_case != "unknown":
-            use_case_candidates = self.registry.catalog_summary(domain=normalized_use_case, limit=35)
+            use_case_candidates = self.registry.catalog_summary(domain=normalized_use_case, limit=None)
             for candidate in use_case_candidates:
                 entity = self.registry.resolve_entity(candidate["canonical_id"])
                 if entity and entity.canonical_id not in seen:
@@ -461,7 +461,7 @@ class SchemaCompiler:
         country: str | None,
         type_of_data: str | None,
         scenario_mode: str,
-        max_variables: int,
+        max_variables: int | None = None,
     ) -> list[GeneratedSchemaField]:
         raw_ideas = [idea.model_dump() for idea in intent.candidate_variables]
         ideas: list[dict[str, object]] = []
@@ -476,10 +476,9 @@ class SchemaCompiler:
             anchor_norm = self._normalize_variable_name(entity_key)
             if anchor_norm not in seen_idea_keys:
                 ideas.insert(0, {"name": entity_key, "description": f"Stable identifier for the requested {intent.use_case or 'telecom'} entity.", "role": "identity", "grain": "entity", "dtype": "string", "depends_on": []})
-        # Respect a 30-35 target without turning it into a hard minimum. If the model
-        # proposes more than the public maximum, retain the most scenario-relevant ideas.
-        if len(ideas) > max_variables:
-            ideas = ideas[:max_variables]
+        # Intentionally do not truncate candidate variables. The scenario, LLM intent, and
+        # standards registry determine the appropriate width. ``max_variables`` is retained
+        # only for backward-compatible callers and is deliberately ignored.
 
         fields: list[GeneratedSchemaField] = []
         used_names: set[str] = set()
@@ -574,7 +573,7 @@ class SchemaCompiler:
         self,
         intent: ScenarioIntent,
         selected_entities: list[str] | None = None,
-        max_variables: int = 35,
+        max_variables: int | None = None,
         domain_query: str | None = None,
         entity_key: str | None = None,
         industry_type: str | None = None,
@@ -616,9 +615,12 @@ class SchemaCompiler:
         frontier = list(entities)
         visited = set(entity_ids)
         allowed_expansion_ids = {
-            item["canonical_id"] for item in self.registry.search(domain_query or intent.domain, limit=50)
+            item["canonical_id"] for item in self.registry.search(domain_query or intent.domain, limit=None)
         } | entity_ids
-        for _ in range(2):
+        # Expand until the approved registry graph reaches a fixed point. There is no
+        # hop-count or entity-count ceiling; the current scenario and registry graph are
+        # the constraints.
+        while frontier:
             candidates: list[str] = []
             for entity in frontier:
                 for rel in entity.relationships:
@@ -636,11 +638,7 @@ class SchemaCompiler:
                 entities.append(ent)
                 entity_ids.add(cid)
                 new_frontier.append(ent)
-                if len(entities) >= 10:
-                    break
             frontier = new_frontier
-            if not new_frontier:
-                break
 
         scenario_mode = classify_outcome_mode(
             scenario_type=scenario_type or requested.scenario_type,
@@ -655,7 +653,7 @@ class SchemaCompiler:
             country=country,
             type_of_data=type_of_data,
             scenario_mode=scenario_mode,
-            max_variables=max(1, min(35, max_variables)),
+            max_variables=max_variables,
         )
         field_names = [f.name for f in fields]
         if not fields:
@@ -681,7 +679,7 @@ class SchemaCompiler:
         hard_constraints = [
             "scenarioId is identifier-only and does not select variables or business rules.",
             "The proposal is a fresh semantic variable set derived from the current scenario context; it is not a replay of a fixed scenario template.",
-            "30-35 variables is a target range, not a validation minimum. A smaller semantically justified schema is valid.",
+            "There is no artificial variable-count target or maximum; schema width is determined by the current scenario and approved registry grounding.",
             "Each semantic variable is compiled into a deterministic executable generator contract.",
             "Transactional entity-grain variables are stable across the entity history; transaction/event/derived variables are regenerated per transaction/event.",
             "Generated records must pass deterministic type, choice, dependency, temporal, formula and scenario-semantic validation.",

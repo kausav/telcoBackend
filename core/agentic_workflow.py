@@ -102,8 +102,10 @@ class AgenticSchemaWorkflow:
             f"Country: {req.country}\n"
             f"Entity key: {req.entity_key}\n"
             f"Business scenario: {prompt}\n\n"
-            "Variable-design requirement: propose a fresh variable set, targeting 30-35 semantic variables when the scenario supports it. "
-            "Do not copy reference CSV variable names. Return fewer only when fewer variables are genuinely justified by the scenario."
+            "Variable-design requirement: propose a fresh semantic variable set with NO artificial count target or maximum. "
+            "Use all relevant concepts from the complete approved telecom standards registry context, across all registered source URLs. "
+            "Do not copy reference CSV variable names. Include every variable genuinely needed to represent the business scenario; "
+            "return fewer or more as justified by the scenario."
         )
 
         cid = ensure_conversation(req.scenario_id)
@@ -134,7 +136,7 @@ class AgenticSchemaWorkflow:
             intent.use_case = req.use_case
             schema = self.compiler.compile(
                 intent,
-                max_variables=35,
+                max_variables=None,
                 domain_query=req.domain,
                 entity_key=req.entity_key,
                 industry_type=req.industry_type,

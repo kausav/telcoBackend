@@ -110,8 +110,8 @@ class TelecomRegistry:
         self.profiles_dir = Path(profiles_dir or os.getenv("REGISTRY_PROFILES_DIR") or DEFAULT_PROFILES_DIR).expanduser().resolve()
         self._cache_lock = RLock()
         self._entity_cache: dict[str, EntityDef] = {}
-        self._catalog_cache: dict[tuple[str | None, int], list[dict[str, Any]]] = {}
-        self._search_cache: dict[tuple[str, str | None, int], list[dict[str, Any]]] = {}
+        self._catalog_cache: dict[tuple[str | None, int | None], list[dict[str, Any]]] = {}
+        self._search_cache: dict[tuple[str, str | None, int | None], list[dict[str, Any]]] = {}
         if auto_bootstrap:
             self.ensure_current()
 
@@ -164,20 +164,24 @@ class TelecomRegistry:
             "fingerprint": meta.get("fingerprint"),
         }
 
-    def catalog_summary(self, domain: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    def catalog_summary(self, domain: str | None = None, limit: int | None = 200) -> list[dict[str, Any]]:
         sql = "SELECT canonical_id, name, domain, description FROM entities"
         args: list[Any] = []
         if domain:
             sql += " WHERE domain = ?"
             args.append(domain)
-        effective_limit = max(1, min(int(limit), 1000))
+        # ``None`` means no application-side result cap. This is intentionally used by
+        # the agentic proposal path so the complete approved registry is available.
+        effective_limit = None if limit is None else max(1, int(limit))
         cache_key = (domain, effective_limit)
         with self._cache_lock:
             cached = self._catalog_cache.get(cache_key)
             if cached is not None:
                 return [dict(item) for item in cached]
-        sql += " ORDER BY canonical_id LIMIT ?"
-        args.append(effective_limit)
+        sql += " ORDER BY canonical_id"
+        if effective_limit is not None:
+            sql += " LIMIT ?"
+            args.append(effective_limit)
         with self._connect() as conn:
             rows = conn.execute(sql, args).fetchall()
             result = []
@@ -198,6 +202,126 @@ class TelecomRegistry:
             with self._cache_lock:
                 self._catalog_cache[cache_key] = [dict(item) for item in result]
             return result
+
+    def llm_catalog_context(self) -> dict[str, Any]:
+        """Return the complete standards-backed registry context for intent grounding.
+
+        This deliberately has no entity, attribute, relationship, or source-URL count cap.
+        The registry is the authoritative semantic boundary; the LLM receives the complete
+        currently-ingested normalized telecom model and all registered provenance URLs, then
+        the deterministic compiler decides what is executable for the requested scenario.
+        """
+        with self._connect() as conn:
+            standard_rows = conn.execute(
+                """SELECT artifact_id, organization, title, version, status, source_kind, source_url
+                   FROM standards ORDER BY organization, artifact_id"""
+            ).fetchall()
+            entity_rows = conn.execute(
+                """SELECT canonical_id, name, domain, description
+                   FROM entities ORDER BY canonical_id"""
+            ).fetchall()
+
+            standards = [
+                {
+                    "artifact_id": row[0],
+                    "organization": row[1],
+                    "title": row[2],
+                    "version": row[3],
+                    "status": row[4],
+                    "source_kind": row[5],
+                    "source_url": row[6],
+                }
+                for row in standard_rows
+            ]
+
+            entities: list[dict[str, Any]] = []
+            for canonical_id, name, domain, description in entity_rows:
+                aliases = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT alias FROM aliases WHERE canonical_id=? ORDER BY alias",
+                        (canonical_id,),
+                    ).fetchall()
+                ]
+                sources = [
+                    dict(zip(("standard", "artifact", "version", "reference", "url", "source_role"), row))
+                    for row in conn.execute(
+                        """SELECT standard, artifact, version, reference, url, source_role
+                           FROM entity_sources WHERE canonical_id=?
+                           ORDER BY standard, artifact, reference""",
+                        (canonical_id,),
+                    ).fetchall()
+                ]
+                attributes = []
+                for row in conn.execute(
+                    """SELECT name, dtype, required, nullable, description, enum_values_json,
+                              generator, params_json, derived_formula, depends_on_json
+                       FROM attributes WHERE canonical_id=? ORDER BY ordinal""",
+                    (canonical_id,),
+                ).fetchall():
+                    attributes.append({
+                        "name": row[0],
+                        "dtype": row[1],
+                        "required": bool(row[2]),
+                        "nullable": bool(row[3]),
+                        "description": row[4] or "",
+                        "enum_values": json.loads(row[5] or "[]"),
+                        "generator": row[6] or "",
+                        "params": json.loads(row[7] or "{}"),
+                        "derived_formula": row[8],
+                        "depends_on": json.loads(row[9] or "[]"),
+                    })
+                relationships = [
+                    dict(zip(("target_entity", "relation", "cardinality", "required", "description"), row))
+                    for row in conn.execute(
+                        """SELECT target_entity, relation, cardinality, required, description
+                           FROM relationships WHERE source_entity=? ORDER BY ordinal""",
+                        (canonical_id,),
+                    ).fetchall()
+                ]
+                entities.append({
+                    "canonical_id": canonical_id,
+                    "name": name,
+                    "aliases": aliases,
+                    "domain": domain,
+                    "description": description,
+                    "sources": sources,
+                    "attributes": attributes,
+                    "relationships": relationships,
+                })
+
+        # Deduplicate the source URLs across artifact/entity provenance while retaining
+        # their standard/artifact context. These URLs are supplied as grounding references;
+        # the code does not pretend to fetch live standards during every proposal request.
+        sources_by_url: dict[str, dict[str, Any]] = {}
+        for standard in standards:
+            url = standard.get("source_url")
+            if url:
+                sources_by_url.setdefault(url, {
+                    "url": url,
+                    "standard": standard["organization"],
+                    "artifact_ids": [],
+                })["artifact_ids"].append(standard["artifact_id"])
+        for entity in entities:
+            for source in entity["sources"]:
+                url = source.get("url")
+                if not url:
+                    continue
+                item = sources_by_url.setdefault(url, {
+                    "url": url,
+                    "standard": source.get("standard"),
+                    "artifact_ids": [],
+                })
+                artifact_name = source.get("artifact")
+                if artifact_name and artifact_name not in item["artifact_ids"]:
+                    item["artifact_ids"].append(artifact_name)
+
+        return {
+            "standards": standards,
+            "source_urls": sorted(sources_by_url.values(), key=lambda item: item["url"]),
+            "entities": entities,
+            "registry_health": self.health(),
+        }
 
     def entities_with_attribute(self, attribute_name: str) -> list[EntityDef]:
         """Return registry entities exposing an exact attribute name, deterministically."""
@@ -352,10 +476,10 @@ class TelecomRegistry:
         except KeyError:
             return False
 
-    def search(self, query: str, domain: str | None = None, limit: int = 35) -> list[dict[str, Any]]:
+    def search(self, query: str, domain: str | None = None, limit: int | None = 35) -> list[dict[str, Any]]:
         """Deterministic lexical search over names and aliases; one result per entity."""
         normalized = _normalise(query)
-        effective_limit = max(1, min(limit, 100))
+        effective_limit = None if limit is None else max(1, int(limit))
         cache_key = (normalized, domain, effective_limit)
         with self._cache_lock:
             cached = self._search_cache.get(cache_key)
@@ -406,7 +530,8 @@ class TelecomRegistry:
 
         scored = list(best_by_entity.values())
         scored.sort(key=lambda item: (-item[0], item[1]["canonical_id"]))
-        result = [item for _, item in scored[:effective_limit]]
+        result = scored if effective_limit is None else scored[:effective_limit]
+        result = [item for _, item in result]
         with self._cache_lock:
             self._search_cache[cache_key] = [dict(item) for item in result]
         return result

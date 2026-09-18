@@ -45,7 +45,9 @@ class ScenarioIntent(BaseModel):
     use_case: str = ""
     requested_entities: list[str] = Field(default_factory=list, max_length=35)
     requested_relationships: list[str] = Field(default_factory=list, max_length=45)
-    candidate_variables: list[VariableIdea] = Field(default_factory=list, max_length=35)
+    # Deliberately unbounded: the scenario and registry determine how many semantic
+    # variables are appropriate. The application must never truncate this list by count.
+    candidate_variables: list[VariableIdea] = Field(default_factory=list)
     country: str | None = None
     currency: str | None = None
     record_count: int | None = Field(default=None, ge=1, le=5_000_000)
