@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -68,20 +69,72 @@ def _download(url: str, destination: Path, max_bytes: int, timeout: int) -> None
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response, destination.open("wb") as output:
-            total = 0
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_bytes:
-                    raise OfficialStandardsError(
-                        f"Official source exceeds configured limit of {max_bytes} bytes: {url}"
-                    )
-                output.write(chunk)
+        # Both handles are scoped explicitly so Windows can safely move the file
+        # immediately after this function returns.
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            with destination.open("wb") as output:
+                total = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise OfficialStandardsError(
+                            f"Official source exceeds configured limit of {max_bytes} bytes: {url}"
+                        )
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise OfficialStandardsError(f"Could not download official source {url}: {exc}") from exc
+
+
+def _make_closed_temp_file(directory: Path) -> Path:
+    """Create a unique temporary path whose OS-level file descriptor is closed.
+
+    ``tempfile.mkstemp`` leaves its descriptor open; on Windows that descriptor can
+    prevent ``os.replace`` and cleanup from succeeding.
+    """
+    fd, name = tempfile.mkstemp(prefix="official-source-", suffix=".download", dir=str(directory))
+    os.close(fd)
+    return Path(name)
+
+
+def _best_effort_unlink(path: Path, retries: int = 5) -> None:
+    """Delete a temporary file without turning transient Windows locks into startup failures."""
+    for attempt in range(max(1, retries)):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if attempt + 1 >= retries:
+                return
+            time.sleep(0.1 * (2**attempt))
+        except OSError:
+            return
+
+
+def _atomic_install(temp: Path, target: Path, retries: int = 6) -> None:
+    """Atomically install a downloaded artifact, tolerating short Windows file locks."""
+    last_error: OSError | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            os.replace(temp, target)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if attempt + 1 >= retries:
+                break
+            time.sleep(0.15 * (2**attempt))
+        except OSError as exc:
+            last_error = exc
+            if getattr(exc, "winerror", None) != 32 or attempt + 1 >= retries:
+                break
+            time.sleep(0.15 * (2**attempt))
+    raise OfficialStandardsError(
+        f"Could not atomically install official source {temp.name} -> {target.name}: {last_error}"
+    ) from last_error
 
 
 def load_source_manifest(path: str | Path) -> list[SourceSpec]:
@@ -189,17 +242,38 @@ def sync_official_standards(
 
         source_file_name = _safe_name(source.url.rsplit("/", 1)[-1] or source.source_id)
         downloaded = source_dir / source_file_name
-        cached_ok = downloaded.exists() and downloaded.stat().st_size > 0 and source_meta.get("url") == source.url and source_meta.get("version") == source.version
+        cached_ok = (
+            downloaded.exists()
+            and downloaded.stat().st_size > 0
+            and source_meta.get("url") == source.url
+            and source_meta.get("version") == source.version
+        )
+        effective_downloaded = downloaded
+        temp: Path | None = None
         if force or not cached_ok:
-            temp = Path(tempfile.mkstemp(prefix="official-source-", suffix=".download", dir=str(source_dir))[1])
+            # Clean only stale downloader artifacts. Never remove the canonical cache file.
+            for stale in source_dir.glob("*.download"):
+                _best_effort_unlink(stale)
+            temp = _make_closed_temp_file(source_dir)
             try:
                 _download(source.url, temp, max_bytes, timeout_s)
-                os.replace(temp, downloaded)
-            finally:
-                if temp.exists():
-                    temp.unlink(missing_ok=True)
+                try:
+                    _atomic_install(temp, downloaded)
+                    effective_downloaded = downloaded
+                    temp = None
+                except OfficialStandardsError:
+                    # A third-party Windows process (typically antivirus/indexing)
+                    # can briefly hold the existing destination.  The freshly
+                    # downloaded file is still valid, so use it for this sync and
+                    # leave the old cache untouched rather than failing startup.
+                    effective_downloaded = temp
+            except Exception:
+                if temp is not None:
+                    _best_effort_unlink(temp)
+                    temp = None
+                raise
 
-        checksum = _sha256(downloaded)
+        checksum = _sha256(effective_downloaded)
         metadata = {
             "source_id": source.source_id,
             "organization": source.organization,
@@ -220,7 +294,7 @@ def sync_official_standards(
         existing_outputs = sorted(output_dir.glob("*.json")) if output_dir.exists() else []
         cache_matches = (
             not force
-            and downloaded.exists()
+            and effective_downloaded.exists()
             and metadata_path.exists()
             and output_dir.exists()
             and bool(existing_outputs)
@@ -239,6 +313,9 @@ def sync_official_standards(
             except (OSError, json.JSONDecodeError):
                 cache_matches = False
         if cache_matches:
+            if temp is not None:
+                _best_effort_unlink(temp)
+                temp = None
             source_results.append({**metadata, "normalized_files": [str(p.relative_to(normalized_root)) for p in existing_outputs]})
             normalized_outputs.extend(existing_outputs)
             continue
@@ -252,7 +329,7 @@ def sync_official_standards(
             extracted_root = source_dir / "extracted"
             if extracted_root.exists():
                 shutil.rmtree(extracted_root)
-            extracted = _extract_archive(downloaded, extracted_root, source.include, source.exclude)
+            extracted = _extract_archive(effective_downloaded, extracted_root, source.include, source.exclude)
             if source.parser in {"asn1", "asn1_zip"} or source.format == "asn1":
                 files = [p for p in extracted if p.suffix.lower() in {".asn", ".asn1", ".asn1p"}]
             elif source.parser in {"json_schema", "mef_schema"} or source.format in {"yaml", "json_schema"}:
@@ -260,21 +337,25 @@ def sync_official_standards(
             else:
                 files = [p for p in extracted if p.is_file()]
         else:
-            files = [downloaded]
+            files = [effective_downloaded]
 
-        generated = normalize_official_file(
-            files,
-            output_dir,
-            organization=source.organization,
-            artifact=source.artifact,
-            version=source.version,
-            source_url=source.url,
-            source_page=source.source_page,
-            source_id=source.source_id,
-            parser=source.parser,
-        )
-        normalized_outputs.extend(generated)
-        source_results.append({**metadata, "normalized_files": [str(p.relative_to(normalized_root)) for p in generated]})
+        try:
+            generated = normalize_official_file(
+                files,
+                output_dir,
+                organization=source.organization,
+                artifact=source.artifact,
+                version=source.version,
+                source_url=source.url,
+                source_page=source.source_page,
+                source_id=source.source_id,
+                parser=source.parser,
+            )
+            normalized_outputs.extend(generated)
+            source_results.append({**metadata, "normalized_files": [str(p.relative_to(normalized_root)) for p in generated]})
+        finally:
+            if temp is not None:
+                _best_effort_unlink(temp)
 
     # Write a compact audit manifest for operators and client evidence.
     lock_file.write_text(
