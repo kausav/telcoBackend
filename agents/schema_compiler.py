@@ -21,6 +21,11 @@ class SchemaCompiler:
     # scenario-specific names. They are stable subscriber/account contact anchors.
     REQUIRED_TELECOM_FIELDS = ("subscriber_id", "account_id", "msisdn")
 
+    @classmethod
+    def is_mandatory_telecom_field(cls, name: str | None) -> bool:
+        normalized = cls._normalize_variable_name(name or "")
+        return normalized in {cls._normalize_variable_name(item) for item in cls.REQUIRED_TELECOM_FIELDS}
+
     def __init__(self, registry: TelecomRegistry | None = None):
         self.registry = registry or TelecomRegistry()
 
@@ -97,7 +102,12 @@ class SchemaCompiler:
             if key_entity and key_entity.canonical_id not in seen:
                 resolved.insert(0, key_entity)
                 seen.add(key_entity.canonical_id)
-            elif key_entity is None:
+            elif key_entity is None and not self.is_mandatory_telecom_field(entity_key):
+                # subscriber_id/account_id/msisdn are stable application-level telecom
+                # contract anchors. They are deliberately injected by the compiler even
+                # when an official model uses a different identifier name or nests the
+                # identifier under a different object. They must not become an unresolved
+                # registry requirement and must never block HITL confirmation.
                 unresolved.append(f"Entity key '{entity_key}' is not a field in the approved telecom registry")
 
         # Use-case is a semantic selector within telecom. It contributes only approved
@@ -804,7 +814,11 @@ class SchemaCompiler:
         field_names = [f.name for f in fields]
         if not fields:
             unresolved.append("The scenario did not yield any usable semantic variables.")
-        if entity_key and self._normalize_variable_name(entity_key) not in {self._normalize_variable_name(n) for n in field_names}:
+        if (
+            entity_key
+            and self._normalize_variable_name(entity_key) not in {self._normalize_variable_name(n) for n in field_names}
+            and not self.is_mandatory_telecom_field(entity_key)
+        ):
             unresolved.append(f"Requested entity key '{entity_key}' could not be represented by the proposed variables")
 
         relationships: list[SchemaRelationship] = []

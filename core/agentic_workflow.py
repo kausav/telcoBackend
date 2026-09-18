@@ -80,7 +80,7 @@ class AgenticSchemaWorkflow:
             req.scenario_type.strip().lower(),
             req.type_of_data,
             req.use_case.strip().lower(),
-            req.entity_key.strip().lower(),
+            (req.entity_key or "").strip().lower(),
             " ".join(req.business_scenario.split()).strip().lower(),
         )
 
@@ -131,7 +131,7 @@ class AgenticSchemaWorkflow:
                 intent.country = req.country
             intent.scenario_type = req.scenario_type
             intent.type_of_data = req.type_of_data
-            intent.entity_key = req.entity_key
+            intent.entity_key = req.entity_key or ""
             intent.use_case = req.use_case
             schema = self.compiler.compile(
                 intent,
@@ -209,11 +209,22 @@ class AgenticSchemaWorkflow:
         # executable failures (no usable fields / requested entity key not represented)
         # block confirmation. This also makes older drafts containing legacy
         # ``Unknown concept ...`` items confirmable without requiring a re-proposal.
-        blocking_unresolved = [
-            item for item in schema.unresolved_items
-            if not str(item).lower().startswith("unknown concept ")
-            and not str(item).lower().startswith("unknown requested concept ")
-        ]
+        blocking_unresolved = []
+        for item in schema.unresolved_items:
+            text = str(item).strip()
+            lower = text.lower()
+            if lower.startswith("unknown concept ") or lower.startswith("unknown requested concept "):
+                continue
+            # subscriber_id/account_id/msisdn are application-level mandatory anchors,
+            # not required literal attribute names in every official telecom model.
+            # The compiler supplies executable fallbacks for them, so legacy/current
+            # drafts containing this historical unresolved marker remain confirmable.
+            if ("entity key '" in lower or "requested entity key '" in lower):
+                marker = lower.split("entity key '", 1)[-1]
+                candidate = marker.split("'", 1)[0].strip()
+                if SchemaCompiler.is_mandatory_telecom_field(candidate):
+                    continue
+            blocking_unresolved.append(text)
         if blocking_unresolved:
             raise ValueError(
                 "Cannot confirm an agentic draft with unresolved executable requirements: "

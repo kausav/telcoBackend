@@ -117,7 +117,7 @@ class ScenarioProposeRequest(BaseModel):
     business_scenario: str = Field(alias="businessScenario", min_length=1, max_length=12000)
     type_of_data: Literal["transactional", "aggregational"] = Field(alias="typeOfData")
     country: str = Field(min_length=1, max_length=20)
-    entity_key: str = Field(alias="entityKey", min_length=1, max_length=200)
+    entity_key: str | None = Field(default=None, alias="entityKey", max_length=200)
     use_case: str = Field(alias="useCase", min_length=1, max_length=200)
 
 
