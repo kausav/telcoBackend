@@ -26,7 +26,13 @@ def resolve_path(value: str | None, default: Path) -> Path:
 
 
 RUNTIME_DATA_DIR = resolve_path(os.getenv("RUNTIME_DATA_DIR"), ROOT / "runtime_data")
-RUNTIME_DATA_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    RUNTIME_DATA_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as exc:
+    raise RuntimeError(
+        f"Runtime data directory is not writable or could not be created: {RUNTIME_DATA_DIR}. "
+        "Set RUNTIME_DATA_DIR to a writable directory for the service account."
+    ) from exc
 
 # Mutable, generated runtime cache of official source artifacts and their internal index.
 TELECOM_STANDARDS_CACHE_DIR = resolve_path(

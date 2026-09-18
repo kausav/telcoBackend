@@ -32,6 +32,7 @@ from config.runtime import (  # noqa: E402
 from core.official_standards import sync_official_standards  # noqa: E402
 from core.standards_ingestion import normalize_openapi_file  # noqa: E402
 from core.telecom_registry import RegistryBuilder, registry_fingerprint  # noqa: E402
+from core.runtime_lock import RuntimeFileLock  # noqa: E402
 
 
 def main() -> int:
@@ -51,29 +52,32 @@ def main() -> int:
     normalized_dir = cache_dir / "normalized"
     profiles_dir = Path(args.profiles_dir).resolve()
 
-    if args.openapi:
-        normalized_dir.mkdir(parents=True, exist_ok=True)
-        normalize_openapi_file(
-            args.openapi,
-            normalized_dir / args.output_name,
-            source_url=args.source_url,
-            organization=args.organization,
-        )
-    else:
-        result = sync_official_standards(
-            args.manifest,
-            cache_dir / "raw",
-            normalized_dir,
-            force=args.force,
-            timeout=OFFICIAL_STANDARDS_TIMEOUT_SEC,
-            max_download_mb=OFFICIAL_STANDARDS_MAX_DOWNLOAD_MB,
-        )
-        for item in result["sources"]:
-            print(f"Synced: {item['organization']} | {item['artifact']} | {item['version']}")
+    lock_path = cache_dir / "raw" / ".official-standards.sync.lock"
+    with RuntimeFileLock(lock_path):
+        if args.openapi:
+            normalized_dir.mkdir(parents=True, exist_ok=True)
+            normalize_openapi_file(
+                args.openapi,
+                normalized_dir / args.output_name,
+                source_url=args.source_url,
+                organization=args.organization,
+            )
+        else:
+            result = sync_official_standards(
+                args.manifest,
+                cache_dir / "raw",
+                normalized_dir,
+                force=args.force,
+                timeout=OFFICIAL_STANDARDS_TIMEOUT_SEC,
+                max_download_mb=OFFICIAL_STANDARDS_MAX_DOWNLOAD_MB,
+                acquire_lock=False,
+            )
+            for item in result["sources"]:
+                print(f"Synced: {item['organization']} | {item['artifact']} | {item['version']}")
 
-    fingerprint = registry_fingerprint(normalized_dir, profiles_dir)
-    RegistryBuilder(Path(args.db).resolve(), normalized_dir, profiles_dir).rebuild(fingerprint)
-    print(f"Runtime registry rebuilt: {Path(args.db).resolve()}")
+        fingerprint = registry_fingerprint(normalized_dir, profiles_dir)
+        RegistryBuilder(Path(args.db).resolve(), normalized_dir, profiles_dir).rebuild(fingerprint)
+        print(f"Runtime registry rebuilt: {Path(args.db).resolve()}")
     return 0
 
 

@@ -17,17 +17,18 @@ import uuid
 from contextlib import contextmanager
 from typing import Any
 
-from config.runtime import DYNAMIC_SCENARIOS_DB
+from config.runtime import DYNAMIC_SCENARIOS_DB, resolve_path
 
-_DB_PATH = str(DYNAMIC_SCENARIOS_DB)
+_DB_PATH = DYNAMIC_SCENARIOS_DB
 
 _DRAFT_TTL_SECONDS = int(os.environ.get("DRAFT_TTL_SECONDS", 24 * 3600))
 
 
 @contextmanager
 def _connect():
-    os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(_DB_PATH, timeout=30)
+    db_path = resolve_path(os.environ.get("DYNAMIC_SCENARIOS_DB"), _DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     try:

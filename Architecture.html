@@ -132,14 +132,28 @@ Accepted dataset</pre>
     <tr><td><code>resources/telecom/standards/official_sources.json</code></td><td>Pinned official model source manifest.</td></tr>
     <tr><td><code>core/official_standards.py</code></td><td>Downloads/checksums/caches official model artifacts.</td></tr>
     <tr><td><code>core/standards_ingestion.py</code></td><td>Normalizes TM Forum OpenAPI, MEF YAML/JSON Schema and 3GPP ASN.1 into the runtime index.</td></tr>
-    <tr><td><code>core/telecom_registry.py</code></td><td>Builds/queries the authoritative runtime registry and applies strict generation-policy overlays.</td></tr>
+    <tr><td><code>core/telecom_registry.py</code></td><td>Builds/queries the official-model runtime registry and applies optional generation-policy overlays.</td></tr>
     <tr><td><code>resources/telecom/generation_profiles/telecom_official_generation_v2.json</code></td><td>INGENII sampling policy only; targets exact official model fields.</td></tr>
     <tr><td><code>agents/intent_agent.py</code></td><td>Gemini intent extraction from business-facing scenario context.</td></tr>
     <tr><td><code>agents/schema_compiler.py</code></td><td>Deterministic compilation and comprehensive variable expansion.</td></tr>
     <tr><td><code>agents/data_generation_agent.py</code></td><td>Record generation, dependencies, formulas, timestamp repair and serialization.</td></tr>
   </table>
 
-  <h2>11. Operations</h2>
+  <h2>11. Cross-platform server runtime</h2>
+  <pre>Application code
+        ↓
+OS-independent pathlib paths
+        ↓
+Persistent writable RUNTIME_DATA_DIR
+        ↓
+Official-source sync / normalized index / SQLite registry
+        ↓
+Native OS-level bootstrap lock
+        ↓
+Safe with Windows Server, Linux, and container deployments</pre>
+  <p>Official archive extraction uses the operating-system temporary directory rather than the application/runtime tree. Registry bootstrap uses an OS-level process lock so multiple Uvicorn workers cannot race during official-source synchronization or registry rebuild.</p>
+
+  <h2>12. Operations</h2>
   <pre># install
 pip install -r requirements.txt
 
@@ -150,7 +164,7 @@ uvicorn server:app --reload
 python scripts/ingest_standards.py --force</pre>
   <p class="small">Generated values use stochastic sampling. The architecture persists the standards lineage and confirmed contract; bit-for-bit dataset reproducibility requires an explicit generation seed, which is not currently part of the public agentic API.</p>
 
-  <div class="callout danger"><strong>Design invariant:</strong> an official source/model change that makes a generation-policy target invalid causes registry-build failure. The system does not silently ignore stale generation-profile references.</div>
+  <div class="callout danger"><strong>Design invariant:</strong> the official model remains authoritative. Optional generation-policy references that do not exist in the active official model are logged and skipped; a target explicitly marked <code>required=true</code> fails registry construction. The system never silently changes official semantic definitions.</div>
 </main>
 </body>
 </html>

@@ -25,7 +25,65 @@ import sqlite3
 from contextlib import contextmanager
 from threading import RLock
 
+try:
+    import fcntl  # type: ignore
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
+
+class _CrossPlatformFileLock:
+    """Small OS-level lock that works on both POSIX and Windows without extra deps."""
+
+    def __init__(self, path: Path, timeout: float = 180.0) -> None:
+        self.path = Path(path)
+        self.timeout = timeout
+        self._handle = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        self._handle = handle
+        deadline = __import__("time").monotonic() + self.timeout
+        while True:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    import msvcrt  # type: ignore
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return self
+            except (BlockingIOError, OSError):
+                if __import__("time").monotonic() >= deadline:
+                    handle.close()
+                    self._handle = None
+                    raise RegistryError(
+                        f"Timed out waiting for the registry bootstrap lock: {self.path}"
+                    )
+                __import__("time").sleep(0.25)
+
+    def __exit__(self, exc_type, exc, tb):
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return False
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            else:
+                import msvcrt  # type: ignore
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            handle.close()
+        return False
+
+
 from config.runtime import (
+    resolve_path,
     TELECOM_STANDARDS_DIR,
     TELECOM_STANDARDS_MANIFEST,
     TELECOM_STANDARDS_CACHE_DIR,
@@ -36,6 +94,7 @@ from config.runtime import (
     OFFICIAL_STANDARDS_MAX_DOWNLOAD_MB,
 )
 from core.official_standards import sync_official_standards, OfficialStandardsError
+from core.runtime_lock import RuntimeFileLock, RuntimeLockError
 
 
 DEFAULT_STANDARDS_DIR = TELECOM_STANDARDS_DIR
@@ -120,12 +179,24 @@ class TelecomRegistry:
         profiles_dir: str | Path | None = None,
         auto_bootstrap: bool = True,
     ) -> None:
-        self.db_path = Path(db_path or os.getenv("REGISTRY_DB_PATH") or DEFAULT_DB_PATH)
+        self.db_path = resolve_path(str(db_path) if db_path is not None else os.getenv("REGISTRY_DB_PATH"), DEFAULT_DB_PATH)
         explicit_standards_dir = standards_dir is not None or bool(os.getenv("REGISTRY_STANDARDS_DIR"))
-        self.standards_dir = Path(standards_dir or os.getenv("REGISTRY_STANDARDS_DIR") or DEFAULT_STANDARDS_DIR).expanduser().resolve()
-        self.profiles_dir = Path(profiles_dir or os.getenv("REGISTRY_PROFILES_DIR") or DEFAULT_PROFILES_DIR).expanduser().resolve()
-        self.manifest_path = Path(os.getenv("OFFICIAL_STANDARDS_MANIFEST") or TELECOM_STANDARDS_MANIFEST).expanduser().resolve()
-        self.official_cache_dir = Path(os.getenv("TELECOM_STANDARDS_CACHE_DIR") or TELECOM_STANDARDS_CACHE_DIR).expanduser().resolve()
+        self.standards_dir = resolve_path(
+            str(standards_dir) if standards_dir is not None else os.getenv("REGISTRY_STANDARDS_DIR"),
+            DEFAULT_STANDARDS_DIR,
+        )
+        self.profiles_dir = resolve_path(
+            str(profiles_dir) if profiles_dir is not None else os.getenv("REGISTRY_PROFILES_DIR"),
+            DEFAULT_PROFILES_DIR,
+        )
+        self.manifest_path = resolve_path(
+            os.getenv("OFFICIAL_STANDARDS_MANIFEST"),
+            TELECOM_STANDARDS_MANIFEST,
+        )
+        self.official_cache_dir = resolve_path(
+            os.getenv("TELECOM_STANDARDS_CACHE_DIR"),
+            TELECOM_STANDARDS_CACHE_DIR,
+        )
         self._explicit_standards_dir = explicit_standards_dir
         self._cache_lock = RLock()
         self._entity_cache: dict[str, EntityDef] = {}
@@ -147,41 +218,45 @@ class TelecomRegistry:
             conn.close()
 
     def ensure_current(self) -> None:
-        # Normal operation bootstraps from the official-source manifest.  An explicit
-        # REGISTRY_STANDARDS_DIR/constructor path remains supported for offline tests or
-        # operators who maintain their own approved registry input.
-        if not self._explicit_standards_dir and OFFICIAL_STANDARDS_SYNC != "disabled":
-            try:
-                sync_official_standards(
-                    self.manifest_path,
-                    self.official_cache_dir / "raw",
-                    self.standards_dir,
-                    timeout=OFFICIAL_STANDARDS_TIMEOUT_SEC,
-                    max_download_mb=OFFICIAL_STANDARDS_MAX_DOWNLOAD_MB,
-                )
-            except OfficialStandardsError as exc:
-                cached = _canonical_file_list(self.standards_dir)
-                if not cached:
-                    raise RegistryError(
-                        "Official telecom standards could not be synchronized and no cached model is available: "
-                        f"{exc}"
-                    ) from exc
-        if not self.standards_dir.exists():
-            raise RegistryError(f"Standards directory does not exist: {self.standards_dir}")
-        standards = _canonical_file_list(self.standards_dir)
-        if not standards:
-            raise RegistryError(f"No official standards model artifacts found in {self.standards_dir}")
-
-        fingerprint = registry_fingerprint(self.standards_dir, self.profiles_dir)
+        """Synchronize and build the shared registry exactly once per deployment."""
+        bootstrap_lock = self.official_cache_dir / "raw" / ".official-standards.sync.lock"
         try:
-            with self._connect() as conn:
-                row = conn.execute("SELECT value FROM registry_meta WHERE key='fingerprint'").fetchone()
-                schema_row = conn.execute("SELECT value FROM registry_meta WHERE key='schema_version'").fetchone()
-                if row and schema_row and row[0] == fingerprint and schema_row[0] == REGISTRY_SCHEMA_VERSION:
-                    return
-        except sqlite3.OperationalError:
-            pass
-        RegistryBuilder(self.db_path, self.standards_dir, self.profiles_dir).rebuild(fingerprint)
+            with RuntimeFileLock(bootstrap_lock):
+                if not self._explicit_standards_dir and OFFICIAL_STANDARDS_SYNC != "disabled":
+                    try:
+                        sync_official_standards(
+                            self.manifest_path,
+                            self.official_cache_dir / "raw",
+                            self.standards_dir,
+                            timeout=OFFICIAL_STANDARDS_TIMEOUT_SEC,
+                            max_download_mb=OFFICIAL_STANDARDS_MAX_DOWNLOAD_MB,
+                            acquire_lock=False,
+                        )
+                    except OfficialStandardsError as exc:
+                        cached = _canonical_file_list(self.standards_dir)
+                        if not cached:
+                            raise RegistryError(
+                                "Official telecom standards could not be synchronized and no cached model is available: "
+                                f"{exc}"
+                            ) from exc
+                if not self.standards_dir.exists():
+                    raise RegistryError(f"Standards directory does not exist: {self.standards_dir}")
+                standards = _canonical_file_list(self.standards_dir)
+                if not standards:
+                    raise RegistryError(f"No official standards model artifacts found in {self.standards_dir}")
+
+                fingerprint = registry_fingerprint(self.standards_dir, self.profiles_dir)
+                try:
+                    with self._connect() as conn:
+                        row = conn.execute("SELECT value FROM registry_meta WHERE key='fingerprint'").fetchone()
+                        schema_row = conn.execute("SELECT value FROM registry_meta WHERE key='schema_version'").fetchone()
+                        if row and schema_row and row[0] == fingerprint and schema_row[0] == REGISTRY_SCHEMA_VERSION:
+                            return
+                except sqlite3.OperationalError:
+                    pass
+                RegistryBuilder(self.db_path, self.standards_dir, self.profiles_dir).rebuild(fingerprint)
+        except RuntimeLockError as exc:
+            raise RegistryError(str(exc)) from exc
 
     def health(self) -> dict[str, Any]:
         with self._connect() as conn:

@@ -25,6 +25,7 @@ import zipfile
 from typing import Any, Iterable
 
 from core.standards_ingestion import ASN1_NORMALIZER_VERSION, normalize_official_file
+from core.runtime_lock import RuntimeFileLock
 
 
 @dataclass(frozen=True)
@@ -209,13 +210,34 @@ def sync_official_standards(
     force: bool = False,
     timeout: int | None = None,
     max_download_mb: int | None = None,
+    acquire_lock: bool = True,
 ) -> dict[str, Any]:
     """Download pinned official sources and rebuild the normalized runtime cache.
 
-    ``resources/`` remains the source *manifest* only.  Normalized JSON files are
-    generated into runtime_data and are never authoritative copies of the standards.
+    The sync lock is process-safe across Linux/macOS and Windows. Callers that already
+    hold the shared bootstrap lock may set ``acquire_lock=False``.
     """
     raw_dir = Path(raw_cache_dir).resolve()
+    if acquire_lock:
+        with RuntimeFileLock(raw_dir / ".official-standards.sync.lock"):
+            return _sync_official_standards_locked(
+                manifest_path, raw_dir, normalized_dir, force=force, timeout=timeout, max_download_mb=max_download_mb
+            )
+    return _sync_official_standards_locked(
+        manifest_path, raw_dir, normalized_dir, force=force, timeout=timeout, max_download_mb=max_download_mb
+    )
+
+
+def _sync_official_standards_locked(
+    manifest_path: str | Path,
+    raw_dir: Path,
+    normalized_dir: str | Path,
+    *,
+    force: bool = False,
+    timeout: int | None = None,
+    max_download_mb: int | None = None,
+) -> dict[str, Any]:
+    """Locked implementation shared by the API bootstrap and manual sync command."""
     normalized_root = Path(normalized_dir).resolve()
     raw_dir.mkdir(parents=True, exist_ok=True)
     normalized_root.mkdir(parents=True, exist_ok=True)

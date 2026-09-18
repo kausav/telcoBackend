@@ -7,20 +7,21 @@ import time
 import uuid
 from contextlib import contextmanager
 
-from config.runtime import CONVERSATION_DB_PATH
+from config.runtime import CONVERSATION_DB_PATH, resolve_path
 
-_DEFAULT_DB_PATH = str(CONVERSATION_DB_PATH)
+_DEFAULT_DB_PATH = CONVERSATION_DB_PATH
 
 
 def _db_path() -> str:
-    return os.environ.get("CONVERSATION_DB_PATH", _DEFAULT_DB_PATH)
+    return str(resolve_path(os.environ.get("CONVERSATION_DB_PATH"), _DEFAULT_DB_PATH))
 
 
 @contextmanager
 def _connect():
     db_path = _db_path()
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=30)
+    path = resolve_path(db_path, _DEFAULT_DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     _init_db(conn)
