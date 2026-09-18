@@ -2,7 +2,9 @@
 
 The application never stores the telecom entity catalogue in Python source code.
 Runtime definitions are loaded from a SQLite registry database that is rebuilt from
-versioned standards artifacts and INGENII generation profiles.
+pinned official standards artifacts and optional INGENII generation-policy profiles.
+Generation profiles reference exact official source/model/field identities and may only
+overlay generation behavior; they are never semantic sources.
 
 Trust boundary:
     standards artifacts -> canonical runtime registry -> deterministic compiler
@@ -22,13 +24,23 @@ import sqlite3
 from contextlib import contextmanager
 from threading import RLock
 
-from config.runtime import TELECOM_STANDARDS_DIR, TELECOM_PROFILES_DIR, REGISTRY_DB_PATH
+from config.runtime import (
+    TELECOM_STANDARDS_DIR,
+    TELECOM_STANDARDS_MANIFEST,
+    TELECOM_STANDARDS_CACHE_DIR,
+    TELECOM_PROFILES_DIR,
+    REGISTRY_DB_PATH,
+    OFFICIAL_STANDARDS_SYNC,
+    OFFICIAL_STANDARDS_TIMEOUT_SEC,
+    OFFICIAL_STANDARDS_MAX_DOWNLOAD_MB,
+)
+from core.official_standards import sync_official_standards, OfficialStandardsError
 
 
 DEFAULT_STANDARDS_DIR = TELECOM_STANDARDS_DIR
 DEFAULT_PROFILES_DIR = TELECOM_PROFILES_DIR
 DEFAULT_DB_PATH = REGISTRY_DB_PATH
-REGISTRY_SCHEMA_VERSION = "2"
+REGISTRY_SCHEMA_VERSION = "4"
 
 
 @dataclass(frozen=True)
@@ -106,8 +118,12 @@ class TelecomRegistry:
         auto_bootstrap: bool = True,
     ) -> None:
         self.db_path = Path(db_path or os.getenv("REGISTRY_DB_PATH") or DEFAULT_DB_PATH)
+        explicit_standards_dir = standards_dir is not None or bool(os.getenv("REGISTRY_STANDARDS_DIR"))
         self.standards_dir = Path(standards_dir or os.getenv("REGISTRY_STANDARDS_DIR") or DEFAULT_STANDARDS_DIR).expanduser().resolve()
         self.profiles_dir = Path(profiles_dir or os.getenv("REGISTRY_PROFILES_DIR") or DEFAULT_PROFILES_DIR).expanduser().resolve()
+        self.manifest_path = Path(os.getenv("OFFICIAL_STANDARDS_MANIFEST") or TELECOM_STANDARDS_MANIFEST).expanduser().resolve()
+        self.official_cache_dir = Path(os.getenv("TELECOM_STANDARDS_CACHE_DIR") or TELECOM_STANDARDS_CACHE_DIR).expanduser().resolve()
+        self._explicit_standards_dir = explicit_standards_dir
         self._cache_lock = RLock()
         self._entity_cache: dict[str, EntityDef] = {}
         self._catalog_cache: dict[tuple[str | None, int | None], list[dict[str, Any]]] = {}
@@ -128,11 +144,30 @@ class TelecomRegistry:
             conn.close()
 
     def ensure_current(self) -> None:
+        # Normal operation bootstraps from the official-source manifest.  An explicit
+        # REGISTRY_STANDARDS_DIR/constructor path remains supported for offline tests or
+        # operators who maintain their own approved registry input.
+        if not self._explicit_standards_dir and OFFICIAL_STANDARDS_SYNC != "disabled":
+            try:
+                sync_official_standards(
+                    self.manifest_path,
+                    self.official_cache_dir / "raw",
+                    self.standards_dir,
+                    timeout=OFFICIAL_STANDARDS_TIMEOUT_SEC,
+                    max_download_mb=OFFICIAL_STANDARDS_MAX_DOWNLOAD_MB,
+                )
+            except OfficialStandardsError as exc:
+                cached = _canonical_file_list(self.standards_dir)
+                if not cached:
+                    raise RegistryError(
+                        "Official telecom standards could not be synchronized and no cached model is available: "
+                        f"{exc}"
+                    ) from exc
         if not self.standards_dir.exists():
             raise RegistryError(f"Standards directory does not exist: {self.standards_dir}")
         standards = _canonical_file_list(self.standards_dir)
         if not standards:
-            raise RegistryError(f"No normalized standards artifacts found in {self.standards_dir}")
+            raise RegistryError(f"No official standards model artifacts found in {self.standards_dir}")
 
         fingerprint = registry_fingerprint(self.standards_dir, self.profiles_dir)
         try:
@@ -203,23 +238,38 @@ class TelecomRegistry:
                 self._catalog_cache[cache_key] = [dict(item) for item in result]
             return result
 
-    def llm_catalog_context(self) -> dict[str, Any]:
-        """Return the complete standards-backed registry context for intent grounding.
+    def llm_catalog_context(self, query: str | None = None) -> dict[str, Any]:
+        """Return official-model-derived grounding context for intent understanding.
 
-        This deliberately has no entity, attribute, relationship, or source-URL count cap.
-        The registry is the authoritative semantic boundary; the LLM receives the complete
-        currently-ingested normalized telecom model and all registered provenance URLs, then
-        the deterministic compiler decides what is executable for the requested scenario.
+        All registered official source metadata/URLs are always included. When a query is
+        supplied, entity/attribute/relationship payload is restricted to entities that are
+        lexically relevant to that request; there is no numeric entity/field cap. The compiler
+        still operates against the full registry graph and can expand every approved relation.
+        This avoids blowing the LLM context window on unrelated portions of a complete standards
+        library while preserving all official models in the backend registry.
         """
         with self._connect() as conn:
             standard_rows = conn.execute(
-                """SELECT artifact_id, organization, title, version, status, source_kind, source_url
+                """SELECT artifact_id, organization, title, version, status, source_kind, source_url, source_page
                    FROM standards ORDER BY organization, artifact_id"""
             ).fetchall()
-            entity_rows = conn.execute(
-                """SELECT canonical_id, name, domain, description
-                   FROM entities ORDER BY canonical_id"""
-            ).fetchall()
+            if query and str(query).strip():
+                selected_ids = [item["canonical_id"] for item in self.search(str(query), limit=None)]
+                if selected_ids:
+                    placeholders = ",".join("?" for _ in selected_ids)
+                    entity_rows = conn.execute(
+                        f"""SELECT canonical_id, name, domain, description
+                            FROM entities WHERE canonical_id IN ({placeholders})
+                            ORDER BY canonical_id""",
+                        selected_ids,
+                    ).fetchall()
+                else:
+                    entity_rows = []
+            else:
+                entity_rows = conn.execute(
+                    """SELECT canonical_id, name, domain, description
+                       FROM entities ORDER BY canonical_id"""
+                ).fetchall()
 
             standards = [
                 {
@@ -230,6 +280,7 @@ class TelecomRegistry:
                     "status": row[4],
                     "source_kind": row[5],
                     "source_url": row[6],
+                    "source_page": row[7],
                 }
                 for row in standard_rows
             ]
@@ -244,9 +295,9 @@ class TelecomRegistry:
                     ).fetchall()
                 ]
                 sources = [
-                    dict(zip(("standard", "artifact", "version", "reference", "url", "source_role"), row))
+                    dict(zip(("standard", "artifact", "version", "reference", "url", "source_page", "source_role"), row))
                     for row in conn.execute(
-                        """SELECT standard, artifact, version, reference, url, source_role
+                        """SELECT standard, artifact, version, reference, url, source_page, source_role
                            FROM entity_sources WHERE canonical_id=?
                            ORDER BY standard, artifact, reference""",
                         (canonical_id,),
@@ -361,7 +412,7 @@ class TelecomRegistry:
     def resolve_entity(self, value: str) -> EntityDef | None:
         key = _normalise(value)
         with self._connect() as conn:
-            row = conn.execute("SELECT canonical_id FROM aliases WHERE alias=?", (key,)).fetchone()
+            row = conn.execute("SELECT canonical_id FROM aliases WHERE alias=? ORDER BY canonical_id LIMIT 1", (key,)).fetchone()
             if row is None:
                 row = conn.execute("SELECT canonical_id FROM entities WHERE canonical_id=?", (key.replace(" ", "_"),)).fetchone()
             if row is None:
@@ -383,9 +434,9 @@ class TelecomRegistry:
             canonical_id, name, domain, description = entity
             aliases = tuple(r[0] for r in conn.execute("SELECT alias FROM aliases WHERE canonical_id=? ORDER BY alias", (canonical_id,)).fetchall())
             sources = tuple(
-                dict(zip(("standard", "artifact", "version", "reference", "url", "source_role"), row))
+                dict(zip(("standard", "artifact", "version", "reference", "url", "source_page", "source_role"), row))
                 for row in conn.execute(
-                    "SELECT standard, artifact, version, reference, url, source_role FROM entity_sources WHERE canonical_id=? ORDER BY standard, artifact, reference",
+                    "SELECT standard, artifact, version, reference, url, source_page, source_role FROM entity_sources WHERE canonical_id=? ORDER BY standard, artifact, reference",
                     (canonical_id,),
                 ).fetchall()
             )
@@ -476,7 +527,7 @@ class TelecomRegistry:
         except KeyError:
             return False
 
-    def search(self, query: str, domain: str | None = None, limit: int | None = 35) -> list[dict[str, Any]]:
+    def search(self, query: str, domain: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
         """Deterministic lexical search over names and aliases; one result per entity."""
         normalized = _normalise(query)
         effective_limit = None if limit is None else max(1, int(limit))
@@ -490,21 +541,31 @@ class TelecomRegistry:
 
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT e.canonical_id, e.name, e.domain, e.description, a.alias
-                   FROM entities e JOIN aliases a ON a.canonical_id=e.canonical_id"""
+                """SELECT e.canonical_id, e.name, e.domain, e.description,
+                          GROUP_CONCAT(DISTINCT a.alias), GROUP_CONCAT(DISTINCT es.artifact)
+                   FROM entities e
+                   LEFT JOIN aliases a ON a.canonical_id=e.canonical_id
+                   LEFT JOIN entity_sources es ON es.canonical_id=e.canonical_id
+                   GROUP BY e.canonical_id, e.name, e.domain, e.description"""
             ).fetchall()
 
             source_cache: dict[str, list[str]] = {}
-            for canonical_id, name, entity_domain, description, alias in rows:
+            for canonical_id, name, entity_domain, description, aliases_text, artifacts_text in rows:
                 if domain and entity_domain != domain:
                     continue
-                alias_norm = _normalise(alias)
+                aliases = [item for item in str(aliases_text or "").split(",") if item]
+                search_text = _normalise(" ".join([
+                    str(name or ""), str(canonical_id or ""), str(description or ""),
+                    *aliases, *(str(artifacts_text or "").split(",")),
+                ]))
                 score = 0
-                if alias_norm == normalized:
+                if normalized and normalized in search_text:
+                    score += 45
+                for token in tokens:
+                    if token in search_text:
+                        score += 10
+                if any(_normalise(alias) == normalized for alias in aliases):
                     score += 100
-                if normalized and normalized in alias_norm:
-                    score += 40
-                score += sum(10 for token in tokens if token in alias_norm)
                 if score <= 0:
                     continue
 
@@ -538,7 +599,7 @@ class TelecomRegistry:
 
 
 class RegistryBuilder:
-    """Build the runtime SQLite registry from versioned JSON artifacts."""
+    """Build the runtime SQLite registry from generated indexes of official artifacts."""
 
     def __init__(self, db_path: Path, standards_dir: Path, profiles_dir: Path) -> None:
         self.db_path = db_path
@@ -595,6 +656,7 @@ class RegistryBuilder:
             conn.close()
 
     def _create_tables(self, conn: sqlite3.Connection) -> None:
+        self._migrate_legacy_schema(conn)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS registry_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -606,6 +668,7 @@ class RegistryBuilder:
                 status TEXT,
                 source_kind TEXT,
                 source_url TEXT,
+                source_page TEXT,
                 source_sha256 TEXT
             );
             CREATE TABLE IF NOT EXISTS entities(
@@ -616,7 +679,12 @@ class RegistryBuilder:
                 artifact_id TEXT NOT NULL,
                 FOREIGN KEY(artifact_id) REFERENCES standards(artifact_id)
             );
-            CREATE TABLE IF NOT EXISTS aliases(alias TEXT PRIMARY KEY, canonical_id TEXT NOT NULL, FOREIGN KEY(canonical_id) REFERENCES entities(canonical_id));
+            CREATE TABLE IF NOT EXISTS aliases(
+                alias TEXT NOT NULL,
+                canonical_id TEXT NOT NULL,
+                PRIMARY KEY(alias, canonical_id),
+                FOREIGN KEY(canonical_id) REFERENCES entities(canonical_id)
+            );
             CREATE TABLE IF NOT EXISTS entity_sources(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 canonical_id TEXT NOT NULL,
@@ -625,6 +693,7 @@ class RegistryBuilder:
                 version TEXT,
                 reference TEXT NOT NULL,
                 url TEXT,
+                source_page TEXT,
                 source_role TEXT NOT NULL DEFAULT 'semantic-source',
                 FOREIGN KEY(canonical_id) REFERENCES entities(canonical_id)
             );
@@ -673,19 +742,40 @@ class RegistryBuilder:
         )
 
     @staticmethod
+    def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
+        """Upgrade the small runtime SQLite schema used by prior application versions."""
+        def columns(table: str) -> dict[str, int]:
+            try:
+                return {row[1]: row[5] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            except sqlite3.OperationalError:
+                return {}
+
+        # Older builds made alias globally unique, which is unsafe once multiple official
+        # TMF/MEF model files contain the same model name. Recreate the tiny table.
+        alias_cols = columns("aliases")
+        if alias_cols and alias_cols.get("alias") == 1:
+            conn.execute("DROP TABLE IF EXISTS aliases")
+
+        if "source_page" not in columns("standards") and columns("standards"):
+            conn.execute("ALTER TABLE standards ADD COLUMN source_page TEXT")
+        if "source_page" not in columns("entity_sources") and columns("entity_sources"):
+            conn.execute("ALTER TABLE entity_sources ADD COLUMN source_page TEXT")
+
+    @staticmethod
     def _normalise_canonical_id(value: str) -> str:
         return _normalise(value).replace(" ", "_")
 
     def _insert_artifact(self, conn: sqlite3.Connection, artifact: dict[str, Any], path: Path) -> None:
         sources = artifact.get("sources") or []
         default_url = sources[0].get("url") if sources else artifact.get("source_url")
+        default_page = sources[0].get("source_page") if sources else artifact.get("source_page")
         default_version = sources[0].get("version") if sources else artifact.get("version")
         conn.execute(
-            "INSERT INTO standards(artifact_id, organization, title, version, status, source_kind, source_url, source_sha256) VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO standards(artifact_id, organization, title, version, status, source_kind, source_url, source_page, source_sha256) VALUES(?,?,?,?,?,?,?,?,?)",
             (
                 artifact["artifact_id"], artifact.get("organization", "Unknown"), artifact.get("title", artifact["artifact_id"]),
-                artifact.get("artifact_version", default_version), artifact.get("status"), artifact.get("source_kind", "normalized"),
-                default_url, hashlib.sha256(path.read_bytes()).hexdigest(),
+                artifact.get("artifact_version", default_version), artifact.get("status"), artifact.get("source_kind", "official-machine-readable-model"),
+                default_url, default_page, hashlib.sha256(path.read_bytes()).hexdigest(),
             ),
         )
 
@@ -696,24 +786,29 @@ class RegistryBuilder:
         )
         aliases = set(entity.get("aliases") or []) | {cid, entity["name"]}
         for alias in aliases:
-            conn.execute("INSERT OR REPLACE INTO aliases(alias,canonical_id) VALUES(?,?)", (_normalise(alias), cid))
+            conn.execute("INSERT OR IGNORE INTO aliases(alias,canonical_id) VALUES(?,?)", (_normalise(alias), cid))
         source_records = entity.get("sources") or artifact.get("sources") or []
         for source in source_records:
             conn.execute(
-                "INSERT INTO entity_sources(canonical_id,standard,artifact,version,reference,url,source_role) VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO entity_sources(canonical_id,standard,artifact,version,reference,url,source_page,source_role) VALUES(?,?,?,?,?,?,?,?)",
                 (
                     cid, source.get("standard", artifact.get("organization", "Unknown")), source.get("artifact", artifact.get("title", artifact["artifact_id"])),
                     source.get("version") or artifact.get("artifact_version"), source.get("reference", artifact["artifact_id"]),
-                    source.get("url") or artifact.get("source_url"), source.get("source_role", "semantic-source"),
+                    source.get("url") or artifact.get("source_url"), source.get("source_page") or artifact.get("source_page"),
+                    source.get("source_role", "semantic-source"),
                 ),
             )
         for ordinal, attribute in enumerate(entity.get("attributes") or []):
             conn.execute(
-                """INSERT INTO attributes(canonical_id,name,ordinal,dtype,required,nullable,description,enum_values_json)
-                   VALUES(?,?,?,?,?,?,?,?)""",
+                """INSERT INTO attributes(
+                    canonical_id,name,ordinal,dtype,required,nullable,description,enum_values_json,
+                    generator,params_json,derived_formula,depends_on_json
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     cid, attribute["name"], ordinal, attribute.get("dtype", "string"), int(bool(attribute.get("required"))),
                     int(bool(attribute.get("nullable"))), attribute.get("description", ""), _json(attribute.get("enum_values") or []),
+                    attribute.get("generator", "") or "", _json(attribute.get("params") or {}),
+                    attribute.get("derived_formula"), _json(attribute.get("depends_on") or []),
                 ),
             )
         for ordinal, relationship in enumerate(entity.get("relationships") or []):
@@ -731,34 +826,76 @@ class RegistryBuilder:
         for path in _canonical_file_list(self.profiles_dir):
             with path.open(encoding="utf-8") as handle:
                 document = json.load(handle)
-            if "profile" not in document or "fields" not in document:
-                raise RegistryError(f"Invalid generation profile: {path}")
+            profile = document.get("profile") if isinstance(document, dict) else None
+            targets = document.get("targets") if isinstance(document, dict) else None
+            if not isinstance(profile, dict) or not profile.get("profile_id") or not isinstance(targets, list):
+                raise RegistryError(
+                    f"Invalid generation profile: {path}. Expected {{profile: {{profile_id: ...}}, targets: [...]}}."
+                )
+            for index, target in enumerate(targets):
+                if not isinstance(target, dict) or not target.get("source_id") or not target.get("model") or not target.get("field") or not target.get("generator"):
+                    raise RegistryError(
+                        f"Invalid generation profile target at {path} index {index}: expected source_id, model, field and generator."
+                    )
             profiles.append(document)
         return profiles
 
     def _insert_profile(self, conn: sqlite3.Connection, document: dict[str, Any]) -> None:
         profile = document["profile"]
         profile_id = profile["profile_id"]
-        for key, config in (document.get("fields") or {}).items():
-            if "." not in key:
-                raise RegistryError(f"Generation profile key must be '<entity>.<field>': {key}")
-            entity, field = key.split(".", 1)
-            conn.execute(
-                "INSERT INTO generation_profiles(profile_id,canonical_id,field_name,generator,params_json,derived_formula,depends_on_json) VALUES(?,?,?,?,?,?,?)",
-                (
-                    profile_id, self._normalise_canonical_id(entity), field, config.get("generator", ""), _json(config.get("params") or {}),
-                    config.get("derived_formula"), _json(config.get("depends_on") or []),
-                ),
-            )
+        for target in document.get("targets") or []:
+            source_id = self._normalise_canonical_id(str(target["source_id"]))
+            model = str(target["model"]).strip()
+            field = str(target["field"]).strip()
+            if not field:
+                raise RegistryError(f"Generation profile '{profile_id}' contains an empty field target")
+
+            if model == "*":
+                entity_rows = conn.execute(
+                    "SELECT canonical_id FROM entities WHERE artifact_id=? ORDER BY canonical_id",
+                    (source_id,),
+                ).fetchall()
+            else:
+                entity_rows = conn.execute(
+                    "SELECT canonical_id FROM entities WHERE artifact_id=? AND lower(name)=lower(?) ORDER BY canonical_id",
+                    (source_id, model),
+                ).fetchall()
+
+            if not entity_rows:
+                raise RegistryError(
+                    f"Generation profile '{profile_id}' target does not exist in the official registry: "
+                    f"{source_id}:{model}.{field}"
+                )
+
+            matched_fields = []
+            for (canonical_id,) in entity_rows:
+                row = conn.execute(
+                    "SELECT 1 FROM attributes WHERE canonical_id=? AND name=?",
+                    (canonical_id, field),
+                ).fetchone()
+                if row is not None:
+                    matched_fields.append(canonical_id)
+
+            if not matched_fields:
+                raise RegistryError(
+                    f"Generation profile '{profile_id}' targets an attribute that is not present in the official registry: "
+                    f"{source_id}:{model}.{field}"
+                )
+
+            for canonical_id in matched_fields:
+                conn.execute(
+                    "INSERT INTO generation_profiles(profile_id,canonical_id,field_name,generator,params_json,derived_formula,depends_on_json) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        profile_id, canonical_id, field, target.get("generator", ""), _json(target.get("params") or {}),
+                        target.get("derived_formula"), _json(target.get("depends_on") or []),
+                    ),
+                )
 
     def _apply_generation_profiles(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(
-            "SELECT profile_id, canonical_id, field_name, generator, params_json, derived_formula, depends_on_json FROM generation_profiles ORDER BY profile_id"
+            "SELECT profile_id, canonical_id, field_name, generator, params_json, derived_formula, depends_on_json FROM generation_profiles ORDER BY profile_id, canonical_id, field_name"
         ).fetchall()
         for _, cid, field, generator, params_json, formula, depends_on_json in rows:
-            exists = conn.execute("SELECT 1 FROM attributes WHERE canonical_id=? AND name=?", (cid, field)).fetchone()
-            if not exists:
-                raise RegistryError(f"Generation profile references unknown standards attribute: {cid}.{field}")
             conn.execute(
                 "UPDATE attributes SET generator=?, params_json=?, derived_formula=?, depends_on_json=? WHERE canonical_id=? AND name=?",
                 (generator, params_json, formula, depends_on_json, cid, field),

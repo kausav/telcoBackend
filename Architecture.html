@@ -1,523 +1,156 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>INGENII — Telecom Agentic Synthetic Data Platform Architecture</title>
-  <script type="module">
-    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-    mermaid.initialize({
-      startOnLoad: true,
-      securityLevel: 'loose',
-      theme: 'base',
-      themeVariables: {
-        primaryColor: '#eef6ff',
-        primaryTextColor: '#17202a',
-        primaryBorderColor: '#1769aa',
-        lineColor: '#687684',
-        secondaryColor: '#f7f9fb',
-        tertiaryColor: '#ffffff'
-      },
-      flowchart: { htmlLabels: true, curve: 'basis' },
-      sequence: { useMaxWidth: true }
-    });
-  </script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>INGENII Telecom Synthetic Data Generator — Architecture</title>
   <style>
-    :root {
-      --bg:#f4f7fa; --card:#fff; --text:#17202a; --muted:#5c6873; --border:#dce3e8;
-      --accent:#1769aa; --accent-soft:#eef6ff; --good:#2e7d32; --good-soft:#eef8ef;
-      --warn:#996a00; --warn-soft:#fff8e5; --danger:#b3261e; --danger-soft:#fff0ef;
-      --code:#10151a; --code-text:#e9eef2; --shadow:0 4px 18px rgba(20,30,40,.05);
-    }
-    *{box-sizing:border-box}
-    body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Arial,Helvetica,sans-serif;line-height:1.62}
-    header{padding:48px 7%;background:linear-gradient(135deg,#17202a,#29455e);color:#fff}
-    header h1{margin:0 0 10px;font-size:36px;letter-spacing:-.4px}
-    header p{margin:0;max-width:1120px;color:#d9e1e7;font-size:16px}
-    header .meta{margin-top:16px;font-size:13px;color:#c4d0d9}
-    main{max-width:1320px;margin:28px auto 80px;padding:0 24px}
-    section{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:27px;margin:22px 0;box-shadow:var(--shadow)}
-    h2{margin:0 0 12px;color:var(--accent);font-size:26px}
-    h3{margin:20px 0 8px;font-size:19px} h4{margin:18px 0 8px;font-size:16px}
-    p{margin:9px 0}.small{font-size:13px;color:var(--muted)}
-    .toc a{color:var(--accent);text-decoration:none}.toc a:hover{text-decoration:underline}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(255px,1fr));gap:16px}
-    .card{border:1px solid var(--border);border-radius:11px;padding:16px;background:#fff}
-    .badge{display:inline-block;padding:3px 8px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:11px;font-weight:700;margin-right:6px}
-    .good,.warn,.danger,.note{padding:13px 16px;border-left:4px solid;margin:14px 0;border-radius:4px}
-    .good{background:var(--good-soft);border-color:var(--good)} .warn{background:var(--warn-soft);border-color:var(--warn)}
-    .danger{background:var(--danger-soft);border-color:var(--danger)} .note{background:var(--accent-soft);border-color:var(--accent)}
-    .diagram{border:1px solid var(--border);border-radius:11px;padding:14px;margin:16px 0;background:#fcfdff;overflow:auto}
-    .mermaid{min-width:720px}
-    table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 11px;border-bottom:1px solid var(--border);vertical-align:top}
-    th{background:#f1f4f6}tr:last-child td{border-bottom:0}
-    code{background:#eef1f4;padding:2px 6px;border-radius:5px;font-size:.92em}
-    pre{background:var(--code);color:var(--code-text);padding:16px;border-radius:9px;overflow:auto}
-    .two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-    .pill{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;background:#f2f5f7;border:1px solid var(--border);padding:4px 7px;border-radius:6px;display:inline-block;margin:3px 4px 3px 0}
-    .flow-step{font-weight:700;color:var(--accent)}
-    footer{max-width:1320px;margin:0 auto 50px;padding:0 24px;color:var(--muted);font-size:13px}
-    @media(max-width:900px){.two{grid-template-columns:1fr}.mermaid{min-width:620px}header h1{font-size:30px}}
+    :root{--bg:#f7f9fc;--card:#fff;--text:#152033;--muted:#526176;--line:#dfe5ee;--accent:#3559e0;--accent2:#eef2ff;--good:#087443;--warn:#8a5a00;--danger:#a62b2b}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 Arial,Helvetica,sans-serif}
+    main{max-width:1180px;margin:0 auto;padding:32px 22px 60px}h1{font-size:34px;line-height:1.15;margin:0 0 8px}h2{margin-top:38px;font-size:24px}h3{margin:0 0 8px;font-size:18px}.lead{color:var(--muted);font-size:17px;max-width:920px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.card,.callout{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin:14px 0}.badge{display:inline-block;background:var(--accent2);color:var(--accent);border-radius:999px;padding:3px 9px;font-size:12px;font-weight:700;margin-bottom:8px}code,pre{font-family:Consolas,Monaco,monospace}code{background:#eef1f6;padding:1px 4px;border-radius:4px}pre{background:#101828;color:#eef2f6;border-radius:12px;padding:16px;overflow:auto;font-size:13px}.diagram{background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px;overflow:auto}table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden}th,td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left}th{background:#f0f3f8}a{color:var(--accent)}.small{color:var(--muted);font-size:13px}.good{border-left:4px solid var(--good)}.warn{border-left:4px solid #c08300}.danger{border-left:4px solid var(--danger)}.flow{font-weight:700}.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:800px){.two{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
-<header>
-  <h1>INGENII — Telecom Agentic Synthetic Data Platform</h1>
-  <p>Architecture and code-level walkthrough for the MVP scenario workflow: <strong>propose OR import-csv → confirm → generate</strong>. The design uses PydanticAI for constrained natural-language intent extraction, a standards-backed runtime registry for telecom semantics, a deterministic schema compiler, persisted HITL approval, and deterministic generation/validation.</p>
-  <div class="meta">MVP baseline: FastAPI · Pydantic / PydanticAI · Gemini · LangGraph · SQLite runtime stores · deterministic generators</div>
-</header>
-
 <main>
-  <section class="toc">
-    <h2>Contents</h2>
-    <p>
-      <a href="#principles">1. Architecture principles</a> ·
-      <a href="#selection-model">2. Industry and Domain Selection</a> ·
-      <a href="#overview">3. End-to-end architecture</a> ·
-      <a href="#api">4. Public API contract</a> ·
-      <a href="#agent">5. Agentic schema proposal</a> ·
-      <a href="#registry">6. Standards-backed runtime registry</a> ·
-      <a href="#hitl">7. HITL / confirmation</a> ·
-      <a href="#generation">8. Deterministic generation</a> ·
-      <a href="#qa">9. Validation & repair</a> ·
-      <a href="#persistence">10. Persistence & lifecycle</a> ·
-      <a href="#security">11. Trust & security boundaries</a> ·
-      <a href="#files">12. Code map</a> ·
-      <a href="#runbook">13. Run / test / operate</a>
-    </p>
-  </section>
+  <h1>INGENII Telecom Synthetic Data Generator</h1>
+  <p class="lead">Current architecture: official TM Forum, 3GPP and MEF machine-readable data models are the semantic source of truth; INGENII generation profiles are behavior-only overlays; Gemini interprets scenarios; a deterministic compiler builds the executable schema; and deterministic validation enforces the final contract.</p>
 
-  <section id="principles">
-    <h2>1. Architecture principles</h2>
-    <div class="grid">
-      <div class="card"><span class="badge">P0</span><h3>LLM is not the telecom authority</h3><p>Gemini extracts intent and resolves user language to candidate concepts. It does not create executable entities, fields, relationships, formulas, generators or enums.</p></div>
-      <div class="card"><span class="badge">P1</span><h3>Standards define semantics</h3><p>TM Forum, 3GPP and selectively MEF provide provenance-backed source semantics. INGENII normalizes these artifacts into a runtime registry.</p></div>
-      <div class="card"><span class="badge">P2</span><h3>Compiler creates the schema</h3><p>The scenario schema is built deterministically from the runtime registry plus approved generation-policy overlays. The LLM does not directly author the schema.</p></div>
-      <div class="card"><span class="badge">P3</span><h3>HITL approves ambiguity</h3><p>The human reviews the proposed schema and may apply safe edits. Unknown concepts and executable semantics remain blocked.</p></div>
-      <div class="card"><span class="badge">P4</span><h3>Generation is deterministic</h3><p>The approved contract is passed to the existing deterministic generation pipeline. Agentic scenarios do not get silently reinterpreted by later LLM stages.</p></div>
-      <div class="card"><span class="badge">P5</span><h3>Every run is reproducible</h3><p>Scenario metadata, schema, registry provenance, generation policy and validation results are persisted so a run can be audited and recreated.</p></div>
-    </div>
-    <div class="danger"><strong>Anti-hallucination rule:</strong> structured LLM output alone is not sufficient. Pydantic validates shape; registry resolution validates telecom vocabulary; deterministic compilation validates executable semantics.</div>
-  </section>
+  <div class="callout good"><strong>Core rule:</strong> official models define <em>what a field means</em>. INGENII generation policies define <em>how a synthetic value may be sampled</em>. The two are intentionally separate.</div>
 
-  <section id="selection-model">
-    <h2>2. Industry and Domain Selection</h2>
-    <div class="two">
-      <div class="card"><h3>IndustryType = model-family selector</h3><p><code>industryType</code> is the authoritative industry selector. For the current release, <code>Telecommunications</code>, <code>Telecom</code> and their normalized forms select the telecom model family. Unsupported industries are rejected before proposal compilation.</p></div>
-      <div class="card"><h3>Domain = variable selector</h3><p><code>domain</code> is the authoritative business-domain selector inside the chosen industry. It is passed to the standards-backed runtime registry as the deterministic search query used to retrieve suitable entities and variables.</p></div>
-    </div>
-    <div class="diagram">
-      <div class="mermaid">
-flowchart LR
-  I[industryType] --> N[Normalize Industry]
-  N --> T[Telecom Model Family]
-  D[domain] --> R[Deterministic Domain Search]
-  T --> R
-  R --> C[TM Forum / 3GPP / MEF Runtime Registry]
-  C --> S[Registry-backed entities, attributes, relationships]
-  S --> SC[Deterministic Schema Compiler]
-  SC --> H[HITL Confirmation]
-  H --> G[Deterministic Generation]
-      </div>
-    </div>
-    <div class="note"><strong>Anti-hallucination boundary:</strong> Gemini receives a constrained telecom catalog and returns intent only. The backend treats <code>industryType</code>, <code>domain</code>, <code>scenarioType</code>, <code>typeOfData</code>, <code>country</code>, <code>entityKey</code>, <code>useCase</code>, and <code>businessScenario</code> as authoritative proposal inputs. <code>scenarioId</code> is identifier/audit metadata only and is excluded from semantic selection. The LLM never creates executable entities, fields, relationships, formulas, generators or enums.</div>
-  </section>
-
-  <section id="overview">
-    <h2>3. End-to-end architecture</h2>
-    <div class="diagram">
-      <div class="mermaid">
-flowchart LR
-  U[User / Flutter / Web UI] --> API[FastAPI]
-  API --> P[POST /scenario/propose]
-  API --> CSV[POST /scenario/import-csv]
-  P --> IA[PydanticAI Intent Agent]
-  IA -->|Intent only; backend request fields remain authoritative| R[Telecom Runtime Registry]
-  P -. industryType .-> R
-  P -. domain .-> R
-  P -. useCase .-> R
-  R --> C[Deterministic Schema Compiler]
-  P -. scenarioType / typeOfData / country / entityKey / businessScenario .-> C
-  C --> D[(Draft / HITL state)]
-  CSV --> D2[Imported CSV Draft]
-  D2 --> H
-  D --> H[Human Review]
-  H -->|POST /scenario/confirm| F[Confirmed Scenario]
-  F --> G[POST /scenario/generate]
-  G --> LG[LangGraph Generation Workflow]
-  LG --> O[Orchestrator]
-  O --> S[Schema / Rules Agent]
-  S --> DG[Deterministic Data Generation]
-  DG --> QA[Validation + Repair]
-  QA --> OUT[Validated Dataset + Report]
-  OUT --> API
-
-  R --> ST[(SQLite Runtime Registry)]
-  R --> SA[/Versioned standards artifacts/]
-  IA -. chat context .-> CHAT[(SQLite Conversation Store)]
-  F --> DS[(Confirmed Scenarios)]
-  DG --> CACHE[(Compiled / Runtime Cache)]
-      </div>
-    </div>
-
-    <div class="two">
-      <div class="card"><h3>Agentic path</h3><p><span class="flow-step">Intent → Standards Registry → Compiler → HITL</span>. Used by <code>/scenario/propose</code>; the deterministic compiler expands the approved registry graph to at least 20 distinct variables.</p></div>
-      <div class="card"><h3>CSV path</h3><p><span class="flow-step">CSV → deterministic parser → HITL</span>. Used by <code>/scenario/import-csv</code> when the client already owns the schema definition.</p></div>
-    </div>
-    <div class="card"><h3>Common execution path</h3><p><span class="flow-step">Confirmed contract → Generator → Validation</span>. Both proposal paths converge on <code>/scenario/confirm</code> and then <code>/scenario/generate</code>.</p></div>
-
-    <h3>Runtime trust hierarchy</h3>
-    <pre>Industry standards artifacts
-        ↓
-Normalized standards model
-        ↓
-INGENII runtime registry
-        ↓
+  <h2>1. Source-of-truth hierarchy</h2>
+  <pre>Official TM Forum / 3GPP / MEF model artifacts
+            ↓
+Official-source synchronization
+            ↓
+Runtime normalized/indexed registry
+            ↓
+Scenario relevance + relationship expansion
+            ↓
+INGENII generation-policy overlay
+            ↓
 Scenario schema compiler
-        ↓
-HITL-approved scenario contract
-        ↓
-Deterministic generator
-        ↓
-Deterministic QA / reconciliation</pre>
-  </section>
+            ↓
+HITL-approved executable contract
+            ↓
+Deterministic generation
+            ↓
+Validation / repair / acceptance</pre>
+  <p>Normalized JSON files under <code>runtime_data</code> are generated indexes/cache artifacts. They are not presented as official standards documents and are not hand-authored semantic sources.</p>
 
-  <section id="api">
-    <h2>4. Public API contract</h2>
-    <p>The scenario workflow exposes four APIs. Clients may choose either the agentic JSON proposal path or the explicit CSV definition path; both converge on the same HITL confirmation and generation APIs. Liveness and health endpoints remain operational endpoints.</p>
-    <table>
-      <tr><th>Method</th><th>Path</th><th>Purpose</th><th>LLM</th><th>Input</th><th>Output</th></tr>
-      <tr><td>POST</td><td><code>/scenario/propose</code></td><td>Interpret JSON request metadata + natural-language businessScenario, resolve concepts against the standards-backed registry, and create an agentic schema draft.</td><td>Yes — intent only</td><td>JSON body</td><td><code>ScenarioImportResponse</code></td></tr>
-      <tr><td>POST</td><td><code>/scenario/import-csv</code></td><td>Parse an explicit CSV variable definition and create a draft using the explicit CSV schema contract.</td><td>No</td><td>multipart/form-data + CSV</td><td><code>ScenarioImportResponse</code></td></tr>
-      <tr><td>POST</td><td><code>/scenario/confirm</code></td><td>HITL boundary. Apply safe edits to either kind of draft and promote it to an executable scenario.</td><td>No</td><td>JSON body</td><td><code>ConfirmResponse</code></td></tr>
-      <tr><td>POST</td><td><code>/scenario/generate</code></td><td>Execute the confirmed scenario and return validated synthetic records.</td><td>Existing non-agentic pipeline only; approved agentic scenarios bypass additional semantic LLM passes</td><td>JSON body</td><td><code>GenerateResponse</code></td></tr>
-    </table>
+  <h2>2. Official model ingestion</h2>
+  <div class="grid">
+    <div class="card"><h3>TM Forum</h3><p>Official TM Forum OpenAPI/data-model artifacts are synchronized from pinned URLs in <code>resources/telecom/standards/official_sources.json</code>. The current manifest includes TMF620, TMF629, TMF637, TMF654, TMF666, TMF676 and TMF677 v4.0.0 sources.</p></div>
+    <div class="card"><h3>MEF</h3><p>MEF machine-readable YAML/JSON Schema archives are synchronized at pinned Git commits for the MEF 125 Subscriber Ethernet and MEF 139 Internet Access schema sets.</p></div>
+    <div class="card"><h3>3GPP</h3><p>The current manifest pins 3GPP TS 32.298 Release 19 v19.4.0 and parses the machine-processable ASN.1 structures into the runtime registry.</p></div>
+  </div>
+  <p class="small">The manifest preserves source URL and SHA-256 metadata. A deployment can rebuild the runtime registry from the same pinned inputs.</p>
 
-    <h3>3.1 <code>POST /scenario/propose</code></h3>
-    <p>The request body is the business-facing JSON contract. The backend derives technical schema details, resolves concepts against the TM Forum / 3GPP / MEF runtime registry, and deterministically builds an approved-registry schema containing at least 20 variables before HITL confirmation.</p>
-    <p>For subscriber-centric prepaid scenarios, the flat response contract uses <code>subscriber_id</code> as the entity key and retains <code>account_id</code> as the subscriber's prepaid account reference. <code>customer_id</code> is intentionally not projected into this response.</p>
-    <pre>{
-  "scenarioId": "LB-01",
-  "scenarioType": "Normal",
-  "industryType": "Telecommunications",
-  "domain": "Low Balance & Top-up",
-  "businessScenario": "Generate a high-fidelity synthetic dataset to model subscriber recharge behavior, analyze top-up trigger sensitivity, and evaluate proactive retention interventions without exposing sensitive customer PII.",
-  "typeOfData": "transactional",
-  "country": "IN",
-  "entityKey": "subscriber_id",
-  "useCase": "prepaid"
+  <h2>3. Generation profiles: policy, not semantics</h2>
+  <p>The directory <code>resources/telecom/generation_profiles/</code> now contains one policy file: <code>telecom_official_generation_v2.json</code>. Its targets use the exact identity <code>source_id + model + field</code>. Legacy keys such as <code>recharge.recharge_amount</code> are no longer accepted.</p>
+  <pre>{
+  "source_id": "tmf654_v4",
+  "model": "TopupBalance",
+  "field": "requestedDate",
+  "generator": "timestamp",
+  "params": {"lookback_days": 365}
 }</pre>
-    <div class="note"><strong>Response contract:</strong> <code>ScenarioImportResponse</code> is shared with CSV import and exposes <code>requested_scenario_id</code>, <code>draft_id</code>, <code>scenario_id</code>, <code>variables</code>, <code>field_order</code>, <code>typeOfData</code>, and <code>entityKey</code>. Agentic proposals must contain at least 20 distinct registry-backed variables.</div>
+  <div class="callout warn"><strong>Important:</strong> a distribution such as “95% completed” is an INGENII synthetic-data assumption, not a statement that TM Forum mandates that operational frequency. The standard supplies semantics and constraints; the profile supplies sampling policy.</div>
 
-    <h3>3.2 <code>POST /scenario/import-csv</code></h3>
-    <p>This path remains available for clients that already have a complete variable-level CSV definition. It accepts the same scenario metadata as before as multipart form fields plus a UTF-8 CSV file, parses and normalizes the CSV deterministically, and creates a non-agentic draft.</p>
-    <pre>multipart/form-data
-  file: definition.csv
-  scenarioId: PREPAID-CSV-01
-  domain: telecom
-  typeOfData: transactional
-  industryType: telecom
-  country: IN
-  businessScenario: Prepaid recharge and usage
-  scenarioType: csv
-  useCase: prepaid
-  label: Prepaid CSV
-  entityKey: subscriber_id</pre>
-    <p>The parser supports the existing client CSV conventions for types, generators, dependency aliases, timestamp formats, numeric buckets, weights, precision, currency and related deterministic parameters. The resulting response is the same <code>ScenarioImportResponse</code> used by <code>/scenario/propose</code>, including <code>requested_scenario_id</code>.</p>
+  <h2>4. Scenario proposal and variable breadth</h2>
+  <pre>POST /scenario/propose
+        ↓
+Scenario metadata + businessScenario
+        ↓
+Gemini intent extraction
+        ↓
+Official registry grounding
+        ↓
+All attributes on scenario-relevant official entities
+        ↓
+Relationship expansion until the approved graph is exhausted
+        ↓
+No 30/35 variable ceiling
+        ↓
+ScenarioSchema draft</pre>
+  <p>There is no application-level 30–35 variable ceiling. The output size is driven by the scenario and the breadth of the official models selected for that scenario. The practical size is therefore the size of the approved runtime registry, not an arbitrary proposal cap.</p>
+  <p>For telecom transactional scenarios, the application contract always includes <code>subscriber_id</code>, <code>account_id</code> and <code>msisdn</code>. These are application-level anchors; they are not claimed to be literal field names of a single 3GPP/TM Forum/MEF model.</p>
 
-    <h3>3.3 <code>POST /scenario/confirm</code></h3>
-    <p>This is the only HITL action API. It accepts <code>draft_id</code>, optional safe field edits, deletions, and feedback. For an unchanged agentic proposal, send empty <code>add</code>, <code>edit</code>, and <code>delete</code> arrays; Swagger's placeholder values such as <code>"string"</code> are not valid field names.</p>
-    <pre>{
-  "draft_id": "draft-...",
-  "add": [],
-  "edit": [
-    {"name": "recharge_amount", "changes": {"description": "Recharge amount in INR"}}
-  ],
-  "delete": [],
-  "feedback": "Use realistic Indian prepaid behavior"
-}</pre>
-    <p>For agentic drafts, confirmation rejects unknown fields and executable semantic changes. Generator names, formulas, dependency contracts and new parameters cannot be invented through HITL.</p>
+  <h2>5. Gemini boundary</h2>
+  <div class="card"><h3>Gemini receives</h3><p><code>scenarioType</code>, <code>industryType</code>, <code>domain</code>, <code>businessScenario</code>, <code>useCase</code>, <code>typeOfData</code> and <code>country</code>, plus constrained official-model grounding.</p></div>
+  <div class="card"><h3>Gemini does not own</h3><p>Official field definitions, types, relationships, generators, formulas, or arbitrary telecom vocabulary. The LLM output is validated and resolved against the official registry before it becomes executable.</p></div>
+  <p><code>entity_key</code> may still be supplied in the API for grouping/output behavior, but it is not part of the Gemini intent message.</p>
 
-    <h3>3.4 <code>POST /scenario/generate</code></h3>
-    <pre>{
-  "scenario": "PREPAID-01",
-  "draftId": "draft-...",
-  "count": 1000,
-  "recordsPerUser": 10
-}</pre>
-    <p>An agentic scenario is resolved from the confirmed scenario record and executed from its persisted contract. The API is deliberately separated from schema proposal so generation cannot silently change the approved semantics.</p>
-  </section>
+  <h2>6. Public APIs</h2>
+  <table>
+    <tr><th>Endpoint</th><th>Purpose</th><th>LLM?</th></tr>
+    <tr><td><code>POST /scenario/propose</code></td><td>Interpret the scenario and build an official-registry-backed draft schema.</td><td>Yes, intent only.</td></tr>
+    <tr><td><code>POST /scenario/import-csv</code></td><td>Parse an explicitly supplied CSV schema definition.</td><td>No.</td></tr>
+    <tr><td><code>POST /scenario/confirm</code></td><td>Human-in-the-loop approval/edit boundary.</td><td>No.</td></tr>
+    <tr><td><code>POST /scenario/generate</code></td><td>Generate and validate records from the confirmed contract.</td><td>Approved agentic scenarios do not re-enter the semantic LLM pipeline.</td></tr>
+  </table>
 
-  <section id="agent">
-    <h2>5. Agentic schema proposal</h2>
-    <div class="diagram">
-      <div class="mermaid">
-sequenceDiagram
-  participant UI as UI
-  participant API as FastAPI
-  participant CHAT as Conversation Store
-  participant LLM as PydanticAI + Gemini
-  participant REG as Runtime Registry
-  participant COMP as Schema Compiler
-  participant DB as Scenario DB
+  <h2>7. Mandatory telecom identity anchors</h2>
+  <table>
+    <tr><th>Field</th><th>Rule</th><th>Why</th></tr>
+    <tr><td><code>subscriber_id</code></td><td>Required, non-null, entity-level</td><td>Stable subscriber anchor in the application output contract.</td></tr>
+    <tr><td><code>account_id</code></td><td>Required, non-null, entity-level</td><td>Stable account anchor in the application output contract.</td></tr>
+    <tr><td><code>msisdn</code></td><td>Required, non-null, entity-level</td><td>Mobile number anchor; generated using country-aware E.164 logic.</td></tr>
+  </table>
 
-  UI->>API: POST /scenario/propose
-  API->>CHAT: append current proposal request for audit
-  API->>LLM: approved catalog + current request fields (scenarioId excluded)
-  LLM-->>API: ScenarioIntent
-  API->>REG: resolve concepts within industry + domain/useCase
-  REG-->>API: canonical entities / attrs / relationships / provenance
-  API->>COMP: compile using all request fields except scenarioId
-  COMP-->>API: executable ScenarioSchema
-  API->>DB: persist draft + schema + intent + conversation id
-  DB-->>API: draft_id
-  API-->>UI: ScenarioImportResponse
-      </div>
-    </div>
+  <h2>8. Validation and repair</h2>
+  <pre>Generated candidate values
+        ↓
+Type / declared-parameter checks
+        ↓
+Formula validation
+        ↓
+Scenario semantics
+        ↓
+Temporal ordering / bounded-delay repair
+        ↓
+Formula recalculation after temporal repair
+        ↓
+Final contract validation
+        ↓
+Accepted dataset</pre>
+  <p>Timestamp arithmetic is performed on real datetime values before final presentation formatting. This avoids validating timestamp relationships against display strings.</p>
 
-    <h3>LLM output contract</h3>
-    <p>The PydanticAI agent returns only <code>ScenarioIntent</code>. It can identify concepts, country/currency, approximate record count, time window and ambiguities. It cannot return an executable field definition.</p>
-    <pre>ScenarioIntent
-  industry_type
-  domain
-  subdomain / use_case
-  scenario_type
-  type_of_data
-  entity_key
-  requested_entities[]
-  requested_relationships[]
-  country
-  currency
-  record_count
-  time_window_days
-  notes[]
-  ambiguities[]</pre>
+  <h2>9. Provenance and client traceability</h2>
+  <p>Each official entity retains the organization, artifact, version, source URL, source page and source reference from the ingested model. The generation-policy traceability file documents which official model fields receive INGENII sampling policies.</p>
+  <table>
+    <tr><th>Layer</th><th>Authority</th><th>Example</th></tr>
+    <tr><td>Official semantic model</td><td>TM Forum / 3GPP / MEF</td><td><code>TMF654 / TopupBalance / requestedDate</code></td></tr>
+    <tr><td>Generation policy</td><td>INGENII</td><td><code>timestamp + lookback_days=365</code></td></tr>
+    <tr><td>Scenario selection</td><td>Business request + registry resolution</td><td>Prepaid recharge scenario</td></tr>
+    <tr><td>Executable contract</td><td>Compiler + HITL</td><td>Confirmed scenario schema</td></tr>
+    <tr><td>Acceptance</td><td>Deterministic QA</td><td>Formula and temporal consistency</td></tr>
+  </table>
 
-    <h3>Follow-up conversation</h3>
-    <p>The proposal request intentionally contains only business-facing fields. <code>scenarioId</code> is persisted for audit/draft correlation only and is excluded from semantic intent and schema selection. Every other request field is forwarded into the controlled intent/compilation context; no hidden client-side technical schema fields are required.</p>
+  <h2>10. Key source files</h2>
+  <table>
+    <tr><th>File</th><th>Role</th></tr>
+    <tr><td><code>resources/telecom/standards/official_sources.json</code></td><td>Pinned official model source manifest.</td></tr>
+    <tr><td><code>core/official_standards.py</code></td><td>Downloads/checksums/caches official model artifacts.</td></tr>
+    <tr><td><code>core/standards_ingestion.py</code></td><td>Normalizes TM Forum OpenAPI, MEF YAML/JSON Schema and 3GPP ASN.1 into the runtime index.</td></tr>
+    <tr><td><code>core/telecom_registry.py</code></td><td>Builds/queries the authoritative runtime registry and applies strict generation-policy overlays.</td></tr>
+    <tr><td><code>resources/telecom/generation_profiles/telecom_official_generation_v2.json</code></td><td>INGENII sampling policy only; targets exact official model fields.</td></tr>
+    <tr><td><code>agents/intent_agent.py</code></td><td>Gemini intent extraction from business-facing scenario context.</td></tr>
+    <tr><td><code>agents/schema_compiler.py</code></td><td>Deterministic compilation and comprehensive variable expansion.</td></tr>
+    <tr><td><code>agents/data_generation_agent.py</code></td><td>Record generation, dependencies, formulas, timestamp repair and serialization.</td></tr>
+  </table>
 
-    <div class="good"><strong>Important boundary:</strong> even if the model names an unsupported concept, the proposal is not executable. Registry resolution records the concept as unresolved and <code>/scenario/confirm</code> refuses promotion until the issue is resolved.</div>
-  </section>
+  <h2>11. Operations</h2>
+  <pre># install
+pip install -r requirements.txt
 
-  <section id="registry">
-    <h2>5. Standards-backed runtime registry</h2>
-    <p>The application contains no hard-coded Python telecom catalog; <code>core/telecom_registry.py</code> is an implementation of a read-only runtime registry over SQLite; the source material lives under versioned normalized artifacts and generation-policy overlays.</p>
+# start API
+uvicorn server:app --reload
 
-    <div class="diagram">
-      <div class="mermaid">
-flowchart LR
-  TMF[TM Forum artifacts] --> N[Normalized JSON artifacts]
-  GPP[3GPP artifacts] --> N
-  MEF[MEF artifacts when applicable] --> N
-  N --> B[RegistryBuilder]
-  GP[INGENII generation profiles] --> B
-  B --> DB[(SQLite runtime registry)]
-  DB --> API[TelecomRegistry]
-  API --> C[SchemaCompiler]
-      </div>
-    </div>
+# force refresh of official model inputs and rebuild runtime registry
+python scripts/ingest_standards.py --force</pre>
+  <p class="small">Generated values use stochastic sampling. The architecture persists the standards lineage and confirmed contract; bit-for-bit dataset reproducibility requires an explicit generation seed, which is not currently part of the public agentic API.</p>
 
-    <h3>5.1 Separation of concerns</h3>
-    <table>
-      <tr><th>Layer</th><th>Owns</th><th>Must not own</th></tr>
-      <tr><td>Standards artifacts</td><td>Telecom semantics, source terminology, provenance</td><td>INGENII-specific synthetic generation behavior</td></tr>
-      <tr><td>Generation profiles</td><td>Generator, params, dependencies and scenario-specific deterministic behavior</td><td>Inventing new standards entities or attributes</td></tr>
-      <tr><td>Runtime registry</td><td>Executable view, lookup, aliases, relationships, attributes and provenance</td><td>LLM-generated semantics</td></tr>
-      <tr><td>Schema compiler</td><td>Scenario-specific subset and contract assembly</td><td>External standards discovery at runtime</td></tr>
-    </table>
-
-    <h3>5.2 Standards roles for telecom</h3>
-    <div class="grid">
-      <div class="card"><h3>TM Forum</h3><p>Useful for CSP business/customer/product/service/account semantics. The current source model lineage is based on the Information Framework and relevant TM Forum APIs such as TMF654 Prepay Balance Management.</p><p class="small"><a href="https://www.tmforum.org/open-digital-architecture/information-framework-sid/">Information Framework</a> · <a href="https://www.tmforum.org/open-digital-architecture/open-apis/prepay-balance-management-api-TMF654/v4.0">TMF654</a></p></div>
-      <div class="card"><h3>3GPP</h3><p>Useful for mobile-network and charging semantics, especially the 32.xxx management/charging family. Prepaid charging should use the relevant 3GPP release/specification rather than generic LLM assumptions.</p><p class="small"><a href="https://portal.3gpp.org/">3GPP portal</a></p></div>
-      <div class="card"><h3>MEF</h3><p>MEF is loaded as a first-class telecom standards pack. The MVP includes Subscriber Ethernet and Internet Access model subsets. It is selected automatically only when the requested concepts resolve to MEF-backed entities; it is not artificially injected into a mobile-prepaid schema where it is not semantically relevant.</p><p class="small"><a href="https://www.mef.net/learn/mef-technical-standards-sdks/standard-type-view/">MEF Information &amp; Data Models</a> · <a href="https://www.mef.net/resources/mef-139-lso-sonata-internet-access-product-schemas-and-developer-guide/">MEF 139</a></p></div>
-    </div>
-
-    <div class="note"><strong>Deterministic standard applicability:</strong> the platform does not ask Gemini to choose TM Forum, 3GPP or MEF. It resolves the requested concepts first, then groups source provenance from the runtime registry. A prepaid request may therefore resolve primarily to TM Forum + 3GPP, while a connectivity request can resolve to MEF + TM Forum, with 3GPP added only when mobile charging/network semantics are actually requested.</div>
-
-    <h3>5.3 Registry provenance</h3>
-    <pre>canonical entity
-  → source organization
-  → source artifact
-  → source version / release
-  → source reference / URL
-  → source role
-  → INGENII policy overlay</pre>
-
-    <div class="warn"><strong>MVP qualification:</strong> the repository contains three normalized standards packs with provenance—TM Forum, 3GPP and MEF—but they are curated MVP subsets, not the complete standards corpora. Before production certification, pin the required releases and ingest the authoritative machine-readable/model artifacts for the supported domains.</div>
-  </section>
-
-  <section id="hitl">
-    <h2>6. HITL / confirmation workflow</h2>
-    <div class="diagram">
-      <div class="mermaid">
-flowchart LR
-  D[Draft schema] --> V[Deterministic validation]
-  V --> H[Human review]
-  H -->|Approve| C[Confirmed scenario]
-  H -->|Safe edit| V2[Revalidate edit]
-  V2 --> H
-  H -->|Reject| X[Rejected / discarded]
-  V -->|Unresolved concept| Q[Resolve before confirm]
-  Q --> H
-      </div>
-    </div>
-
-    <h3>Allowed HITL changes</h3>
-    <p>For agentic drafts, HITL can make presentation-level or safe contract-level changes that remain within the approved registry-backed definition: descriptions, nullability where allowed, existing parameter values, and field deletion where dependencies and required fields remain valid.</p>
-
-    <h3>Blocked HITL changes</h3>
-    <div class="danger"><span class="pill">new_entity</span><span class="pill">new_field</span><span class="pill">new_relationship</span><span class="pill">new_generator</span><span class="pill">new_formula</span><span class="pill">new_enum</span><span class="pill">unknown_parameter</span></div>
-    <p>A human can request a model extension, but that extension belongs in a new standards artifact or approved INGENII model extension, followed by registry rebuild and a new proposal.</p>
-  </section>
-
-  <section id="generation">
-    <h2>7. Deterministic generation</h2>
-    <p>The confirmed scenario is passed into the existing generation pipeline. The generator layer is responsible for record production; the LLM does not generate rows.</p>
-    <div class="diagram">
-      <div class="mermaid">
-flowchart LR
-  C[Confirmed Scenario] --> P[core/pipeline.py]
-  P --> LG[LangGraph]
-  LG --> O[Orchestrator]
-  O --> S[SchemaAgent / rules]
-  S --> D[DataGenerationAgent]
-  D --> X[Dependency-aware generation]
-  X --> T[Transactional grouping or flat aggregate]
-  T --> Q[QA / Repair]
-  Q --> R[GenerateResponse]
-      </div>
-    </div>
-
-    <h3>Agentic scenario exception</h3>
-    <p>For confirmed agentic scenarios, the orchestrator and schema stage use the persisted registry-backed contract as authoritative input and skip additional semantic reinterpretation. This prevents a second LLM pass from mutating the approved schema.</p>
-
-    <h3>Prepaid telecom generation example</h3>
-    <pre>Customer
-  ↓
-CustomerAccount
-  ↓
-PrepaidAccount
-  ├── Bucket
-  └── Recharge
-          ↓
-Subscriber
-  ├── UsageEvent
-  └── ChargingEvent</pre>
-    <p>The generation profile supplies deterministic behavior such as INR currency, Indian MSISDN generation, recharge denominations, subscriber status weights and relationship dependencies. Those are INGENII generation policies, not additional claims about the standards themselves.</p>
-  </section>
-
-  <section id="qa">
-    <h2>8. Validation, reconciliation and repair</h2>
-    <p>Quality is handled in multiple layers. A dataset is not considered valid merely because its columns match a Pydantic model.</p>
-    <table>
-      <tr><th>Layer</th><th>Question answered</th></tr>
-      <tr><td>Schema validation</td><td>Are required fields present and typed correctly?</td></tr>
-      <tr><td>Registry validation</td><td>Do entities, attributes and relationships exist in the approved model?</td></tr>
-      <tr><td>Reference validation</td><td>Do foreign/reference values resolve to generated records?</td></tr>
-      <tr><td>Temporal validation</td><td>Do causal timestamps occur in the correct order and within bounded delays?</td></tr>
-      <tr><td>Arithmetic validation</td><td>Do derived values reconcile with their inputs?</td></tr>
-      <tr><td>Distribution validation</td><td>Do generated records respect declared weights/buckets/precision?</td></tr>
-      <tr><td>Repair</td><td>Can a bad record be deterministically corrected without changing the approved contract?</td></tr>
-    </table>
-
-    <div class="good"><strong>Example:</strong> if <code>charge_timestamp</code> is causally downstream of <code>usage_timestamp</code>, the validator checks <code>charge_timestamp &gt;= usage_timestamp</code>. A failed row is repaired or rejected deterministically; the LLM is not permitted to change the relationship definition during generation.</div>
-  </section>
-
-  <section id="persistence">
-    <h2>9. Persistence and lifecycle</h2>
-    <div class="grid">
-      <div class="card"><h3>Conversation store</h3><p><code>core/conversation_store.py</code> persists user/assistant messages so proposal follow-ups can use chat context across requests and workers.</p></div>
-      <div class="card"><h3>Scenario store</h3><p><code>core/dynamic_scenarios.py</code> persists drafts and confirmed scenarios. Runtime databases are ignored by Git and recreated on a clean environment.</p></div>
-      <div class="card"><h3>Runtime registry</h3><p><code>runtime_data/registry.db</code> is mutable runtime state created automatically from the immutable resources under <code>resources/telecom/</code>. It is not source-of-truth model data and should live on a persistent deployment volume.</p></div>
-      <div class="card"><h3>Cache invalidation</h3><p>Scenario confirmation clears scenario-dependent cached artifacts so generation cannot accidentally use a stale schema.</p></div>
-    </div>
-
-    <h3>Draft lifecycle</h3>
-    <pre>proposed → pending HITL → confirmed → generated
-                     │
-                     ├→ rejected
-                     └→ revised → pending HITL</pre>
-  </section>
-
-  <section id="security">
-    <h2>10. Trust and security boundaries</h2>
-    <table>
-      <tr><th>Component</th><th>Trust level</th><th>Allowed authority</th></tr>
-      <tr><td>Gemini / PydanticAI</td><td>Advisory</td><td>Interpretation and candidate concepts only</td></tr>
-      <tr><td>Runtime registry</td><td>Authoritative</td><td>Entity/attribute/relationship vocabulary and provenance</td></tr>
-      <tr><td>Schema compiler</td><td>Authoritative</td><td>Executable schema construction</td></tr>
-      <tr><td>HITL</td><td>Authoritative for ambiguity</td><td>Approve/revise/reject within registry constraints</td></tr>
-      <tr><td>Generator</td><td>Authoritative for execution</td><td>Record creation according to approved contract</td></tr>
-      <tr><td>QA</td><td>Authoritative for acceptance</td><td>Validation, repair, rejection</td></tr>
-    </table>
-
-    <h3>External LLM boundary</h3>
-    <p>The proposal prompt includes a compact approved telecom catalog and relevant conversation history. No generated schema is sent back to the model as an executable tool definition. The model receives the semantic vocabulary; the compiler remains the gate.</p>
-  </section>
-
-  <section id="files">
-    <h2>11. Code map</h2>
-    <table>
-      <tr><th>File</th><th>Responsibility</th></tr>
-      <tr><td><code>server.py</code></td><td>Four public scenario APIs, request/response models, errors, request correlation.</td></tr>
-      <tr><td><code>core/agentic_models.py</code></td><td>Pydantic contracts for intent, resolved concepts, compiled schema and propose request/response.</td></tr>
-      <tr><td><code>core/agentic_workflow.py</code></td><td>Proposal lifecycle, conversation integration, deterministic schema compilation and HITL safety checks.</td></tr>
-      <tr><td><code>agents/intent_agent.py</code></td><td>PydanticAI + Gemini intent extraction only.</td></tr>
-      <tr><td><code>agents/schema_compiler.py</code></td><td>Deterministic registry-to-schema compiler.</td></tr>
-      <tr><td><code>core/telecom_registry.py</code></td><td>Runtime SQLite registry, provenance, aliases, graph validation and generation-policy application.</td></tr>
-      <tr><td><code>core/standards_ingestion.py</code></td><td>Normalizer for machine-readable standards artifacts; currently provides Swagger/OpenAPI ingestion.</td></tr>
-      <tr><td><code>scripts/ingest_standards.py</code></td><td>Rebuild command for the runtime registry.</td></tr>
-      <tr><td><code>core/conversation_store.py</code></td><td>Persistent chat context.</td></tr>
-      <tr><td><code>core/dynamic_scenarios.py</code></td><td>Drafts, confirmed scenarios, scenario metadata and feedback.</td></tr>
-      <tr><td><code>core/pipeline.py</code></td><td>LangGraph generation workflow.</td></tr>
-      <tr><td><code>agents/orchestrator.py</code></td><td>Scenario validation/routing and agent-stage orchestration.</td></tr>
-      <tr><td><code>agents/schema_agent.py</code></td><td>Existing rules/semantic stage for non-agentic execution; approved agentic scenarios use persisted contract semantics.</td></tr>
-      <tr><td><code>agents/data_generation_agent.py</code></td><td>Deterministic generation, dependency ordering, grouping, formulas and repair.</td></tr>
-      <tr><td><code>core/runtime_cache.py</code></td><td>Process-local runtime artifact cache and invalidation.</td></tr>
-    </table>
-  </section>
-
-  <section id="runbook">
-    <h2>12. Production Deployment</h2>
-    <div class="grid">
-      <div class="card"><h3>Immutable resources</h3><p><code>resources/telecom/</code> contains model artifacts and generation profiles shipped with the build. They are read-only inputs to registry construction.</p></div>
-      <div class="card"><h3>Mutable runtime state</h3><p><code>runtime_data/</code> is created automatically at startup for the registry, scenarios and conversations. Mount it on durable storage in production.</p></div>
-      <div class="card"><h3>Configuration</h3><p>Secrets and deployment-specific values are supplied through environment variables. CORS is explicit by default; production deployments should set approved origins.</p></div>
-      <div class="card"><h3>Container</h3><p>The supplied Dockerfile runs the service as a non-root user and copies only application source and immutable resources into the image.</p></div>
-    </div>
-    <h2>13. Run and operate</h2>
-    <h3>Install</h3>
-    <pre>pip install -r requirements.txt</pre>
-
-    <h3>Environment</h3>
-    <pre>GOOGLE_API_KEY=...
-GEMINI_API_KEY=...
-PYDANTIC_AI_GEMINI_MODEL=gemini-3.8-flash
-GEMINI_MODEL=gemini-3.8-flash</pre>
-    <p class="small">Pydantic AI's current Google integration uses <code>GoogleModel</code>/<code>GoogleProvider</code> backed by the <code>google-genai</code> SDK. Google's current SDK documentation likewise recommends the unified <code>google-genai</code> client for Gemini integrations.</p>
-
-    <h3>Run</h3>
-    <pre>uvicorn server:app --reload</pre>
-
-    <h3>Rebuild runtime registry</h3>
-    <pre>python scripts/ingest_standards.py</pre>
-
-    <h3>MVP-to-production evolution</h3>
-    <div class="grid">
-      <div class="card"><h3>Now</h3><p>Three standards packs (TM Forum, 3GPP, MEF), SQLite runtime registry, PydanticAI intent agent, four scenario APIs, persisted HITL through scenario confirmation, and deterministic generation.</p></div>
-      <div class="card"><h3>Next</h3><p>Replace curated MVP subsets with pinned official TM Forum, 3GPP and MEF machine-readable artifacts, preserve model/release lineage, and add graph search with formal evidence.</p></div>
-      <div class="card"><h3>Later</h3><p>Multi-domain standards packs, tenant-scoped registries, asynchronous generation jobs, richer provenance, large-scale data sinks and production observability.</p></div>
-    </div>
-
-    <div class="note"><strong>Engineering invariant:</strong> a user request can be ambiguous; a proposal can be incomplete; generation cannot proceed from an unresolved or unconfirmed schema.</div>
-  </section>
+  <div class="callout danger"><strong>Design invariant:</strong> an official source/model change that makes a generation-policy target invalid causes registry-build failure. The system does not silently ignore stale generation-profile references.</div>
 </main>
-
-<footer>
-  INGENII architecture snapshot — aligned with the current four-API MVP implementation and standards-backed runtime registry.
-</footer>
-
-
 </body>
 </html>

@@ -100,7 +100,6 @@ class AgenticSchemaWorkflow:
             f"Scenario type: {req.scenario_type}\n"
             f"Data type: {req.type_of_data}\n"
             f"Country: {req.country}\n"
-            f"Entity key: {req.entity_key}\n"
             f"Business scenario: {prompt}\n\n"
             "Variable-design requirement: propose a fresh semantic variable set with NO artificial count target or maximum. "
             "Use all relevant concepts from the complete approved telecom standards registry context, across all registered source URLs. "

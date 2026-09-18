@@ -1,0 +1,133 @@
+{
+  "manifest_version": "1.0.0",
+  "description": "Pinned official telecom data-model sources consumed by INGENII. Source files are downloaded at runtime into runtime_data; they are not bundled as custom normalized resources.",
+  "source_policy": {
+    "source_of_truth": "official-model-artifact",
+    "normalized_artifacts_are_runtime_cache": true,
+    "preserve_source_url_and_sha256": true
+  },
+  "sources": [
+    {
+      "source_id": "tmf654_v4",
+      "organization": "TM Forum",
+      "artifact": "TMF654 Prepay Balance Management API",
+      "version": "4.0.0",
+      "kind": "file",
+      "format": "json",
+      "parser": "openapi",
+      "url": "https://raw.githubusercontent.com/tmforum-apis/TMF654_PrepayBalanceManagement/master/TMF654-PrepayBalance-v4.0.0.swagger.json",
+      "source_page": "https://www.tmforum.org/open-digital-architecture/open-apis/prepay-balance-management-api-TMF654/v4.0"
+    },
+    {
+      "source_id": "tmf629_v4",
+      "organization": "TM Forum",
+      "artifact": "TMF629 Customer Management API",
+      "version": "4.0.0",
+      "kind": "file",
+      "format": "json",
+      "parser": "openapi",
+      "url": "https://raw.githubusercontent.com/tmforum-apis/TMF629_CustomerManagement/master/TMF629-Customer-v4.0.0.swagger.json",
+      "source_page": "https://www.tmforum.org/oda/open-apis/directory/"
+    },
+    {
+      "source_id": "tmf666_v4",
+      "organization": "TM Forum",
+      "artifact": "TMF666 Account Management API",
+      "version": "4.0.0",
+      "kind": "file",
+      "format": "json",
+      "parser": "openapi",
+      "url": "https://raw.githubusercontent.com/tmforum-apis/TMF666_AccountManagement/master/TMF666-Account-v4.0.0.swagger.json",
+      "source_page": "https://www.tmforum.org/oda/open-apis/directory/"
+    },
+    {
+      "source_id": "tmf637_v4",
+      "organization": "TM Forum",
+      "artifact": "TMF637 Product Inventory API",
+      "version": "4.0.0",
+      "kind": "file",
+      "format": "json",
+      "parser": "openapi",
+      "url": "https://raw.githubusercontent.com/tmforum-apis/TMF637_ProductInventory/master/TMF637-ProductInventory-v4.0.0.swagger.json",
+      "source_page": "https://www.tmforum.org/oda/open-apis/directory/"
+    },
+    {
+      "source_id": "tmf677_v4",
+      "organization": "TM Forum",
+      "artifact": "TMF677 Usage Consumption API",
+      "version": "4.0.0",
+      "kind": "file",
+      "format": "json",
+      "parser": "openapi",
+      "url": "https://raw.githubusercontent.com/tmforum-apis/TMF677_UsageConsumption/master/TMF677-UsageConsumption-v4.0.0.swagger.json",
+      "source_page": "https://www.tmforum.org/oda/open-apis/directory/"
+    },
+    {
+      "source_id": "tmf676_v4",
+      "organization": "TM Forum",
+      "artifact": "TMF676 Payment Management API",
+      "version": "4.0.0",
+      "kind": "file",
+      "format": "json",
+      "parser": "openapi",
+      "url": "https://raw.githubusercontent.com/tmforum-apis/TMF676_PaymentManagement/master/TMF676-Payment-v4.0.0.swagger.json",
+      "source_page": "https://www.tmforum.org/oda/open-apis/directory/"
+    },
+    {
+      "source_id": "tmf620_v4",
+      "organization": "TM Forum",
+      "artifact": "TMF620 Product Catalog Management API",
+      "version": "4.0.0",
+      "kind": "file",
+      "format": "json",
+      "parser": "openapi",
+      "url": "https://raw.githubusercontent.com/tmforum-apis/TMF620_ProductCatalog/master/TMF620-ProductCatalog-v4.0.0.swagger.json",
+      "source_page": "https://www.tmforum.org/oda/open-apis/directory/"
+    },
+    {
+      "source_id": "mef125_commit_c9c742a",
+      "organization": "MEF",
+      "artifact": "MEF 125 Subscriber Ethernet Product Schemas",
+      "version": "MEF 125 / pinned Git commit",
+      "kind": "archive",
+      "format": "yaml",
+      "parser": "json_schema",
+      "url": "https://github.com/MEF-GIT/MEF-LSO-Sonata-SDK/archive/c9c742c81d9a0ac5c19edc8c86e50e41ed3c51fa.zip",
+      "source_page": "https://www.mef.net/wp-content/uploads/MEF-125.pdf",
+      "include": [
+        "MEF-LSO-Sonata-SDK-c9c742c81d9a0ac5c19edc8c86e50e41ed3c51fa/carrierEthernet/subscriberEthernet/"
+      ],
+      "exclude": [
+        "/preStandard/"
+      ]
+    },
+    {
+      "source_id": "mef139_commit_e89a376",
+      "organization": "MEF",
+      "artifact": "MEF 139 Internet Access Product Schemas",
+      "version": "MEF 139 / pinned Git commit",
+      "kind": "archive",
+      "format": "yaml",
+      "parser": "json_schema",
+      "url": "https://github.com/MEF-GIT/MEF-LSO-Sonata-SDK/archive/e89a37675a0323ad993a7bbd0cdbc936ebed92c8.zip",
+      "source_page": "https://www.mef.net/resources/mef-139-lso-sonata-internet-access-product-schemas-and-developer-guide/",
+      "include": [
+        "MEF-LSO-Sonata-SDK-e89a37675a0323ad993a7bbd0cdbc936ebed92c8/productSchema/ip/"
+      ],
+      "exclude": [
+        "/preStandard/"
+      ]
+    },
+    {
+      "source_id": "3gpp_32298_r19_v194",
+      "organization": "3GPP",
+      "artifact": "3GPP TS 32.298 Charging Data Record parameter description",
+      "version": "19.4.0 / Release 19",
+      "kind": "archive",
+      "format": "asn1",
+      "parser": "asn1_zip",
+      "url": "https://www.3gpp.org/ftp/Specs/archive/32_series/32.298/32298-j40.zip",
+      "source_page": "https://portal.3gpp.org/desktopmodules/Specifications/SpecificationDetails.aspx?specificationId=1915"
+    }
+  ]
+}

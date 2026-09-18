@@ -163,6 +163,17 @@ class SchemaCompiler:
         generator = str(getattr(attr, "generator", "") or "").strip().lower()
         runtime_params = dict(params or {})
 
+        # Translate JSON Schema/OpenAPI validation keywords into the generator's
+        # canonical parameter names without discarding the original constraints.
+        if "minimum" in runtime_params and "min" not in runtime_params:
+            runtime_params["min"] = runtime_params["minimum"]
+        if "maximum" in runtime_params and "max" not in runtime_params:
+            runtime_params["max"] = runtime_params["maximum"]
+        if "minLength" in runtime_params and "min_length" not in runtime_params:
+            runtime_params["min_length"] = runtime_params["minLength"]
+        if "maxLength" in runtime_params and "max_length" not in runtime_params:
+            runtime_params["max_length"] = runtime_params["maxLength"]
+
         if generator == "unique_id":
             return "prefixed_int", runtime_params
         if generator == "msisdn":
@@ -413,6 +424,14 @@ class SchemaCompiler:
         desc = str(idea.get("description") or "")
         country_code = str(country or "IN").upper()
 
+        if name.strip().lower() == "msisdn":
+            iso = str(country or "IN").strip().upper()
+            dial_codes = {
+                "IN": "+91", "US": "+1", "CA": "+1", "GB": "+44", "AU": "+61",
+                "AE": "+971", "SG": "+65", "DE": "+49", "FR": "+33", "IT": "+39",
+            }
+            dial = dial_codes.get(iso, iso if iso.startswith("+") else "+" + iso)
+            return "e164_phone", "string", {"country_codes": [dial], "country": iso}
         if role == "identity" or name.lower().endswith(("_id", "_key")):
             return "prefixed_int", "string", {"prefix": f"{name[:-3].upper()}-" if name.lower().endswith("_id") else "ID-", "digits": 10}
         if dtype in {"datetime", "timestamp"} or role == "timing":
@@ -521,7 +540,8 @@ class SchemaCompiler:
             ideas.append(item)
 
         # Mandatory telecom anchors first so they keep their exact public names and stable
-        # entity grain. They are always registry-backed.
+        # entity grain. When the official registry does not expose a literal ``subscriber``
+        # entity, the compiler still emits these application-contract fields deterministically.
         if (intent.industry_type or "telecom").strip().lower() in {"telecom", "telecommunications"}:
             mandatory_defs = {
                 "subscriber_id": ("subscriber", "subscriber_id", "Stable subscriber identifier."),
@@ -739,9 +759,10 @@ class SchemaCompiler:
         # There is deliberately no minimum-width padding loop.
         frontier = list(entities)
         visited = set(entity_ids)
-        allowed_expansion_ids = {
-            item["canonical_id"] for item in self.registry.search(domain_query or intent.domain, limit=None)
-        } | entity_ids
+        # The registry is built only from official source artifacts. Once the scenario has
+        # established its approved semantic anchors, relationship expansion may use the complete
+        # official model graph. There is deliberately no application-level entity/hop ceiling.
+        allowed_expansion_ids = {item["canonical_id"] for item in self.registry.catalog_summary(limit=None)} | entity_ids
         # Expand until the approved registry graph reaches a fixed point. There is no
         # hop-count or entity-count ceiling; the current scenario and registry graph are
         # the constraints.

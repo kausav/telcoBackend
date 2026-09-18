@@ -1,0 +1,433 @@
+{
+  "profile": {
+    "profile_id": "ingenii-telecom-official-model-generation-v2",
+    "profile_version": "2.0.0",
+    "owner": "INGENII",
+    "description": "INGENII synthetic-data generation policy overlay. Targets reference exact official model artifacts by source_id + model + field. This file controls generation behavior only; it does not define telecom semantics, types, enums, or relationships.",
+    "applies_to": [
+      "telecom",
+      "prepaid",
+      "charging",
+      "usage",
+      "network",
+      "connectivity"
+    ],
+    "authority": "official-model-registry-for-semantics; ingenii-policy-for-generation-behavior"
+  },
+  "targets": [
+    {
+      "source_id": "3gpp_32298_r19_v194",
+      "model": "*",
+      "field": "duration",
+      "generator": "range",
+      "params": {
+        "min": 0,
+        "max": 86400,
+        "precision": 0
+      }
+    },
+    {
+      "source_id": "3gpp_32298_r19_v194",
+      "model": "*",
+      "field": "recordOpeningTime",
+      "generator": "timestamp",
+      "params": {
+        "lookback_days": 365
+      }
+    },
+    {
+      "source_id": "3gpp_32298_r19_v194",
+      "model": "*",
+      "field": "servedMSISDN",
+      "generator": "msisdn",
+      "params": {
+        "country": "IN"
+      }
+    },
+    {
+      "source_id": "mef125_commit_c9c742a",
+      "model": "*",
+      "field": "id",
+      "generator": "unique_id",
+      "params": {
+        "prefix": "MEF-",
+        "digits": 10
+      }
+    },
+    {
+      "source_id": "mef139_commit_e89a376",
+      "model": "*",
+      "field": "id",
+      "generator": "unique_id",
+      "params": {
+        "prefix": "MEF-",
+        "digits": 10
+      }
+    },
+    {
+      "source_id": "tmf620_v4",
+      "model": "ProductOffering",
+      "field": "id",
+      "generator": "unique_id",
+      "params": {
+        "prefix": "PO-",
+        "digits": 8
+      }
+    },
+    {
+      "source_id": "tmf620_v4",
+      "model": "ProductOffering",
+      "field": "isBundle",
+      "generator": "weighted_choice",
+      "params": {
+        "choices": [
+          false,
+          true
+        ],
+        "weights": [
+          0.8,
+          0.2
+        ]
+      }
+    },
+    {
+      "source_id": "tmf620_v4",
+      "model": "ProductOffering",
+      "field": "isSellable",
+      "generator": "weighted_choice",
+      "params": {
+        "choices": [
+          true,
+          false
+        ],
+        "weights": [
+          0.97,
+          0.03
+        ]
+      }
+    },
+    {
+      "source_id": "tmf620_v4",
+      "model": "ProductOffering",
+      "field": "lastUpdate",
+      "generator": "timestamp",
+      "params": {
+        "lookback_days": 365
+      }
+    },
+    {
+      "source_id": "tmf620_v4",
+      "model": "ProductOffering",
+      "field": "lifecycleStatus",
+      "generator": "weighted_choice",
+      "params": {
+        "choices": [
+          "Active",
+          "Draft",
+          "Retired"
+        ],
+        "weights": [
+          0.85,
+          0.1,
+          0.05
+        ]
+      }
+    },
+    {
+      "source_id": "tmf629_v4",
+      "model": "Customer",
+      "field": "id",
+      "generator": "unique_id",
+      "params": {
+        "prefix": "CUS-",
+        "digits": 10
+      }
+    },
+    {
+      "source_id": "tmf629_v4",
+      "model": "Customer",
+      "field": "name",
+      "generator": "weighted_choice",
+      "params": {
+        "choices": [
+          "Consumer Customer",
+          "SMB Customer",
+          "Enterprise Customer"
+        ],
+        "weights": [
+          0.85,
+          0.12,
+          0.03
+        ]
+      }
+    },
+    {
+      "source_id": "tmf629_v4",
+      "model": "Customer",
+      "field": "status",
+      "generator": "weighted_choice",
+      "params": {
+        "choices": [
+          "active",
+          "suspended",
+          "terminated"
+        ],
+        "weights": [
+          0.95,
+          0.04,
+          0.01
+        ]
+      }
+    },
+    {
+      "source_id": "tmf654_v4",
+      "model": "Bucket",
+      "field": "confirmationDate",
+      "generator": "timestamp",
+      "params": {
+        "lookback_days": 365
+      }
+    },
+    {
+      "source_id": "tmf654_v4",
+      "model": "Bucket",
+      "field": "id",
+      "generator": "unique_id",
+      "params": {
+        "prefix": "BKT-",
+        "digits": 9
+      }
+    },
+    {
+      "source_id": "tmf654_v4",
+      "model": "Bucket",
+      "field": "isShared",
+      "generator": "weighted_choice",
+      "params": {
+        "choices": [
+          false,
+          true
+        ],
+        "weights": [
+          0.9,
+          0.1
+        ]
+      }
+    },
+    {
+      "source_id": "tmf654_v4",
+      "model": "Bucket",
+      "field": "requestedDate",
+      "generator": "timestamp",
+      "params": {
+        "lookback_days": 365
+      }
+    },
+    {
+      "source_id": "tmf654_v4",
+      "model": "TopupBalance",
+      "field": "confirmationDate",
+      "generator": "timestamp",
+      "params": {
+        "lookback_days": 365
+      }
+    },
+    {
+      "source_id": "tmf654_v4",
+      "model": "TopupBalance",
+      "field": "id",
+      "generator": "unique_id",
+      "params": {
+        "prefix": "RCH-",
+        "digits": 10
+      }
+    },
+    {
+      "source_id": "tmf654_v4",
+      "model": "TopupBalance",
+      "field": "isAutoTopup",
+      "generator": "weighted_choice",
+      "params": {
+        "choices": [
+          false,
+          true
+        ],
+        "weights": [
+          0.92,
+          0.08
+        ]
+      }
+    },
+    {
+      "source_id": "tmf654_v4",
+      "model": "TopupBalance",
+      "field": "numberOfPeriods",
+      "generator": "range",
+      "params": {
+        "min": 1,
+        "max": 12,
+        "precision": 0
+      }
+    },
+    {
+      "source_id": "tmf654_v4",
+      "model": "TopupBalance",
+      "field": "requestedDate",
+      "generator": "timestamp",
+      "params": {
+        "lookback_days": 365
+      }
+    },
+    {
+      "source_id": "tmf654_v4",
+      "model": "TopupBalance",
+      "field": "voucher",
+      "generator": "unique_id",
+      "params": {
+        "prefix": "VCH-",
+        "digits": 12
+      }
+    },
+    {
+      "source_id": "tmf666_v4",
+      "model": "BillingAccount",
+      "field": "accountType",
+      "generator": "weighted_choice",
+      "params": {
+        "choices": [
+          "prepaid",
+          "postpaid",
+          "hybrid"
+        ],
+        "weights": [
+          0.7,
+          0.25,
+          0.05
+        ]
+      }
+    },
+    {
+      "source_id": "tmf666_v4",
+      "model": "BillingAccount",
+      "field": "id",
+      "generator": "unique_id",
+      "params": {
+        "prefix": "ACC-",
+        "digits": 10
+      }
+    },
+    {
+      "source_id": "tmf666_v4",
+      "model": "BillingAccount",
+      "field": "lastModified",
+      "generator": "timestamp",
+      "params": {
+        "lookback_days": 365
+      }
+    },
+    {
+      "source_id": "tmf666_v4",
+      "model": "BillingAccount",
+      "field": "paymentStatus",
+      "generator": "weighted_choice",
+      "params": {
+        "choices": [
+          "paid",
+          "due",
+          "in arrears"
+        ],
+        "weights": [
+          0.92,
+          0.06,
+          0.02
+        ]
+      }
+    },
+    {
+      "source_id": "tmf666_v4",
+      "model": "BillingAccount",
+      "field": "state",
+      "generator": "weighted_choice",
+      "params": {
+        "choices": [
+          "Active",
+          "Suspended",
+          "Closed"
+        ],
+        "weights": [
+          0.95,
+          0.04,
+          0.01
+        ]
+      }
+    },
+    {
+      "source_id": "tmf676_v4",
+      "model": "Payment",
+      "field": "authorizationCode",
+      "generator": "unique_id",
+      "params": {
+        "prefix": "AUTH-",
+        "digits": 8
+      }
+    },
+    {
+      "source_id": "tmf676_v4",
+      "model": "Payment",
+      "field": "correlatorId",
+      "generator": "unique_id",
+      "params": {
+        "prefix": "CORR-",
+        "digits": 10
+      }
+    },
+    {
+      "source_id": "tmf676_v4",
+      "model": "Payment",
+      "field": "id",
+      "generator": "unique_id",
+      "params": {
+        "prefix": "PAY-",
+        "digits": 10
+      }
+    },
+    {
+      "source_id": "tmf676_v4",
+      "model": "Payment",
+      "field": "paymentDate",
+      "generator": "timestamp",
+      "params": {
+        "lookback_days": 365
+      }
+    },
+    {
+      "source_id": "tmf676_v4",
+      "model": "Payment",
+      "field": "status",
+      "generator": "weighted_choice",
+      "params": {
+        "choices": [
+          "completed",
+          "pending",
+          "failed",
+          "cancelled"
+        ],
+        "weights": [
+          0.95,
+          0.02,
+          0.02,
+          0.01
+        ]
+      }
+    },
+    {
+      "source_id": "tmf676_v4",
+      "model": "Payment",
+      "field": "statusDate",
+      "generator": "timestamp",
+      "params": {
+        "lookback_days": 365
+      }
+    }
+  ]
+}

@@ -30,7 +30,7 @@ IMPORTANT BOUNDARIES:
 - Do not output executable generators, generator parameters, formulas, SQL, or schema implementation details.
 - Candidate variables are semantic ideas only. The deterministic compiler assigns executable generator contracts.
 - scenarioId is an identifier only and MUST NOT influence what variables are proposed.
-- Use scenarioType, domain, businessScenario, useCase, country, typeOfData, and entityKey together.
+- Use scenarioType, domain, businessScenario, useCase, country, and typeOfData together. Entity key is backend schema metadata; do not use it to ideate variables.
 - There is NO variable-count target and NO variable-count maximum. Be COMPREHENSIVE: return as many
   semantically relevant variables as the full registry supports for this scenario. Prefer high coverage
   over minimality. NEVER truncate for count, but do not invent variables that have no plausible scenario
@@ -38,7 +38,6 @@ IMPORTANT BOUNDARIES:
 - For telecom transactional data, subscriber_id, account_id and msisdn are mandatory and must always be
   present as stable entity-level fields.
 - Candidate variable names must be FRESH and should not simply copy a template or reference list.
-- Always include the requested entity key when it is meaningful for the requested grain.
 - For transactional data, distinguish stable entity/profile fields from repeated transaction/event/decision fields using grain.
 - Prefer variables that explain triggers, states, transitions, outcomes, timing, monetary/usage measures,
   decisions, contention, suppression, recovery, or retention when those concepts fit the scenario.
@@ -119,9 +118,6 @@ def _as_list(value: Any, limit: int) -> list[Any]:
 def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Make common model-output deviations harmless before strict app validation."""
     normalized = dict(payload)
-
-    for key, limit in (("requested_entities", 35), ("requested_relationships", 45), ("notes", 35), ("ambiguities", 35)):
-        normalized[key] = [str(item).strip() for item in _as_list(normalized.get(key), limit) if str(item).strip()]
 
     variables: list[dict[str, Any]] = []
     allowed_roles = {
@@ -224,24 +220,24 @@ class GeminiIntentAgent:
 
     def run(
         self,
-        message: str,
+        request_context: str,
         country: str | None = None,
         industry_type: str = "telecom",
         domain_query: str | None = None,
     ) -> ScenarioIntent:
-        catalog = (
-            self.registry.llm_catalog_context()
+        catalog = self.registry.llm_catalog_context(
+            query=" ".join(part for part in (domain_query, request_context) if part)
         )
         catalog_text = json.dumps(catalog, separators=(",", ":"), sort_keys=True)
         prompt = (
             "APPROVED TELECOM STANDARDS REGISTRY (authoritative grounding only):\n"
-            "The context below contains ALL standards/artifact source URLs currently registered by the application, "
-            "plus every normalized entity, attribute, relationship, and provenance record in the runtime registry. "
+            "The context below contains ALL official standard/model source URLs currently registered by the application, "
+            "plus the complete relevant entity, attribute, relationship, and provenance records derived from those official models. "
             "Use the complete context to select the concepts needed by the business scenario; do not treat one source "
             "family as automatically sufficient when the scenario spans multiple telecom standards.\n\n"
             f"{catalog_text}\n\n"
             "Authoritative request context:\n"
-            f"{message}\n\n"
+            f"{request_context}\n\n"
             f"Selected industry: {industry_type}\n"
             f"Business domain: {domain_query or '<none>'}\n"
             f"Country: {country or '<none>'}\n\n"

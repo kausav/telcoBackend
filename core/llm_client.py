@@ -1,7 +1,8 @@
 """Gemini client wrapper used by the legacy generation pipeline.
 
-The agentic schema proposal path uses PydanticAI directly; this client remains for
-legacy generation/QA stages. Provider failures are normalized into a stable application error contract.
+The agentic schema proposal path uses the Google GenAI SDK with local Pydantic validation; this
+client remains the shared Gemini wrapper for proposal and legacy generation/QA stages. Provider failures are
+normalized into a stable application error contract.
 """
 from __future__ import annotations
 

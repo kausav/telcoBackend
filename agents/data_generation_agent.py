@@ -122,6 +122,14 @@ def _generic_value(var: dict, rec: dict):
         return _recent_datetime(p, rec)
     if dtype == "date":
         return _recent_datetime(p, rec)[:10]
+    if dtype == "array":
+        choices = p.get("choices", p.get("values"))
+        if isinstance(choices, (list, tuple)) and choices:
+            size = random.randint(0, min(3, len(choices)))
+            return random.sample(list(choices), size) if size else []
+        return []
+    if dtype == "object":
+        return {}
     return _semantic_placeholder(name, p, rec)
 
 # ── Generator functions ────────────────────────────────────────────────────────

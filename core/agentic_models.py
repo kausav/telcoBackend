@@ -43,8 +43,8 @@ class ScenarioIntent(BaseModel):
     type_of_data: Literal["transactional", "aggregational"] = "transactional"
     entity_key: str = ""
     use_case: str = ""
-    requested_entities: list[str] = Field(default_factory=list, max_length=35)
-    requested_relationships: list[str] = Field(default_factory=list, max_length=45)
+    requested_entities: list[str] = Field(default_factory=list)
+    requested_relationships: list[str] = Field(default_factory=list)
     # Deliberately unbounded: the scenario and registry determine how many semantic
     # variables are appropriate. The application must never truncate this list by count.
     candidate_variables: list[VariableIdea] = Field(default_factory=list)
@@ -52,8 +52,8 @@ class ScenarioIntent(BaseModel):
     currency: str | None = None
     record_count: int | None = Field(default=None, ge=1, le=5_000_000)
     time_window_days: int | None = Field(default=None, ge=1, le=3650)
-    notes: list[str] = Field(default_factory=list, max_length=35)
-    ambiguities: list[str] = Field(default_factory=list, max_length=35)
+    notes: list[str] = Field(default_factory=list)
+    ambiguities: list[str] = Field(default_factory=list)
 
 
 
