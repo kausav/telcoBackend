@@ -5,5 +5,5 @@ SUPPORTED_GENERATORS = frozenset({
     "dependent_choice", "weighted_bucket", "uniform", "uniform_int", "lognormal",
     "lognormal_int", "beta", "segment_range", "uniform_bounded", "recent_datetime",
     "ts_offset", "ts_add_field", "date_offset", "date_offset_range", "prefixed_uuid",
-    "tx_id", "formula", "generic", "semantic_event",
+    "tx_id", "formula", "generic", "semantic_event", "semantic_string",
 })

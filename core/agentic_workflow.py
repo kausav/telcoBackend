@@ -73,7 +73,7 @@ class AgenticSchemaWorkflow:
     @staticmethod
     def _cache_key(req: ScenarioProposeRequest) -> tuple:
         return (
-            "agentic_proposal_v3",
+            "agentic_proposal_v4",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),

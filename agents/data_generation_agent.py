@@ -92,7 +92,80 @@ def _semantic_placeholder(name: str, params: dict, rec: dict) -> str:
         return str(choices[0])
     field = str(name or rec.get("__current_field__") or "event").strip()
     token = re.sub(r"[^A-Za-z0-9]+", "_", field).strip("_").upper()
-    return token or "EVENT"
+    if token.lower().endswith("_id"):
+        return _prefixed_int({"prefix": f"{token[:-3]}-", "digits": 10}, rec)
+    return f"EVENT_{token[:32]}_{random.randint(1000, 9999)}" if token else f"EVENT_{random.randint(1000, 9999)}"
+
+
+def _semantic_string(var: dict, rec: dict) -> str | None:
+    """Generate a useful synthetic string for legacy/semantic fields without echoing field names."""
+    p = dict(var.get("params") or {})
+    name = str(var.get("name") or rec.get("__current_field__") or "").strip()
+    n = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+    if "choices" in p or "values" in p:
+        vals = p.get("choices", p.get("values"))
+        if isinstance(vals, str):
+            vals = [x.strip() for x in re.split(r"[;,|]", vals) if x.strip()]
+        if vals:
+            return str(random.choice(list(vals)))
+    if p.get("value") is not None:
+        return str(p["value"])
+
+    if n.endswith("_id") or n == "id" or n.endswith("_key"):
+        return _prefixed_int({"prefix": f"{n[:-3].upper()}-" if n.endswith("_id") else "ID-", "digits": 10}, rec)
+    if "phone" in n or "mobile" in n or n == "msisdn":
+        country = str(p.get("country") or "IN").upper()
+        dial_codes = {
+            "IN":"+91","US":"+1","CA":"+1","GB":"+44","AU":"+61",
+            "AE":"+971","SG":"+65","DE":"+49","FR":"+33","IT":"+39",
+        }
+        dial = dial_codes.get(country, "+91")
+        return _e164_phone({"country_codes":[dial], "country":country}, rec)
+    if "email" in n:
+        return f"user{random.randint(100000, 999999)}@example.test"
+    if any(token in n for token in ("href", "url", "schemalocation", "resourcepath", "path")):
+        return f"https://example.test/telecom/{uuid.uuid4().hex[:12]}"
+    if "channel" in n:
+        return random.choice(["APP", "SMS", "WEB", "USSD", "WHATSAPP", "IVR", "RETAIL"])
+    if "payment" in n and ("method" in n or "instrument" in n):
+        return random.choice(["UPI", "CREDIT_CARD", "DEBIT_CARD", "WALLET", "CASH", "AUTO_DEBIT"])
+    if "reason" in n:
+        return random.choice(["LOW_BALANCE", "DATA_EXHAUSTED", "VALIDITY_EXPIRY", "CUSTOMER_REQUEST"])
+    if n in {"stateorprovince", "province", "state"} or n.endswith("_state_or_province"):
+        return random.choice(["Haryana", "Punjab", "Delhi", "Maharashtra", "Karnataka", "Tamil Nadu", "Gujarat"])
+    if n in {"city"} or n.endswith("_city"):
+        return random.choice(["Delhi", "Gurugram", "Ludhiana", "Chandigarh", "Mumbai", "Bengaluru", "Pune"])
+    if n in {"postcode", "postalcode", "postal_code"}:
+        return str(random.randint(110001, 999999))
+    if "network" in n and "capability" in n:
+        return random.choice(["2G", "3G", "4G", "5G"])
+    if "status" in n or n.endswith("_state") or n in {"state"}:
+        return random.choice(["PENDING", "COMPLETED", "FAILED"])
+    if "offer" in n:
+        return random.choice(["EXTRA_DATA", "CASH_BACK", "VALIDITY_BOOSTER", "DISCOUNT_VOUCHER"])
+    if "segment" in n:
+        return random.choice(["ULTRA_LOW", "MASS", "MID_TIER", "HIGH_VALUE"])
+    if n in {"role", "partyroletype"} or n.endswith("_role"):
+        return random.choice(["subscriber", "customer", "agent", "system"])
+    if n == "name" or n.endswith("_name"):
+        return random.choice(["Recharge Plan", "Data Booster", "Talktime Pack", "Retention Offer"])
+    if n == "title" or n.endswith("_title"):
+        return random.choice(["Low Balance Alert", "Recharge Event", "Top-up Request"])
+    if n == "description" or n.endswith("_description"):
+        return random.choice(["Recharge operation", "Balance adjustment", "Retention intervention"])
+    if n in {"type", "basetype", "referredtype"} or n.endswith("_type"):
+        return random.choice(["PrepayBalance", "BalanceTopup", "ProductOffering", "Subscriber"])
+    if "code" in n:
+        return f"CODE-{random.randint(100000, 999999)}"
+    if "country" in n:
+        return str(p.get("country") or "IN").upper()
+    if "currency" in n:
+        return str(p.get("currency") or "INR").upper()
+
+    # Last-resort semantic token: it is intentionally not the field name and is clearly synthetic.
+    label = re.sub(r"_+", "_", n.upper()).strip("_") or "VALUE"
+    return f"SYN_{label[:24]}_{random.randint(1000, 9999)}"
 
 
 def _generic_value(var: dict, rec: dict):
@@ -127,10 +200,12 @@ def _generic_value(var: dict, rec: dict):
         if isinstance(choices, (list, tuple)) and choices:
             size = random.randint(0, min(3, len(choices)))
             return random.sample(list(choices), size) if size else []
-        return []
+        return None
     if dtype == "object":
-        return {}
-    return _semantic_placeholder(name, p, rec)
+        # Empty objects are not valid synthetic data. A flat dataset cannot invent nested
+        # structure safely, so callers must omit/nullable this field or reject the record.
+        return None
+    return _semantic_string(var, rec)
 
 # ── Generator functions ────────────────────────────────────────────────────────
 
@@ -458,6 +533,9 @@ _TIMESTAMP_FORMAT_ALIASES = {
     "yyyy-mm-dd hh:mm": "%Y-%m-%d %H:%M",
     "iso": "ISO",
     "iso-8601": "ISO",
+    "date-time": DEFAULT_TIMESTAMP_FORMAT,
+    "datetime": DEFAULT_TIMESTAMP_FORMAT,
+    "timestamp": DEFAULT_TIMESTAMP_FORMAT,
 }
 
 def _normalize_timestamp_format(params: dict | None = None) -> str:
@@ -562,6 +640,7 @@ _GENERATORS = {
     "formula":        lambda v, rec: _formula(v, rec),
     "generic":        lambda v, rec: _generic_value(v, rec),
     "semantic_event": lambda v, rec: _semantic_placeholder(v.get("name"), v.get("params") or {}, rec),
+    "semantic_string": lambda v, rec: _semantic_string(v, rec),
 }
 
 
@@ -1514,6 +1593,183 @@ def _enforce_csv_contract(
     return rec, issues
 
 
+def _is_placeholder_value(field_name: str, value: Any, var: dict) -> bool:
+    """Reject obvious schema/sample placeholders while preserving legitimate declared values."""
+    if isinstance(value, dict) and not value:
+        return True
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    declared = _declared_param_options(var.get("params") or {})
+    if declared and any(_matches_declared_option(text, opt) for opt in declared):
+        return False
+
+    norm_value = re.sub(r"[^a-z0-9]+", "", text.lower())
+    norm_field = re.sub(r"[^a-z0-9]+", "", str(field_name or "").lower())
+    known = {
+        "date-time", "datetime", "timestamp", "string", "object", "array",
+        "null", "none", "unknown", "placeholder",
+    }
+    if text.lower() in known:
+        return True
+    if norm_field and norm_value == norm_field:
+        return True
+    # Catch generated placeholders such as LOW_BALANCE_EVENT_ID for low_balance_event_id.
+    return bool(norm_field and norm_value == norm_field.replace("scenario", ""))
+
+def _strip_unusable_placeholders(rec: dict, variables: list[dict]) -> tuple[dict, list[str]]:
+    out = dict(rec)
+    issues: list[str] = []
+    for var in variables:
+        name = str(var.get("name") or "")
+        if name not in out:
+            continue
+        if _is_placeholder_value(name, out.get(name), var):
+            out.pop(name, None)
+            issues.append(f"{name} removed as placeholder")
+    return out, issues
+
+
+def _enforce_obvious_semantic_consistency(rec: dict, variables: list[dict]) -> tuple[dict, list[str]]:
+    """Repair deterministic cross-field contradictions that are obvious from field semantics."""
+    rec = dict(rec)
+    issues: list[str] = []
+    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+
+    def set_value(name: str, value: Any, reason: str) -> None:
+        if name in rec and rec.get(name) != value:
+            rec[name] = value
+            issues.append(reason)
+
+    def dt(name: str) -> datetime | None:
+        return _qa_parse_dt(rec.get(name)) if name in rec else None
+
+    # Generic paired numeric bounds: lower/min cannot exceed upper/max.
+    for low, high in (
+        ("numberRelOfferLowerLimit", "numberRelOfferUpperLimit"),
+        ("minCardinality", "maxCardinality"),
+        ("minValue", "maxValue"),
+        ("lowerLimit", "upperLimit"),
+    ):
+        if low in rec and high in rec and isinstance(rec.get(low), (int, float)) and isinstance(rec.get(high), (int, float)):
+            if float(rec[low]) > float(rec[high]):
+                low_val, high_val = rec[high], rec[low]
+                set_value(low, low_val, f"{low} corrected to be <= {high}")
+                set_value(high, high_val, f"{high} corrected to be >= {low}")
+
+    # Low-balance/top-up causal chain.
+    trigger = dt("low_balance_trigger_timestamp")
+    recharge = dt("recharge_timestamp")
+    if trigger is not None and recharge is not None and "hours_to_recharge_after_trigger" in rec:
+        hours_params = by_name.get("hours_to_recharge_after_trigger", {}).get("params") or {}
+        precision = int(hours_params.get("precision", 2) or 2)
+        lo_hours = _to_finite_float(hours_params.get("min", hours_params.get("lo")), 0.0) or 0.0
+        hi_hours = _to_finite_float(hours_params.get("max", hours_params.get("hi")), None)
+        try:
+            requested_hours = float(rec.get("hours_to_recharge_after_trigger"))
+        except (TypeError, ValueError):
+            requested_hours = 1.0
+        if hi_hours is not None:
+            requested_hours = min(requested_hours, hi_hours)
+        requested_hours = max(lo_hours, requested_hours)
+
+        elapsed_hours = max(0.0, (recharge - trigger).total_seconds() / 3600.0)
+        # The timestamp pair and duration are one contract. Choose a timestamp consistent with
+        # the bounded duration, rather than clamping the duration after the fact.
+        if abs(elapsed_hours - requested_hours) > (0.5 / (10 ** max(0, precision))):
+            repaired_recharge = trigger + timedelta(hours=requested_hours)
+            params = by_name.get("recharge_timestamp", {}).get("params") or {}
+            set_value("recharge_timestamp", _format_datetime(repaired_recharge, params),
+                      "recharge_timestamp aligned to hours_to_recharge_after_trigger")
+            recharge = repaired_recharge
+            elapsed_hours = requested_hours
+        set_value("hours_to_recharge_after_trigger", round(elapsed_hours, precision),
+                  "hours_to_recharge_after_trigger recalculated from timestamps")
+    elif trigger is not None and recharge is not None and recharge < trigger:
+        params = by_name.get("recharge_timestamp", {}).get("params") or {}
+        repaired_recharge = trigger + timedelta(hours=1)
+        set_value("recharge_timestamp", _format_datetime(repaired_recharge, params),
+                  "recharge_timestamp moved after low_balance_trigger_timestamp")
+        recharge = repaired_recharge
+
+    if "pre_trigger_core_balance_inr" in rec and "threshold_breach_limit_inr" in rec:
+        pre = rec.get("pre_trigger_core_balance_inr")
+        threshold = rec.get("threshold_breach_limit_inr")
+        if isinstance(pre, (int, float)) and isinstance(threshold, (int, float)) and pre > threshold:
+            set_value("threshold_breach_limit_inr", round(float(pre), 2),
+                      "threshold_breach_limit_inr raised to contain pre-trigger balance")
+
+    if "zero_balance_outage_duration_hours" in rec and "hours_to_recharge_after_trigger" in rec:
+        outage = rec.get("zero_balance_outage_duration_hours")
+        elapsed = rec.get("hours_to_recharge_after_trigger")
+        if isinstance(outage, (int, float)) and isinstance(elapsed, (int, float)) and outage > elapsed:
+            max_outage = max(0, int(math.floor(float(elapsed))))
+            set_value("zero_balance_outage_duration_hours", max_outage,
+                      "zero_balance_outage_duration_hours capped by recharge delay")
+
+    if all(k in rec for k in ("pre_trigger_core_balance_inr", "credited_monetary_amount_inr", "emergency_credit_deducted_inr", "post_recharge_core_balance_inr")):
+        pre = rec.get("pre_trigger_core_balance_inr")
+        credited = rec.get("credited_monetary_amount_inr")
+        emergency = rec.get("emergency_credit_deducted_inr")
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (pre, credited, emergency)):
+            target_params = by_name.get("post_recharge_core_balance_inr", {}).get("params") or {}
+            post_lo = _to_finite_float(target_params.get("min", target_params.get("lo")), 0.0) or 0.0
+            post_hi = _to_finite_float(target_params.get("max", target_params.get("hi")), 100.0)
+            raw_expected = float(pre) + float(credited) - float(emergency)
+            if post_hi is not None and raw_expected > post_hi:
+                adjusted_credited = max(0.0, min(float(credited), float(post_hi) - float(pre) + float(emergency)))
+                set_value("credited_monetary_amount_inr", round(adjusted_credited, 2),
+                          "credited_monetary_amount_inr adjusted to preserve post-balance bounds")
+                credited = adjusted_credited
+                raw_expected = float(pre) + float(credited) - float(emergency)
+            elif raw_expected < post_lo:
+                adjusted_emergency = max(0.0, min(float(emergency), float(pre) + float(credited) - float(post_lo)))
+                set_value("emergency_credit_deducted_inr", round(adjusted_emergency, 2),
+                          "emergency_credit_deducted_inr adjusted to preserve post-balance bounds")
+                emergency = adjusted_emergency
+                raw_expected = float(pre) + float(credited) - float(emergency)
+            expected = round(max(post_lo, min(post_hi if post_hi is not None else raw_expected, raw_expected)), 2)
+            set_value("post_recharge_core_balance_inr", expected,
+                      "post_recharge_core_balance_inr recalculated from balance movement")
+
+    # Intervention fields: a conversion cannot occur without an intervention being sent.
+    if rec.get("proactive_nudge_sent_flag") is False:
+        for name in ("nudge_channel", "nudge_offer_type"):
+            if name in rec and by_name.get(name, {}).get("nullable", True):
+                set_value(name, None, f"{name} cleared because proactive nudge was not sent")
+        if "intervention_conversion_flag" in rec:
+            set_value("intervention_conversion_flag", False,
+                      "intervention_conversion_flag forced false because proactive nudge was not sent")
+
+    # Obvious lifecycle ordering for commonly named datetime pairs. Iterate because repairing
+    # one edge can legitimately move a shared timestamp and therefore require a second pass.
+    date_pairs = (
+        ("startDate", "terminationDate"),
+        ("startDateTime", "endDateTime"),
+        ("orderDate", "startDate"),
+        ("requestedDate", "confirmationDate"),
+        ("creationDate", "lastUpdate"),
+        ("effectiveDate", "lastUpdate"),
+    )
+    for _ in range(max(2, len(date_pairs))):
+        changed = False
+        for start, end in date_pairs:
+            a, b = dt(start), dt(end)
+            if a is not None and b is not None and b < a and end in by_name:
+                params = by_name[end].get("params") or {}
+                new_value = _format_datetime(a, params)
+                if rec.get(end) != new_value:
+                    rec[end] = new_value
+                    issues.append(f"{end} moved after {start}")
+                    changed = True
+        if not changed:
+            break
+
+    return rec, issues
+
+
 def _validate_record(
     rec: dict,
     variables: list[dict],
@@ -1525,6 +1781,9 @@ def _validate_record(
     rec = dict(rec)
     issues: list[str] = []
     active_fields = set(field_order)
+
+    rec, placeholder_issues = _strip_unusable_placeholders(rec, variables)
+    issues.extend(placeholder_issues)
 
     for var in variables:
         name = var["name"]
@@ -1545,8 +1804,7 @@ def _validate_record(
             elif var.get("nullable"):
                 continue
             else:
-                rec[name] = _default_for_dtype(var.get("dtype", "string"))
-                issues.append(f"{name} filled with safe dtype default")
+                raise ValueError(f"Non-nullable field '{name}' has no valid executable generation value")
             if rec.get(name) is None:
                 continue
         value = rec[name]
@@ -1702,10 +1960,40 @@ def _validate_record(
         rec["customer_response_ts"] = _format_datetime(dispatch_ts, response_var.get("params") or {})
         issues.append("customer_response_ts corrected")
 
+    rec, semantic_issues = _enforce_obvious_semantic_consistency(rec, variables)
+    issues.extend(semantic_issues)
+    rec, final_contract_issues = _enforce_csv_contract(rec, variables, rules=rules)
+    issues.extend(final_contract_issues)
+
+    bad_placeholders = []
+    for var in variables:
+        name = str(var.get("name") or "")
+        if name in rec and _is_placeholder_value(name, rec.get(name), var):
+            bad_placeholders.append(name)
+    if bad_placeholders:
+        raise ValueError(f"Unresolved placeholder values remain: {bad_placeholders}")
+
     # Presentation format is a deterministic CSV concern, not an LLM concern.
     # Internally timestamps are parsed as real datetimes for formulas/comparisons;
     # the record returned to callers uses each field's declared timestamp_format.
     rec = _format_datetime_fields(rec, variables)
+
+    # Recalculate displayed-duration fields after timestamp serialization. The public format is
+    # minute-based by default, so computing the duration before formatting can differ by a
+    # fraction of a minute from the timestamps the client actually receives.
+    final_trigger = _qa_parse_dt(rec.get("low_balance_trigger_timestamp"))
+    final_recharge = _qa_parse_dt(rec.get("recharge_timestamp"))
+    if final_trigger is not None and final_recharge is not None and "hours_to_recharge_after_trigger" in rec:
+        hour_params = next((v.get("params") or {} for v in variables if v.get("name") == "hours_to_recharge_after_trigger"), {})
+        hour_precision = int(hour_params.get("precision", 2) or 2)
+        final_hours = round(max(0.0, (final_recharge - final_trigger).total_seconds() / 3600.0), hour_precision)
+        lo = _to_finite_float(hour_params.get("min", hour_params.get("lo")), 0.0) or 0.0
+        hi = _to_finite_float(hour_params.get("max", hour_params.get("hi")), None)
+        if final_hours < lo:
+            final_hours = lo
+        if hi is not None and final_hours > hi:
+            final_hours = hi
+        rec["hours_to_recharge_after_trigger"] = final_hours
 
     allowed = set(field_order)
     return {k: v for k, v in rec.items() if k in allowed}, issues
@@ -1797,7 +2085,7 @@ def run_deterministic_agentic_generation(
         "llm_issues": 0,
         "deterministic_checks": [
             "schema_and_type", "declared_ranges_and_choices", "formula_and_arithmetic",
-            "scenario_semantics", "timestamp_relationships", "user_history_consistency",
+            "scenario_semantics", "cross_field_semantics", "timestamp_relationships", "user_history_consistency",
         ],
     }
     return state

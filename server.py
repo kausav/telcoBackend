@@ -135,6 +135,7 @@ class GenerateRequest(BaseModel):
 class GenerateResponse(BaseModel):
     success: bool = True
     scenario_id: str
+    requested_scenario_id: str | None = None
     typeOfData: Literal["transactional", "aggregational"]
     draft_id: str | None = None
     scenario_label: str
@@ -600,7 +601,8 @@ def generate_scenario(req: GenerateRequest):
         total_records=sum(len(x.get("records",[])) for x in entity_records)
 
     return GenerateResponse(
-        success=True,scenario_id=scenario_id,typeOfData=state.type_of_data,entityKey=entity_key,totalCount=total_count,recordsPerUser=records_per_user,
+        success=True,scenario_id=scenario_id,requested_scenario_id=meta.get("requested_scenario_id", meta.get("label", scenario_id)),
+        typeOfData=state.type_of_data,entityKey=entity_key,totalCount=total_count,recordsPerUser=records_per_user,
         draft_id=req.draftId,scenario_label=meta.get("label",scenario_id),fields=state.field_order or ((resolve_variables(scenario_id) or ([],[]))[1]),
         total_records=total_records,validation_report=state.validation_report,records=response_records,errors=state.errors,record_errors=state.record_errors,
     )

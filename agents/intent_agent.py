@@ -31,19 +31,25 @@ IMPORTANT BOUNDARIES:
 - Candidate variables are semantic ideas only. The deterministic compiler assigns executable generator contracts.
 - scenarioId is an identifier only and MUST NOT influence what variables are proposed.
 - Use scenarioType, domain, businessScenario, useCase, country, and typeOfData together. Entity key is backend schema metadata; do not use it to ideate variables.
-- There is NO variable-count target and NO variable-count maximum. Be COMPREHENSIVE: return as many
-  semantically relevant variables as the full registry supports for this scenario. Prefer high coverage
-  over minimality. NEVER truncate for count, but do not invent variables that have no plausible scenario
-  purpose. The compiler will additionally include all attributes from resolved registry entities.
+- There is NO variable-count target and NO variable-count maximum. Be COMPREHENSIVE in semantic coverage,
+  but include ONLY variables that materially represent this business scenario. Never add a variable merely
+  because an attribute exists somewhere in the telecom registry or in a related entity. The compiler will
+  ground relevant ideas to the approved registry and will reject any idea that lacks a safe executable
+  generation contract.
 - For telecom transactional data, subscriber_id, account_id and msisdn are mandatory and must always be
   present as stable entity-level fields.
 - Candidate variable names must be FRESH and should not simply copy a template or reference list.
+- Avoid redundant identity/contact fields. In a telecom transactional scenario, msisdn is the canonical
+  subscriber mobile identifier; do NOT also propose phoneNumber, mobileNumber, telephoneNumber, or equivalent
+  duplicates unless the business scenario explicitly requires a separate contact-medium concept.
 - For transactional data, distinguish stable entity/profile fields from repeated transaction/event/decision fields using grain.
 - Prefer variables that explain triggers, states, transitions, outcomes, timing, monetary/usage measures,
   decisions, contention, suppression, recovery, or retention when those concepts fit the scenario.
 - Treat scenarioType as a behavioral mode and make the variable set materially reflect it.
 - Cover only concepts justified by the current business scenario and domain.
 - The telecom catalog is grounding information, not a variable template. Do not dump catalog attributes.
+- Do not propose unsupported nested/object fields when a flat synthetic dataset cannot deterministically
+  populate their nested structure.
 
 Return this JSON shape:
 {
@@ -244,7 +250,7 @@ class GeminiIntentAgent:
             "Create a comprehensive fresh scenario intent. There is NO artificial variable-count target or maximum. "
             "Prefer the maximum set of relevant variables supported by the complete approved registry and the scenario semantics. "
             "Never truncate for count. For transactional telecom scenarios, ALWAYS include subscriber_id, account_id, and msisdn. "
-            "Do not invent unsupported telecom entities or fields; the compiler will add all attributes from resolved registry entities. "
+            "Do not invent unsupported telecom entities or fields; the compiler will ground only relevant selected concepts from the approved registry. "
             "Return JSON only."
         )
 

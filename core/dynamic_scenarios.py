@@ -182,49 +182,122 @@ def resolve_scenario_meta(scenario_id: str) -> dict[str, Any] | None:
     return dyn["meta"] if dyn else None
 
 
-def _repair_legacy_variables(variables: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Repair legacy normalized variables saved by older parser versions.
+def _repair_legacy_categorical(var: dict[str, Any], norm_name: str) -> None:
+    """Correct known legacy enum mismatches where the confirmed field description is authoritative."""
+    mapping = {
+        "subscriber_segment": ["ULTRA_LOW", "MASS", "MID_TIER", "HIGH_VALUE"],
+        "handset_network_capability": ["4G", "5G"],
+        "low_balance_trigger_reason": ["LOW_BALANCE", "DATA_EXHAUSTED", "VALIDITY_EXPIRY"],
+        "nudge_channel": ["SMS", "WHATSAPP", "APP_PUSH", "IVR"],
+        "nudge_offer_type": ["EXTRA_DATA", "CASH_BACK", "VALIDITY_BOOSTER", "DISCOUNT_VOUCHER"],
+        "recharge_channel": ["UPI_APP", "TELCO_APP", "RETAIL_POS", "ATM", "NETBANKING", "USSD"],
+        "payment_instrument_type": ["UPI", "CREDIT_CARD", "DEBIT_CARD", "PREPAID_WALLET", "CASH", "AUTO_DEBIT"],
+        "recharge_pack_category": ["UNLIMITED_COMBO", "DATA_ADDON", "TALKTIME_TOPUP", "INTERNATIONAL_ROAMING", "ISD"],
+        "topup_fulfillment_status": ["COMPLETED", "FAILED", "PENDING", "REVERSED"],
+    }
+    choices = mapping.get(norm_name)
+    if choices:
+        params = dict(var.get("params") or {})
+        params["choices"] = choices
+        params["weights"] = [1.0] * len(choices)
+        var["params"] = params
+        var["gen"] = "weighted_choice"
 
-    Older confirmed scenarios could persist event/object fields as
-    ``constant(value="unknown")``. Generation must not continue replaying that
-    stale artifact after the parser has been fixed. This repair is deliberately
-    narrow: it only changes an exact legacy unknown placeholder on event-like
-    fields and otherwise leaves confirmed schema definitions untouched.
-    """
-    repaired = []
+
+def _repair_legacy_variables(variables: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Repair legacy confirmed variables so generation cannot replay placeholder artifacts."""
+    repaired: list[dict[str, Any]] = []
+    names = {
+        str(raw.get("name") or "").strip().lower()
+        for raw in variables or []
+        if isinstance(raw, dict)
+    }
+    has_msisdn = "msisdn" in names
+
     for raw in variables or []:
-        var = dict(raw) if isinstance(raw, dict) else raw
-        if not isinstance(var, dict):
-            repaired.append(var)
+        if not isinstance(raw, dict):
             continue
-        name = str(var.get("name") or "")
+        var = dict(raw)
+        name = str(var.get("name") or "").strip()
+        if not name:
+            continue
+        name_key = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+        norm_name = name_key.replace("_", "")
         dtype = str(var.get("dtype") or "").strip().lower()
         gen = str(var.get("gen") or "").strip().lower()
         params = dict(var.get("params") or {})
-        value = params.get("value")
-        semantic_like = (
-            dtype in {"event", "event_type", "event_container"}
-            or name.lower().endswith(("_event", "_decision", "_outcome", "_state", "_action"))
-            or " event " in f" {str(var.get('description') or '').lower()} "
-            or " decision " in f" {str(var.get('description') or '').lower()} "
-            or " outcome " in f" {str(var.get('description') or '').lower()} "
-            or " action " in f" {str(var.get('description') or '').lower()} "
-            or " state " in f" {str(var.get('description') or '').lower()} "
-        )
-        if semantic_like and gen in {"constant", ""} and isinstance(value, str) and value.strip().lower() in {"unknown", ""}:
-            var["gen"] = "semantic_event"
-            params.pop("value", None)
+
+        # One canonical subscriber phone identifier: msisdn.
+        if has_msisdn and norm_name in {"phonenumber", "mobilenumber", "telephonenumber"}:
+            continue
+
+        # Flat generation cannot safely materialize arbitrary nested objects. Drop the
+        # legacy generic/empty object contracts instead of returning {}.
+        if (
+            dtype in {"object", "array"}
+            and gen in {"generic", ""}
+            and name_key not in {"subscriber_id", "account_id", "msisdn"}
+            and not (params.get("choices") or params.get("values") or params.get("value"))
+        ):
+            continue
+
+        # Correct known semantic/categorical mismatches from earlier confirmed drafts.
+        _repair_legacy_categorical(var, name_key)
+        dtype = str(var.get("dtype") or dtype).strip().lower()
+        gen = str(var.get("gen") or gen).strip().lower()
+        params = dict(var.get("params") or {})
+
+        # Mandatory telecom identity anchors are application-level contracts and must never
+        # be downgraded to a generic generator during legacy migration.
+        if name_key == "subscriber_id":
+            var["dtype"] = "string"
+            var["gen"] = "prefixed_int"
+            var["params"] = {"prefix": "SUB-", "digits": 10}
+        elif name_key == "account_id":
+            var["dtype"] = "string"
+            var["gen"] = "id_mirror"
+            var["params"] = {
+                "prefix": "ACC-", "source_field": "subscriber_id", "source_prefix": "SUB-"
+            }
+        elif name_key == "msisdn":
+            var["dtype"] = "string"
+            var["gen"] = "e164_phone"
+            params.setdefault("country_codes", ["+91"])
+            params.setdefault("country", "IN")
             var["params"] = params
+        # Old schema versions used generic generators that intentionally produced placeholders.
+        # Route other legacy generic strings through the safe semantic generator.
+        elif dtype in {"string", "str", "text"} and gen in {"generic", ""}:
+            var["gen"] = "semantic_string"
+
+        # Preserve booleans as a concrete true/false generator, even when an old draft
+        # accidentally attached a categorical lifecycle choice list to a boolean field.
+        if dtype not in {"boolean", "bool"} and bool(re.match(r"^(?:is|has)[A-Z]", name)):
+            dtype = "boolean"
+            var["dtype"] = "boolean"
+        if dtype in {"boolean", "bool"}:
+            var["dtype"] = "boolean"
+            var["gen"] = "weighted_choice"
+            var["params"] = {"choices": [False, True], "weights": [0.5, 0.5]}
+
+        # Normalize JSON/OpenAPI's "date-time" format so it can never be used as a literal strftime mask.
+        if dtype == "datetime" and str(params.get("format") or "").strip().lower() in {"date-time", "datetime", "timestamp"}:
+            params.pop("format", None)
+            params.setdefault("timestamp_format", "dd/mm/yyyy hh:mm a")
+            var["params"] = params
+
         repaired.append(var)
     return repaired
 
-
 def resolve_variables(scenario_id: str) -> tuple[list[dict[str, Any]], list[str]] | None:
-    """Return (variables, field_order) for a confirmed scenario, repairing legacy placeholders."""
+    """Return repaired variables and a field order consistent with the repaired contract."""
     dyn = get_confirmed(scenario_id)
     if not dyn:
         return None
-    return (_repair_legacy_variables(dyn["variables"]), list(dyn["field_order"]))
+    variables = _repair_legacy_variables(dyn["variables"])
+    allowed = {str(v.get("name")) for v in variables if isinstance(v, dict) and v.get("name")}
+    field_order = [name for name in list(dyn["field_order"]) if str(name) in allowed]
+    return variables, field_order
 
 
 
