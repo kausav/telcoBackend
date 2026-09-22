@@ -98,10 +98,17 @@ def _semantic_placeholder(name: str, params: dict, rec: dict) -> str:
 
 
 def _semantic_string(var: dict, rec: dict) -> str | None:
-    """Generate a useful synthetic string for legacy/semantic fields without echoing field names."""
+    """Generate a useful synthetic string from field name/description semantics.
+
+    This is intentionally conservative: explicit params remain authoritative, then clear
+    description examples and well-known telecom/domain semantics are used before the final
+    synthetic fallback. The fallback never echoes the schema field name verbatim.
+    """
     p = dict(var.get("params") or {})
     name = str(var.get("name") or rec.get("__current_field__") or "").strip()
+    desc = str(var.get("description") or "").strip()
     n = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    d = desc.lower()
 
     if "choices" in p or "values" in p:
         vals = p.get("choices", p.get("values"))
@@ -112,20 +119,99 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
     if p.get("value") is not None:
         return str(p["value"])
 
-    if n.endswith("_id") or n == "id" or n.endswith("_key"):
-        return _prefixed_int({"prefix": f"{n[:-3].upper()}-" if n.endswith("_id") else "ID-", "digits": 10}, rec)
+    # Clear description examples are stronger than fuzzy field-name heuristics.
+    example_bodies = []
+    for pattern in (
+        r"\bsuch as\s+(.+?)(?:\.|$)",
+        r"\bfor example\s+(.+?)(?:\.|$)",
+        r"\bpossible values (?:are|include)\s+(.+?)(?:\.|$)",
+        r"\bvalid values (?:are|include)\s+(.+?)(?:\.|$)",
+    ):
+        match = re.search(pattern, desc, flags=re.IGNORECASE)
+        if match:
+            example_bodies.append(match.group(1).strip())
+    for body in example_bodies:
+        parts = [
+            re.sub(r"^[\s\"'`]+|[\s\"'`]+$", "", item).strip()
+            for item in re.split(r"\s*(?:,|;|\bor\b|\band\b)\s*", body, flags=re.IGNORECASE)
+        ]
+        parts = [x for x in parts if x and len(x) <= 80 and x.strip().lower() not in {"and so forth", "etc", "etc."}]
+        if len(parts) >= 2:
+            return str(random.choice(parts))
+
+    # Identifier/reference semantics must be checked before broad words such as "offer",
+    # "type", or "status", because many TMF fields are references to another entity.
+    if (
+        n.endswith("_id") or n == "id" or n.endswith("_key")
+        or "identifier" in d or "reference id" in d or "unique reference" in d
+    ):
+        prefix_source = n[:-3] if n.endswith("_id") else n
+        prefix = re.sub(r"[^A-Z0-9]+", "_", prefix_source.upper()).strip("_") or "REF"
+        return _prefixed_int({"prefix": f"{prefix}-", "digits": 10}, rec)
+
     if "phone" in n or "mobile" in n or n == "msisdn":
         country = str(p.get("country") or "IN").upper()
         dial_codes = {
-            "IN":"+91","US":"+1","CA":"+1","GB":"+44","AU":"+61",
-            "AE":"+971","SG":"+65","DE":"+49","FR":"+33","IT":"+39",
+            "IN": "+91", "US": "+1", "CA": "+1", "GB": "+44", "AU": "+61",
+            "AE": "+971", "SG": "+65", "DE": "+49", "FR": "+33", "IT": "+39",
         }
         dial = dial_codes.get(country, "+91")
-        return _e164_phone({"country_codes":[dial], "country":country}, rec)
+        return _e164_phone({"country_codes": [dial], "country": country}, rec)
     if "email" in n:
         return f"user{random.randint(100000, 999999)}@example.test"
-    if any(token in n for token in ("href", "url", "schemalocation", "resourcepath", "path")):
+    if "uri" in d or "url" in d or any(token in n for token in ("href", "url", "schemalocation", "resourcepath", "path")):
         return f"https://example.test/telecom/{uuid.uuid4().hex[:12]}"
+    if "reference" in d and not any(token in d for token in ("uri", "url", "documentation")):
+        prefix = re.sub(r"[^A-Z0-9]+", "_", n.upper()).strip("_") or "REF"
+        return _prefixed_int({"prefix": f"{prefix}-", "digits": 10}, rec)
+
+    if "operating circle" in d or "regulatory service area" in d:
+        return random.choice([
+            "Delhi", "Haryana", "Punjab", "Rajasthan", "Uttar Pradesh East", "Uttar Pradesh West",
+            "Maharashtra", "Mumbai", "Gujarat", "Karnataka", "Tamil Nadu", "Kerala",
+            "Andhra Pradesh", "Telangana", "West Bengal", "Bihar", "Odisha", "Assam",
+            "North East", "Himachal Pradesh", "Jammu Kashmir", "Madhya Pradesh", "Kolkata",
+        ])
+    if "medium" in n and "contact" in d:
+        return random.choice(["email", "telephone", "postal_address"])
+    if "contact medium" in d:
+        return random.choice(["email", "telephone", "postal_address"])
+    if "type of contact" in d:
+        return random.choice(["mobile", "fixed_home", "fixed_office", "shipping_address"])
+    if "payment plan" in d or n == "plantype":
+        return random.choice(["prepaid", "postpaid", "hybrid"])
+    if "consumption counter" in d:
+        return random.choice(["used", "outOfBucket"])
+    if "currency" in d or "iso4217" in d:
+        return str(p.get("currency") or "INR").upper()
+    if "currency" in n:
+        return str(p.get("currency") or "INR").upper()
+    if "billing time period" in d or "repeat the application of the price" in d:
+        return random.choice(["week", "month", "quarter", "year"])
+    if "frequency of" in d or "frequency" == n:
+        return random.choice(["daily", "weekly", "monthly", "quarterly"])
+    if "price" in n and ("recurring" in d or "discount" in d or "allowance" in d or "penalty" in d):
+        return random.choice(["recurring", "discount", "allowance", "penalty"])
+    if "catalog" in n and "catalog" in d:
+        return random.choice(["product", "service", "resource"])
+    if "relationship" in n and ("relationship" in d or "migration" in d or "substitution" in d):
+        return random.choice(["override", "discount", "replace", "migrate"])
+    if n == "value_type" or ("kind of value" in d and "numeric" in d and "text" in d):
+        return random.choice(["numeric", "text"])
+    if n == "range_interval" or "inclusion or exclusion" in d:
+        return random.choice(["open", "closed", "closedBottom", "closedTop"])
+    if n == "adjust_type" or "recurringcharge" in d or "onetimecharge" in d:
+        return random.choice(["RecurringCharge", "OneTimeCharge"])
+    if "format of the exported data" in d or n == "content_type":
+        return random.choice(["application/json", "text/csv", "application/xml"])
+    if "attachment mime type" in d:
+        return random.choice(["application/pdf", "image/png", "video/mp4"])
+    if n == "attachment_type" or "attachment type" in d:
+        return random.choice(["document", "image", "video"])
+    if "type of notification" in d or "type of the notification" in d:
+        return random.choice(["LOW_BALANCE_ALERT", "RECHARGE_UPDATE", "PAYMENT_UPDATE", "SYSTEM_NOTIFICATION"])
+    if "network" in n and "capability" in n:
+        return random.choice(["2G", "3G", "4G", "5G"])
     if "channel" in n:
         return random.choice(["APP", "SMS", "WEB", "USSD", "WHATSAPP", "IVR", "RETAIL"])
     if "payment" in n and ("method" in n or "instrument" in n):
@@ -134,17 +220,17 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         return random.choice(["LOW_BALANCE", "DATA_EXHAUSTED", "VALIDITY_EXPIRY", "CUSTOMER_REQUEST"])
     if n in {"stateorprovince", "province", "state"} or n.endswith("_state_or_province"):
         return random.choice(["Haryana", "Punjab", "Delhi", "Maharashtra", "Karnataka", "Tamil Nadu", "Gujarat"])
-    if n in {"city"} or n.endswith("_city"):
+    if n == "city" or n.endswith("_city"):
         return random.choice(["Delhi", "Gurugram", "Ludhiana", "Chandigarh", "Mumbai", "Bengaluru", "Pune"])
-    if n in {"postcode", "postalcode", "postal_code"}:
+    if n in {"postcode", "postalcode", "postal_code", "postcode"}:
         return str(random.randint(110001, 999999))
-    if "network" in n and "capability" in n:
-        return random.choice(["2G", "3G", "4G", "5G"])
+    if "status reason" in d or n == "status_reason":
+        return random.choice(["CUSTOMER_REQUEST", "PAYMENT_FAILURE", "SYSTEM_ERROR", "POLICY_VIOLATION"])
     if "status" in n or n.endswith("_state") or n in {"state"}:
         return random.choice(["PENDING", "COMPLETED", "FAILED"])
-    if "offer" in n:
+    if "offer" in n and any(token in d for token in ("incentive", "recommendation", "cash back", "validity booster")):
         return random.choice(["EXTRA_DATA", "CASH_BACK", "VALIDITY_BOOSTER", "DISCOUNT_VOUCHER"])
-    if "segment" in n:
+    if "segment" in n or "market segment" in d:
         return random.choice(["ULTRA_LOW", "MASS", "MID_TIER", "HIGH_VALUE"])
     if n in {"role", "partyroletype"} or n.endswith("_role"):
         return random.choice(["subscriber", "customer", "agent", "system"])
@@ -160,10 +246,7 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         return f"CODE-{random.randint(100000, 999999)}"
     if "country" in n:
         return str(p.get("country") or "IN").upper()
-    if "currency" in n:
-        return str(p.get("currency") or "INR").upper()
 
-    # Last-resort semantic token: it is intentionally not the field name and is clearly synthetic.
     label = re.sub(r"_+", "_", n.upper()).strip("_") or "VALUE"
     return f"SYN_{label[:24]}_{random.randint(1000, 9999)}"
 

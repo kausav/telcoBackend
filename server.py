@@ -35,6 +35,9 @@ from config.industry_profiles import COUNTRY_BASE
 from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES
 from core.agentic_workflow import AgenticSchemaWorkflow, get_agentic_workflow
 from core.telecom_registry import RegistryError, get_registry
+from core.scenario_variable_store import upsert_recommended, get_recommended, set_user_variables, get_user_variables, get_user_variable_records, delete_user_variable
+from models.database import ping as ping_mongodb
+from models.model_registry import ensure_indexes as ensure_model_indexes
 
 
 
@@ -72,6 +75,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(_app: FastAPI):
     """Validate immutable model inputs and initialize mutable runtime state once per process."""
     try:
+        ping_mongodb()
+        ensure_model_indexes()
         registry = get_registry()
         health = registry.health()
         if not health["healthy"]:
@@ -120,7 +125,7 @@ async def request_id_middleware(request: Request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
 )
 
@@ -172,6 +177,19 @@ class ConfirmRequest(BaseModel):
     edit: list[VariableEdit] = Field(default_factory=list, description="Optional HITL edits to existing variables")
     delete: list[str] = Field(default_factory=list, description="Optional variable names to delete")
     feedback: str | None = None
+
+
+class ScenarioVariableRecommendationRequest(BaseModel):
+    scenarioId: str = Field(min_length=1, max_length=200)
+    scenarioVersion: int = Field(1, ge=1)
+    variables: list[dict] = Field(default_factory=list)
+    userId: str | None = Field(None, max_length=200)
+
+class UserScenarioVariablesRequest(BaseModel):
+    userId: str = Field(min_length=1, max_length=200)
+    scenarioId: str = Field(min_length=1, max_length=200)
+    scenarioVersion: int = Field(1, ge=1)
+    variables: list[dict] = Field(default_factory=list)
 
 
 class ConfirmResponse(BaseModel):
@@ -314,6 +332,52 @@ def _country_from_csv_params(variables: list[dict]) -> str | None:
         counts[candidate] = counts.get(candidate, 0) + 1
     return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
 
+
+@app.post("/scenario/variables/recommend")
+def recommend_scenario_variables(req: ScenarioVariableRecommendationRequest):
+    """Persist a selected subset of a proposal as scenario-level DB recommendations."""
+    try:
+        count = upsert_recommended(req.scenarioId.strip(), req.scenarioVersion, req.variables, req.userId)
+    except ValueError as exc:
+        raise HTTPException(400, detail={"error": str(exc)}) from exc
+    return {"success": True, "scenarioId": req.scenarioId, "scenarioVersion": req.scenarioVersion, "saved": count}
+
+@app.get("/scenario/{scenario_id}/variables/recommended")
+def recommended_scenario_variables(scenario_id: str, scenarioVersion: int = 1):
+    return {"success": True, "scenarioId": scenario_id, "scenarioVersion": scenarioVersion, "variables": get_recommended(scenario_id, scenarioVersion)}
+
+@app.post("/scenario/variables/user")
+def save_user_scenario_variables(req: UserScenarioVariablesRequest):
+    try:
+        count = set_user_variables(req.userId.strip(), req.scenarioId.strip(), req.scenarioVersion, req.variables)
+    except ValueError as exc:
+        raise HTTPException(400, detail={"error": str(exc)}) from exc
+    return {"success": True, "userId": req.userId, "scenarioId": req.scenarioId, "scenarioVersion": req.scenarioVersion, "saved": count}
+
+@app.get("/scenario/{scenario_id}/variables/user/{user_id}")
+def get_saved_user_scenario_variables(scenario_id: str, user_id: str, scenarioVersion: int = 1):
+    return {"success": True, "userId": user_id, "scenarioId": scenario_id, "scenarioVersion": scenarioVersion, "variables": get_user_variables(user_id, scenario_id, scenarioVersion), "records": get_user_variable_records(user_id, scenario_id, scenarioVersion)}
+
+@app.patch("/scenario/{scenario_id}/variables/user/{user_id}/{variable_key}")
+def edit_user_scenario_variable(scenario_id: str, user_id: str, variable_key: str, changes: dict, scenarioVersion: int = 1):
+    current = get_user_variable_records(user_id, scenario_id, scenarioVersion)
+    match = next((item for item in current if item.get("variable_key") == variable_key), None)
+    if not match:
+        raise HTTPException(404, detail={"error": "User scenario variable not found"})
+    definition = dict(match.get("definition") or {})
+    definition.update(changes or {})
+    try:
+        set_user_variables(user_id, scenario_id, scenarioVersion, [definition], state="OVERRIDDEN")
+    except ValueError as exc:
+        raise HTTPException(400, detail={"error": str(exc)}) from exc
+    return {"success": True, "userId": user_id, "scenarioId": scenario_id, "variableKey": variable_key, "updated": True}
+
+@app.delete("/scenario/{scenario_id}/variables/user/{user_id}/{variable_key}")
+def remove_user_scenario_variable(scenario_id: str, user_id: str, variable_key: str, scenarioVersion: int = 1):
+    deleted = delete_user_variable(user_id, scenario_id, scenarioVersion, variable_key)
+    if not deleted:
+        raise HTTPException(404, detail={"error": "User scenario variable not found"})
+    return {"success": True, "userId": user_id, "scenarioId": scenario_id, "variableKey": variable_key, "deleted": True}
 
 @app.post("/scenario/import-csv", response_model=ScenarioImportResponse)
 def import_scenario_csv(

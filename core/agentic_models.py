@@ -119,6 +119,7 @@ class ScenarioProposeRequest(BaseModel):
     country: str = Field(min_length=1, max_length=20)
     entity_key: str | None = Field(default=None, alias="entityKey", max_length=200)
     use_case: str = Field(alias="useCase", min_length=1, max_length=200)
+    user_id: str | None = Field(default=None, alias="userId", max_length=200, description="Future authenticated user identity; optional until login is enabled")
 
 
 class ScenarioImportResponse(BaseModel):

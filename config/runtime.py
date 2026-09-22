@@ -42,10 +42,6 @@ TELECOM_STANDARDS_DIR = resolve_path(
     os.getenv("REGISTRY_STANDARDS_DIR"), TELECOM_STANDARDS_CACHE_DIR / "normalized"
 )
 
-REGISTRY_DB_PATH = resolve_path(os.getenv("REGISTRY_DB_PATH"), RUNTIME_DATA_DIR / "registry.db")
-DYNAMIC_SCENARIOS_DB = resolve_path(os.getenv("DYNAMIC_SCENARIOS_DB"), RUNTIME_DATA_DIR / "dynamic_scenarios.db")
-CONVERSATION_DB_PATH = resolve_path(os.getenv("CONVERSATION_DB_PATH"), RUNTIME_DATA_DIR / "conversations.db")
-
 CORS_ALLOW_ORIGINS = [
     item.strip() for item in os.getenv(
         "CORS_ALLOW_ORIGINS",

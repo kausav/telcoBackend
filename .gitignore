@@ -7,7 +7,6 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 runtime_data/
-*.db
 
 # Official source downloads and generated normalized runtime indexes
 runtime_data/official_standards/

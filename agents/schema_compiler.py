@@ -234,9 +234,14 @@ class SchemaCompiler:
             if not runtime_params.get("mapping"):
                 raise ValueError(f"Dependent choice field '{name}' is missing its mapping")
             return "dependent_choice", runtime_params
+        # `generic` in the standards-derived profile means "no executable generator was
+        # declared"; it must never reach the runtime because the old generic path emitted
+        # field-name placeholders. Resolve it using the attribute's concrete dtype/semantics.
+        if generator in {"generic", "string", "text"}:
+            generator = ""
         # Flat synthetic records cannot safely materialize arbitrary nested JSON objects/arrays.
         if dtype in {"object", "array"}:
-            return None
+            return None, runtime_params
         if not generator:
             enum_values = tuple(getattr(attr, "enum_values", ()) or ())
             if enum_values:
@@ -649,54 +654,62 @@ class SchemaCompiler:
                 "depends_on": [],
             }, force_name=entity_key)
 
-        # Relevance-first grounding:
-        # 1) mandatory application anchors,
-        # 2) semantic ideas returned by the intent agent,
-        # 3) explicit registry matches for those ideas,
-        # 4) only explicit dependency closure required by selected concepts.
+        # Comprehensive registry grounding:
         #
-        # Do NOT copy every attribute from every graph-expanded registry entity. That turns
-        # a business scenario into the entire telecom catalog and creates unexecutable noise.
-        candidate_names = {self._normalize_variable_name(str(item.get("name") or "")) for item in ideas}
-        registry_dependency_ideas: list[dict[str, object]] = []
-
+        # The proposal must retain broad semantic coverage (the prior contract exposed
+        # hundreds of registry-backed variables), while the generation side must stay safe.
+        # Therefore we include every *materializable scalar* attribute on the resolved
+        # scenario graph, not only the LLM's candidate list. This preserves dynamic width
+        # without reintroducing arbitrary nested `{}` objects or semantically unrelated
+        # placeholder contracts.
+        #
+        # Nested object/array attributes are intentionally excluded from the flat synthetic
+        # row contract. Their scalar children remain available when the official model exposes
+        # them as separate attributes.
         for entity in entities:
+            entity_grain = (
+                "entity"
+                if entity.canonical_id in {"subscriber", "customer", "customer_account", "prepaid_account"}
+                else "transaction"
+            )
             for attr in entity.attributes:
-                attr_key = self._normalize_variable_name(attr.name)
-                if attr_key not in candidate_names:
+                attr_name = str(attr.name or "")
+                attr_key = self._normalize_variable_name(attr_name)
+                if not attr_key:
                     continue
-                # Respect an explicit candidate variable. Registry attributes are only added
-                # when the semantic proposal actually selected the same concept.
-                registry_dependency_ideas.append({
-                    "name": attr.name,
-                    "description": attr.description or f"{entity.name} {attr.name} attribute.",
+                if attr_key in self.REDUNDANT_MSISDN_FIELDS and any(
+                    self._normalize_variable_name(str(item.get("name") or "")) == "msisdn"
+                    for item in ideas
+                ):
+                    continue
+                raw_dtype = str(attr.dtype or "string").lower()
+                if raw_dtype in self.UNSUPPORTED_NESTED_DTYPES:
+                    continue
+                add_idea({
+                    "name": attr_name,
+                    "description": attr.description or f"{entity.name} {attr_name} attribute.",
                     "role": (
-                        "timing" if str(attr.dtype).lower() in {"datetime", "timestamp", "date"}
-                        else "measurement" if str(attr.dtype).lower() in {"float", "decimal", "number", "numeric", "int", "integer"}
-                        else "status" if "status" in attr.name.lower() or "state" in attr.name.lower()
-                        else "identity" if attr.name.lower().endswith("_id")
+                        "timing" if raw_dtype in {"datetime", "timestamp", "date"}
+                        else "measurement" if raw_dtype in {"float", "decimal", "number", "numeric", "int", "integer"}
+                        else "status" if "status" in attr_name.lower() or "state" in attr_name.lower()
+                        else "identity" if attr_name.lower().endswith("_id")
                         else "other"
                     ),
-                    "grain": "entity" if entity.canonical_id in {"subscriber", "customer", "customer_account", "prepaid_account"} else "transaction",
+                    "grain": entity_grain,
                     "dtype": (
-                        "integer" if str(attr.dtype).lower() in {"int", "integer", "bigint", "smallint"} else
-                        "float" if str(attr.dtype).lower() in {"float", "decimal", "number", "numeric"} else
-                        "datetime" if str(attr.dtype).lower() in {"datetime", "timestamp"} else
-                        "date" if str(attr.dtype).lower() == "date" else
+                        "integer" if raw_dtype in {"int", "integer", "bigint", "smallint"} else
+                        "float" if raw_dtype in {"float", "decimal", "number", "numeric"} else
+                        "datetime" if raw_dtype in {"datetime", "timestamp"} else
+                        "date" if raw_dtype == "date" else
                         "categorical" if attr.enum_values or str(attr.generator).lower() in {"weighted_choice", "dependent_choice", "categorical"} else
-                        "boolean" if str(attr.dtype).lower() in {"bool", "boolean"} else "string"
+                        "boolean" if raw_dtype in {"bool", "boolean"} else "string"
                     ),
                     "depends_on": list(attr.depends_on),
                     "_registry_entity": entity.canonical_id,
                     "_registry_required": bool(attr.required),
                     "_registry_nullable": bool(attr.nullable),
                     "_registry_exact": True,
-                })
-
-        # Add only the registry-backed concepts that correspond to selected semantic ideas.
-        # Do not add unselected attributes simply because their entity was graph-expanded.
-        for item in registry_dependency_ideas:
-            add_idea(item, preserve_name=True)
+                }, preserve_name=True)
 
         # Explicit telecom de-duplication before field construction.
         if any(self._normalize_variable_name(str(item.get("name") or "")) == "msisdn" for item in ideas):
@@ -813,6 +826,12 @@ class SchemaCompiler:
             if not runtime_generator or not dtype or not isinstance(params, dict):
                 # Fail closed: a proposal field must have a concrete deterministic generator.
                 continue
+            # A field is executable only when the compiler has a concrete generator.
+            # This is a second safety gate for registry attributes whose official model is
+            # structurally richer than the flat synthetic CSV contract.
+            if runtime_generator is None:
+                continue
+
             role = str(idea.get("role") or "other")
             grain = str(idea.get("grain") or ("entity" if original_name == entity_key else "transaction"))
             deps = self._merge_dependencies(idea, name_map, grain, entity_key)
@@ -964,7 +983,7 @@ class SchemaCompiler:
         hard_constraints = [
             "scenarioId is identifier-only and does not select variables or business rules.",
             "The proposal is a fresh semantic variable set derived from the current scenario context; it is not a replay of a fixed scenario template.",
-            "There is no artificial variable-count target or maximum; schema width is determined by the current scenario and approved registry grounding.",
+            "There is no artificial variable-count target or maximum; schema width is determined by the current scenario and approved registry grounding. All materializable scalar attributes on resolved entities are eligible for inclusion.",
             "Each semantic variable is compiled into a deterministic executable generator contract.",
             "Transactional entity-grain variables are stable across the entity history; transaction/event/derived variables are regenerated per transaction/event.",
             "Generated records must pass deterministic type, choice, dependency, temporal, formula and scenario-semantic validation.",
@@ -974,7 +993,7 @@ class SchemaCompiler:
             hard_constraints.append(f"'{entity_key}' is the authoritative entity key for transactional grouping.")
         if (requested.industry_type or "telecom").strip().lower() in {"telecom", "telecommunications"}:
             hard_constraints.append("subscriber_id, account_id and msisdn are mandatory non-null entity-level fields in telecom scenario schemas.")
-            hard_constraints.append("Schema width is comprehensive by semantic relevance, with no fixed variable-count cap; unselected registry attributes are not included.")
+            hard_constraints.append("Schema width is comprehensive over scalar attributes on the resolved scenario registry graph, with no fixed variable-count cap; unsupported nested object/array structures are excluded from the flat record contract.")
         warnings = [
             "Scenario IDs are identifiers only; variables and generation rules are derived from the current request, registry grounding, and scenario semantics.",
         ]

@@ -25,13 +25,12 @@ from config.runtime import (  # noqa: E402
     TELECOM_STANDARDS_MANIFEST,
     TELECOM_STANDARDS_CACHE_DIR,
     TELECOM_PROFILES_DIR,
-    REGISTRY_DB_PATH,
     OFFICIAL_STANDARDS_TIMEOUT_SEC,
     OFFICIAL_STANDARDS_MAX_DOWNLOAD_MB,
 )
 from core.official_standards import sync_official_standards  # noqa: E402
 from core.standards_ingestion import normalize_openapi_file  # noqa: E402
-from core.telecom_registry import RegistryBuilder, registry_fingerprint  # noqa: E402
+from core.telecom_registry import get_registry, registry_fingerprint  # noqa: E402
 from core.runtime_lock import RuntimeFileLock  # noqa: E402
 
 
@@ -40,7 +39,6 @@ def main() -> int:
     parser.add_argument("--manifest", default=str(TELECOM_STANDARDS_MANIFEST))
     parser.add_argument("--cache-dir", default=str(TELECOM_STANDARDS_CACHE_DIR))
     parser.add_argument("--profiles-dir", default=str(TELECOM_PROFILES_DIR))
-    parser.add_argument("--db", default=str(REGISTRY_DB_PATH))
     parser.add_argument("--force", action="store_true", help="Re-download pinned official sources even when cached")
     parser.add_argument("--openapi", help="Optional custom Swagger/OpenAPI JSON for a controlled extension")
     parser.add_argument("--source-url", default="")
@@ -76,8 +74,12 @@ def main() -> int:
                 print(f"Synced: {item['organization']} | {item['artifact']} | {item['version']}")
 
         fingerprint = registry_fingerprint(normalized_dir, profiles_dir)
-        RegistryBuilder(Path(args.db).resolve(), normalized_dir, profiles_dir).rebuild(fingerprint)
-        print(f"Runtime registry rebuilt: {Path(args.db).resolve()}")
+        registry = get_registry()
+        registry.standards_dir = normalized_dir
+        registry.profiles_dir = profiles_dir
+        from core.telecom_registry import RegistryBuilder
+        RegistryBuilder(registry, normalized_dir, profiles_dir).rebuild(fingerprint)
+        print("Runtime MongoDB registry rebuilt")
     return 0
 
 

@@ -9,12 +9,13 @@ from typing import Any
 import json
 import logging
 
-from core.agentic_models import ScenarioImportResponse, ScenarioProposeRequest, ScenarioSchema, ScenarioIntent
+from core.agentic_models import ScenarioImportResponse, ScenarioProposeRequest, ScenarioSchema, ScenarioIntent, GeneratedSchemaField
 from core.conversation_store import append_message, ensure_conversation
 from core.dynamic_scenarios import new_draft_id, save_draft
 from core.telecom_registry import TelecomRegistry, get_registry
 from core.errors import LLMUpstreamError
 from core.runtime_cache import get_proposal, set_proposal
+from core.scenario_variable_store import get_recommended, get_user_variables, save_proposal
 
 logger = logging.getLogger(__name__)
 from agents.intent_agent import GeminiIntentAgent
@@ -73,7 +74,7 @@ class AgenticSchemaWorkflow:
     @staticmethod
     def _cache_key(req: ScenarioProposeRequest) -> tuple:
         return (
-            "agentic_proposal_v4",
+            "agentic_proposal_v5",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -83,6 +84,43 @@ class AgenticSchemaWorkflow:
             (req.entity_key or "").strip().lower(),
             " ".join(req.business_scenario.split()).strip().lower(),
         )
+
+    @staticmethod
+    def _merge_persisted_variables(schema: ScenarioSchema, recommended: list[dict[str, Any]], user_selected: list[dict[str, Any]]) -> tuple[ScenarioSchema, dict[str, str]]:
+        """Merge DB-controlled variables without allowing duplicate field names.
+
+        Precedence: user-selected > DB-recommended > LLM-generated.
+        """
+        source_by_name: dict[str, str] = {}
+        ordered: list[GeneratedSchemaField] = []
+        by_name: dict[str, GeneratedSchemaField] = {}
+
+        def add(items: list[dict[str, Any]], source: str, replace: bool = False):
+            for raw in items or []:
+                try:
+                    field = GeneratedSchemaField.model_validate(raw)
+                except Exception:
+                    logger.warning("Ignoring invalid persisted scenario variable '%s'", raw.get("name") if isinstance(raw, dict) else raw)
+                    continue
+                key = field.name.strip().lower()
+                if not key:
+                    continue
+                if key in by_name and not replace:
+                    continue
+                if key in by_name and replace:
+                    idx = next(i for i, existing in enumerate(ordered) if existing.name.strip().lower() == key)
+                    ordered[idx] = field
+                else:
+                    ordered.append(field)
+                by_name[key] = field
+                source_by_name[key] = source
+
+        # Start with the LLM/registry schema, then overlay DB recommendations, then user choices.
+        add([field.model_dump() for field in schema.fields], "LLM_GENERATED")
+        add(recommended, "DB_RECOMMENDED", replace=True)
+        add(user_selected, "USER_SELECTED", replace=True)
+        merged = schema.model_copy(update={"fields": ordered})
+        return merged, source_by_name
 
     def propose(self, req: ScenarioProposeRequest) -> ScenarioImportResponse:
         prompt = req.business_scenario.strip()
@@ -107,7 +145,7 @@ class AgenticSchemaWorkflow:
             "return fewer or more as justified by the scenario."
         )
 
-        cid = ensure_conversation(req.scenario_id)
+        cid = ensure_conversation(req.scenario_id, req.user_id)
         append_message(cid, "user", agent_prompt)
         cache_key = self._cache_key(req)
         cached = get_proposal(cache_key)
@@ -149,8 +187,18 @@ class AgenticSchemaWorkflow:
             )
             set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
 
+        # Persisted scenario configuration is layered on top of the current LLM proposal.
+        # The base LLM proposal remains cacheable and user-independent; only the merge is user-specific.
+        scenario_key = req.scenario_id.strip()
+        recommended = get_recommended(scenario_key, 1)
+        user_selected = get_user_variables(req.user_id.strip(), scenario_key, 1) if req.user_id and req.user_id.strip() else []
+        schema, variable_sources = self._merge_persisted_variables(schema, recommended, user_selected)
+
         unresolved_questions = self.compiler.approval_questions(intent, schema)
         variables, field_order = self._schema_to_variables(schema)
+        for variable in variables:
+            key = str(variable.get("name") or "").strip().lower()
+            variable["source"] = variable_sources.get(key, "LLM_GENERATED")
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
         entity_key = self._entity_key(req.entity_key, field_order, type_of_data)
 
@@ -181,6 +229,13 @@ class AgenticSchemaWorkflow:
             "approval_questions": unresolved_questions,
         }
         save_draft(draft_id, draft)
+        save_proposal(
+            request_id=draft_id,
+            user_id=req.user_id.strip() if req.user_id else None,
+            scenario_key=scenario_key,
+            scenario_version=1,
+            payload={"scenario_id": req.scenario_id, "variables": variables, "field_order": field_order, "intent": intent.model_dump()},
+        )
         append_message(cid, "assistant", json.dumps({"intent": intent.model_dump(), "action": "schema_proposed"}, sort_keys=True))
         return ScenarioImportResponse(
             success=True,
