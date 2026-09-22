@@ -881,21 +881,35 @@ class SchemaCompiler:
         country: str | None,
         type_of_data: str | None,
         entity_key: str | None,
+        scenario_type: str | None = None,
+        industry_type: str | None = None,
     ) -> ScenarioSchema:
-        """Compile Low Balance & Top-up strictly from the supplied TMF PDFs.
+        """Compile Low Balance & Top-up from the supplied PDF catalog.
 
-        This path deliberately does not resolve entities, attributes, relationships,
-        or generation contracts from the telecom registry.  The PDF catalog is the
-        semantic source of truth for this domain; generators are generic execution
-        mechanics applied to the documented scalar types.
+        The PDF catalog remains the semantic source of truth for domain fields. The
+        application-level subscriber/account/MSISDN anchors are added separately because
+        they are a mandatory telecom row contract, not PDF semantic claims.
+
+        The compiler intentionally emits the *maximum relevant flat scalar width* from the
+        selected PDF resources. Scenario inputs still control resource selection, scope,
+        country-aware generators, status semantics, and business-specific categorical bias.
         """
         catalog = catalog_for_request(business_scenario, use_case)
         request_text = f"{business_scenario} {use_case}".lower()
+        normalized_country = str(country or "IN").strip().upper()
+        normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
+        normalized_scenario = str(scenario_type or intent.scenario_type or "").strip()
+        scenario_mode = classify_outcome_mode(
+            scenario_type=normalized_scenario,
+            expected_outcome="",
+            business_response="",
+            business_scenario=business_scenario or "",
+        )
 
         resources: list[str] = ["bucket", "topupbalance"]
-        if "transfer" in request_text or "colleague" in request_text:
+        if any(token in request_text for token in ("transfer", "colleague", "send balance")) and "transferbalance" in catalog:
             resources.append("transferbalance")
-        if "reserve" in request_text or "reservation" in request_text:
+        if any(token in request_text for token in ("reserve", "reservation", "reserve balance")) and "reservebalance" in catalog:
             resources.append("reservebalance")
         if any(token in request_text for token in ("usage", "voice call", "voicemail", "usage specification", "rated", "billed")):
             for rid in ("usage", "usagespecification"):
@@ -903,75 +917,148 @@ class SchemaCompiler:
                     resources.append(rid)
         resources = list(dict.fromkeys(r for r in resources if r in catalog))
 
-        ideas = [idea.model_dump() for idea in intent.candidate_variables]
-        requested_names = {self._normalize_variable_name(str(i.get("name") or "")) for i in ideas}
-        requested_text = " ".join(
-            str(i.get("name") or "") + " " + str(i.get("description") or "")
-            for i in ideas
-        ).lower()
-        request_text += " " + requested_text
-
-        def field_requested(resource: str, field: str) -> bool:
-            n = self._normalize_variable_name(field)
-            if n in requested_names:
-                return True
-            return self._normalize_variable_name(f"{resource}_{field}") in requested_names
-
-
-        # Core fields keep the proposal useful even when the model returns a sparse
-        # candidate list; all additions still come from the PDF catalog.
-        core_fields = {
-            "bucket": {"id", "status", "usageType", "remainingValue", "remainingValue_units", "validFor"},
-            "topupbalance": {"id", "requestedDate", "confirmationDate", "status", "usageType", "isAutoTopup", "amount", "amount_units"},
+        # Application-level telecom anchors are always present, regardless of entityKey.
+        fields: list[GeneratedSchemaField] = [
+            GeneratedSchemaField(
+                name="subscriber_id",
+                dtype="string",
+                description="Stable synthetic subscriber identifier used to group transactional history.",
+                gen="prefixed_int",
+                params={"prefix": "SUB-", "digits": 10},
+                depends_on=[],
+                nullable=False,
+                required=True,
+                formula=None,
+                scope="entity",
+                useCase=use_case or "prepaid",
+                provenance={"source_policy": "application_contract", "source": "APPLICATION_REQUIRED", "reason": "mandatory telecom identity anchor"},
+            ),
+            GeneratedSchemaField(
+                name="account_id",
+                dtype="string",
+                description="Stable synthetic subscriber account identifier linked to subscriber_id.",
+                gen="id_mirror",
+                params={"prefix": "ACC-", "source_field": "subscriber_id", "source_prefix": "SUB-"},
+                depends_on=["subscriber_id"],
+                nullable=False,
+                required=True,
+                formula=None,
+                scope="entity",
+                useCase=use_case or "prepaid",
+                provenance={"source_policy": "application_contract", "source": "APPLICATION_REQUIRED", "reason": "mandatory telecom identity anchor"},
+            ),
+            GeneratedSchemaField(
+                name="msisdn",
+                dtype="string",
+                description="Synthetic subscriber MSISDN in a country-aware E.164-like format.",
+                gen="e164_phone",
+                params={"country_codes": [], "country": normalized_country},
+                depends_on=[],
+                nullable=False,
+                required=True,
+                formula=None,
+                scope="entity",
+                useCase=use_case or "prepaid",
+                provenance={"source_policy": "application_contract", "source": "APPLICATION_REQUIRED", "reason": "mandatory telecom identity anchor"},
+            ),
+        ]
+        dial_codes = {
+            "IN": "+91", "US": "+1", "CA": "+1", "GB": "+44", "AU": "+61",
+            "AE": "+971", "SG": "+65", "DE": "+49", "FR": "+33", "IT": "+39",
         }
-        if "recurr" in request_text or "auto top" in request_text:
-            core_fields["topupbalance"].update({"numberOfPeriods", "recurringPeriod"})
-        if "voucher" in request_text:
-            core_fields["topupbalance"].add("voucher")
+        fields[2].params["country_codes"] = [dial_codes.get(normalized_country, normalized_country if normalized_country.startswith("+") else "+" + normalized_country)]
 
-        fields: list[GeneratedSchemaField] = []
-        used_names: set[str] = set()
-        selected_standards: set[str] = set()
-        selected_entities: list[ResolvedConcept] = []
+        profile = get_profile("telecom", normalized_country)
+        currency = str(profile.get("currency") or ("INR" if normalized_country == "IN" else "")).upper() or "INR"
+
+        def item_base_type(resource: str) -> str:
+            return {
+                "bucket": "Bucket",
+                "topupbalance": "TopupBalance",
+                "transferbalance": "TransferBalance",
+                "reservebalance": "ReserveBalance",
+                "usage": "Usage",
+                "usagespecification": "UsageSpecification",
+            }.get(resource, resource)
+
+        def item_type(resource: str) -> str:
+            # TMF @type is an extensibility/type discriminator. Use the resource
+            # type itself rather than unrelated subscriber/product labels.
+            return item_base_type(resource)
+
+        def operation_status_params() -> dict[str, object]:
+            # Normal/happy-path transactional operations are successful. Other scenario types
+            # retain a complete executable vocabulary while deterministic scenario semantics
+            # select the matching outcome.
+            choices = ["COMPLETED", "FAILED", "PENDING"]
+            return {"choices": choices, "weights": [1.0, 0.0, 0.0] if scenario_mode == "positive" else [1.0, 1.0, 1.0]}
+
+        def field_params(resource: str, pdf_field: str, dtype: str) -> tuple[str, dict[str, object]]:
+            if dtype == "categorical":
+                choices = list(catalog[resource].get("choices", {}).get(pdf_field, []))
+                if resource == "bucket" and pdf_field == "status":
+                    # Normal means an active bucket; preserve the complete documented vocabulary.
+                    return "weighted_choice", {"choices": choices or ["active", "expired", "suspended"], "weights": [1.0, 0.0, 0.0] if scenario_mode == "positive" and len(choices) == 3 else [1.0] * len(choices)}
+                if choices:
+                    return "weighted_choice", {"choices": choices, "weights": [1.0] * len(choices)}
+                return "semantic_string", {}
+            if pdf_field == "status" and resource in {"topupbalance", "transferbalance", "reservebalance"}:
+                return "weighted_choice", operation_status_params()
+            if pdf_field in {"isAutoTopup"}:
+                return "weighted_choice", {"choices": [True, False], "weights": [0.55, 0.45]}
+            if pdf_field == "numberOfPeriods":
+                return "uniform_int", {"min": 1, "max": 12}
+            if pdf_field == "recurringPeriod":
+                return "weighted_choice", {"choices": ["weekly", "monthly"], "weights": [0.35, 0.65]}
+            if pdf_field in {"remainingValue", "reservedValue", "amount", "transferCost"}:
+                return "uniform", {"min": 0, "max": 1000, "precision": 2, "currency": currency}
+            if pdf_field.endswith("_units") or pdf_field == "amount_units" or pdf_field == "transferCost_units":
+                return "constant", {"value": currency}
+            if pdf_field in {"requestedDate", "confirmationDate", "usageDate", "lastUpdate"}:
+                return "recent_datetime", {"days_back": 365, "timezone": "Asia/Kolkata" if normalized_country == "IN" else "UTC", "timestamp_format": "dd/mm/yyyy hh:mm a"}
+            if pdf_field == "usageType" and resource in {"bucket", "topupbalance"}:
+                return "constant", {"value": "currency"}
+            if pdf_field == "@baseType":
+                return "constant", {"value": item_base_type(resource)}
+            if pdf_field == "@type":
+                return "constant", {"value": item_type(resource)}
+            if pdf_field == "reason" and resource in {"topupbalance", "transferbalance", "reservebalance"}:
+                return "weighted_choice", {
+                    "choices": ["LOW_BALANCE", "CUSTOMER_REQUEST", "VALIDITY_EXPIRY", "DATA_EXHAUSTED"],
+                    "weights": [0.65, 0.20, 0.10, 0.05],
+                }
+            if pdf_field in {"isShared"}:
+                return "weighted_choice", {"choices": [False, True], "weights": [0.85, 0.15]}
+            return {
+                "string": "semantic_string", "datetime": "recent_datetime", "integer": "uniform_int",
+                "float": "uniform", "boolean": "weighted_choice", "categorical": "weighted_choice",
+            }.get(dtype, "semantic_string"), ({"days_back": 365} if dtype == "datetime" else ({"min": 1, "max": 12} if dtype == "integer" else ({"min": 0, "max": 1000, "precision": 2} if dtype == "float" else {})))
+
         for resource in resources:
             item = catalog[resource]
-            selected_entities.append(ResolvedConcept(
+            if resource == "bucket":
+                entity_scope_fields = set(item["fields"].keys())
+            else:
+                entity_scope_fields = set()
+            selected_attributes = list(item["fields"].keys())
+            selected_concept = ResolvedConcept(
                 canonical_id=resource,
                 name=item["name"],
                 source_model=item["standard"],
                 source_references=[PDF_SOURCE_NAMES[item["source_id"]]],
-                selected_attributes=list(item["fields"].keys()),
-            ))
-            selected_standards.add(item["standard"])
+                selected_attributes=selected_attributes,
+            )
+            # Stash selected concepts once, after the loop below.
             for pdf_field, (dtype, description) in item["fields"].items():
-                # Do not emit arbitrary nested reference/list structures: only fields
-                # explicitly represented in the scalar PDF catalog are eligible.
-                if not field_requested(resource, pdf_field) and pdf_field not in core_fields.get(resource, set()):
-                    # Include a small set of scenario-specific fields when the request
-                    # clearly mentions their semantics.
-                    semantic = f"{pdf_field} {description}".lower()
-                    if not any(token in request_text for token in re.findall(r"[a-z0-9]+", semantic) if len(token) > 3):
-                        continue
-                use_case_value = use_case_for(resource, pdf_field, business_scenario, use_case)
+                gen, params = field_params(resource, pdf_field, dtype)
+                # Keep schema metadata fields executable but stable at entity scope for bucket.
+                grain = "entity" if resource == "bucket" else "transaction"
+                nullable = False
+                required = False
+                if resource == "topupbalance" and pdf_field in {"numberOfPeriods", "recurringPeriod", "voucher"}:
+                    # One-time top-ups do not require recurring configuration or vouchers.
+                    nullable = True
                 base = self._normalize_variable_name(f"{resource}_{pdf_field}")
-                if base in used_names:
-                    continue
-                used_names.add(base)
-                params: dict[str, object] = {}
-                if dtype == "categorical":
-                    params = {"choices": item.get("choices", {}).get(pdf_field, ["active", "expired", "suspended"])}
-                    gen = "weighted_choice"
-                elif dtype == "boolean":
-                    gen, params = "weighted_choice", {"choices": [True, False], "weights": [0.5, 0.5]}
-                elif dtype == "datetime":
-                    gen, params = "recent_datetime", {"days_back": 365}
-                elif dtype == "integer":
-                    gen, params = "uniform_int", {"min": 1, "max": 12}
-                elif dtype == "float":
-                    gen, params = "uniform", {"min": 0, "max": 1000, "precision": 2}
-                else:
-                    gen, params = "semantic_string", {}
-                grain = "entity" if resource == "bucket" and pdf_field in {"id", "name", "isShared", "status", "usageType", "validFor"} else "transaction"
                 fields.append(GeneratedSchemaField(
                     name=base,
                     dtype=dtype,
@@ -979,26 +1066,53 @@ class SchemaCompiler:
                     gen=gen,
                     params=params,
                     depends_on=[],
-                    nullable=False,
-                    required=False,
+                    nullable=nullable,
+                    required=required,
                     formula=None,
                     scope=grain,
-                    useCase=use_case_value,
-                    provenance=pdf_provenance(resource, pdf_field, use_case_value),
+                    useCase=use_case_for(resource, pdf_field, business_scenario, use_case),
+                    provenance=pdf_provenance(resource, pdf_field, use_case_for(resource, pdf_field, business_scenario, use_case)),
                 ))
 
-        if not fields:
-            raise ValueError("The supplied TMF654/TMF635 PDFs did not yield any executable scalar variables for this scenario")
+        # Annotate selected concepts exactly once from the chosen resources.
+        selected_entities = [
+            ResolvedConcept(
+                canonical_id=resource,
+                name=catalog[resource]["name"],
+                source_model=catalog[resource]["standard"],
+                source_references=[PDF_SOURCE_NAMES[catalog[resource]["source_id"]]],
+                selected_attributes=list(catalog[resource]["fields"].keys()),
+            )
+            for resource in resources
+        ]
+        selected_standards = sorted({catalog[r]["standard"] for r in resources})
 
+        # Width is intentionally the full scalar catalog for this scenario, not an LLM-driven
+        # subset. This is the concrete implementation of "maximum relevant variables".
         standards = [
-            {"standard": standard, "source_policy": "supplied_pdf_only", "source_documents": [PDF_SOURCE_NAMES[sid] for sid in ("tmf654_v4", "tmf635_v4") if ("TMF654" if sid == "tmf654_v4" else "TMF635") == standard]}
-            for standard in sorted(selected_standards)
+            {
+                "standard": standard,
+                "source_policy": "supplied_pdf_only",
+                "source_documents": [
+                    PDF_SOURCE_NAMES[sid]
+                    for sid in ("tmf654_v4", "tmf635_v4")
+                    if ("TMF654" if sid == "tmf654_v4" else "TMF635") == standard
+                ],
+            }
+            for standard in selected_standards
         ]
         hard_constraints = [
-            "PDF-grounded domain: semantic variables, resources, fields and use cases come only from the supplied TMF654/TMF635 v4.0.0 user guides.",
-            "The telecom registry and other standards are not consulted for this proposal path.",
-            "Nested reference/list objects from the PDFs are excluded from the flat synthetic record contract; Quantity.amount and Quantity.units are represented as scalar fields.",
-            "Every proposed variable carries a PDF-defined useCase and supplied-PDF provenance.",
+            "scenarioId is identifier-only and does not select variables or business rules.",
+            "All business/domain semantic fields are grounded only in the supplied TMF654/TMF635 PDFs for Low Balance & Top-up.",
+            "Application-level telecom identity anchors subscriber_id, account_id and msisdn are always included and are backend contract fields, not PDF semantic claims.",
+            "The proposal uses the full scalar field set of every PDF resource selected by the businessScenario/useCase context; there is no variable-count cap or truncation.",
+            "scenarioType, country, typeOfData, industryType, domain, useCase and businessScenario affect executable scope/generation semantics; scenarioId and entityKey do not ideate variables.",
+            "For Normal scenarios, successful top-up operation status is deterministic (COMPLETED) and bucket status is active unless an explicit adverse outcome is requested.",
+            "Top-up requestedDate must not occur after confirmationDate; recurring fields are coherent with isAutoTopup; bucket balance/usage fields are internally consistent.",
+            "Transactional entity-level fields are stable across history records; transaction-level fields are regenerated per transaction.",
+        ]
+        warnings = [
+            "PDF-grounded mode does not invent trigger-threshold fields absent from the supplied PDFs; the request is represented using the complete applicable scalar PDF model plus mandatory telecom identity anchors.",
         ]
         return ScenarioSchema(
             domain=intent.domain,
@@ -1009,7 +1123,7 @@ class SchemaCompiler:
             fields=fields,
             hard_constraints=hard_constraints,
             unresolved_items=[],
-            warnings=["This proposal is strictly grounded in the supplied TMF654/TMF635 user guides; no other semantic source is used."],
+            warnings=warnings,
         )
 
     def compile(

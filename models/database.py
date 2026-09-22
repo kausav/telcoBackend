@@ -3,11 +3,33 @@ from __future__ import annotations
 
 from functools import lru_cache
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.database import Database
 
+ROOT = Path(__file__).resolve().parents[1]
+
+# Load the project .env here as well as from config.runtime. This module is imported
+# through models.scenario during FastAPI application import, which can happen before
+# config.runtime is imported. Loading here prevents an accidental localhost fallback.
+load_dotenv(ROOT / ".env", override=False)
+
 DEFAULT_URI = "mongodb://localhost:27017"
 DEFAULT_DB_NAME = "telco_scenario_db"
+
+
+def _normalize_mongodb_uri(uri: str) -> str:
+    """Accept the project's existing escaped dotenv URI without requiring .env edits.
+
+    The currently documented local .env may contain escaped colon and at-sign
+    characters in the connection string. python-dotenv preserves those backslashes,
+    but MongoDB's
+    URI parser expects the literal URI delimiters. Normalize only these two
+    escaped delimiters and leave all other characters untouched.
+    """
+    return uri.replace(r"\:", ":").replace(r"\@", "@")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -20,7 +42,7 @@ def _env_int(name: str, default: int) -> int:
 
 @lru_cache(maxsize=1)
 def get_client() -> MongoClient:
-    uri = os.getenv("MONGODB_URI", DEFAULT_URI).strip()
+    uri = _normalize_mongodb_uri(os.getenv("MONGODB_URI", DEFAULT_URI).strip())
     if not uri:
         raise RuntimeError("MONGODB_URI is required")
     return MongoClient(

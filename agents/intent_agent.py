@@ -31,7 +31,7 @@ IMPORTANT BOUNDARIES:
 - Do not output executable generators, generator parameters, formulas, SQL, or schema implementation details.
 - Candidate variables are semantic ideas only. The deterministic compiler assigns executable generator contracts.
 - scenarioId is an identifier only and MUST NOT influence what variables are proposed.
-- Use scenarioType, domain, businessScenario, useCase, country, and typeOfData together. Entity key is backend schema metadata; do not use it to ideate variables.
+- Use scenarioType, industryType, domain, businessScenario, useCase, country, and typeOfData together. Entity key is backend schema metadata; do not use it to ideate variables.
 - There is NO variable-count target and NO variable-count maximum. Be COMPREHENSIVE in semantic coverage,
   but include ONLY variables that materially represent this business scenario. Never add a variable merely
   because an attribute exists somewhere in the telecom registry or in a related entity. The compiler will
@@ -46,7 +46,7 @@ IMPORTANT BOUNDARIES:
 - For transactional data, distinguish stable entity/profile fields from repeated transaction/event/decision fields using grain.
 - Prefer variables that explain triggers, states, transitions, outcomes, timing, monetary/usage measures,
   decisions, contention, suppression, recovery, or retention when those concepts fit the scenario.
-- Treat scenarioType as a behavioral mode and make the variable set materially reflect it.
+- Treat scenarioType as a behavioral mode and make the variable set materially reflect it. For a Normal scenario in a transactional top-up workflow, prioritize completed/successful operational states and coherent lifecycle timing; do not introduce pending/failed operation outcomes unless the business scenario explicitly asks for adverse outcomes.
 - Cover only concepts justified by the current business scenario and domain.
 - The telecom registry is grounding information for normal registry-grounded requests, not a variable template. Do not dump catalog attributes.
 - For a PDF-grounded request, the supplied PDF catalog is the only semantic source and every candidate variable must be traceable to it.

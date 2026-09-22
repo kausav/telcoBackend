@@ -204,11 +204,13 @@ def use_case_for(resource: str, field: str, business_scenario: str = "", use_cas
         if resource == "bucket":
             return USE_CASES["tmf654_uc3"]
     if resource == "topupbalance":
+        if "cancel" in text or "cancellation" in text:
+            return USE_CASES["tmf654_uc3"]
         if field in {"isAutoTopup", "numberOfPeriods", "recurringPeriod"} or "recurr" in text or "auto top" in text:
             return USE_CASES["tmf654_uc2"]
-        if field == "voucher" or "voucher" in text or "one time" in text or "one-time" in text:
-            return USE_CASES["tmf654_uc1"]
-        return f"{USE_CASES['tmf654_uc1']} / {USE_CASES['tmf654_uc2']} / {USE_CASES['tmf654_uc3']}"
+        # A prepaid recharge/top-up request without transfer/reservation/cancellation semantics
+        # maps to the one-time top-up use case rather than a combined ambiguous label.
+        return USE_CASES["tmf654_uc1"]
     if resource == "transferbalance":
         return USE_CASES["tmf654_uc4"]
     if resource == "reservebalance":

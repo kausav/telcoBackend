@@ -1097,6 +1097,7 @@ def _generate_record(variables: list[dict], rules: dict | None = None) -> dict:
     rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
     rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
     rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+    rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
     return _format_datetime_fields(rec, variables)
 
 
@@ -1151,6 +1152,7 @@ def _generate_selected_record(
     rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
     rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
     rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+    rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
     return _format_datetime_fields(rec, variables)
 
 
@@ -1715,6 +1717,154 @@ def _strip_unusable_placeholders(rec: dict, variables: list[dict]) -> tuple[dict
     return out, issues
 
 
+
+def _enforce_low_balance_topup_consistency(
+    rec: dict, variables: list[dict], rules: dict | None = None
+) -> tuple[dict, list[str]]:
+    """Enforce lifecycle invariants for the PDF-grounded Low Balance & Top-up model.
+
+    These are deterministic contract-level rules, not random business assumptions:
+      * Normal/happy-path top-up operations are COMPLETED.
+      * Bucket status is active for normal scenarios.
+      * requestedDate <= confirmationDate.
+      * isAutoTopup controls recurring-period configuration.
+      * monetary units are consistent within the balance/top-up transaction.
+      * reservedValue cannot exceed remainingValue.
+      * bucket/top-up usageType remains consistent.
+    The function is a no-op outside the PDF field namespace.
+    """
+    rec = dict(rec)
+    names = {str(v.get("name")) for v in variables if v.get("name")}
+    pdf_names = {n for n in names if n.startswith("bucket_") or n.startswith("topupbalance_")}
+    if not pdf_names:
+        return rec, []
+    issues: list[str] = []
+    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+
+    scenario_text = " ".join(str(x or "") for x in (
+        (rules or {}).get("scenario_semantics", {}).get("mode"),
+        (rules or {}).get("scenario_summary"),
+    )).lower()
+    outcome_mode = str((rules or {}).get("scenario_semantics", {}).get("outcome_mode") or "").lower()
+    normal_mode = outcome_mode == "positive"
+
+    def setv(name: str, value: Any, reason: str) -> None:
+        if name in rec and rec.get(name) != value:
+            rec[name] = value
+            issues.append(reason)
+
+    # A normal top-up is a completed operation. Prefer this over generic semantic generation.
+    if "topupbalance_status" in rec and normal_mode:
+        setv("topupbalance_status", "COMPLETED", "topupbalance_status set to COMPLETED for Normal scenario")
+
+    if "bucket_status" in rec and normal_mode:
+        setv("bucket_status", "active", "bucket_status set to active for Normal scenario")
+
+    # A confirmation must follow its request and should remain within a realistic
+    # operational window. Independent recent_datetime sampling can otherwise create
+    # impossible-looking months-long gaps even though the ordering is technically valid.
+    requested = _qa_parse_dt(rec.get("topupbalance_requesteddate"))
+    confirmation = _qa_parse_dt(rec.get("topupbalance_confirmationdate"))
+    if requested is not None and confirmation is not None:
+        gap = confirmation - requested
+        # Synthetic top-up confirmation is bounded to at most 24 hours after request.
+        # Keep a small positive latency rather than making request and confirmation identical.
+        if gap.total_seconds() <= 0 or gap > timedelta(hours=24):
+            params = by_name.get("topupbalance_confirmationdate", {}).get("params") or {}
+            latency = timedelta(minutes=random.randint(1, 60))
+            repaired = requested + latency
+            setv("topupbalance_confirmationdate", _format_datetime(repaired, params),
+                 "topupbalance_confirmationdate aligned to a bounded post-request latency")
+
+    # Auto-top-up and recurrence fields must agree.
+    auto = _boolean_semantic(rec.get("topupbalance_isautotopup")) if "topupbalance_isautotopup" in rec else None
+    if auto is False:
+        if "topupbalance_numberofperiods" in rec:
+            setv("topupbalance_numberofperiods", 1, "one-time top-up fixed to numberOfPeriods=1")
+        if "topupbalance_recurringperiod" in rec:
+            setv("topupbalance_recurringperiod", None, "recurringPeriod cleared for one-time top-up")
+    elif auto is True:
+        if "topupbalance_numberofperiods" in rec:
+            params = by_name.get("topupbalance_numberofperiods", {}).get("params") or {}
+            lo = int(_to_finite_float(params.get("min"), 1) or 1)
+            hi = int(_to_finite_float(params.get("max"), 12) or 12)
+            try:
+                periods = int(rec.get("topupbalance_numberofperiods"))
+            except Exception:
+                periods = lo
+            setv("topupbalance_numberofperiods", max(lo, min(hi, periods)), "auto-top-up periods clamped to declared bounds")
+        if "topupbalance_recurringperiod" in rec and not rec.get("topupbalance_recurringperiod"):
+            setv("topupbalance_recurringperiod", "monthly", "auto-top-up assigned a recurring period")
+
+    # Currency/usage-unit consistency for the prepaid recharge scenario.
+    unit_values = []
+    for name in ("bucket_remainingvalue_units", "bucket_reservedvalue_units", "topupbalance_amount_units"):
+        if name in rec and rec.get(name):
+            unit_values.append(name)
+    if unit_values:
+        canonical = str(rec.get("topupbalance_amount_units") or rec.get(unit_values[0]) or "INR")
+        for name in unit_values:
+            setv(name, canonical, f"{name} aligned to common monetary unit")
+
+    if "bucket_usagetype" in rec and "topupbalance_usagetype" in rec:
+        usage = str(rec.get("bucket_usagetype") or "currency")
+        setv("topupbalance_usagetype", usage, "topupbalance_usagetype aligned to bucket_usagetype")
+
+    # Reserved balance cannot exceed the remaining balance in the same snapshot.
+    if "bucket_remainingvalue" in rec and "bucket_reservedvalue" in rec:
+        remaining = _to_finite_float(rec.get("bucket_remainingvalue"), None)
+        reserved = _to_finite_float(rec.get("bucket_reservedvalue"), None)
+        if remaining is not None and reserved is not None and reserved > remaining:
+            setv("bucket_reservedvalue", round(max(0.0, remaining), 2), "bucket_reservedvalue reduced to remaining balance")
+
+    # Top-up amount is a positive monetary movement.
+    if "topupbalance_amount" in rec:
+        amount = _to_finite_float(rec.get("topupbalance_amount"), None)
+        if amount is not None and amount <= 0:
+            params = by_name.get("topupbalance_amount", {}).get("params") or {}
+            hi = _to_finite_float(params.get("max"), 1000.0) or 1000.0
+            setv("topupbalance_amount", round(min(1.0, hi), 2), "topupbalance_amount corrected to a positive value")
+
+    # Voucher is naturally tied to a one-time/manual top-up; clear it for automatic top-ups.
+    if auto is True and "topupbalance_voucher" in rec and rec.get("topupbalance_voucher"):
+        setv("topupbalance_voucher", None, "voucher cleared for automatic top-up")
+
+    return rec, issues
+
+
+def _assert_low_balance_topup_consistency(rec: dict, variables: list[dict], rules: dict | None = None) -> None:
+    """Fail closed if a repaired PDF-grounded top-up record is still contradictory."""
+    names = {str(v.get("name")) for v in variables if v.get("name")}
+    if not any(name.startswith("topupbalance_") for name in names):
+        return
+    semantics = (rules or {}).get("scenario_semantics", {}) if isinstance(rules, dict) else {}
+    if semantics.get("outcome_mode") == "positive" and rec.get("topupbalance_status") not in {None, "COMPLETED"}:
+        raise ValueError("Normal Low Balance & Top-up record has non-success topupbalance_status")
+    requested = _qa_parse_dt(rec.get("topupbalance_requesteddate"))
+    confirmation = _qa_parse_dt(rec.get("topupbalance_confirmationdate"))
+    if requested is not None and confirmation is not None and confirmation < requested:
+        raise ValueError("topupbalance_confirmationdate precedes topupbalance_requesteddate")
+    auto = _boolean_semantic(rec.get("topupbalance_isautotopup"))
+    periods = rec.get("topupbalance_numberofperiods")
+    recurring = rec.get("topupbalance_recurringperiod")
+    if auto is False and periods not in (None, 1):
+        raise ValueError("One-time top-up has invalid numberOfPeriods")
+    if auto is False and recurring not in (None, ""):
+        raise ValueError("One-time top-up has a recurringPeriod")
+    if auto is True and periods is not None:
+        try:
+            if not 1 <= int(periods) <= 12:
+                raise ValueError("Auto-top-up numberOfPeriods outside 1..12")
+        except (TypeError, ValueError):
+            raise ValueError("Auto-top-up numberOfPeriods is invalid")
+    remaining = _to_finite_float(rec.get("bucket_remainingvalue"), None)
+    reserved = _to_finite_float(rec.get("bucket_reservedvalue"), None)
+    if remaining is not None and reserved is not None and reserved > remaining + 1e-9:
+        raise ValueError("bucket_reservedvalue exceeds bucket_remainingvalue")
+    units = {str(rec.get(k)).strip() for k in ("bucket_remainingvalue_units", "bucket_reservedvalue_units", "topupbalance_amount_units") if rec.get(k)}
+    if len(units) > 1:
+        raise ValueError("Monetary unit mismatch across bucket/top-up fields")
+
 def _enforce_obvious_semantic_consistency(rec: dict, variables: list[dict]) -> tuple[dict, list[str]]:
     """Repair deterministic cross-field contradictions that are obvious from field semantics."""
     rec = dict(rec)
@@ -2045,8 +2195,14 @@ def _validate_record(
 
     rec, semantic_issues = _enforce_obvious_semantic_consistency(rec, variables)
     issues.extend(semantic_issues)
+    rec, topup_issues = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
+    issues.extend(topup_issues)
     rec, final_contract_issues = _enforce_csv_contract(rec, variables, rules=rules)
     issues.extend(final_contract_issues)
+
+    # Fail closed after every repair/constraint pass. This prevents a future change to
+    # one repair stage from silently reintroducing a contradiction into final_records.
+    _assert_low_balance_topup_consistency(rec, variables, rules=rules)
 
     bad_placeholders = []
     for var in variables:

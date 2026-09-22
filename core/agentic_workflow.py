@@ -75,14 +75,13 @@ class AgenticSchemaWorkflow:
     @staticmethod
     def _cache_key(req: ScenarioProposeRequest) -> tuple:
         return (
-            "agentic_proposal_v7_pdf_grounded",
+            "agentic_proposal_v9_context_complete_pdf",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
             req.scenario_type.strip().lower(),
             req.type_of_data,
             req.use_case.strip().lower(),
-            (req.entity_key or "").strip().lower(),
             " ".join(req.business_scenario.split()).strip().lower(),
         )
 
@@ -149,8 +148,10 @@ class AgenticSchemaWorkflow:
             f"Business scenario: {prompt}\n\n"
             "Variable-design requirement: propose a fresh semantic variable set with NO artificial count target or maximum. "
             + grounding_requirement + " "
-            "Do not copy reference CSV variable names. Include every variable genuinely needed to represent the business scenario; "
-            "return fewer or more as justified by the scenario."
+            "Do not copy reference CSV variable names. Include every variable genuinely needed to represent the business scenario. "
+            "Use ALL request inputs except scenarioId and entityKey as semantic/context signals: scenarioType, industryType, domain, "
+            "businessScenario, typeOfData, country, and useCase must materially constrain the variable set, field parameters, scope, "
+            "and generation behavior. Return the widest relevant schema supported by the approved grounding; do not truncate it."
         )
 
         cid = ensure_conversation(req.scenario_id, req.user_id)
@@ -211,7 +212,14 @@ class AgenticSchemaWorkflow:
         variables, field_order = self._schema_to_variables(schema)
         for variable in variables:
             key = str(variable.get("name") or "").strip().lower()
-            variable["source"] = variable_sources.get(key, "LLM_GENERATED")
+            if is_pdf_grounded_domain(req.domain):
+                variable["source"] = (
+                    "APPLICATION_REQUIRED"
+                    if key in {"subscriber_id", "account_id", "msisdn"}
+                    else "PDF_GROUNDED"
+                )
+            else:
+                variable["source"] = variable_sources.get(key, "LLM_GENERATED")
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
         entity_key = self._entity_key(req.entity_key, field_order, type_of_data)
 
