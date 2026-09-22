@@ -6,6 +6,7 @@ variable contract plus request context into machine-readable generation guardrai
 from __future__ import annotations
 
 from typing import Any
+import re
 
 from core.scenario_semantics import derive_scenario_semantics, temporal_delay_limit_seconds, temporal_role
 
@@ -89,6 +90,31 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
                     temporal_delay_limit_seconds(child, parent),
                     "Scenario lifecycle semantics imply chronological order.",
                 )
+
+    # Low Balance & Top-up uses short operational lifecycles. The supplied TMF654
+    # Swagger defines request/confirmation timestamps but does not define a synthetic
+    # latency window, so keep this domain's generated event gaps bounded to one day.
+    domain_text = str(getattr(state, "domain", "") or "").strip().lower()
+    if "low balance" in domain_text and ("top up" in domain_text or "top-up" in domain_text or "recharge" in domain_text):
+        compact = lambda value: re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+        datetime_names = [str(v.get("name")) for v in variables if str(v.get("dtype", "")).lower() == "datetime" and v.get("name")]
+        requested_fields = [n for n in datetime_names if "request" in compact(n)]
+        confirmation_fields = [n for n in datetime_names if "confirm" in compact(n) or "completion" in compact(n)]
+        for parent in requested_fields:
+            for child in confirmation_fields:
+                add_edge(parent, child, 24 * 3600, "Low Balance top-up lifecycle is bounded to a realistic operational window.")
+
+        # Override broader generic lifecycle ceilings for intervention response timing.
+        # This specifically prevents presentation -> decision examples from drifting into
+        # multi-week/month gaps while leaving unrelated timestamps unconstrained.
+        for item in temporal:
+            parent = compact(item.get("before"))
+            child = compact(item.get("after"))
+            if (
+                ("present" in parent or "offer" in parent or "dispatch" in parent)
+                and ("decision" in child or "declin" in child or "response" in child or "accept" in child)
+            ):
+                item["max_delay_seconds"] = min(int(item.get("max_delay_seconds", 24 * 3600) or 24 * 3600), 24 * 3600)
 
     semantics = derive_scenario_semantics(state, variables)
     for field, preferred in semantics.get("preferred_values", {}).items():

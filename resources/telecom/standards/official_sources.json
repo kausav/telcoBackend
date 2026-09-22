@@ -1,6 +1,6 @@
 {
   "manifest_version": "1.0.0",
-  "description": "Pinned official telecom data-model sources consumed by INGENII. Source files are downloaded at runtime into runtime_data; they are not bundled as custom normalized resources.",
+  "description": "Pinned official telecom data-model sources consumed by INGENII. Low Balance & Top-up uses the bundled TMF654/TMF629 Swagger artifacts as its reproducible domain sources; other official sources retain runtime synchronization.",
   "source_policy": {
     "source_of_truth": "official-model-artifact",
     "normalized_artifacts_are_runtime_cache": true,
@@ -16,7 +16,8 @@
       "format": "json",
       "parser": "openapi",
       "url": "https://raw.githubusercontent.com/tmforum-apis/TMF654_PrepayBalanceManagement/master/TMF654-PrepayBalance-v4.0.0.swagger.json",
-      "source_page": "https://www.tmforum.org/open-digital-architecture/open-apis/prepay-balance-management-api-TMF654/v4.0"
+      "source_page": "https://www.tmforum.org/open-digital-architecture/open-apis/prepay-balance-management-api-TMF654/v4.0",
+      "local_path": "../domain_sources/low_balance_topup/TMF654_Prepay_Balance_Management_API_v4.0.0_swagger.json"
     },
     {
       "source_id": "tmf629_v4",
@@ -27,7 +28,8 @@
       "format": "json",
       "parser": "openapi",
       "url": "https://raw.githubusercontent.com/tmforum-apis/TMF629_CustomerManagement/master/TMF629-Customer-v4.0.0.swagger.json",
-      "source_page": "https://www.tmforum.org/oda/open-apis/directory/"
+      "source_page": "https://www.tmforum.org/oda/open-apis/directory/",
+      "local_path": "../domain_sources/low_balance_topup/TMF629_Customer_Management_API_v4.0.0_swagger.json"
     },
     {
       "source_id": "tmf666_v4",

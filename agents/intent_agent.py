@@ -17,7 +17,7 @@ from core.agentic_models import ScenarioIntent
 from core.errors import LLMUpstreamError
 from core.llm_client import GeminiClient
 from core.telecom_registry import TelecomRegistry
-from core.pdf_domain_policy import catalog_for_request, is_pdf_grounded_domain, PDF_SOURCE_NAMES
+from core.json_domain_policy import catalog_for_request, is_json_grounded_domain
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ IMPORTANT BOUNDARIES:
   ground relevant ideas to the approved registry and will reject any idea that lacks a safe executable
   generation contract.
 - For normal registry-grounded telecom transactional data, subscriber_id, account_id and msisdn are mandatory stable entity-level fields.
-  Exception: when the requested domain is explicitly PDF-grounded, use only the supplied PDF catalog and do not inject generic telecom anchors.
+  For Low Balance & Top-up, keep the three backend telecom anchors but do not use them as standards-model evidence.
 - Candidate variable names must be FRESH and should not simply copy a template or reference list.
 - Avoid redundant identity/contact fields. In a telecom transactional scenario, msisdn is the canonical
   subscriber mobile identifier; do NOT also propose phoneNumber, mobileNumber, telephoneNumber, or equivalent
@@ -49,7 +49,7 @@ IMPORTANT BOUNDARIES:
 - Treat scenarioType as a behavioral mode and make the variable set materially reflect it. For a Normal scenario in a transactional top-up workflow, prioritize completed/successful operational states and coherent lifecycle timing; do not introduce pending/failed operation outcomes unless the business scenario explicitly asks for adverse outcomes.
 - Cover only concepts justified by the current business scenario and domain.
 - The telecom registry is grounding information for normal registry-grounded requests, not a variable template. Do not dump catalog attributes.
-- For a PDF-grounded request, the supplied PDF catalog is the only semantic source and every candidate variable must be traceable to it.
+- For Low Balance & Top-up, the supplied machine-readable TMF654/TMF629 Swagger catalog is the authoritative standards source. Scenario-specific analytical fields may be proposed only when they are clearly derived from the business scenario and must not be misrepresented as TM Forum fields.
 - Do not propose unsupported nested/object fields when a flat synthetic dataset cannot deterministically
   populate their nested structure.
 
@@ -72,7 +72,7 @@ Return this JSON shape:
       "grain": "entity|transaction|event|derived",
       "dtype": "string|integer|float|decimal|boolean|categorical|datetime|date",
       "depends_on": ["existing_candidate_variable_name"],
-      "useCase": "PDF-defined use case when the domain is PDF-grounded"
+      "useCase": "Relevant use-case label when applicable"
     }
   ],
   "country": "...",
@@ -235,22 +235,18 @@ class GeminiIntentAgent:
         industry_type: str = "telecom",
         domain_query: str | None = None,
     ) -> ScenarioIntent:
-        pdf_only = is_pdf_grounded_domain(domain_query)
-        if pdf_only:
-            pdf_catalog = catalog_for_request(request_context, domain_query or "")
-            catalog = {
-                "source_policy": "supplied_pdf_only",
-                "source_documents": PDF_SOURCE_NAMES,
-                "resources": pdf_catalog,
-            }
+        json_grounded = is_json_grounded_domain(domain_query)
+        if json_grounded:
+            catalog = catalog_for_request()
             catalog_text = json.dumps(catalog, separators=(",", ":"), sort_keys=True)
             grounding_header = (
-                "SUPPLIED PDF-ONLY GROUNDING (authoritative for this domain):\n"
-                "The ONLY semantic sources allowed for this proposal are the supplied TMF654 and TMF635 v4.0.0 user guides. "
-                "Do not use any other registry source, standard, template, CSV, memory, or general telecom knowledge. "
-                "Only propose variables represented by the supplied PDF catalog below.\n\n"
+                "SUPPLIED MACHINE-READABLE GROUNDING (authoritative for this domain):\n"
+                "The ONLY official semantic sources for Low Balance & Top-up are the supplied TMF654 and TMF629 v4.0.0 Swagger/OpenAPI documents. "
+                "Use their scalar fields, descriptions, types, and enum values as the standards boundary. "
+                "Do not use PDFs, unrelated telecom standards, templates, CSV examples, memory, or general telecom knowledge as the standards source. "
+                "Scenario-specific analytical variables are allowed when the business scenario requires a concept absent from the official models, but they must be clearly scenario-derived and not presented as official TM Forum attributes.\n\n"
             )
-            mandatory_line = "Do NOT add subscriber_id, account_id, msisdn, phoneNumber, or other generic telecom anchors unless they are explicitly represented by the supplied PDFs and materially requested. "
+            mandatory_line = "Keep subscriber_id, account_id, and msisdn as backend-required synthetic anchors; they are application contract fields, not TM Forum claims. "
         else:
             catalog = self.registry.llm_catalog_context(
                 query=" ".join(part for part in (domain_query, request_context) if part)

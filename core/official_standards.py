@@ -41,6 +41,7 @@ class SourceSpec:
     parser: str = "auto"
     include: tuple[str, ...] = ()
     exclude: tuple[str, ...] = ()
+    local_path: str | None = None
     enabled: bool = True
 
 
@@ -163,6 +164,7 @@ def load_source_manifest(path: str | Path) -> list[SourceSpec]:
                 parser=str(item.get("parser") or "auto"),
                 include=tuple(str(x) for x in item.get("include", []) or []),
                 exclude=tuple(str(x) for x in item.get("exclude", []) or []),
+                local_path=str(item.get("local_path") or "").strip() or None,
                 enabled=bool(item.get("enabled", True)),
             )
         )
@@ -246,6 +248,7 @@ def _sync_official_standards_locked(
 
     sources = load_source_manifest(manifest_path)
     manifest_hash = _sha256(Path(manifest_path))
+    manifest_root = Path(manifest_path).resolve().parent
     lock_file = raw_dir / ".manifest.json"
 
     normalized_outputs: list[Path] = []
@@ -264,18 +267,23 @@ def _sync_official_standards_locked(
 
         source_file_name = _safe_name(source.url.rsplit("/", 1)[-1] or source.source_id)
         downloaded = source_dir / source_file_name
+        local_source = (manifest_root / source.local_path).resolve() if source.local_path else None
+        if local_source is not None and not local_source.is_file():
+            local_source = None
         # Raw-source validity is independent from the normalizer implementation.
         # A parser/normalizer upgrade should re-index an already cached official
-        # artifact without forcing another network download.
+        # artifact without forcing another network download. Bundled sources take
+        # precedence so the domain remains reproducible and offline-safe.
         raw_cached_ok = (
             downloaded.exists()
             and downloaded.stat().st_size > 0
             and source_meta.get("url") == source.url
             and source_meta.get("version") == source.version
+            and source_meta.get("sha256") == _sha256(downloaded)
         )
-        effective_downloaded = downloaded
+        effective_downloaded = local_source or downloaded
         temp: Path | None = None
-        if force or not raw_cached_ok:
+        if local_source is None and (force or not raw_cached_ok):
             # Clean only stale downloader artifacts. Never remove the canonical cache file.
             for stale in source_dir.glob("*.download"):
                 _best_effort_unlink(stale)
@@ -312,6 +320,7 @@ def _sync_official_standards_locked(
             "normalizer_version": ASN1_NORMALIZER_VERSION,
             "include": list(source.include),
             "exclude": list(source.exclude),
+            "local_path": source.local_path,
             "sha256": checksum,
             "downloaded_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -336,6 +345,7 @@ def _sync_official_standards_locked(
                     and old_meta.get("normalizer_version") == ASN1_NORMALIZER_VERSION
                     and old_meta.get("include") == list(source.include)
                     and old_meta.get("exclude") == list(source.exclude)
+                    and old_meta.get("local_path") == source.local_path
                 )
             except (OSError, json.JSONDecodeError):
                 cache_matches = False

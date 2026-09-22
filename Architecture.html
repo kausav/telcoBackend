@@ -39,7 +39,7 @@ Validation / repair / acceptance</pre>
 
   <h2>2. Official model ingestion</h2>
   <div class="grid">
-    <div class="card"><h3>TM Forum</h3><p>Official TM Forum OpenAPI/data-model artifacts are synchronized from pinned URLs in <code>resources/telecom/standards/official_sources.json</code>. The current manifest includes TMF620, TMF629, TMF637, TMF654, TMF666, TMF676 and TMF677 v4.0.0 sources.</p></div>
+    <div class="card"><h3>TM Forum</h3><p>Official TM Forum OpenAPI/data-model artifacts are synchronized from <code>resources/telecom/standards/official_sources.json</code>. Low Balance &amp; Top-up additionally uses the bundled TMF654 and TMF629 v4.0.0 Swagger artifacts as reproducible domain sources; the other TM Forum sources retain runtime synchronization.</p></div>
     <div class="card"><h3>MEF</h3><p>MEF machine-readable YAML/JSON Schema archives are synchronized at pinned Git commits for the MEF 125 Subscriber Ethernet and MEF 139 Internet Access schema sets.</p></div>
     <div class="card"><h3>3GPP</h3><p>The current manifest pins 3GPP TS 32.298 Release 19 v19.4.0 and parses the machine-processable ASN.1 structures into the runtime registry.</p></div>
   </div>
@@ -65,14 +65,14 @@ Gemini intent extraction
         ↓
 Official registry grounding
         ↓
-All attributes on scenario-relevant official entities
+Scenario-aware official-model selection
         ↓
-Relationship expansion until the approved graph is exhausted
+Low Balance: TMF654 Bucket/TopupBalance + TMF629 Customer scalar fields
         ↓
-No 30/35 variable ceiling
+Scenario-derived analytical extensions where needed
         ↓
 ScenarioSchema draft</pre>
-  <p>There is no application-level 30–35 variable ceiling. The output size is driven by the scenario and the breadth of the official models selected for that scenario. The practical size is therefore the size of the approved runtime registry, not an arbitrary proposal cap.</p>
+  <p>There is no application-level 30–35 variable ceiling. For most domains, breadth is driven by the scenario and approved registry resolution. Low Balance &amp; Top-up intentionally compiles only the scenario-selected scalar attributes from the bundled TMF654/TMF629 primary models, rather than replaying the full model catalog.</p>
   <p>For telecom transactional scenarios, the application contract always includes <code>subscriber_id</code>, <code>account_id</code> and <code>msisdn</code>. These are application-level anchors; they are not claimed to be literal field names of a single 3GPP/TM Forum/MEF model.</p>
 
   <h2>5. Gemini boundary</h2>

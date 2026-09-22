@@ -7,10 +7,7 @@ from config.industry_profiles import get_profile
 import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
-from core.pdf_domain_policy import (
-    PDF_CATALOG, catalog_for_request, is_pdf_grounded_domain, pdf_provenance,
-    use_case_for, PDF_SOURCE_STANDARDS, PDF_SOURCE_NAMES,
-)
+from core.json_domain_policy import LOW_BALANCE_MAIN_MODEL_IDS, LOW_BALANCE_SOURCE_IDS, is_json_grounded_domain
 
 
 def _tokens(value: str) -> list[str]:
@@ -18,7 +15,15 @@ def _tokens(value: str) -> list[str]:
 
 
 class SchemaCompiler:
-    """Compiles a scenario schema only from the runtime standards registry."""
+    """Compiles scenario schemas from the approved telecom standards registry."""
+
+    @staticmethod
+    def _source_id(entity: EntityDef) -> str:
+        return str(entity.canonical_id).split("__", 1)[0]
+
+    @classmethod
+    def _is_allowed_source(cls, entity: EntityDef, source_ids: set[str] | None) -> bool:
+        return not source_ids or cls._source_id(entity) in source_ids
 
     # These fields are part of the public telecom row contract. Keep their exact
     # names even when the rest of the schema uses fresh
@@ -29,6 +34,14 @@ class SchemaCompiler:
         "telephonenumber", "subscriber_phone", "subscriber_mobile",
     }
     UNSUPPORTED_NESTED_DTYPES = {"object", "array"}
+    LOW_BALANCE_SCENARIO_DERIVED_FIELDS = {
+        "intervention_suppression_state",
+        "intervention_eligibility",
+        "customer_decision",
+        "decline_reason",
+        "recharge_outcome",
+        "priority_resolution",
+    }
 
     @classmethod
     def is_mandatory_telecom_field(cls, name: str | None) -> bool:
@@ -47,103 +60,52 @@ class SchemaCompiler:
         scenario_type: str | None = None,
         type_of_data: str | None = None,
         entity_key: str | None = None,
+        source_ids: set[str] | None = None,
     ) -> tuple[list[EntityDef], list[str]]:
-        """Resolve concepts from the approved registry.
-
-        The semantic inputs are deliberately separated: ``domain`` establishes the
-        primary registry slice, while the LLM's requested concepts refine that slice.
-        ``business_scenario`` is interpreted by the intent agent; it is not used as an
-        uncontrolled full-catalog search. ``scenario_id`` is intentionally absent.
-        """
+        """Resolve only concepts supported by the current request and optional source boundary."""
         resolved: list[EntityDef] = []
         unresolved: list[str] = []
         seen: set[str] = set()
 
-        # Domain is the primary selector. Only these registry results establish the
-        # initial domain boundary; this prevents a long natural-language request from
-        # accidentally matching unrelated telecom entities.
-        domain_candidates = self.registry.search(domain_query or intent.domain, limit=None)
-        for candidate in domain_candidates:
-            entity = self.registry.resolve_entity(candidate["canonical_id"])
-            if entity and entity.canonical_id not in seen:
+        def add(entity: EntityDef | None, *, first: bool = False) -> None:
+            if entity is None or not self._is_allowed_source(entity, source_ids) or entity.canonical_id in seen:
+                return
+            if first:
+                resolved.insert(0, entity)
+            else:
                 resolved.append(entity)
-                seen.add(entity.canonical_id)
+            seen.add(entity.canonical_id)
 
-        # Explicit concepts extracted by the LLM are allowed only when they exist in the
-        # authoritative registry. This is where businessScenario influences the proposal.
-        # No free-form entity names are copied directly into the schema.
+        for candidate in self.registry.search(domain_query or intent.domain, limit=None):
+            add(self.registry.resolve_entity(candidate["canonical_id"]))
+
         for requested in intent.requested_entities:
-            entity = self.registry.resolve_entity(requested)
-            if entity is None:
-                # Requested entities are semantic hints from the LLM, not executable
-                # registry IDs. A business concept can legitimately have no one-to-one
-                # registry entity (for example ``retention_intervention``). Never guess a
-                # registry entity from a fuzzy match here: an incorrect entity silently
-                # changes the generated schema. Candidate variables, the requested entity
-                # key, domain grounding, and approved relationship expansion are the safe
-                # sources for executable registry entities. Unknown hints are therefore
-                # ignored rather than treated as confirmation-blocking errors.
-                continue
-            if entity.canonical_id not in seen:
-                resolved.append(entity)
-                seen.add(entity.canonical_id)
+            add(self.registry.resolve_entity(requested))
 
-        # Candidate variable names can identify the most relevant registry entities even
-        # when the LLM did not explicitly list those entities. This keeps semantic grounding
-        # dynamic while preventing a generic domain search from selecting an unrelated field
-        # owner when common attributes collide across telecom entities.
         for idea in intent.candidate_variables:
-            idea_name = str(idea.name or "").strip()
-            if not idea_name:
-                continue
-            owners = self.registry.entities_with_attribute(idea_name)
-            for owner in owners:
-                if owner.canonical_id not in seen:
-                    resolved.append(owner)
-                    seen.add(owner.canonical_id)
+            for owner in self.registry.entities_with_attribute(str(idea.name or "")):
+                add(owner)
 
-        # Entity key is authoritative and should be present whenever the registry supports
-        # it. Entity keys are field names, not entity IDs, so resolve them by inspecting
-        # approved registry attributes rather than aliases/canonical entity IDs.
         if entity_key:
-            key_entities = self.registry.entities_with_attribute(entity_key)
-            key_entity = key_entities[0] if key_entities else None
-            if key_entity and key_entity.canonical_id not in seen:
-                resolved.insert(0, key_entity)
-                seen.add(key_entity.canonical_id)
-            elif key_entity is None and not self.is_mandatory_telecom_field(entity_key):
-                # subscriber_id/account_id/msisdn are stable application-level telecom
-                # contract anchors. They are deliberately injected by the compiler even
-                # when an official model uses a different identifier name or nests the
-                # identifier under a different object. They must not become an unresolved
-                # registry requirement and must never block HITL confirmation.
+            key_entities = [
+                e for e in self.registry.entities_with_attribute(entity_key)
+                if self._is_allowed_source(e, source_ids)
+            ]
+            if key_entities:
+                add(key_entities[0], first=True)
+            elif not self.is_mandatory_telecom_field(entity_key):
                 unresolved.append(f"Entity key '{entity_key}' is not a field in the approved telecom registry")
 
-        # Use-case is a semantic selector within telecom. It contributes only approved
-        # concepts whose registry domain matches the use case; no LLM invention occurs here.
         normalized_use_case = (use_case or intent.use_case or intent.subdomain or "").strip().lower()
-        if normalized_use_case and normalized_use_case != "unknown":
-            use_case_candidates = self.registry.catalog_summary(domain=normalized_use_case, limit=None)
-            for candidate in use_case_candidates:
-                entity = self.registry.resolve_entity(candidate["canonical_id"])
-                if entity and entity.canonical_id not in seen:
-                    resolved.append(entity)
-                    seen.add(entity.canonical_id)
+        if normalized_use_case and normalized_use_case != "unknown" and not source_ids:
+            for candidate in self.registry.catalog_summary(domain=normalized_use_case, limit=None):
+                add(self.registry.resolve_entity(candidate["canonical_id"]))
 
-        # Subscriber/account/MSISDN are mandatory for telecom proposals. Bring their
-        # authoritative registry entities into the compile set even when the LLM does not
-        # explicitly mention them. This guarantees a stable subscriber/account/contact
-        # context and allows the mandatory fields to use their real registry generators.
-        if (intent.industry_type or "telecom").strip().lower() in {"telecom", "telecommunications"}:
+        if not source_ids and (intent.industry_type or "telecom").strip().lower() in {"telecom", "telecommunications"}:
             for anchor_id in ("subscriber", "customer_account", "customer"):
-                if self.registry.entity_exists(anchor_id) and anchor_id not in seen:
-                    resolved.append(self.registry.get_entity(anchor_id))
-                    seen.add(anchor_id)
+                if self.registry.entity_exists(anchor_id):
+                    add(self.registry.get_entity(anchor_id))
 
-        # Maximize scenario coverage without dumping an unrelated universal catalog.
-        # Lexically match the complete business request/domain/use-case against every
-        # registry entity; every matching entity then participates in graph expansion.
-        # This is deliberately unbounded because the registry itself is the source of truth.
         context_terms = " ".join(
             str(value or "") for value in (
                 domain_query or intent.domain,
@@ -153,20 +115,12 @@ class SchemaCompiler:
                 *list(intent.requested_entities),
             )
         ).strip()
-        if context_terms:
+        if context_terms and not source_ids:
             for candidate in self.registry.search(context_terms, limit=None):
-                entity = self.registry.resolve_entity(candidate["canonical_id"])
-                if entity and entity.canonical_id not in seen:
-                    resolved.append(entity)
-                    seen.add(entity.canonical_id)
+                add(self.registry.resolve_entity(candidate["canonical_id"]))
 
-        # Prepaid is subscriber-centric in the platform contract; graph expansion will add
-        # the connected prepaid/account/recharge/bucket/charging concepts when the registry
-        # relationships support them.
-        if normalized_use_case == "prepaid" and self.registry.entity_exists("subscriber"):
-            if "subscriber" not in seen:
-                resolved.append(self.registry.get_entity("subscriber"))
-                seen.add("subscriber")
+        if normalized_use_case == "prepaid" and not source_ids and self.registry.entity_exists("subscriber"):
+            add(self.registry.get_entity("subscriber"))
 
         return resolved, unresolved
 
@@ -480,6 +434,9 @@ class SchemaCompiler:
             return "float"
         if any(token in n for token in ("_count", "_days", "_months", "_hours", "_minutes", "number_of", "num_")):
             return "integer"
+        # Preserve explicit boolean declarations before role-based categorical coercion.
+        if dtype in {"boolean", "bool"}:
+            return "boolean"
         if any(token in n for token in ("_channel", "_method", "_type", "_status", "_state", "_reason", "_category", "_segment", "_capability", "circle")):
             return "categorical"
         if "categorical" in role or role in {"status", "decision", "configuration"}:
@@ -535,13 +492,16 @@ class SchemaCompiler:
                 "timezone": "Asia/Kolkata" if country_code == "IN" else "UTC",
                 "days_back": 365,
             }
+        # Preserve an explicit boolean declaration even when the semantic role is
+        # ``decision`` or ``status``. A boolean eligibility/flag must not be coerced into
+        # an open-ended categorical field merely because its business role is a decision.
+        if dtype in {"boolean", "bool"}:
+            return "weighted_choice", "boolean", {"choices": [False, True], "weights": [0.5, 0.5]}
+
         if dtype in {"integer", "int"} or role == "metric":
             return "uniform_int", "integer", {"min": 0, "max": 100, "precision": 0}
         if dtype in {"float", "decimal", "number", "numeric"} or role == "measurement":
             return "uniform", "float", {"min": 0.0, "max": 1000.0, "precision": 2}
-        if dtype == "boolean":
-            return "weighted_choice", "boolean", {"choices": [False, True], "weights": [0.5, 0.5]}
-
         if dtype == "categorical" or role in {"status", "decision", "configuration", "categorical"}:
             explicit = self._description_choices(desc)
             if explicit:
@@ -604,6 +564,7 @@ class SchemaCompiler:
         type_of_data: str | None,
         scenario_mode: str,
         max_variables: int | None = None,
+        include_all_registry_scalars: bool = True,
     ) -> list[GeneratedSchemaField]:
         raw_ideas = [idea.model_dump() for idea in intent.candidate_variables]
         ideas: list[dict[str, object]] = []
@@ -658,62 +619,53 @@ class SchemaCompiler:
                 "depends_on": [],
             }, force_name=entity_key)
 
-        # Comprehensive registry grounding:
-        #
-        # The proposal must retain broad semantic coverage (the prior contract exposed
-        # hundreds of registry-backed variables), while the generation side must stay safe.
-        # Therefore we include every *materializable scalar* attribute on the resolved
-        # scenario graph, not only the LLM's candidate list. This preserves dynamic width
-        # without reintroducing arbitrary nested `{}` objects or semantically unrelated
-        # placeholder contracts.
-        #
-        # Nested object/array attributes are intentionally excluded from the flat synthetic
-        # row contract. Their scalar children remain available when the official model exposes
-        # them as separate attributes.
-        for entity in entities:
-            entity_grain = (
-                "entity"
-                if entity.canonical_id in {"subscriber", "customer", "customer_account", "prepaid_account"}
-                else "transaction"
-            )
-            for attr in entity.attributes:
-                attr_name = str(attr.name or "")
-                attr_key = self._normalize_variable_name(attr_name)
-                if not attr_key:
-                    continue
-                if attr_key in self.REDUNDANT_MSISDN_FIELDS and any(
-                    self._normalize_variable_name(str(item.get("name") or "")) == "msisdn"
-                    for item in ideas
-                ):
-                    continue
-                raw_dtype = str(attr.dtype or "string").lower()
-                if raw_dtype in self.UNSUPPORTED_NESTED_DTYPES:
-                    continue
-                add_idea({
-                    "name": attr_name,
-                    "description": attr.description or f"{entity.name} {attr_name} attribute.",
-                    "role": (
-                        "timing" if raw_dtype in {"datetime", "timestamp", "date"}
-                        else "measurement" if raw_dtype in {"float", "decimal", "number", "numeric", "int", "integer"}
-                        else "status" if "status" in attr_name.lower() or "state" in attr_name.lower()
-                        else "identity" if attr_name.lower().endswith("_id")
-                        else "other"
-                    ),
-                    "grain": entity_grain,
-                    "dtype": (
-                        "integer" if raw_dtype in {"int", "integer", "bigint", "smallint"} else
-                        "float" if raw_dtype in {"float", "decimal", "number", "numeric"} else
-                        "datetime" if raw_dtype in {"datetime", "timestamp"} else
-                        "date" if raw_dtype == "date" else
-                        "categorical" if attr.enum_values or str(attr.generator).lower() in {"weighted_choice", "dependent_choice", "categorical"} else
-                        "boolean" if raw_dtype in {"bool", "boolean"} else "string"
-                    ),
-                    "depends_on": list(attr.depends_on),
-                    "_registry_entity": entity.canonical_id,
-                    "_registry_required": bool(attr.required),
-                    "_registry_nullable": bool(attr.nullable),
-                    "_registry_exact": True,
-                }, preserve_name=True)
+        if include_all_registry_scalars:
+            # Generic registry-grounded domains retain broad scalar coverage. Domain-specific
+            # grounded flows can disable this and compile only the scenario's selected ideas.
+            for entity in entities:
+                entity_grain = (
+                    "entity"
+                    if entity.canonical_id in {"subscriber", "customer", "customer_account", "prepaid_account"}
+                    else "transaction"
+                )
+                for attr in entity.attributes:
+                    attr_name = str(attr.name or "")
+                    attr_key = self._normalize_variable_name(attr_name)
+                    if not attr_key:
+                        continue
+                    if attr_key in self.REDUNDANT_MSISDN_FIELDS and any(
+                        self._normalize_variable_name(str(item.get("name") or "")) == "msisdn"
+                        for item in ideas
+                    ):
+                        continue
+                    raw_dtype = str(attr.dtype or "string").lower()
+                    if raw_dtype in self.UNSUPPORTED_NESTED_DTYPES:
+                        continue
+                    add_idea({
+                        "name": attr_name,
+                        "description": attr.description or f"{entity.name} {attr_name} attribute.",
+                        "role": (
+                            "timing" if raw_dtype in {"datetime", "timestamp", "date"}
+                            else "measurement" if raw_dtype in {"float", "decimal", "number", "numeric", "int", "integer"}
+                            else "status" if "status" in attr_name.lower() or "state" in attr_name.lower()
+                            else "identity" if attr_name.lower().endswith("_id")
+                            else "other"
+                        ),
+                        "grain": entity_grain,
+                        "dtype": (
+                            "integer" if raw_dtype in {"int", "integer", "bigint", "smallint"} else
+                            "float" if raw_dtype in {"float", "decimal", "number", "numeric"} else
+                            "datetime" if raw_dtype in {"datetime", "timestamp"} else
+                            "date" if raw_dtype == "date" else
+                            "categorical" if attr.enum_values or str(attr.generator).lower() in {"weighted_choice", "dependent_choice", "categorical"} else
+                            "boolean" if raw_dtype in {"bool", "boolean"} else "string"
+                        ),
+                        "depends_on": list(attr.depends_on),
+                        "_registry_entity": entity.canonical_id,
+                        "_registry_required": bool(attr.required),
+                        "_registry_nullable": bool(attr.nullable),
+                        "_registry_exact": True,
+                    }, preserve_name=True)
 
         # Explicit telecom de-duplication before field construction.
         if any(self._normalize_variable_name(str(item.get("name") or "")) == "msisdn" for item in ideas):
@@ -763,6 +715,7 @@ class SchemaCompiler:
             original_name = str(idea.get("name") or "scenario_attribute")
             fresh = name_map[self._normalize_variable_name(original_name)]
             matched = None
+            attr = None
             # Mandatory public telecom anchors use authoritative subscriber attributes
             # directly, rather than allowing a generic account_id match to resolve to a
             # different entity.
@@ -772,7 +725,8 @@ class SchemaCompiler:
                     attr = next((a for a in subscriber.attributes if a.name == original_name), None)
                     if attr is not None:
                         matched = (subscriber, attr)
-            if matched is None:
+            normalized_original_name = self._normalize_variable_name(original_name)
+            if normalized_original_name not in self.LOW_BALANCE_SCENARIO_DERIVED_FIELDS:
                 matched = self._match_registry_attribute(idea, entities, used_registry)
             role = str(idea.get("role") or "other").lower()
             idea_text = f"{original_name} {idea.get('description', '')}".lower()
@@ -819,7 +773,17 @@ class SchemaCompiler:
                         dtype = attr.dtype
                         if attr.generator == "msisdn":
                             dtype = "string"
-                    # Never borrow executable params from a fuzzy/non-exact attribute.
+                elif getattr(attr, "enum_values", ()):
+                    # A semantically renamed variable may still map to an official enum field
+                    # (for example topup_status -> TopupBalance.status). Preserve the Swagger
+                    # enum exactly; never substitute scenario-mode values for a standard enum.
+                    choices = list(getattr(attr, "enum_values", ()) or ())
+                    entity = entity or self._choose_entity_for_idea(idea, entities, matched, entity_key)
+                    runtime_generator, dtype, params = (
+                        "weighted_choice",
+                        "categorical",
+                        {"choices": choices, "weights": [1.0] * len(choices)},
+                    )
                 else:
                     entity = entity or self._choose_entity_for_idea(idea, entities, None, entity_key)
                     runtime_generator, dtype, params = self._generic_contract_for_idea(idea, country, scenario_mode) or (None, None, None)
@@ -872,7 +836,68 @@ class SchemaCompiler:
             ))
         return fields
 
-    def _compile_pdf_grounded(
+    def _ensure_low_balance_scenario_ideas(
+        self,
+        intent: ScenarioIntent,
+        scenario_mode: str,
+    ) -> None:
+        """Guarantee that different behavioral modes remain visible in the schema even when the LLM is repetitive."""
+        existing = {self._normalize_variable_name(v.name) for v in intent.candidate_variables}
+        additions: list[dict[str, object]] = []
+
+        if scenario_mode == "suppression":
+            if "intervention_suppression_state" not in existing:
+                additions.append({
+                    "name": "intervention_suppression_state",
+                    "description": "Retention intervention suppression decision. Valid values are SUPPRESSED, NOT_SENT, HELD.",
+                    "role": "decision", "grain": "transaction", "dtype": "categorical", "depends_on": [],
+                })
+            if "intervention_eligibility" not in existing:
+                additions.append({
+                    "name": "intervention_eligibility",
+                    "description": "Whether the subscriber is eligible for the proactive retention intervention.",
+                    "role": "decision", "grain": "transaction", "dtype": "boolean", "depends_on": [],
+                })
+        elif scenario_mode == "decline_or_no_response":
+            if "customer_decision" not in existing:
+                additions.append({
+                    "name": "customer_decision",
+                    "description": "Customer response to the top-up/retention intervention. Valid values are DECLINED, NO_RESPONSE, REJECTED.",
+                    "role": "decision", "grain": "transaction", "dtype": "categorical", "depends_on": [],
+                })
+            if "decline_reason" not in existing:
+                additions.append({
+                    "name": "decline_reason",
+                    "description": "Primary reason associated with a declined or unanswered top-up intervention. Valid values are PRICE, NOT_NEEDED, TRUST, PAYMENT_CONCERN, TIMING.",
+                    "role": "other", "grain": "transaction", "dtype": "categorical", "depends_on": [],
+                })
+        elif scenario_mode == "negative":
+            if "recharge_outcome" not in existing:
+                additions.append({
+                    "name": "recharge_outcome",
+                    "description": "Outcome of the recharge operation. Valid values are FAILED, REJECTED, CANCELLED.",
+                    "role": "status", "grain": "transaction", "dtype": "categorical", "depends_on": [],
+                })
+        elif scenario_mode == "positive":
+            if "recharge_outcome" not in existing:
+                additions.append({
+                    "name": "recharge_outcome",
+                    "description": "Outcome of the recharge operation. Valid values are COMPLETED, APPROVED, ACCEPTED.",
+                    "role": "status", "grain": "transaction", "dtype": "categorical", "depends_on": [],
+                })
+        elif scenario_mode == "concurrent":
+            if "priority_resolution" not in existing:
+                additions.append({
+                    "name": "priority_resolution",
+                    "description": "Resolution of competing interventions. Valid values are NO_CLEAR_PRIORITY, CONFLICT, PENDING_PRIORITY.",
+                    "role": "decision", "grain": "transaction", "dtype": "categorical", "depends_on": [],
+                })
+
+        if additions:
+            from core.agentic_models import VariableIdea
+            intent.candidate_variables.extend(VariableIdea.model_validate(item) for item in additions)
+
+    def _compile_low_balance_json_grounded(
         self,
         intent: ScenarioIntent,
         *,
@@ -882,20 +907,8 @@ class SchemaCompiler:
         type_of_data: str | None,
         entity_key: str | None,
         scenario_type: str | None = None,
-        industry_type: str | None = None,
     ) -> ScenarioSchema:
-        """Compile Low Balance & Top-up from the supplied PDF catalog.
-
-        The PDF catalog remains the semantic source of truth for domain fields. The
-        application-level subscriber/account/MSISDN anchors are added separately because
-        they are a mandatory telecom row contract, not PDF semantic claims.
-
-        The compiler intentionally emits the *maximum relevant flat scalar width* from the
-        selected PDF resources. Scenario inputs still control resource selection, scope,
-        country-aware generators, status semantics, and business-specific categorical bias.
-        """
-        catalog = catalog_for_request(business_scenario, use_case)
-        request_text = f"{business_scenario} {use_case}".lower()
+        """Compile Low Balance & Top-up from TMF654 + TMF629 Swagger-backed registry concepts."""
         normalized_country = str(country or "IN").strip().upper()
         normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
         normalized_scenario = str(scenario_type or intent.scenario_type or "").strip()
@@ -903,226 +916,99 @@ class SchemaCompiler:
             scenario_type=normalized_scenario,
             expected_outcome="",
             business_response="",
-            business_scenario=business_scenario or "",
+            business_scenario=business_scenario,
         )
+        self._ensure_low_balance_scenario_ideas(intent, scenario_mode)
 
-        resources: list[str] = ["bucket", "topupbalance"]
-        if any(token in request_text for token in ("transfer", "colleague", "send balance")) and "transferbalance" in catalog:
-            resources.append("transferbalance")
-        if any(token in request_text for token in ("reserve", "reservation", "reserve balance")) and "reservebalance" in catalog:
-            resources.append("reservebalance")
-        if any(token in request_text for token in ("usage", "voice call", "voicemail", "usage specification", "rated", "billed")):
-            for rid in ("usage", "usagespecification"):
-                if rid in catalog:
-                    resources.append(rid)
-        resources = list(dict.fromkeys(r for r in resources if r in catalog))
+        # Low Balance is intentionally compiled from the three primary resources only.
+        # Create/Update/Event/Ref schemas describe API transport shapes, not the business
+        # entities we want as flat synthetic-data columns. Restricting the entity pool here
+        # also prevents the same attribute name from matching a transport model instead of the
+        # canonical Bucket/TopupBalance/Customer model.
+        entities: list[EntityDef] = []
+        unresolved: list[str] = []
+        for canonical_id in LOW_BALANCE_MAIN_MODEL_IDS:
+            try:
+                ent = self.registry.get_entity(canonical_id)
+            except KeyError:
+                ent = None
+            if ent is not None:
+                entities.append(ent)
 
-        # Application-level telecom anchors are always present, regardless of entityKey.
-        fields: list[GeneratedSchemaField] = [
-            GeneratedSchemaField(
-                name="subscriber_id",
-                dtype="string",
-                description="Stable synthetic subscriber identifier used to group transactional history.",
-                gen="prefixed_int",
-                params={"prefix": "SUB-", "digits": 10},
-                depends_on=[],
-                nullable=False,
-                required=True,
-                formula=None,
-                scope="entity",
-                useCase=use_case or "prepaid",
-                provenance={"source_policy": "application_contract", "source": "APPLICATION_REQUIRED", "reason": "mandatory telecom identity anchor"},
-            ),
-            GeneratedSchemaField(
-                name="account_id",
-                dtype="string",
-                description="Stable synthetic subscriber account identifier linked to subscriber_id.",
-                gen="id_mirror",
-                params={"prefix": "ACC-", "source_field": "subscriber_id", "source_prefix": "SUB-"},
-                depends_on=["subscriber_id"],
-                nullable=False,
-                required=True,
-                formula=None,
-                scope="entity",
-                useCase=use_case or "prepaid",
-                provenance={"source_policy": "application_contract", "source": "APPLICATION_REQUIRED", "reason": "mandatory telecom identity anchor"},
-            ),
-            GeneratedSchemaField(
-                name="msisdn",
-                dtype="string",
-                description="Synthetic subscriber MSISDN in a country-aware E.164-like format.",
-                gen="e164_phone",
-                params={"country_codes": [], "country": normalized_country},
-                depends_on=[],
-                nullable=False,
-                required=True,
-                formula=None,
-                scope="entity",
-                useCase=use_case or "prepaid",
-                provenance={"source_policy": "application_contract", "source": "APPLICATION_REQUIRED", "reason": "mandatory telecom identity anchor"},
-            ),
-        ]
-        dial_codes = {
-            "IN": "+91", "US": "+1", "CA": "+1", "GB": "+44", "AU": "+61",
-            "AE": "+971", "SG": "+65", "DE": "+49", "FR": "+33", "IT": "+39",
-        }
-        fields[2].params["country_codes"] = [dial_codes.get(normalized_country, normalized_country if normalized_country.startswith("+") else "+" + normalized_country)]
+        if not entities:
+            unresolved.append("The Low Balance & Top-up Swagger sources did not yield the expected Bucket, TopupBalance, or Customer models.")
 
-        profile = get_profile("telecom", normalized_country)
-        currency = str(profile.get("currency") or ("INR" if normalized_country == "IN" else "")).upper() or "INR"
+        fields = self._build_fresh_fields(
+            intent,
+            entities,
+            entity_key=entity_key,
+            country=normalized_country,
+            type_of_data=normalized_type,
+            scenario_mode=scenario_mode,
+            max_variables=None,
+            include_all_registry_scalars=False,
+        )
+        field_names = [f.name for f in fields]
+        if not fields:
+            unresolved.append("The Low Balance & Top-up scenario did not yield any usable semantic variables.")
+        if (
+            entity_key
+            and self._normalize_variable_name(entity_key) not in {self._normalize_variable_name(n) for n in field_names}
+            and not self.is_mandatory_telecom_field(entity_key)
+        ):
+            unresolved.append(f"Requested entity key '{entity_key}' could not be represented by the proposed variables")
 
-        def item_base_type(resource: str) -> str:
-            return {
-                "bucket": "Bucket",
-                "topupbalance": "TopupBalance",
-                "transferbalance": "TransferBalance",
-                "reservebalance": "ReserveBalance",
-                "usage": "Usage",
-                "usagespecification": "UsageSpecification",
-            }.get(resource, resource)
+        entity_ids = {e.canonical_id for e in entities}
+        relationships: list[SchemaRelationship] = []
+        for entity in entities:
+            if self._source_id(entity) not in set(LOW_BALANCE_SOURCE_IDS):
+                continue
+            for rel in entity.relationships:
+                if rel.target in entity_ids and self._source_id(self.registry.get_entity(rel.target)) in set(LOW_BALANCE_SOURCE_IDS):
+                    target = self.registry.get_entity(rel.target)
+                    relationships.append(SchemaRelationship(
+                        source_entity=entity.canonical_id,
+                        target_entity=target.canonical_id,
+                        relation=rel.relation,
+                        cardinality=rel.cardinality,
+                        required=rel.required,
+                        source_references=[s.get("reference", "") for s in entity.sources],
+                    ))
 
-        def item_type(resource: str) -> str:
-            # TMF @type is an extensibility/type discriminator. Use the resource
-            # type itself rather than unrelated subscriber/product labels.
-            return item_base_type(resource)
-
-        def operation_status_params() -> dict[str, object]:
-            # Normal/happy-path transactional operations are successful. Other scenario types
-            # retain a complete executable vocabulary while deterministic scenario semantics
-            # select the matching outcome.
-            choices = ["COMPLETED", "FAILED", "PENDING"]
-            return {"choices": choices, "weights": [1.0, 0.0, 0.0] if scenario_mode == "positive" else [1.0, 1.0, 1.0]}
-
-        def field_params(resource: str, pdf_field: str, dtype: str) -> tuple[str, dict[str, object]]:
-            if dtype == "categorical":
-                choices = list(catalog[resource].get("choices", {}).get(pdf_field, []))
-                if resource == "bucket" and pdf_field == "status":
-                    # Normal means an active bucket; preserve the complete documented vocabulary.
-                    return "weighted_choice", {"choices": choices or ["active", "expired", "suspended"], "weights": [1.0, 0.0, 0.0] if scenario_mode == "positive" and len(choices) == 3 else [1.0] * len(choices)}
-                if choices:
-                    return "weighted_choice", {"choices": choices, "weights": [1.0] * len(choices)}
-                return "semantic_string", {}
-            if pdf_field == "status" and resource in {"topupbalance", "transferbalance", "reservebalance"}:
-                return "weighted_choice", operation_status_params()
-            if pdf_field in {"isAutoTopup"}:
-                return "weighted_choice", {"choices": [True, False], "weights": [0.55, 0.45]}
-            if pdf_field == "numberOfPeriods":
-                return "uniform_int", {"min": 1, "max": 12}
-            if pdf_field == "recurringPeriod":
-                return "weighted_choice", {"choices": ["weekly", "monthly"], "weights": [0.35, 0.65]}
-            if pdf_field in {"remainingValue", "reservedValue", "amount", "transferCost"}:
-                return "uniform", {"min": 0, "max": 1000, "precision": 2, "currency": currency}
-            if pdf_field.endswith("_units") or pdf_field == "amount_units" or pdf_field == "transferCost_units":
-                return "constant", {"value": currency}
-            if pdf_field in {"requestedDate", "confirmationDate", "usageDate", "lastUpdate"}:
-                return "recent_datetime", {"days_back": 365, "timezone": "Asia/Kolkata" if normalized_country == "IN" else "UTC", "timestamp_format": "dd/mm/yyyy hh:mm a"}
-            if pdf_field == "usageType" and resource in {"bucket", "topupbalance"}:
-                return "constant", {"value": "currency"}
-            if pdf_field == "@baseType":
-                return "constant", {"value": item_base_type(resource)}
-            if pdf_field == "@type":
-                return "constant", {"value": item_type(resource)}
-            if pdf_field == "reason" and resource in {"topupbalance", "transferbalance", "reservebalance"}:
-                return "weighted_choice", {
-                    "choices": ["LOW_BALANCE", "CUSTOMER_REQUEST", "VALIDITY_EXPIRY", "DATA_EXHAUSTED"],
-                    "weights": [0.65, 0.20, 0.10, 0.05],
-                }
-            if pdf_field in {"isShared"}:
-                return "weighted_choice", {"choices": [False, True], "weights": [0.85, 0.15]}
-            return {
-                "string": "semantic_string", "datetime": "recent_datetime", "integer": "uniform_int",
-                "float": "uniform", "boolean": "weighted_choice", "categorical": "weighted_choice",
-            }.get(dtype, "semantic_string"), ({"days_back": 365} if dtype == "datetime" else ({"min": 1, "max": 12} if dtype == "integer" else ({"min": 0, "max": 1000, "precision": 2} if dtype == "float" else {})))
-
-        for resource in resources:
-            item = catalog[resource]
-            if resource == "bucket":
-                entity_scope_fields = set(item["fields"].keys())
-            else:
-                entity_scope_fields = set()
-            selected_attributes = list(item["fields"].keys())
-            selected_concept = ResolvedConcept(
-                canonical_id=resource,
-                name=item["name"],
-                source_model=item["standard"],
-                source_references=[PDF_SOURCE_NAMES[item["source_id"]]],
-                selected_attributes=selected_attributes,
-            )
-            # Stash selected concepts once, after the loop below.
-            for pdf_field, (dtype, description) in item["fields"].items():
-                gen, params = field_params(resource, pdf_field, dtype)
-                # Keep schema metadata fields executable but stable at entity scope for bucket.
-                grain = "entity" if resource == "bucket" else "transaction"
-                nullable = False
-                required = False
-                if resource == "topupbalance" and pdf_field in {"numberOfPeriods", "recurringPeriod", "voucher"}:
-                    # One-time top-ups do not require recurring configuration or vouchers.
-                    nullable = True
-                base = self._normalize_variable_name(f"{resource}_{pdf_field}")
-                fields.append(GeneratedSchemaField(
-                    name=base,
-                    dtype=dtype,
-                    description=description,
-                    gen=gen,
-                    params=params,
-                    depends_on=[],
-                    nullable=nullable,
-                    required=required,
-                    formula=None,
-                    scope=grain,
-                    useCase=use_case_for(resource, pdf_field, business_scenario, use_case),
-                    provenance=pdf_provenance(resource, pdf_field, use_case_for(resource, pdf_field, business_scenario, use_case)),
-                ))
-
-        # Annotate selected concepts exactly once from the chosen resources.
-        selected_entities = [
-            ResolvedConcept(
-                canonical_id=resource,
-                name=catalog[resource]["name"],
-                source_model=catalog[resource]["standard"],
-                source_references=[PDF_SOURCE_NAMES[catalog[resource]["source_id"]]],
-                selected_attributes=list(catalog[resource]["fields"].keys()),
-            )
-            for resource in resources
-        ]
-        selected_standards = sorted({catalog[r]["standard"] for r in resources})
-
-        # Width is intentionally the full scalar catalog for this scenario, not an LLM-driven
-        # subset. This is the concrete implementation of "maximum relevant variables".
-        standards = [
-            {
-                "standard": standard,
-                "source_policy": "supplied_pdf_only",
-                "source_documents": [
-                    PDF_SOURCE_NAMES[sid]
-                    for sid in ("tmf654_v4", "tmf635_v4")
-                    if ("TMF654" if sid == "tmf654_v4" else "TMF635") == standard
-                ],
-            }
-            for standard in selected_standards
-        ]
+        standards = self.registry.standards_for_entities([e.canonical_id for e in entities])
         hard_constraints = [
             "scenarioId is identifier-only and does not select variables or business rules.",
-            "All business/domain semantic fields are grounded only in the supplied TMF654/TMF635 PDFs for Low Balance & Top-up.",
-            "Application-level telecom identity anchors subscriber_id, account_id and msisdn are always included and are backend contract fields, not PDF semantic claims.",
-            "The proposal uses the full scalar field set of every PDF resource selected by the businessScenario/useCase context; there is no variable-count cap or truncation.",
-            "scenarioType, country, typeOfData, industryType, domain, useCase and businessScenario affect executable scope/generation semantics; scenarioId and entityKey do not ideate variables.",
-            "For Normal scenarios, successful top-up operation status is deterministic (COMPLETED) and bucket status is active unless an explicit adverse outcome is requested.",
-            "Top-up requestedDate must not occur after confirmationDate; recurring fields are coherent with isAutoTopup; bucket balance/usage fields are internally consistent.",
-            "Transactional entity-level fields are stable across history records; transaction-level fields are regenerated per transaction.",
+            "Low Balance & Top-up standards grounding is restricted to the supplied TMF654 Prepay Balance Management and TMF629 Customer Management Swagger/OpenAPI artifacts.",
+            "The candidate variable set is selected from the current scenario context; the compiler does not append the full scalar model catalog.",
+            "Nested object/array properties are excluded from the flat record contract rather than converted into fake scalar values.",
+            "Standard-backed enum values are copied from the official Swagger definitions and cannot be replaced with invented values.",
+            "Scenario-derived analytical variables are explicitly synthetic extensions and are not represented as TM Forum fields.",
+            f"Scenario outcome mode is derived from scenarioType and the business scenario: {scenario_mode}.",
+            "Transactional entity-level fields remain stable across a subscriber history; transaction/event fields are regenerated per record.",
         ]
+        if entity_key:
+            hard_constraints.append(f"'{entity_key}' is the authoritative entity key for transactional grouping.")
+        hard_constraints.append("subscriber_id, account_id and msisdn are mandatory application-level synthetic anchors.")
         warnings = [
-            "PDF-grounded mode does not invent trigger-threshold fields absent from the supplied PDFs; the request is represented using the complete applicable scalar PDF model plus mandatory telecom identity anchors.",
+            "TMF654/TMF629 do not define explicit retention-intervention suppression/decline semantics; those analytical concepts are modeled as clearly marked scenario-derived fields when required.",
         ]
         return ScenarioSchema(
             domain=intent.domain,
             subdomain=intent.subdomain,
             applicable_standards=standards,
-            entities=selected_entities,
-            relationships=[],
+            entities=[
+                ResolvedConcept(
+                    canonical_id=e.canonical_id,
+                    name=e.name,
+                    source_model="/".join(sorted({s["standard"] for s in e.sources})),
+                    source_references=[s.get("reference", "") for s in e.sources],
+                    selected_attributes=[a.name for a in e.attributes],
+                ) for e in entities if self._source_id(e) in set(LOW_BALANCE_SOURCE_IDS)
+            ],
+            relationships=relationships,
             fields=fields,
             hard_constraints=hard_constraints,
-            unresolved_items=[],
+            unresolved_items=unresolved,
             warnings=warnings,
         )
 
@@ -1148,14 +1034,15 @@ class SchemaCompiler:
             raise ValueError(
                 f"Unsupported industryType '{industry_type or intent.industry_type}'. The telecom registry only supports Telecommunications/Telecom."
             )
-        if is_pdf_grounded_domain(domain_query or intent.domain):
-            return self._compile_pdf_grounded(
+        if is_json_grounded_domain(domain_query or intent.domain):
+            return self._compile_low_balance_json_grounded(
                 requested,
                 business_scenario=business_scenario or "",
                 use_case=use_case or requested.use_case or "",
                 country=country,
                 type_of_data=type_of_data or requested.type_of_data,
                 entity_key=entity_key,
+                scenario_type=scenario_type,
             )
         if selected_entities is not None:
             normalized: list[str] = []

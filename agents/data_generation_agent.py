@@ -1721,7 +1721,7 @@ def _strip_unusable_placeholders(rec: dict, variables: list[dict]) -> tuple[dict
 def _enforce_low_balance_topup_consistency(
     rec: dict, variables: list[dict], rules: dict | None = None
 ) -> tuple[dict, list[str]]:
-    """Enforce lifecycle invariants for the PDF-grounded Low Balance & Top-up model.
+    """Enforce lifecycle invariants for the legacy flat Low Balance & Top-up contract.
 
     These are deterministic contract-level rules, not random business assumptions:
       * Normal/happy-path top-up operations are COMPLETED.
@@ -1731,12 +1731,12 @@ def _enforce_low_balance_topup_consistency(
       * monetary units are consistent within the balance/top-up transaction.
       * reservedValue cannot exceed remainingValue.
       * bucket/top-up usageType remains consistent.
-    The function is a no-op outside the PDF field namespace.
+    The function is a no-op outside the legacy bucket_/topupbalance_ field namespace.
     """
     rec = dict(rec)
     names = {str(v.get("name")) for v in variables if v.get("name")}
-    pdf_names = {n for n in names if n.startswith("bucket_") or n.startswith("topupbalance_")}
-    if not pdf_names:
+    legacy_names = {n for n in names if n.startswith("bucket_") or n.startswith("topupbalance_")}
+    if not legacy_names:
         return rec, []
     issues: list[str] = []
     by_name = {str(v.get("name")): v for v in variables if v.get("name")}
@@ -1833,7 +1833,7 @@ def _enforce_low_balance_topup_consistency(
 
 
 def _assert_low_balance_topup_consistency(rec: dict, variables: list[dict], rules: dict | None = None) -> None:
-    """Fail closed if a repaired PDF-grounded top-up record is still contradictory."""
+    """Fail closed if a repaired legacy flat top-up record is still contradictory."""
     names = {str(v.get("name")) for v in variables if v.get("name")}
     if not any(name.startswith("topupbalance_") for name in names):
         return

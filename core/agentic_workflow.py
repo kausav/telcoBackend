@@ -16,7 +16,7 @@ from core.telecom_registry import TelecomRegistry, get_registry
 from core.errors import LLMUpstreamError
 from core.runtime_cache import get_proposal, set_proposal
 from core.scenario_variable_store import get_recommended, get_user_variables, save_proposal
-from core.pdf_domain_policy import is_pdf_grounded_domain, source_manifest
+from core.json_domain_policy import is_json_grounded_domain, source_manifest
 
 logger = logging.getLogger(__name__)
 from agents.intent_agent import GeminiIntentAgent
@@ -75,7 +75,7 @@ class AgenticSchemaWorkflow:
     @staticmethod
     def _cache_key(req: ScenarioProposeRequest) -> tuple:
         return (
-            "agentic_proposal_v9_context_complete_pdf",
+            "agentic_proposal_v11_low_balance_json_scenario_semantics",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -131,11 +131,12 @@ class AgenticSchemaWorkflow:
                 "Telecom, Telecommunication, or Telecommunications (case-insensitive)"
             )
 
+        json_grounded = is_json_grounded_domain(req.domain)
         grounding_requirement = (
-            "PDF-ONLY REQUIREMENT: because this domain is Low Balance & Top-up, use ONLY the supplied TMF654 and TMF635 v4.0.0 user guides. "
-            "Do not use the telecom registry, any other standard, template, CSV, memory, or general telecom knowledge as a semantic source. "
-            "Every semantic variable must be traceable to one of those PDFs and must carry a PDF-defined useCase. "
-            if is_pdf_grounded_domain(req.domain)
+            "JSON-SOURCE REQUIREMENT: because this domain is Low Balance & Top-up, use the supplied TMF654 and TMF629 v4.0.0 Swagger/OpenAPI artifacts as the official standards grounding. "
+            "Do not use PDFs, unrelated telecom standards, templates, CSV examples, memory, or general telecom knowledge as standards evidence. "
+            "Standard-backed variables must come from those machine-readable models. Scenario-specific analytical variables may be added only when required by the business scenario and must be clearly treated as scenario-derived. "
+            if json_grounded
             else "Use all relevant concepts from the complete approved telecom standards registry context, across all registered source URLs. "
         )
         agent_prompt = (
@@ -149,6 +150,8 @@ class AgenticSchemaWorkflow:
             "Variable-design requirement: propose a fresh semantic variable set with NO artificial count target or maximum. "
             + grounding_requirement + " "
             "Do not copy reference CSV variable names. Include every variable genuinely needed to represent the business scenario. "
+            "Scenario type is a hard semantic signal: two requests with different scenarioType values must not be forced into the same variable set. "
+            "Select variables that make the behavioral difference observable; do not use scenarioId to achieve that difference. "
             "Use ALL request inputs except scenarioId and entityKey as semantic/context signals: scenarioType, industryType, domain, "
             "businessScenario, typeOfData, country, and useCase must materially constrain the variable set, field parameters, scope, "
             "and generation behavior. Return the widest relevant schema supported by the approved grounding; do not truncate it."
@@ -199,9 +202,9 @@ class AgenticSchemaWorkflow:
         # Persisted scenario configuration is layered on top of the current LLM proposal.
         # The base LLM proposal remains cacheable and user-independent; only the merge is user-specific.
         scenario_key = req.scenario_id.strip()
-        if is_pdf_grounded_domain(req.domain):
-            # PDF-grounded proposals cannot inherit DB recommendations/user-selected
-            # variables because those records may originate from other standards.
+        if is_json_grounded_domain(req.domain):
+            # Standards-grounded domain proposals must remain reproducible from the approved
+            # source artifacts; do not overlay unrelated persisted recommendations.
             schema, variable_sources = schema, {}
         else:
             recommended = get_recommended(scenario_key, 1)
@@ -212,12 +215,14 @@ class AgenticSchemaWorkflow:
         variables, field_order = self._schema_to_variables(schema)
         for variable in variables:
             key = str(variable.get("name") or "").strip().lower()
-            if is_pdf_grounded_domain(req.domain):
-                variable["source"] = (
-                    "APPLICATION_REQUIRED"
-                    if key in {"subscriber_id", "account_id", "msisdn"}
-                    else "PDF_GROUNDED"
-                )
+            if is_json_grounded_domain(req.domain):
+                field = next((candidate for candidate in schema.fields if candidate.name == variable.get("name")), None)
+                if key in {"subscriber_id", "account_id", "msisdn"}:
+                    variable["source"] = "APPLICATION_REQUIRED"
+                elif field and field.provenance.get("source_registry_attribute"):
+                    variable["source"] = "OFFICIAL_JSON_GROUNDED"
+                else:
+                    variable["source"] = "SCENARIO_DERIVED"
             else:
                 variable["source"] = variable_sources.get(key, "LLM_GENERATED")
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
@@ -248,8 +253,8 @@ class AgenticSchemaWorkflow:
             "intent": intent.model_dump(),
             "schema": schema.model_dump(),
             "approval_questions": unresolved_questions,
-            "source_policy": "supplied_pdf_only" if is_pdf_grounded_domain(req.domain) else "approved_telecom_standards_registry",
-            "source_documents": source_manifest() if is_pdf_grounded_domain(req.domain) else [],
+            "source_policy": "bundled_official_swagger_only" if json_grounded else "approved_telecom_standards_registry",
+            "source_documents": source_manifest() if json_grounded else [],
         }
         save_draft(draft_id, draft)
         save_proposal(
