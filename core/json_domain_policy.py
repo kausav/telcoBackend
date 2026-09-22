@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -57,85 +58,123 @@ def _load(source_id: str) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _resolve(definitions: dict[str, Any], ref: str) -> dict[str, Any] | None:
-    if not ref.startswith("#/definitions/"):
+
+LOW_BALANCE_MAIN_MODELS = {
+    "tmf654_v4": (("Bucket", "bucket", "entity"), ("TopupBalance", "topupbalance", "transaction")),
+    "tmf629_v4": (("Customer", "customer", "entity"),),
+}
+
+_IGNORED_METADATA_FIELDS = {"@baseType", "@schemaLocation", "@type"}
+
+
+def _snake_case(value: str) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value or ""))
+    text = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").lower()
+    return re.sub(r"_+", "_", text)
+
+
+def _schema_scalar_spec(definitions: dict[str, Any], schema: dict[str, Any], *, source_id: str, model_name: str, field_name: str, path: str, required: bool, depth: int) -> dict[str, Any] | None:
+    if not isinstance(schema, dict):
         return None
-    name = ref.split("/", 2)[-1]
-    value = definitions.get(name)
-    return value if isinstance(value, dict) else None
-
-
-def _dtype(schema: dict[str, Any]) -> str:
+    ref = str(schema.get("$ref") or "").strip()
+    if ref.startswith("#/definitions/"):
+        target_name = ref.split("/", 2)[-1]
+        target = definitions.get(target_name)
+        if not isinstance(target, dict) or isinstance(target.get("properties"), dict):
+            return None
+        schema = {**target, **{k: v for k, v in schema.items() if k != "$ref"}}
     schema_type = schema.get("type")
-    if schema_type in {"integer", "int", "number", "float", "double", "decimal"}:
-        return "integer" if schema_type in {"integer", "int"} else "float"
-    if schema_type == "boolean":
-        return "boolean"
-    if schema_type == "string":
-        fmt = str(schema.get("format") or "").lower()
-        if fmt in {"date-time", "datetime", "timestamp"}:
-            return "datetime"
-        if fmt == "date":
-            return "date"
-        return "categorical" if schema.get("enum") else "string"
-    return "string"
+    enum_values = list(schema.get("enum") or [])
+    if schema_type in {"object", "array"} and not enum_values:
+        return None
+    if schema_type is None and not enum_values:
+        return None
+    return {
+        "source_id": source_id,
+        "model": model_name,
+        "field": field_name,
+        "path": path,
+        "name": _snake_case(path),
+        "dtype": schema_type or "string",
+        "description": str(schema.get("description") or ""),
+        "enum_values": enum_values,
+        "format": schema.get("format"),
+        "required": bool(required),
+        "depth": depth,
+    }
 
 
-def _flatten_model(definitions: dict[str, Any], model_name: str) -> list[dict[str, Any]]:
-    model = definitions.get(model_name)
-    if not isinstance(model, dict):
-        return []
+def _expand_model_scalars(definitions: dict[str, Any], source_id: str, model_name: str, prefix: str, grain: str, *, max_depth: int = 3) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    required = set(model.get("required") or [])
-    for name, prop in (model.get("properties") or {}).items():
-        if not isinstance(prop, dict):
-            continue
-        resolved = _resolve(definitions, str(prop.get("$ref") or ""))
-        effective = dict(resolved or {})
-        effective.update({k: v for k, v in prop.items() if k != "$ref"})
-        # Nested reference/collection structures are intentionally not flattened into
-        # fake scalar values. Their scalar child models can still be referenced by the
-        # model catalog when separately relevant.
-        if effective.get("type") == "array" or (resolved and resolved.get("properties")):
-            continue
-        rows.append({
-            "model": model_name,
-            "field": name,
-            "dtype": _dtype(effective),
-            "required": name in required,
-            "description": prop.get("description") or effective.get("description") or "",
-            "enum_values": list(prop.get("enum") or effective.get("enum") or []),
-            "format": effective.get("format"),
-        })
+
+    def visit(def_name: str, path_prefix: str, parent_required: bool, stack: tuple[str, ...], depth: int) -> None:
+        if depth > max_depth or def_name in stack:
+            return
+        model = definitions.get(def_name)
+        if not isinstance(model, dict):
+            return
+        required_names = set(model.get("required") or [])
+        for field_name, prop in (model.get("properties") or {}).items():
+            if field_name in _IGNORED_METADATA_FIELDS or not isinstance(prop, dict):
+                continue
+            path = f"{path_prefix}.{field_name}" if path_prefix else field_name
+            child_required = parent_required and field_name in required_names
+            ref = str(prop.get("$ref") or "").strip()
+            if ref.startswith("#/definitions/"):
+                target_name = ref.split("/", 2)[-1]
+                target = definitions.get(target_name)
+                if isinstance(target, dict) and isinstance(target.get("properties"), dict):
+                    visit(target_name, path, child_required, stack + (def_name,), depth + 1)
+                    continue
+            if prop.get("type") == "array":
+                continue
+            spec = _schema_scalar_spec(definitions, prop, source_id=source_id, model_name=model_name, field_name=field_name, path=path, required=child_required, depth=depth)
+            if spec is not None:
+                spec["model_grain"] = grain
+                rows.append(spec)
+
+    visit(model_name, prefix, True, (), 0)
     return rows
 
 
-def catalog_for_request() -> dict[str, Any]:
-    """Return the exact flat scalar model catalog exposed to the Low Balance agent."""
-    payload: list[dict[str, Any]] = []
-    for source_id in LOW_BALANCE_SOURCE_IDS:
+def expanded_scalar_catalog() -> list[dict[str, Any]]:
+    """Return every safe scalar leaf from the supplied primary TMF Swagger models."""
+    rows: list[dict[str, Any]] = []
+    for source_id, model_specs in LOW_BALANCE_MAIN_MODELS.items():
         document = _load(source_id)
         definitions = document.get("definitions") or {}
-        models = (
-            ("Bucket", "Balance bucket state"),
-            ("TopupBalance", "Prepay top-up/recharge operation"),
-            ("Customer", "Customer/account relationship context"),
-        )
-        for model_name, model_role in models:
-            for field in _flatten_model(definitions, model_name):
-                field["model_role"] = model_role
-                payload.append({"source_id": source_id, **field})
+        for model_name, prefix, grain in model_specs:
+            rows.extend(_expand_model_scalars(definitions, source_id, model_name, prefix, grain))
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        name = str(row.get("name") or "")
+        if name and name not in seen:
+            seen.add(name)
+            result.append(row)
+    return result
+
+
+def catalog_for_request() -> dict[str, Any]:
+    """Return the broad source catalog exposed to the Low Balance intent agent."""
+    payload = expanded_scalar_catalog()
+    for row in payload:
+        row["model_role"] = {
+            "Bucket": "Balance bucket state",
+            "TopupBalance": "Prepay top-up/recharge operation",
+            "Customer": "Customer/account relationship context",
+        }.get(row["model"], row["model"])
     return {
         "source_policy": "bundled_official_swagger_only",
         "sources": source_manifest(),
         "models": payload,
         "notes": [
-            "Only scalar fields from TMF654 Bucket/TopupBalance and TMF629 Customer are exposed to flat synthetic-data generation.",
-            "Nested object/array references are not converted into fake scalar values.",
+            "The catalog includes all materializable scalar leaves from TMF654 Bucket/TopupBalance and TMF629 Customer, including scalar leaves inside referenced objects.",
+            "One-to-many array relationships are intentionally excluded from the flat row contract rather than collapsed into a fake scalar.",
+            "Swagger metadata fields beginning with @ are excluded because they are implementation/type-system metadata rather than useful business dimensions.",
             "Scenario-specific analytical fields may be proposed when they are not standard attributes; those fields are marked SCENARIO_DERIVED and receive deterministic synthetic contracts.",
         ],
     }
-
 
 def source_manifest() -> list[dict[str, str]]:
     result = []

@@ -75,7 +75,7 @@ class AgenticSchemaWorkflow:
     @staticmethod
     def _cache_key(req: ScenarioProposeRequest) -> tuple:
         return (
-            "agentic_proposal_v11_low_balance_json_scenario_semantics",
+            "agentic_proposal_v12_low_balance_json_expanded_scalars",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -219,7 +219,7 @@ class AgenticSchemaWorkflow:
                 field = next((candidate for candidate in schema.fields if candidate.name == variable.get("name")), None)
                 if key in {"subscriber_id", "account_id", "msisdn"}:
                     variable["source"] = "APPLICATION_REQUIRED"
-                elif field and field.provenance.get("source_registry_attribute"):
+                elif field and (field.provenance.get("source_registry_attribute") or field.provenance.get("source_json_id")):
                     variable["source"] = "OFFICIAL_JSON_GROUNDED"
                 else:
                     variable["source"] = "SCENARIO_DERIVED"

@@ -7,7 +7,7 @@ from config.industry_profiles import get_profile
 import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
-from core.json_domain_policy import LOW_BALANCE_MAIN_MODEL_IDS, LOW_BALANCE_SOURCE_IDS, is_json_grounded_domain
+from core.json_domain_policy import LOW_BALANCE_MAIN_MODEL_IDS, LOW_BALANCE_SOURCE_IDS, expanded_scalar_catalog, is_json_grounded_domain
 
 
 def _tokens(value: str) -> list[str]:
@@ -538,6 +538,36 @@ class SchemaCompiler:
         return None
 
     @staticmethod
+    def _json_source_contract(spec: dict[str, object], country: str | None) -> tuple[str, str, dict]:
+        """Create an executable generator contract from a flattened Swagger scalar leaf."""
+        dtype = str(spec.get("dtype") or "string").strip().lower()
+        fmt = str(spec.get("format") or "").strip().lower()
+        enum_values = list(spec.get("enum_values") or [])
+        params: dict = {}
+
+        if enum_values:
+            return "weighted_choice", "categorical", {"choices": enum_values, "weights": [1.0] * len(enum_values)}
+        if dtype in {"boolean", "bool"}:
+            return "weighted_choice", "boolean", {"choices": [False, True], "weights": [0.5, 0.5]}
+        if fmt in {"date-time", "datetime", "timestamp"} or dtype in {"date-time", "datetime", "timestamp"}:
+            return "recent_datetime", "datetime", {
+                "timezone": "Asia/Kolkata" if str(country or "IN").upper() == "IN" else "UTC",
+                "days_back": 365,
+            }
+        if dtype == "date":
+            return "recent_datetime", "date", {
+                "timezone": "Asia/Kolkata" if str(country or "IN").upper() == "IN" else "UTC",
+                "days_back": 365,
+            }
+        if dtype in {"integer", "int", "bigint", "smallint"}:
+            return "uniform_int", "integer", {"min": 0, "max": 100, "precision": 0}
+        if dtype in {"number", "float", "double", "decimal", "numeric"}:
+            return "uniform", "float", {"min": 0.0, "max": 1000.0, "precision": 2}
+        # Identifier/reference/URI semantics are handled by semantic_string, which already
+        # creates deterministic synthetic identifiers and example.test URIs safely.
+        return "semantic_string", "string", {}
+
+    @staticmethod
     def _merge_dependencies(
         idea: dict[str, object],
         name_map: dict[str, str],
@@ -565,6 +595,7 @@ class SchemaCompiler:
         scenario_mode: str,
         max_variables: int | None = None,
         include_all_registry_scalars: bool = True,
+        include_all_json_source_scalars: bool = False,
     ) -> list[GeneratedSchemaField]:
         raw_ideas = [idea.model_dump() for idea in intent.candidate_variables]
         ideas: list[dict[str, object]] = []
@@ -606,6 +637,42 @@ class SchemaCompiler:
                     "dtype": "string",
                     "depends_on": [],
                 })
+
+        if include_all_json_source_scalars:
+            # Low Balance & Top-up uses the supplied TMF654/TMF629 Swagger files as the
+            # complete standards source. Include every safe scalar leaf, including scalar
+            # properties inside referenced objects, while keeping arrays out of the flat row.
+            for spec in expanded_scalar_catalog():
+                model = str(spec.get("model") or "")
+                dtype = str(spec.get("dtype") or "string").lower()
+                if dtype in self.UNSUPPORTED_NESTED_DTYPES:
+                    continue
+                add_idea({
+                    "name": str(spec["name"]),
+                    "description": str(spec.get("description") or f"{model} {spec['path']} from the supplied official Swagger model."),
+                    "role": (
+                        "timing" if str(spec.get("format") or "").lower() == "date-time" or dtype in {"date", "datetime", "timestamp"}
+                        else "measurement" if dtype in {"integer", "number", "float", "double", "decimal"}
+                        else "status" if str(spec.get("enum_values") or []) and any(token in str(spec.get("path") or "").lower() for token in ("status", "state", "reason"))
+                        else "identity" if str(spec.get("path") or "").lower().endswith(".id")
+                        else "other"
+                    ),
+                    "grain": str(spec.get("model_grain") or "transaction"),
+                    "dtype": (
+                        "integer" if dtype in {"integer", "int"}
+                        else "float" if dtype in {"number", "float", "double", "decimal"}
+                        else "datetime" if dtype in {"date-time", "datetime", "timestamp"}
+                        else "date" if dtype == "date"
+                        else "categorical" if spec.get("enum_values")
+                        else "boolean" if dtype in {"boolean", "bool"}
+                        else "string"
+                    ),
+                    "depends_on": [],
+                    "_json_source_spec": spec,
+                    "_json_source": True,
+                    "_registry_required": bool(spec.get("required")),
+                    "_registry_nullable": not bool(spec.get("required")),
+                }, preserve_name=True)
 
         for idea in raw_ideas:
             add_idea(idea)
@@ -716,6 +783,11 @@ class SchemaCompiler:
             fresh = name_map[self._normalize_variable_name(original_name)]
             matched = None
             attr = None
+            source_spec = idea.get("_json_source_spec") if isinstance(idea.get("_json_source_spec"), dict) else None
+            if source_spec is not None:
+                source_model = str(source_spec.get("model") or "")
+                entity = next((e for e in entities if e.name == source_model), None)
+                runtime_generator, dtype, params = self._json_source_contract(source_spec, country)
             # Mandatory public telecom anchors use authoritative subscriber attributes
             # directly, rather than allowing a generic account_id match to resolve to a
             # different entity.
@@ -726,12 +798,15 @@ class SchemaCompiler:
                     if attr is not None:
                         matched = (subscriber, attr)
             normalized_original_name = self._normalize_variable_name(original_name)
-            if normalized_original_name not in self.LOW_BALANCE_SCENARIO_DERIVED_FIELDS:
+            if source_spec is None and normalized_original_name not in self.LOW_BALANCE_SCENARIO_DERIVED_FIELDS:
                 matched = self._match_registry_attribute(idea, entities, used_registry)
             role = str(idea.get("role") or "other").lower()
             idea_text = f"{original_name} {idea.get('description', '')}".lower()
             outcome_semantic = role in {"status", "decision"} or any(token in idea_text for token in ("status", "state", "outcome", "decision", "result"))
-            if original_name in self.REQUIRED_TELECOM_FIELDS:
+            if source_spec is not None:
+                # Contract was already compiled from the authoritative Swagger leaf above.
+                pass
+            elif original_name in self.REQUIRED_TELECOM_FIELDS:
                 entity = next((e for e in entities if e.canonical_id == "subscriber"), None)
                 if original_name == "subscriber_id":
                     runtime_generator, dtype, params = (
@@ -811,10 +886,14 @@ class SchemaCompiler:
             required = original_name == entity_key or original_name in self.REQUIRED_TELECOM_FIELDS or registry_required
             nullable = False if required else registry_nullable
             description = str(idea.get("description") or "").strip() or f"Scenario-specific {role.replace('_', ' ')} attribute for {intent.domain}."
+            source_from_json = isinstance(source_spec, dict)
             provenance = {
-                "generated_from": "registry_attribute" if idea.get("_preserve_name") else "semantic_variable_idea",
+                "generated_from": "official_json_source" if source_from_json else ("registry_attribute" if idea.get("_preserve_name") else "semantic_variable_idea"),
                 "canonical_entity": entity.canonical_id if entity else None,
-                "source_registry_attribute": getattr(attr, "name", None) if matched else None,
+                "source_registry_attribute": getattr(attr, "name", None) if matched and not source_from_json else None,
+                "source_json_id": source_spec.get("source_id") if source_from_json else None,
+                "source_json_model": source_spec.get("model") if source_from_json else None,
+                "source_json_path": source_spec.get("path") if source_from_json else None,
                 "grain": grain,
             }
             fields.append(GeneratedSchemaField(
@@ -947,6 +1026,7 @@ class SchemaCompiler:
             scenario_mode=scenario_mode,
             max_variables=None,
             include_all_registry_scalars=False,
+            include_all_json_source_scalars=True,
         )
         field_names = [f.name for f in fields]
         if not fields:
@@ -979,8 +1059,8 @@ class SchemaCompiler:
         hard_constraints = [
             "scenarioId is identifier-only and does not select variables or business rules.",
             "Low Balance & Top-up standards grounding is restricted to the supplied TMF654 Prepay Balance Management and TMF629 Customer Management Swagger/OpenAPI artifacts.",
-            "The candidate variable set is selected from the current scenario context; the compiler does not append the full scalar model catalog.",
-            "Nested object/array properties are excluded from the flat record contract rather than converted into fake scalar values.",
+            "The Low Balance & Top-up compiler includes all materializable scalar leaves from the supplied TMF654/TMF629 Swagger models, including scalar leaves inside referenced objects.",
+            "One-to-many array properties are excluded from the flat record contract rather than converted into fake scalar values.",
             "Standard-backed enum values are copied from the official Swagger definitions and cannot be replaced with invented values.",
             "Scenario-derived analytical variables are explicitly synthetic extensions and are not represented as TM Forum fields.",
             f"Scenario outcome mode is derived from scenarioType and the business scenario: {scenario_mode}.",

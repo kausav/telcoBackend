@@ -49,7 +49,7 @@ IMPORTANT BOUNDARIES:
 - Treat scenarioType as a behavioral mode and make the variable set materially reflect it. For a Normal scenario in a transactional top-up workflow, prioritize completed/successful operational states and coherent lifecycle timing; do not introduce pending/failed operation outcomes unless the business scenario explicitly asks for adverse outcomes.
 - Cover only concepts justified by the current business scenario and domain.
 - The telecom registry is grounding information for normal registry-grounded requests, not a variable template. Do not dump catalog attributes.
-- For Low Balance & Top-up, the supplied machine-readable TMF654/TMF629 Swagger catalog is the authoritative standards source. Scenario-specific analytical fields may be proposed only when they are clearly derived from the business scenario and must not be misrepresented as TM Forum fields.
+- For Low Balance & Top-up, the supplied machine-readable TMF654/TMF629 Swagger catalog is the authoritative standards source. The backend can flatten all materializable scalar leaves inside the primary resources and their referenced objects; do not assume only top-level fields are available. Scenario-specific analytical fields may be proposed only when they are clearly derived from the business scenario and must not be misrepresented as TM Forum fields.
 - Do not propose unsupported nested/object fields when a flat synthetic dataset cannot deterministically
   populate their nested structure.
 
@@ -242,7 +242,7 @@ class GeminiIntentAgent:
             grounding_header = (
                 "SUPPLIED MACHINE-READABLE GROUNDING (authoritative for this domain):\n"
                 "The ONLY official semantic sources for Low Balance & Top-up are the supplied TMF654 and TMF629 v4.0.0 Swagger/OpenAPI documents. "
-                "Use their scalar fields, descriptions, types, and enum values as the standards boundary. "
+                "Use their scalar fields, descriptions, types, and enum values as the standards boundary, including scalar leaves inside referenced objects. "
                 "Do not use PDFs, unrelated telecom standards, templates, CSV examples, memory, or general telecom knowledge as the standards source. "
                 "Scenario-specific analytical variables are allowed when the business scenario requires a concept absent from the official models, but they must be clearly scenario-derived and not presented as official TM Forum attributes.\n\n"
             )
