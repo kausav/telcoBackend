@@ -17,6 +17,7 @@ from core.agentic_models import ScenarioIntent
 from core.errors import LLMUpstreamError
 from core.llm_client import GeminiClient
 from core.telecom_registry import TelecomRegistry
+from core.pdf_domain_policy import catalog_for_request, is_pdf_grounded_domain, PDF_SOURCE_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +37,8 @@ IMPORTANT BOUNDARIES:
   because an attribute exists somewhere in the telecom registry or in a related entity. The compiler will
   ground relevant ideas to the approved registry and will reject any idea that lacks a safe executable
   generation contract.
-- For telecom transactional data, subscriber_id, account_id and msisdn are mandatory and must always be
-  present as stable entity-level fields.
+- For normal registry-grounded telecom transactional data, subscriber_id, account_id and msisdn are mandatory stable entity-level fields.
+  Exception: when the requested domain is explicitly PDF-grounded, use only the supplied PDF catalog and do not inject generic telecom anchors.
 - Candidate variable names must be FRESH and should not simply copy a template or reference list.
 - Avoid redundant identity/contact fields. In a telecom transactional scenario, msisdn is the canonical
   subscriber mobile identifier; do NOT also propose phoneNumber, mobileNumber, telephoneNumber, or equivalent
@@ -47,7 +48,8 @@ IMPORTANT BOUNDARIES:
   decisions, contention, suppression, recovery, or retention when those concepts fit the scenario.
 - Treat scenarioType as a behavioral mode and make the variable set materially reflect it.
 - Cover only concepts justified by the current business scenario and domain.
-- The telecom catalog is grounding information, not a variable template. Do not dump catalog attributes.
+- The telecom registry is grounding information for normal registry-grounded requests, not a variable template. Do not dump catalog attributes.
+- For a PDF-grounded request, the supplied PDF catalog is the only semantic source and every candidate variable must be traceable to it.
 - Do not propose unsupported nested/object fields when a flat synthetic dataset cannot deterministically
   populate their nested structure.
 
@@ -69,7 +71,8 @@ Return this JSON shape:
       "role": "identity|profile|event|transaction|status|measurement|metric|timing|decision|configuration|derived|other",
       "grain": "entity|transaction|event|derived",
       "dtype": "string|integer|float|decimal|boolean|categorical|datetime|date",
-      "depends_on": ["existing_candidate_variable_name"]
+      "depends_on": ["existing_candidate_variable_name"],
+      "useCase": "PDF-defined use case when the domain is PDF-grounded"
     }
   ],
   "country": "...",
@@ -152,6 +155,7 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 for dep in _as_list(raw.get("depends_on"), 8)
                 if str(dep).strip()
             ],
+            "useCase": (str(raw.get("useCase") or "").strip()[:300] or None),
         }
         if item["role"] not in allowed_roles:
             item["role"] = "other"
@@ -231,16 +235,37 @@ class GeminiIntentAgent:
         industry_type: str = "telecom",
         domain_query: str | None = None,
     ) -> ScenarioIntent:
-        catalog = self.registry.llm_catalog_context(
-            query=" ".join(part for part in (domain_query, request_context) if part)
-        )
-        catalog_text = json.dumps(catalog, separators=(",", ":"), sort_keys=True)
+        pdf_only = is_pdf_grounded_domain(domain_query)
+        if pdf_only:
+            pdf_catalog = catalog_for_request(request_context, domain_query or "")
+            catalog = {
+                "source_policy": "supplied_pdf_only",
+                "source_documents": PDF_SOURCE_NAMES,
+                "resources": pdf_catalog,
+            }
+            catalog_text = json.dumps(catalog, separators=(",", ":"), sort_keys=True)
+            grounding_header = (
+                "SUPPLIED PDF-ONLY GROUNDING (authoritative for this domain):\n"
+                "The ONLY semantic sources allowed for this proposal are the supplied TMF654 and TMF635 v4.0.0 user guides. "
+                "Do not use any other registry source, standard, template, CSV, memory, or general telecom knowledge. "
+                "Only propose variables represented by the supplied PDF catalog below.\n\n"
+            )
+            mandatory_line = "Do NOT add subscriber_id, account_id, msisdn, phoneNumber, or other generic telecom anchors unless they are explicitly represented by the supplied PDFs and materially requested. "
+        else:
+            catalog = self.registry.llm_catalog_context(
+                query=" ".join(part for part in (domain_query, request_context) if part)
+            )
+            catalog_text = json.dumps(catalog, separators=(",", ":"), sort_keys=True)
+            grounding_header = (
+                "APPROVED TELECOM STANDARDS REGISTRY (authoritative grounding only):\n"
+                "The context below contains ALL official standard/model source URLs currently registered by the application, "
+                "plus the complete relevant entity, attribute, relationship, and provenance records derived from those official models. "
+                "Use the complete context to select the concepts needed by the business scenario; do not treat one source "
+                "family as automatically sufficient when the scenario spans multiple telecom standards.\n\n"
+            )
+            mandatory_line = "For transactional telecom scenarios, ALWAYS include subscriber_id, account_id, and msisdn. "
         prompt = (
-            "APPROVED TELECOM STANDARDS REGISTRY (authoritative grounding only):\n"
-            "The context below contains ALL official standard/model source URLs currently registered by the application, "
-            "plus the complete relevant entity, attribute, relationship, and provenance records derived from those official models. "
-            "Use the complete context to select the concepts needed by the business scenario; do not treat one source "
-            "family as automatically sufficient when the scenario spans multiple telecom standards.\n\n"
+            grounding_header +
             f"{catalog_text}\n\n"
             "Authoritative request context:\n"
             f"{request_context}\n\n"
@@ -248,8 +273,8 @@ class GeminiIntentAgent:
             f"Business domain: {domain_query or '<none>'}\n"
             f"Country: {country or '<none>'}\n\n"
             "Create a comprehensive fresh scenario intent. There is NO artificial variable-count target or maximum. "
-            "Prefer the maximum set of relevant variables supported by the complete approved registry and the scenario semantics. "
-            "Never truncate for count. For transactional telecom scenarios, ALWAYS include subscriber_id, account_id, and msisdn. "
+            "Prefer the maximum set of relevant variables supported by the approved grounding catalog and scenario semantics. "
+            "Never truncate for count. " + mandatory_line + "\n"
             "Do not invent unsupported telecom entities or fields; the compiler will ground only relevant selected concepts from the approved registry. "
             "Return JSON only."
         )

@@ -7,6 +7,10 @@ from config.industry_profiles import get_profile
 import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
+from core.pdf_domain_policy import (
+    PDF_CATALOG, catalog_for_request, is_pdf_grounded_domain, pdf_provenance,
+    use_case_for, PDF_SOURCE_STANDARDS, PDF_SOURCE_NAMES,
+)
 
 
 def _tokens(value: str) -> list[str]:
@@ -868,6 +872,146 @@ class SchemaCompiler:
             ))
         return fields
 
+    def _compile_pdf_grounded(
+        self,
+        intent: ScenarioIntent,
+        *,
+        business_scenario: str,
+        use_case: str,
+        country: str | None,
+        type_of_data: str | None,
+        entity_key: str | None,
+    ) -> ScenarioSchema:
+        """Compile Low Balance & Top-up strictly from the supplied TMF PDFs.
+
+        This path deliberately does not resolve entities, attributes, relationships,
+        or generation contracts from the telecom registry.  The PDF catalog is the
+        semantic source of truth for this domain; generators are generic execution
+        mechanics applied to the documented scalar types.
+        """
+        catalog = catalog_for_request(business_scenario, use_case)
+        request_text = f"{business_scenario} {use_case}".lower()
+
+        resources: list[str] = ["bucket", "topupbalance"]
+        if "transfer" in request_text or "colleague" in request_text:
+            resources.append("transferbalance")
+        if "reserve" in request_text or "reservation" in request_text:
+            resources.append("reservebalance")
+        if any(token in request_text for token in ("usage", "voice call", "voicemail", "usage specification", "rated", "billed")):
+            for rid in ("usage", "usagespecification"):
+                if rid in catalog:
+                    resources.append(rid)
+        resources = list(dict.fromkeys(r for r in resources if r in catalog))
+
+        ideas = [idea.model_dump() for idea in intent.candidate_variables]
+        requested_names = {self._normalize_variable_name(str(i.get("name") or "")) for i in ideas}
+        requested_text = " ".join(
+            str(i.get("name") or "") + " " + str(i.get("description") or "")
+            for i in ideas
+        ).lower()
+        request_text += " " + requested_text
+
+        def field_requested(resource: str, field: str) -> bool:
+            n = self._normalize_variable_name(field)
+            if n in requested_names:
+                return True
+            return self._normalize_variable_name(f"{resource}_{field}") in requested_names
+
+
+        # Core fields keep the proposal useful even when the model returns a sparse
+        # candidate list; all additions still come from the PDF catalog.
+        core_fields = {
+            "bucket": {"id", "status", "usageType", "remainingValue", "remainingValue_units", "validFor"},
+            "topupbalance": {"id", "requestedDate", "confirmationDate", "status", "usageType", "isAutoTopup", "amount", "amount_units"},
+        }
+        if "recurr" in request_text or "auto top" in request_text:
+            core_fields["topupbalance"].update({"numberOfPeriods", "recurringPeriod"})
+        if "voucher" in request_text:
+            core_fields["topupbalance"].add("voucher")
+
+        fields: list[GeneratedSchemaField] = []
+        used_names: set[str] = set()
+        selected_standards: set[str] = set()
+        selected_entities: list[ResolvedConcept] = []
+        for resource in resources:
+            item = catalog[resource]
+            selected_entities.append(ResolvedConcept(
+                canonical_id=resource,
+                name=item["name"],
+                source_model=item["standard"],
+                source_references=[PDF_SOURCE_NAMES[item["source_id"]]],
+                selected_attributes=list(item["fields"].keys()),
+            ))
+            selected_standards.add(item["standard"])
+            for pdf_field, (dtype, description) in item["fields"].items():
+                # Do not emit arbitrary nested reference/list structures: only fields
+                # explicitly represented in the scalar PDF catalog are eligible.
+                if not field_requested(resource, pdf_field) and pdf_field not in core_fields.get(resource, set()):
+                    # Include a small set of scenario-specific fields when the request
+                    # clearly mentions their semantics.
+                    semantic = f"{pdf_field} {description}".lower()
+                    if not any(token in request_text for token in re.findall(r"[a-z0-9]+", semantic) if len(token) > 3):
+                        continue
+                use_case_value = use_case_for(resource, pdf_field, business_scenario, use_case)
+                base = self._normalize_variable_name(f"{resource}_{pdf_field}")
+                if base in used_names:
+                    continue
+                used_names.add(base)
+                params: dict[str, object] = {}
+                if dtype == "categorical":
+                    params = {"choices": item.get("choices", {}).get(pdf_field, ["active", "expired", "suspended"])}
+                    gen = "weighted_choice"
+                elif dtype == "boolean":
+                    gen, params = "weighted_choice", {"choices": [True, False], "weights": [0.5, 0.5]}
+                elif dtype == "datetime":
+                    gen, params = "recent_datetime", {"days_back": 365}
+                elif dtype == "integer":
+                    gen, params = "uniform_int", {"min": 1, "max": 12}
+                elif dtype == "float":
+                    gen, params = "uniform", {"min": 0, "max": 1000, "precision": 2}
+                else:
+                    gen, params = "semantic_string", {}
+                grain = "entity" if resource == "bucket" and pdf_field in {"id", "name", "isShared", "status", "usageType", "validFor"} else "transaction"
+                fields.append(GeneratedSchemaField(
+                    name=base,
+                    dtype=dtype,
+                    description=description,
+                    gen=gen,
+                    params=params,
+                    depends_on=[],
+                    nullable=False,
+                    required=False,
+                    formula=None,
+                    scope=grain,
+                    useCase=use_case_value,
+                    provenance=pdf_provenance(resource, pdf_field, use_case_value),
+                ))
+
+        if not fields:
+            raise ValueError("The supplied TMF654/TMF635 PDFs did not yield any executable scalar variables for this scenario")
+
+        standards = [
+            {"standard": standard, "source_policy": "supplied_pdf_only", "source_documents": [PDF_SOURCE_NAMES[sid] for sid in ("tmf654_v4", "tmf635_v4") if ("TMF654" if sid == "tmf654_v4" else "TMF635") == standard]}
+            for standard in sorted(selected_standards)
+        ]
+        hard_constraints = [
+            "PDF-grounded domain: semantic variables, resources, fields and use cases come only from the supplied TMF654/TMF635 v4.0.0 user guides.",
+            "The telecom registry and other standards are not consulted for this proposal path.",
+            "Nested reference/list objects from the PDFs are excluded from the flat synthetic record contract; Quantity.amount and Quantity.units are represented as scalar fields.",
+            "Every proposed variable carries a PDF-defined useCase and supplied-PDF provenance.",
+        ]
+        return ScenarioSchema(
+            domain=intent.domain,
+            subdomain=intent.subdomain,
+            applicable_standards=standards,
+            entities=selected_entities,
+            relationships=[],
+            fields=fields,
+            hard_constraints=hard_constraints,
+            unresolved_items=[],
+            warnings=["This proposal is strictly grounded in the supplied TMF654/TMF635 user guides; no other semantic source is used."],
+        )
+
     def compile(
         self,
         intent: ScenarioIntent,
@@ -889,6 +1033,15 @@ class SchemaCompiler:
         if normalized_industry not in {"telecom", "telecommunications"}:
             raise ValueError(
                 f"Unsupported industryType '{industry_type or intent.industry_type}'. The telecom registry only supports Telecommunications/Telecom."
+            )
+        if is_pdf_grounded_domain(domain_query or intent.domain):
+            return self._compile_pdf_grounded(
+                requested,
+                business_scenario=business_scenario or "",
+                use_case=use_case or requested.use_case or "",
+                country=country,
+                type_of_data=type_of_data or requested.type_of_data,
+                entity_key=entity_key,
             )
         if selected_entities is not None:
             normalized: list[str] = []

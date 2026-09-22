@@ -25,6 +25,7 @@ class VariableIdea(BaseModel):
     grain: Literal["entity", "transaction", "event", "derived"] = "transaction"
     dtype: Literal["string", "integer", "float", "decimal", "boolean", "categorical", "datetime", "date"] = "string"
     depends_on: list[str] = Field(default_factory=list, max_length=8)
+    useCase: str | None = Field(default=None, max_length=300)
 
 class ScenarioIntent(BaseModel):
     """LLM output: intent only, never executable schema semantics."""
@@ -86,6 +87,7 @@ class GeneratedSchemaField(BaseModel):
     required: bool = False
     formula: str | None = None
     scope: Literal["entity", "transaction", "event", "derived"] = "transaction"
+    useCase: str | None = Field(default=None, max_length=300)
     provenance: dict[str, Any] = Field(default_factory=dict)
 
 
