@@ -151,14 +151,14 @@ class AgenticSchemaWorkflow:
             + grounding_requirement + " "
             "Do not copy reference CSV variable names. Include every variable genuinely needed to represent the business scenario, but do not add API href/referredType/reference metadata, display-only name/description fields, or semantic aliases solely to increase width. Prefer one canonical variable per business concept. "
             "Scenario type is a hard semantic signal: two requests with different scenarioType values must not be forced into the same variable set. "
-            "Select variables that make the behavioral difference observable; do not use scenarioId to achieve that difference. "
-            "Use ALL request inputs except scenarioId and entityKey as semantic/context signals: scenarioType, industryType, domain, "
+            "Select variables that make the behavioral difference observable; do not use requestedScenarioId to achieve that difference. "
+            "Use ALL request inputs except requestedScenarioId and entityKey as semantic/context signals: scenarioType, industryType, domain, "
             "businessScenario, typeOfData, country, and useCase must materially constrain the variable set, field parameters, scope, "
             "and generation behavior. Return the widest relevant schema supported by the approved grounding; do not truncate it."
         )
 
-        cid = ensure_conversation(req.scenario_id, req.user_id, req.scenario_id)
-        append_message(cid, "user", agent_prompt, requested_scenario_id=req.scenario_id)
+        cid = ensure_conversation(req.requested_scenario_id, req.user_id, req.requested_scenario_id)
+        append_message(cid, "user", agent_prompt, requested_scenario_id=req.requested_scenario_id)
         cache_key = self._cache_key(req)
         cached = get_proposal(cache_key)
         if cached is not None:
@@ -201,7 +201,7 @@ class AgenticSchemaWorkflow:
 
         # Persisted scenario configuration is layered on top of the current LLM proposal.
         # The base LLM proposal remains cacheable and user-independent; only the merge is user-specific.
-        requested_scenario_id = req.scenario_id.strip()
+        requested_scenario_id = req.requested_scenario_id.strip()
         if is_json_grounded_domain(req.domain):
             # Standards-grounded domain proposals must remain reproducible from the approved
             # source artifacts; do not overlay unrelated persisted recommendations.
@@ -231,7 +231,7 @@ class AgenticSchemaWorkflow:
         draft_id = new_draft_id()
         description = req.business_scenario
         draft = {
-            "label": req.scenario_id,
+            "label": req.requested_scenario_id,
             "journey": req.domain,
             "description": description,
             "variables": variables,
@@ -241,8 +241,8 @@ class AgenticSchemaWorkflow:
             "business_response": None,
             "expected_outcome": None,
             "use_case": req.use_case,
-            "scenario_id": req.scenario_id,
-            "requested_scenario_id": req.scenario_id,
+            "scenario_id": req.requested_scenario_id,
+            "requested_scenario_id": req.requested_scenario_id,
             "scenario_type": req.scenario_type or "agentic",
             "industry_type": industry_key,
             "country": intent.country or req.country,
@@ -263,14 +263,14 @@ class AgenticSchemaWorkflow:
             user_id=req.user_id.strip() if req.user_id else None,
             requested_scenario_id=requested_scenario_id,
             scenario_version=1,
-            payload={"scenario_id": req.scenario_id, "requested_scenario_id": requested_scenario_id, "variables": variables, "field_order": field_order, "intent": intent.model_dump()},
+            payload={"scenario_id": req.requested_scenario_id, "requested_scenario_id": requested_scenario_id, "variables": variables, "field_order": field_order, "intent": intent.model_dump()},
         )
         append_message(cid, "assistant", json.dumps({"intent": intent.model_dump(), "action": "schema_proposed"}, sort_keys=True), requested_scenario_id=requested_scenario_id)
         return ScenarioImportResponse(
             success=True,
             draft_id=draft_id,
-            scenario_id=req.scenario_id,
-            requested_scenario_id=req.scenario_id,
+            scenario_id=req.requested_scenario_id,
+            requested_scenario_id=req.requested_scenario_id,
             journey=req.domain,
             description=description,
             variables=variables,
@@ -395,7 +395,7 @@ _WORKFLOW_SINGLETONS: dict[str, AgenticSchemaWorkflow] = {}
 def get_agentic_workflow(api_key: str | None = None, registry: TelecomRegistry | None = None) -> AgenticSchemaWorkflow:
     """Reuse the Gemini intent client/registry objects across proposal requests.
 
-    The cache key is the explicit API key (or a process-local default), never scenarioId.
+    The cache key is the explicit API key (or a process-local default), never requestedScenarioId.
     This removes repeated Gemini client/provider construction from /scenario/propose.
     """
     key = api_key or "__default__"

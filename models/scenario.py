@@ -62,18 +62,62 @@ class ScenarioModel:
     def create_with_allocation(cls, requested_id: str | None, draft_id: str | None,
                                meta: dict[str, Any], variables: list[dict[str, Any]],
                                field_order: list[str]) -> tuple[str, bool]:
+        """Persist the latest confirmed draft under the requested scenario id.
+
+        ``requested_scenario_id`` is the canonical business identifier. Confirming a
+        different draft for the same requested id is an update/re-confirmation, not a
+        duplicate scenario. The newest confirmed draft becomes the active scenario
+        definition while the canonical requested id remains unchanged.
+        """
         requested = str(requested_id or "").strip() or None
         if not requested:
             raise ValueError("requested_scenario_id is required")
-        # requested_scenario_id is the source of truth. Never replace it with an internally
-        # generated/reassigned scenario id. A duplicate is a conflict that the caller must
-        # resolve explicitly.
-        if cls.collection.find_one({"requested_scenario_id": requested}, {"_id": 1}):
-            raise ValueError(f"Scenario '{requested}' already exists")
+
+        now = time.time()
+        persisted_meta = dict(meta)
+        persisted_meta["requested_scenario_id"] = requested
+        persisted_meta["scenario_id"] = requested
+
+        # Prefer the canonical field, but also recover legacy rows that only have
+        # scenario_id. This keeps reconfirmation safe during migration.
+        existing = cls.collection.find_one(
+            {"$or": [{"requested_scenario_id": requested}, {"scenario_id": requested}]},
+            {"_id": 1, "draft_id": 1},
+        )
+
+        document = {
+            "scenario_id": requested,
+            "requested_scenario_id": requested,
+            "scenario_id_reassigned": False,
+            "draft_id": draft_id,
+            "meta": persisted_meta,
+            "variables": variables,
+            "field_order": field_order,
+            "updated_at": now,
+        }
+
         try:
-            cls.create(requested, requested, draft_id, meta, variables, field_order, False)
+            if existing:
+                # A new draft with the same requested_scenario_id is a new confirmed
+                # revision of that scenario. Replace the active definition rather than
+                # returning a false duplicate conflict.
+                document["previous_draft_id"] = existing.get("draft_id")
+                cls.collection.update_one({"_id": existing["_id"]}, {"$set": document})
+            else:
+                document["created_at"] = now
+                cls.collection.insert_one(document)
         except DuplicateKeyError as exc:
-            raise ValueError(f"Scenario '{requested}' already exists") from exc
+            # Handle a race where another request confirmed the same requested id
+            # between our lookup and insert. Re-read and update that canonical row.
+            raced = cls.collection.find_one(
+                {"$or": [{"requested_scenario_id": requested}, {"scenario_id": requested}]},
+                {"_id": 1, "draft_id": 1},
+            )
+            if not raced:
+                raise ValueError(f"Could not persist scenario '{requested}'") from exc
+            document["previous_draft_id"] = raced.get("draft_id")
+            cls.collection.update_one({"_id": raced["_id"]}, {"$set": document})
+
         return requested, False
 
     @classmethod

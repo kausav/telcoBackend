@@ -13,7 +13,7 @@ from core.compiled_schema import compile_scenario
 from core.dynamic_scenarios import (
     resolve_data_type,
     resolve_scenario_context,
-    resolve_scenario_id_from_draft,
+    resolve_requested_scenario_id_from_draft,
     resolve_scenario_meta,
     resolve_variables,
     scenario_exists,
@@ -54,41 +54,41 @@ def _timestamp_sort_key(value: Any):
 
 def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
     """Run the full generation + QA pipeline and build the API response payload."""
-    scenario_id = req_payload.get("scenario")
+    requested_scenario_id = req_payload.get("requested_scenario_id")
     draft_id = req_payload.get("draftId")
     count = int(req_payload.get("count", 35) or 35)
     records_per_user = int(req_payload.get("recordsPerUser", 10) or 10)
 
     if draft_id:
-        resolved = resolve_scenario_id_from_draft(draft_id)
+        resolved = resolve_requested_scenario_id_from_draft(draft_id)
         if resolved is None:
             raise ValueError(f"Unknown or unconfirmed draftId '{draft_id}'")
-        if scenario_id and scenario_id != resolved:
-            raise ValueError(f"draftId '{draft_id}' does not match scenario '{scenario_id}'")
-        scenario_id = resolved
-    if not scenario_id:
-        raise ValueError("Either 'scenario' or 'draftId' is required")
-    if not scenario_exists(scenario_id):
-        raise ValueError(f"Unknown scenario '{scenario_id}'")
+        if requested_scenario_id and requested_scenario_id != resolved:
+            raise ValueError(f"draftId '{draft_id}' does not match requested_scenario_id '{requested_scenario_id}'")
+        requested_scenario_id = resolved
+    if not requested_scenario_id:
+        raise ValueError("Either 'requested_scenario_id' or 'draftId' is required")
+    if not scenario_exists(requested_scenario_id):
+        raise ValueError(f"Unknown requested_scenario_id '{requested_scenario_id}'")
 
-    scenario_context = resolve_scenario_context(scenario_id)
+    scenario_context = resolve_scenario_context(requested_scenario_id)
     if scenario_context.get("agentic"):
         state = run_deterministic_agentic_generation(
-            scenario=scenario_id,
+            scenario=requested_scenario_id,
             count=count,
             industry=scenario_context.get("industry", "telecom"),
             country=scenario_context.get("country"),
-            type_of_data=scenario_context.get("type_of_data", resolve_data_type(scenario_id)),
+            type_of_data=scenario_context.get("type_of_data", resolve_data_type(requested_scenario_id)),
             scenario_context=scenario_context,
             records_per_user=records_per_user,
         )
     else:
         state = run_pipeline(
-            scenario=scenario_id,
+            scenario=requested_scenario_id,
             count=count,
             industry=scenario_context.get("industry", "generic"),
             country=scenario_context.get("country"),
-            type_of_data=scenario_context.get("type_of_data", resolve_data_type(scenario_id)),
+            type_of_data=scenario_context.get("type_of_data", resolve_data_type(requested_scenario_id)),
             scenario_context=scenario_context,
             records_per_user=records_per_user,
         )
@@ -98,7 +98,7 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
     if state.record_errors and not state.final_records:
         raise RuntimeError("Generation produced no valid records: " + str(state.record_errors[:10]))
 
-    meta = resolve_scenario_meta(scenario_id) or {}
+    meta = resolve_scenario_meta(requested_scenario_id) or {}
     final_records = state.final_records
     entity_key = meta.get("entity_key")
     response_records = final_records
@@ -115,7 +115,7 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
                 continue
             grouped.setdefault(str(value), []).append(row)
         entity_records: list[dict[str, Any]] = []
-        compiled = compile_scenario(scenario_id)
+        compiled = compile_scenario(requested_scenario_id)
         user_fields = compiled.user_fields
         user_field_names = set(user_fields)
         user_field_names.add(entity_key)
@@ -149,15 +149,15 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "success": True,
-        "scenario_id": str(meta.get("requested_scenario_id") or scenario_id),
-        "requested_scenario_id": str(meta.get("requested_scenario_id") or scenario_id),
+        "scenario_id": str(meta.get("requested_scenario_id") or requested_scenario_id),
+        "requested_scenario_id": str(meta.get("requested_scenario_id") or requested_scenario_id),
         "typeOfData": state.type_of_data,
         "entityKey": entity_key,
         "totalCount": total_count,
         "recordsPerUser": records_per_user,
         "draft_id": draft_id,
-        "scenario_label": meta.get("label", scenario_id),
-        "fields": state.field_order or (resolve_variables(scenario_id) or ([], []))[1],
+        "scenario_label": meta.get("label", requested_scenario_id),
+        "fields": state.field_order or (resolve_variables(requested_scenario_id) or ([], []))[1],
         "total_records": total_records,
         "validation_report": state.validation_report,
         "records": response_records,

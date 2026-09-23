@@ -89,18 +89,18 @@ def infer_history_field_sets(variables: list[dict[str, Any]], entity_key: str | 
     record_fields=tuple(n for n in names if n not in user_names)
     return user_fields, record_fields
 
-def compile_scenario(scenario_id: str, force: bool=False)->CompiledScenario:
+def compile_scenario(requested_scenario_id: str, force: bool=False)->CompiledScenario:
     with _LOCK:
-        if not force and scenario_id in _CACHE: return _CACHE[scenario_id]
-        resolved=resolve_variables(scenario_id)
-        if resolved is None: raise ValueError(f"Unknown scenario '{scenario_id}'")
+        if not force and requested_scenario_id in _CACHE: return _CACHE[requested_scenario_id]
+        resolved=resolve_variables(requested_scenario_id)
+        if resolved is None: raise ValueError(f"Unknown requested_scenario_id '{requested_scenario_id}'")
         variables,field_order=resolved
-        entity_key=resolve_entity_key(scenario_id)
+        entity_key=resolve_entity_key(requested_scenario_id)
         by_name={str(v['name']):v for v in variables}
         user_fields,record_fields=infer_history_field_sets(variables, entity_key)
-        compiled=CompiledScenario(scenario_id,entity_key,tuple(variables),tuple(field_order),by_name,user_fields,record_fields)
-        _CACHE[scenario_id]=compiled
+        compiled=CompiledScenario(requested_scenario_id,entity_key,tuple(variables),tuple(field_order),by_name,user_fields,record_fields)
+        _CACHE[requested_scenario_id]=compiled
         return compiled
 
-def invalidate_scenario(scenario_id:str)->None:
-    with _LOCK: _CACHE.pop(scenario_id,None)
+def invalidate_scenario(requested_scenario_id:str)->None:
+    with _LOCK: _CACHE.pop(requested_scenario_id,None)

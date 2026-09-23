@@ -21,21 +21,21 @@ def get_draft(draft_id: str) -> dict[str, Any] | None:
 def pop_draft(draft_id: str) -> dict[str, Any] | None:
     return ScenarioDraftModel.pop(draft_id)
 
-def confirm_scenario(scenario_id: str | None, meta: dict[str, Any], variables: list[dict[str, Any]], field_order: list[str], draft_id: str | None = None) -> tuple[str, bool]:
-    requested_id = str(scenario_id or "").strip() or None
+def confirm_scenario(requested_scenario_id: str | None, meta: dict[str, Any], variables: list[dict[str, Any]], field_order: list[str], draft_id: str | None = None) -> tuple[str, bool]:
+    requested_id = str(requested_scenario_id or "").strip() or None
     return ScenarioModel.create_with_allocation(requested_id, draft_id, meta, variables, field_order)
 
-def resolve_scenario_id_from_draft(draft_id: str) -> str | None:
+def resolve_requested_scenario_id_from_draft(draft_id: str) -> str | None:
     return ScenarioModel.by_draft_id(draft_id)
 
-def get_confirmed(scenario_id: str) -> dict[str, Any] | None:
-    return ScenarioModel.get(scenario_id)
+def get_confirmed(requested_scenario_id: str) -> dict[str, Any] | None:
+    return ScenarioModel.get(requested_scenario_id)
 
-def scenario_exists(scenario_id: str) -> bool:
-    return ScenarioModel.exists(scenario_id)
+def scenario_exists(requested_scenario_id: str) -> bool:
+    return ScenarioModel.exists(requested_scenario_id)
 
-def resolve_scenario_meta(scenario_id: str) -> dict[str, Any] | None:
-    dyn = get_confirmed(scenario_id)
+def resolve_scenario_meta(requested_scenario_id: str) -> dict[str, Any] | None:
+    dyn = get_confirmed(requested_scenario_id)
     return dyn["meta"] if dyn else None
 
 def _repair_legacy_categorical(var: dict[str, Any], norm_name: str) -> None:
@@ -191,9 +191,9 @@ def _repair_legacy_variables(variables: list[dict[str, Any]]) -> list[dict[str, 
         repaired.append(var)
     return repaired
 
-def resolve_variables(scenario_id: str) -> tuple[list[dict[str, Any]], list[str]] | None:
+def resolve_variables(requested_scenario_id: str) -> tuple[list[dict[str, Any]], list[str]] | None:
     """Return repaired variables and a field order consistent with the repaired contract."""
-    dyn = get_confirmed(scenario_id)
+    dyn = get_confirmed(requested_scenario_id)
     if not dyn:
         return None
     variables = _repair_legacy_variables(dyn["variables"])
@@ -203,13 +203,13 @@ def resolve_variables(scenario_id: str) -> tuple[list[dict[str, Any]], list[str]
 
 
 
-def resolve_scenario_context(scenario_id: str) -> dict[str, Any]:
+def resolve_scenario_context(requested_scenario_id: str) -> dict[str, Any]:
     """Return the complete confirmed scenario context used by generation agents."""
-    meta = resolve_scenario_meta(scenario_id) or {}
+    meta = resolve_scenario_meta(requested_scenario_id) or {}
     return {
-        "scenario_id": scenario_id,
-        "requested_scenario_id": meta.get("requested_scenario_id", scenario_id),
-        "label": meta.get("label", scenario_id),
+        "scenario_id": requested_scenario_id,
+        "requested_scenario_id": meta.get("requested_scenario_id", requested_scenario_id),
+        "label": meta.get("label", requested_scenario_id),
         "journey": meta.get("journey", ""),
         "description": meta.get("description", ""),
         "domain": meta.get("domain", ""),
@@ -227,19 +227,19 @@ def resolve_scenario_context(scenario_id: str) -> dict[str, Any]:
     }
 
 
-def resolve_data_type(scenario_id: str) -> str:
+def resolve_data_type(requested_scenario_id: str) -> str:
     """Return the persisted data type for a scenario.
 
     Old scenarios created before typeOfData was introduced are treated as
     aggregational so existing scenarios continue to work unchanged.
     """
-    meta = resolve_scenario_meta(scenario_id) or {}
+    meta = resolve_scenario_meta(requested_scenario_id) or {}
     value = str(meta.get("type_of_data", "aggregational")).strip().lower()
     return value if value in {"transactional", "aggregational"} else "aggregational"
 
 
-def resolve_entity_key(scenario_id: str) -> str | None:
-    meta = resolve_scenario_meta(scenario_id) or {}
+def resolve_entity_key(requested_scenario_id: str) -> str | None:
+    meta = resolve_scenario_meta(requested_scenario_id) or {}
     value = meta.get("entity_key")
     return str(value) if value else None
 

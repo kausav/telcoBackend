@@ -18,7 +18,7 @@ from core.dynamic_scenarios import (
     new_draft_id,
     save_draft,
     pop_draft,
-    resolve_scenario_id_from_draft,
+    resolve_requested_scenario_id_from_draft,
     resolve_scenario_meta,
     scenario_exists,
     resolve_data_type,
@@ -92,7 +92,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.7.0",
+    version="2.8.0",
     lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse},
@@ -130,8 +130,9 @@ app.add_middleware(
 
 
 class GenerateRequest(BaseModel):
-    scenario: str | None = Field(None, examples=["LB-01"])
-    draftId: str | None = Field(None, description="Confirmed draft id; disambiguates when scenario ids collide across users")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    requested_scenario_id: str | None = Field(None, alias="requestedScenarioId", examples=["LB-01"], description="Canonical requested scenario identifier")
+    draftId: str | None = Field(None, description="Confirmed draft id associated with the active confirmed scenario definition")
     count: int = Field(35, ge=1, le=5000, description="Number of users/entities to generate for a transactional scenario")
     recordsPerUser: int = Field(10, ge=1, le=10, description="Number of most-recent historical records returned per user for a transactional scenario")
 
@@ -178,14 +179,17 @@ class ConfirmRequest(BaseModel):
 
 
 class ScenarioVariableRecommendationRequest(BaseModel):
-    scenarioId: str = Field(min_length=1, max_length=200)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    requested_scenario_id: str = Field(alias="requestedScenarioId", min_length=1, max_length=200)
     scenarioVersion: int = Field(1, ge=1)
     variables: list[dict] = Field(default_factory=list)
     userId: str | None = Field(None, max_length=200)
 
+
 class UserScenarioVariablesRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
     userId: str = Field(min_length=1, max_length=200)
-    scenarioId: str = Field(min_length=1, max_length=200)
+    requested_scenario_id: str = Field(alias="requestedScenarioId", min_length=1, max_length=200)
     scenarioVersion: int = Field(1, ge=1)
     variables: list[dict] = Field(default_factory=list)
 
@@ -335,52 +339,52 @@ def _country_from_csv_params(variables: list[dict]) -> str | None:
 def recommend_scenario_variables(req: ScenarioVariableRecommendationRequest):
     """Persist a selected subset of a proposal as scenario-level DB recommendations."""
     try:
-        count = upsert_recommended(req.scenarioId.strip(), req.scenarioVersion, req.variables, req.userId)
+        count = upsert_recommended(req.requested_scenario_id.strip(), req.scenarioVersion, req.variables, req.userId)
     except ValueError as exc:
         raise HTTPException(400, detail={"error": str(exc)}) from exc
-    return {"success": True, "scenarioId": req.scenarioId, "scenarioVersion": req.scenarioVersion, "saved": count}
+    return {"success": True, "requestedScenarioId": req.requested_scenario_id, "scenarioId": req.requested_scenario_id, "scenarioVersion": req.scenarioVersion, "saved": count}
 
-@app.get("/scenario/{scenario_id}/variables/recommended")
-def recommended_scenario_variables(scenario_id: str, scenarioVersion: int = 1):
-    return {"success": True, "scenarioId": scenario_id, "scenarioVersion": scenarioVersion, "variables": get_recommended(scenario_id, scenarioVersion)}
+@app.get("/scenario/{requested_scenario_id}/variables/recommended")
+def recommended_scenario_variables(requested_scenario_id: str, scenarioVersion: int = 1):
+    return {"success": True, "requestedScenarioId": requested_scenario_id, "scenarioId": requested_scenario_id, "scenarioVersion": scenarioVersion, "variables": get_recommended(requested_scenario_id, scenarioVersion)}
 
 @app.post("/scenario/variables/user")
 def save_user_scenario_variables(req: UserScenarioVariablesRequest):
     try:
-        count = set_user_variables(req.userId.strip(), req.scenarioId.strip(), req.scenarioVersion, req.variables)
+        count = set_user_variables(req.userId.strip(), req.requested_scenario_id.strip(), req.scenarioVersion, req.variables)
     except ValueError as exc:
         raise HTTPException(400, detail={"error": str(exc)}) from exc
-    return {"success": True, "userId": req.userId, "scenarioId": req.scenarioId, "scenarioVersion": req.scenarioVersion, "saved": count}
+    return {"success": True, "userId": req.userId, "requestedScenarioId": req.requested_scenario_id, "scenarioId": req.requested_scenario_id, "scenarioVersion": req.scenarioVersion, "saved": count}
 
-@app.get("/scenario/{scenario_id}/variables/user/{user_id}")
-def get_saved_user_scenario_variables(scenario_id: str, user_id: str, scenarioVersion: int = 1):
-    return {"success": True, "userId": user_id, "scenarioId": scenario_id, "scenarioVersion": scenarioVersion, "variables": get_user_variables(user_id, scenario_id, scenarioVersion), "records": get_user_variable_records(user_id, scenario_id, scenarioVersion)}
+@app.get("/scenario/{requested_scenario_id}/variables/user/{user_id}")
+def get_saved_user_scenario_variables(requested_scenario_id: str, user_id: str, scenarioVersion: int = 1):
+    return {"success": True, "userId": user_id, "requestedScenarioId": requested_scenario_id, "scenarioId": requested_scenario_id, "scenarioVersion": scenarioVersion, "variables": get_user_variables(user_id, requested_scenario_id, scenarioVersion), "records": get_user_variable_records(user_id, requested_scenario_id, scenarioVersion)}
 
-@app.patch("/scenario/{scenario_id}/variables/user/{user_id}/{variable_key}")
-def edit_user_scenario_variable(scenario_id: str, user_id: str, variable_key: str, changes: dict, scenarioVersion: int = 1):
-    current = get_user_variable_records(user_id, scenario_id, scenarioVersion)
+@app.patch("/scenario/{requested_scenario_id}/variables/user/{user_id}/{variable_key}")
+def edit_user_scenario_variable(requested_scenario_id: str, user_id: str, variable_key: str, changes: dict, scenarioVersion: int = 1):
+    current = get_user_variable_records(user_id, requested_scenario_id, scenarioVersion)
     match = next((item for item in current if item.get("variable_key") == variable_key), None)
     if not match:
         raise HTTPException(404, detail={"error": "User scenario variable not found"})
     definition = dict(match.get("definition") or {})
     definition.update(changes or {})
     try:
-        set_user_variables(user_id, scenario_id, scenarioVersion, [definition], state="OVERRIDDEN")
+        set_user_variables(user_id, requested_scenario_id, scenarioVersion, [definition], state="OVERRIDDEN")
     except ValueError as exc:
         raise HTTPException(400, detail={"error": str(exc)}) from exc
-    return {"success": True, "userId": user_id, "scenarioId": scenario_id, "variableKey": variable_key, "updated": True}
+    return {"success": True, "userId": user_id, "requestedScenarioId": requested_scenario_id, "scenarioId": requested_scenario_id, "variableKey": variable_key, "updated": True}
 
-@app.delete("/scenario/{scenario_id}/variables/user/{user_id}/{variable_key}")
-def remove_user_scenario_variable(scenario_id: str, user_id: str, variable_key: str, scenarioVersion: int = 1):
-    deleted = delete_user_variable(user_id, scenario_id, scenarioVersion, variable_key)
+@app.delete("/scenario/{requested_scenario_id}/variables/user/{user_id}/{variable_key}")
+def remove_user_scenario_variable(requested_scenario_id: str, user_id: str, variable_key: str, scenarioVersion: int = 1):
+    deleted = delete_user_variable(user_id, requested_scenario_id, scenarioVersion, variable_key)
     if not deleted:
         raise HTTPException(404, detail={"error": "User scenario variable not found"})
-    return {"success": True, "userId": user_id, "scenarioId": scenario_id, "variableKey": variable_key, "deleted": True}
+    return {"success": True, "userId": user_id, "requestedScenarioId": requested_scenario_id, "scenarioId": requested_scenario_id, "variableKey": variable_key, "deleted": True}
 
 @app.post("/scenario/import-csv", response_model=ScenarioImportResponse)
 def import_scenario_csv(
     file: UploadFile = File(..., description="CSV scenario definition containing variables"),
-    scenarioId: str = Form(...),
+    requestedScenarioId: str = Form(...),
     domain: str = Form(...),
     typeOfData: Literal["transactional", "aggregational"] | None = Form(None),
     industryType: str = Form("generic"),
@@ -432,7 +436,7 @@ def import_scenario_csv(
 
     draft_id = new_draft_id()
     draft = {
-        "label": label or scenarioId,
+        "label": label or requestedScenarioId,
         "journey": domain,
         "description": businessScenario or f"Scenario imported from CSV for {domain}",
         "variables": variables,
@@ -442,8 +446,8 @@ def import_scenario_csv(
         "business_response": businessResponse,
         "expected_outcome": expectedOutcome,
         "use_case": useCase,
-        "scenario_id": scenarioId,
-        "requested_scenario_id": scenarioId,
+        "scenario_id": requestedScenarioId,
+        "requested_scenario_id": requestedScenarioId,
         "scenario_type": scenarioType,
         "industry_type": industryType,
         "country": effective_country,
@@ -458,8 +462,8 @@ def import_scenario_csv(
     return ScenarioImportResponse(
         success=True,
         draft_id=draft_id,
-        scenario_id=scenarioId,
-        requested_scenario_id=scenarioId,
+        scenario_id=requestedScenarioId,
+        requested_scenario_id=requestedScenarioId,
         journey=draft["journey"],
         description=draft["description"],
         variables=variables,
@@ -596,25 +600,25 @@ def generate_scenario(req: GenerateRequest):
     preserves the exact response contract while the generation engine itself is optimized
     to avoid repeated dependency planning, formula parsing, and duplicate validation passes.
     """
-    scenario_id = req.scenario
+    requested_scenario_id = req.requested_scenario_id
     if req.draftId:
-        resolved = resolve_scenario_id_from_draft(req.draftId)
+        resolved = resolve_requested_scenario_id_from_draft(req.draftId)
         if resolved is None:
             raise HTTPException(404, detail={"error": f"Unknown or unconfirmed draftId '{req.draftId}'"})
-        if req.scenario and req.scenario != resolved:
+        if requested_scenario_id and requested_scenario_id != resolved:
             raise HTTPException(400, detail={
-                "error": f"draftId '{req.draftId}' does not match scenario '{req.scenario}'",
+                "error": f"draftId '{req.draftId}' does not match requested scenario '{requested_scenario_id}'",
                 "draft_scenario_id": resolved,
             })
-        scenario_id = resolved
-    if not scenario_id:
-        raise HTTPException(400, detail={"error": "Either 'scenario' or 'draftId' is required"})
-    if not scenario_exists(scenario_id):
-        raise HTTPException(400, detail={"error": f"Unknown scenario '{scenario_id}'"})
+        requested_scenario_id = resolved
+    if not requested_scenario_id:
+        raise HTTPException(400, detail={"error": "Either 'requestedScenarioId' or 'draftId' is required"})
+    if not scenario_exists(requested_scenario_id):
+        raise HTTPException(400, detail={"error": f"Unknown requested scenario '{requested_scenario_id}'"})
 
     try:
         payload = build_generation_response({
-            "scenario": scenario_id,
+            "requested_scenario_id": requested_scenario_id,
             "draftId": req.draftId,
             "count": req.count,
             "recordsPerUser": req.recordsPerUser,

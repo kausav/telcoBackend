@@ -106,13 +106,16 @@ class ScenarioSchema(BaseModel):
 class ScenarioProposeRequest(BaseModel):
     """Business-facing JSON contract for agentic scenario proposal.
 
-    The client sends scenario/business metadata only. Technical schema details,
+    The client sends scenario/business metadata only. The canonical scenario identifier is
+    ``requestedScenarioId``; ``scenarioId`` / ``scenario_id`` are intentionally rejected. Technical schema details,
     telecom entities, relationships, generators and constraints are resolved by the backend.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
-    scenario_id: str = Field(alias="scenarioId", min_length=1, max_length=200)
+    # Canonical business/source identifier supplied by the client. There is intentionally
+    # no scenarioId/scenario_id input field on this request contract.
+    requested_scenario_id: str = Field(alias="requestedScenarioId", min_length=1, max_length=200)
     scenario_type: str = Field(alias="scenarioType", min_length=1, max_length=100)
     industry_type: str = Field(alias="industryType", min_length=1, max_length=100)
     domain: str = Field(min_length=1, max_length=200)
