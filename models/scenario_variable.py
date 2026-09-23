@@ -12,15 +12,19 @@ class ScenarioVariableModel:
     @classmethod
     def ensure_indexes(cls) -> None:
         cls.collection.create_index(
-            [("scenario_key", 1), ("scenario_version", 1), ("variable_key", 1)],
+            [("requested_scenario_id", 1), ("scenario_version", 1), ("variable_key", 1)],
             unique=True,
         )
+        cls.collection.create_index([("scenario_key", 1), ("scenario_version", 1), ("variable_key", 1)])
 
     @classmethod
-    def upsert_many(cls, scenario_key: str, scenario_version: int,
+    def upsert_many(cls, requested_scenario_id: str, scenario_version: int,
                     variables: list[dict[str, Any]], actor_user_id: str | None = None) -> int:
         from core.agentic_models import GeneratedSchemaField
         import time
+        requested = str(requested_scenario_id or "").strip()
+        if not requested:
+            raise ValueError("requested_scenario_id is required")
         now = time.time()
         count = 0
         actor = actor_user_id or "system"
@@ -30,8 +34,10 @@ class ScenarioVariableModel:
             if not key:
                 continue
             cls.collection.update_one(
-                {"scenario_key": scenario_key, "scenario_version": int(scenario_version), "variable_key": key},
+                {"requested_scenario_id": requested, "scenario_version": int(scenario_version), "variable_key": key},
                 {"$set": {
+                    "requested_scenario_id": requested,
+                    "scenario_key": requested,
                     "display_name": key,
                     "definition": normalized,
                     "source": "DB_RECOMMENDED",
@@ -45,11 +51,11 @@ class ScenarioVariableModel:
         return count
 
     @classmethod
-    def get_enabled(cls, scenario_key: str, scenario_version: int) -> list[dict[str, Any]]:
+    def get_enabled(cls, requested_scenario_id: str, scenario_version: int) -> list[dict[str, Any]]:
         return [
             row["definition"]
             for row in cls.collection.find(
-                {"scenario_key": scenario_key, "scenario_version": int(scenario_version), "enabled": True},
+                {"requested_scenario_id": requested_scenario_id, "scenario_version": int(scenario_version), "enabled": True},
                 {"definition": 1, "_id": 0},
             ).sort("variable_key", 1)
         ]

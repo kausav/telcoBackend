@@ -40,7 +40,7 @@ class VariableQualityEngine:
 
     # Technical/API metadata is useful for API fidelity, but generally has low analytical value.
     LOW_VALUE_SUFFIXES = {
-        "href", "referred_type", "schema_location", "base_type", "type",
+        "href", "referred_type", "schema_location", "base_type",
     }
     LOW_VALUE_TOKENS = {
         "href", "referred", "reference", "uri", "schema", "transport",

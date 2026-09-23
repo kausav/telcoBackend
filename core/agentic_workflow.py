@@ -157,8 +157,8 @@ class AgenticSchemaWorkflow:
             "and generation behavior. Return the widest relevant schema supported by the approved grounding; do not truncate it."
         )
 
-        cid = ensure_conversation(req.scenario_id, req.user_id)
-        append_message(cid, "user", agent_prompt)
+        cid = ensure_conversation(req.scenario_id, req.user_id, req.scenario_id)
+        append_message(cid, "user", agent_prompt, requested_scenario_id=req.scenario_id)
         cache_key = self._cache_key(req)
         cached = get_proposal(cache_key)
         if cached is not None:
@@ -201,14 +201,14 @@ class AgenticSchemaWorkflow:
 
         # Persisted scenario configuration is layered on top of the current LLM proposal.
         # The base LLM proposal remains cacheable and user-independent; only the merge is user-specific.
-        scenario_key = req.scenario_id.strip()
+        requested_scenario_id = req.scenario_id.strip()
         if is_json_grounded_domain(req.domain):
             # Standards-grounded domain proposals must remain reproducible from the approved
             # source artifacts; do not overlay unrelated persisted recommendations.
             schema, variable_sources = schema, {}
         else:
-            recommended = get_recommended(scenario_key, 1)
-            user_selected = get_user_variables(req.user_id.strip(), scenario_key, 1) if req.user_id and req.user_id.strip() else []
+            recommended = get_recommended(requested_scenario_id, 1)
+            user_selected = get_user_variables(req.user_id.strip(), requested_scenario_id, 1) if req.user_id and req.user_id.strip() else []
             schema, variable_sources = self._merge_persisted_variables(schema, recommended, user_selected)
 
         unresolved_questions = self.compiler.approval_questions(intent, schema)
@@ -242,6 +242,7 @@ class AgenticSchemaWorkflow:
             "expected_outcome": None,
             "use_case": req.use_case,
             "scenario_id": req.scenario_id,
+            "requested_scenario_id": req.scenario_id,
             "scenario_type": req.scenario_type or "agentic",
             "industry_type": industry_key,
             "country": intent.country or req.country,
@@ -260,11 +261,11 @@ class AgenticSchemaWorkflow:
         save_proposal(
             request_id=draft_id,
             user_id=req.user_id.strip() if req.user_id else None,
-            scenario_key=scenario_key,
+            requested_scenario_id=requested_scenario_id,
             scenario_version=1,
-            payload={"scenario_id": req.scenario_id, "variables": variables, "field_order": field_order, "intent": intent.model_dump()},
+            payload={"scenario_id": req.scenario_id, "requested_scenario_id": requested_scenario_id, "variables": variables, "field_order": field_order, "intent": intent.model_dump()},
         )
-        append_message(cid, "assistant", json.dumps({"intent": intent.model_dump(), "action": "schema_proposed"}, sort_keys=True))
+        append_message(cid, "assistant", json.dumps({"intent": intent.model_dump(), "action": "schema_proposed"}, sort_keys=True), requested_scenario_id=requested_scenario_id)
         return ScenarioImportResponse(
             success=True,
             draft_id=draft_id,

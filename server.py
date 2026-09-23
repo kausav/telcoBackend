@@ -36,8 +36,7 @@ from core.telecom_registry import RegistryError, get_registry
 from core.scenario_variable_store import upsert_recommended, get_recommended, set_user_variables, get_user_variables, get_user_variable_records, delete_user_variable
 from models.database import ping as ping_mongodb
 from models.model_registry import ensure_indexes as ensure_model_indexes
-from models.generation_job import GenerationJobModel
-from core.generation_jobs import submit_generation_job
+from core.generation_service import build_generation_response
 
 
 
@@ -85,7 +84,6 @@ async def lifespan(_app: FastAPI):
             "Standards registry ready: standards=%s entities=%s attributes=%s relationships=%s",
             health["standards"], health["entities"], health["attributes"], health["relationships"],
         )
-        GenerationJobModel.ensure_indexes()
     except Exception:
         logger.exception("Application startup validation failed")
         raise
@@ -94,7 +92,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.6.0",
+    version="2.7.0",
     lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse},
@@ -154,30 +152,6 @@ class GenerateResponse(BaseModel):
     recordsPerUser: int = Field(10, description="Number of recent records returned for each transactional user")
     errors: list[str]
     record_errors: list[dict] = Field(default_factory=list)
-
-
-class GenerateAcceptedResponse(BaseModel):
-    success: bool = True
-    status: Literal["queued", "running"] = "queued"
-    jobId: str
-    scenario_id: str
-    draft_id: str | None = None
-    totalCount: int
-    recordsPerUser: int
-
-
-class GenerateJobResponse(BaseModel):
-    success: bool = True
-    status: Literal["queued", "running", "completed", "failed"]
-    jobId: str
-    scenario_id: str | None = None
-    draft_id: str | None = None
-    created_at: datetime | None = None
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
-    failed_at: datetime | None = None
-    error: str | None = None
-    result: GenerateResponse | None = None
 
 
 class VariableEdit(BaseModel):
@@ -469,6 +443,7 @@ def import_scenario_csv(
         "expected_outcome": expectedOutcome,
         "use_case": useCase,
         "scenario_id": scenarioId,
+        "requested_scenario_id": scenarioId,
         "scenario_type": scenarioType,
         "industry_type": industryType,
         "country": effective_country,
@@ -529,7 +504,7 @@ def confirm_scenario_route(req: ConfirmRequest):
         preferred=("subscriber_id","customer_id","account_id","user_id","entity_id","customer_key","entity_key","id")
         names={str(v.get("name")) for v in variables if v.get("name")}
         entity_key=next((n for n in preferred if n in names),None) or (next(iter(names),None) if names else None)
-    requested_scenario_id=draft.get("scenario_id")
+    requested_scenario_id=str(draft.get("requested_scenario_id") or draft.get("scenario_id") or "").strip() or None
     scenario_id=requested_scenario_id
     meta={
         "label":draft.get("label",scenario_id),"journey":draft.get("journey",draft.get("domain","")),"description":draft.get("description",""),
@@ -539,13 +514,16 @@ def confirm_scenario_route(req: ConfirmRequest):
         "type_of_data":type_of_data,"entity_key":entity_key,"records_per_user":10,
         "agentic": bool(draft.get("agentic", False)),
     }
-    scenario_id, scenario_id_reassigned = confirm_scenario(
-        scenario_id, meta, variables, field_order, draft_id=req.draft_id
-    )
+    try:
+        scenario_id, scenario_id_reassigned = confirm_scenario(
+            requested_scenario_id, meta, variables, field_order, draft_id=req.draft_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
     invalidate_scenario(scenario_id)
     clear_scenario(scenario_id)
     if not _is_placeholder(req.feedback):
-        add_feedback(draft.get("domain", ""), draft.get("business_scenario", ""), req.feedback)
+        add_feedback(requested_scenario_id, draft.get("domain", ""), draft.get("business_scenario", ""), req.feedback)
     pop_draft(req.draft_id)
     return ConfirmResponse(
         success=True,
@@ -610,9 +588,14 @@ def _timestamp_sort_key(value):
     return dt.astimezone(timezone.utc)
 
 
-@app.post("/scenario/generate", response_model=GenerateAcceptedResponse, status_code=202)
+@app.post("/scenario/generate", response_model=GenerateResponse)
 def generate_scenario(req: GenerateRequest):
-    """Queue scenario generation and return immediately; full deterministic QA runs in a worker."""
+    """Generate and return the complete validated dataset synchronously.
+
+    The request remains open until deterministic generation and final QA are complete. This
+    preserves the exact response contract while the generation engine itself is optimized
+    to avoid repeated dependency planning, formula parsing, and duplicate validation passes.
+    """
     scenario_id = req.scenario
     if req.draftId:
         resolved = resolve_scenario_id_from_draft(req.draftId)
@@ -629,48 +612,15 @@ def generate_scenario(req: GenerateRequest):
     if not scenario_exists(scenario_id):
         raise HTTPException(400, detail={"error": f"Unknown scenario '{scenario_id}'"})
 
-    payload = {
-        "scenario": scenario_id,
-        "draftId": req.draftId,
-        "count": req.count,
-        "recordsPerUser": req.recordsPerUser,
-    }
-    job = submit_generation_job(payload)
-    return GenerateAcceptedResponse(
-        success=True,
-        status="queued",
-        jobId=job["job_id"],
-        scenario_id=scenario_id,
-        draft_id=req.draftId,
-        totalCount=req.count,
-        recordsPerUser=req.recordsPerUser,
-    )
+    try:
+        payload = build_generation_response({
+            "scenario": scenario_id,
+            "draftId": req.draftId,
+            "count": req.count,
+            "recordsPerUser": req.recordsPerUser,
+        })
+        return GenerateResponse.model_validate(payload)
+    except ValueError as exc:
+        raise HTTPException(400, detail={"error": str(exc)}) from exc
 
-
-@app.get("/scenario/generate/{job_id}", response_model=GenerateJobResponse)
-def get_generation_job(job_id: str):
-    """Return generation-job status and the fully validated result when complete."""
-    job = GenerationJobModel.get(job_id)
-    if job is None:
-        raise HTTPException(404, detail={"error": f"Unknown generation job '{job_id}'"})
-
-    result = None
-    if job.get("status") == "completed":
-        payload = GenerationJobModel.result(job_id)
-        if payload is not None:
-            result = GenerateResponse.model_validate(payload)
-
-    return GenerateJobResponse(
-        success=job.get("status") != "failed",
-        status=job.get("status", "failed"),
-        jobId=job_id,
-        scenario_id=job.get("scenario_id"),
-        draft_id=job.get("draft_id"),
-        created_at=job.get("created_at"),
-        started_at=job.get("started_at"),
-        completed_at=job.get("completed_at"),
-        failed_at=job.get("failed_at"),
-        error=job.get("error"),
-        result=result,
-    )
 

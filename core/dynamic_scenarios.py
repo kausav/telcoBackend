@@ -208,6 +208,7 @@ def resolve_scenario_context(scenario_id: str) -> dict[str, Any]:
     meta = resolve_scenario_meta(scenario_id) or {}
     return {
         "scenario_id": scenario_id,
+        "requested_scenario_id": meta.get("requested_scenario_id", scenario_id),
         "label": meta.get("label", scenario_id),
         "journey": meta.get("journey", ""),
         "description": meta.get("description", ""),
@@ -250,9 +251,11 @@ def list_scenarios() -> list[dict[str, Any]]:
 def _feedback_key(domain: str, business_scenario: str) -> str:
     return f"{domain.strip().lower()}::{business_scenario.strip().lower()}"
 
-def add_feedback(domain: str, business_scenario: str, feedback: str) -> None:
+def add_feedback(requested_scenario_id: str, domain: str, business_scenario: str, feedback: str) -> None:
     if not feedback:
         return
-    key = _feedback_key(domain, business_scenario)
-    ScenarioFeedbackModel.add(domain, business_scenario, feedback)
+    requested = str(requested_scenario_id or "").strip()
+    if not requested:
+        raise ValueError("requested_scenario_id is required")
+    ScenarioFeedbackModel.add(requested, domain, business_scenario, feedback)
 

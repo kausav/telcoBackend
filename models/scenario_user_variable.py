@@ -13,15 +13,18 @@ class ScenarioUserVariableModel:
     @classmethod
     def ensure_indexes(cls) -> None:
         cls.collection.create_index(
-            [("user_id", 1), ("scenario_key", 1), ("scenario_version", 1), ("variable_key", 1)],
+            [("user_id", 1), ("requested_scenario_id", 1), ("scenario_version", 1), ("variable_key", 1)],
             unique=True,
         )
-        cls.collection.create_index([("user_id", 1), ("scenario_key", 1), ("selection_state", 1)])
+        cls.collection.create_index([("user_id", 1), ("requested_scenario_id", 1), ("selection_state", 1)])
 
     @classmethod
-    def upsert_many(cls, user_id: str, scenario_key: str, scenario_version: int,
+    def upsert_many(cls, user_id: str, requested_scenario_id: str, scenario_version: int,
                     variables: list[dict[str, Any]], state: str = "SELECTED") -> int:
         from core.agentic_models import GeneratedSchemaField
+        requested = str(requested_scenario_id or "").strip()
+        if not requested:
+            raise ValueError("requested_scenario_id is required")
         if not user_id.strip():
             raise ValueError("user_id is required")
         if state not in {"SELECTED", "DESELECTED", "OVERRIDDEN"}:
@@ -34,8 +37,10 @@ class ScenarioUserVariableModel:
             if not key:
                 continue
             cls.collection.update_one(
-                {"user_id": user_id, "scenario_key": scenario_key, "scenario_version": int(scenario_version), "variable_key": key},
+                {"user_id": user_id, "requested_scenario_id": requested, "scenario_version": int(scenario_version), "variable_key": key},
                 {"$set": {
+                    "requested_scenario_id": requested,
+                    "scenario_key": requested,
                     "definition": normalized,
                     "selection_state": state,
                     "selection_source": "USER",
@@ -50,29 +55,29 @@ class ScenarioUserVariableModel:
         return count
 
     @classmethod
-    def get_active(cls, user_id: str, scenario_key: str, scenario_version: int) -> list[dict[str, Any]]:
+    def get_active(cls, user_id: str, requested_scenario_id: str, scenario_version: int) -> list[dict[str, Any]]:
         return [
             row["definition"]
             for row in cls.collection.find(
-                {"user_id": user_id, "scenario_key": scenario_key, "scenario_version": int(scenario_version),
+                {"user_id": user_id, "requested_scenario_id": requested_scenario_id, "scenario_version": int(scenario_version),
                  "selection_state": {"$in": ["SELECTED", "OVERRIDDEN"]}, "is_active": True},
                 {"definition": 1, "_id": 0},
             ).sort("variable_key", 1)
         ]
 
     @classmethod
-    def delete(cls, user_id: str, scenario_key: str, scenario_version: int, variable_key: str) -> bool:
+    def delete(cls, user_id: str, requested_scenario_id: str, scenario_version: int, variable_key: str) -> bool:
         now = time.time()
         result = cls.collection.update_one(
-            {"user_id": user_id, "scenario_key": scenario_key, "scenario_version": int(scenario_version), "variable_key": variable_key},
+            {"user_id": user_id, "requested_scenario_id": requested_scenario_id, "scenario_version": int(scenario_version), "variable_key": variable_key},
             {"$set": {"selection_state": "DELETED", "is_active": False, "deleted_at": now, "updated_at": now, "updated_by": user_id}},
         )
         return result.matched_count > 0
 
     @classmethod
-    def get_records(cls, user_id: str, scenario_key: str, scenario_version: int) -> list[dict[str, Any]]:
+    def get_records(cls, user_id: str, requested_scenario_id: str, scenario_version: int) -> list[dict[str, Any]]:
         return [{key: value for key, value in row.items() if key != "_id"} for row in cls.collection.find(
-            {"user_id": user_id, "scenario_key": scenario_key, "scenario_version": int(scenario_version)}
+            {"user_id": user_id, "requested_scenario_id": requested_scenario_id, "scenario_version": int(scenario_version)}
         ).sort("variable_key", 1)]
 
 

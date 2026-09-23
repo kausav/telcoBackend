@@ -1,22 +1,15 @@
-"""Durable scenario-generation job queue and worker implementation.
+"""Synchronous scenario-generation service.
 
-The API process only enqueues work. A separate worker process claims jobs from MongoDB and
-executes the complete deterministic generation + validation pipeline. MongoDB provides the
-coordination boundary, so multiple API/worker processes can run safely without an in-memory
-thread pool.
+The API waits for this service to finish and returns the exact generated/validated response.
+Latency optimizations belong here and in the deterministic generation engine rather than
+changing the response into a queued job.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import logging
-import threading
-import time
-import uuid
 from typing import Any
 
-from agents.data_generation_agent import run_deterministic_agentic_generation
-from core.pipeline import run_pipeline
-from core.compiled_schema import infer_history_field_sets
+from core.compiled_schema import compile_scenario
 from core.dynamic_scenarios import (
     resolve_data_type,
     resolve_scenario_context,
@@ -25,14 +18,8 @@ from core.dynamic_scenarios import (
     resolve_variables,
     scenario_exists,
 )
-from config.runtime import (
-    GENERATION_JOB_LEASE_SECONDS,
-    GENERATION_WORKER_POLL_SECONDS,
-    GENERATION_MAX_ATTEMPTS,
-)
-from models.generation_job import GenerationJobModel
-
-logger = logging.getLogger(__name__)
+from agents.data_generation_agent import run_deterministic_agentic_generation
+from core.pipeline import run_pipeline
 
 
 def _timestamp_sort_key(value: Any):
@@ -65,7 +52,7 @@ def _timestamp_sort_key(value: Any):
     return dt.astimezone(timezone.utc)
 
 
-def _build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
+def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
     """Run the full generation + QA pipeline and build the API response payload."""
     scenario_id = req_payload.get("scenario")
     draft_id = req_payload.get("draftId")
@@ -128,9 +115,8 @@ def _build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
                 continue
             grouped.setdefault(str(value), []).append(row)
         entity_records: list[dict[str, Any]] = []
-        resolved = resolve_variables(scenario_id) or ([], [])
-        resolved_vars = resolved[0]
-        user_fields, _record_fields = infer_history_field_sets(resolved_vars, entity_key)
+        compiled = compile_scenario(scenario_id)
+        user_fields = compiled.user_fields
         user_field_names = set(user_fields)
         user_field_names.add(entity_key)
         for entity_value, rows in grouped.items():
@@ -163,8 +149,8 @@ def _build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "success": True,
-        "scenario_id": scenario_id,
-        "requested_scenario_id": meta.get("requested_scenario_id", meta.get("label", scenario_id)),
+        "scenario_id": str(meta.get("requested_scenario_id") or scenario_id),
+        "requested_scenario_id": str(meta.get("requested_scenario_id") or scenario_id),
         "typeOfData": state.type_of_data,
         "entityKey": entity_key,
         "totalCount": total_count,
@@ -179,71 +165,3 @@ def _build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
         "record_errors": state.record_errors,
     }
 
-
-def _heartbeat(job_id: str, stop_event: threading.Event) -> None:
-    interval = max(5, min(60, GENERATION_JOB_LEASE_SECONDS // 3))
-    while not stop_event.wait(interval):
-        try:
-            if not GenerationJobModel.heartbeat(job_id, GENERATION_JOB_LEASE_SECONDS):
-                logger.warning("Generation job %s heartbeat lost", job_id)
-                return
-        except Exception:
-            logger.exception("Failed to heartbeat generation job %s", job_id)
-
-
-def process_job(job: dict[str, Any]) -> None:
-    job_id = str(job["job_id"])
-    stop_event = threading.Event()
-    heartbeat_thread = threading.Thread(
-        target=_heartbeat,
-        args=(job_id, stop_event),
-        name=f"telco-gen-heartbeat-{job_id[-8:]}",
-        daemon=True,
-    )
-    heartbeat_thread.start()
-    try:
-        result = _build_generation_response(job["request"])
-        GenerationJobModel.mark_completed(job_id, result)
-        logger.info("Generation job %s completed: %s records", job_id, result.get("total_records", 0))
-    except Exception as exc:
-        retrying = GenerationJobModel.mark_failed_or_retry(
-            job_id,
-            str(exc),
-            max_attempts=GENERATION_MAX_ATTEMPTS,
-        )
-        if retrying:
-            logger.warning("Generation job %s failed; returned to queue for retry", job_id, exc_info=True)
-        else:
-            logger.exception("Generation job %s permanently failed", job_id)
-    finally:
-        stop_event.set()
-        heartbeat_thread.join(timeout=2)
-
-
-def submit_generation_job(payload: dict[str, Any]) -> dict[str, Any]:
-    """Persist a queued generation job. A separate worker process executes it."""
-    return GenerationJobModel.create(payload)
-
-
-def run_worker(worker_id: str | None = None, stop_event: threading.Event | None = None) -> None:
-    """Run the durable worker loop until interrupted or ``stop_event`` is set."""
-    worker_id = worker_id or f"worker-{uuid.uuid4().hex[:12]}"
-    stop_event = stop_event or threading.Event()
-    logger.info("Generation worker %s started", worker_id)
-    while not stop_event.is_set():
-        try:
-            GenerationJobModel.cleanup_expired_jobs()
-            job = GenerationJobModel.claim_next(
-                worker_id=worker_id,
-                lease_seconds=GENERATION_JOB_LEASE_SECONDS,
-            )
-            if job:
-                process_job(job)
-                continue
-            stop_event.wait(max(0.5, GENERATION_WORKER_POLL_SECONDS))
-        except KeyboardInterrupt:
-            logger.info("Generation worker %s stopped", worker_id)
-            return
-        except Exception:
-            logger.exception("Generation worker %s loop error", worker_id)
-            stop_event.wait(max(1.0, GENERATION_WORKER_POLL_SECONDS))

@@ -32,9 +32,15 @@ class ScenarioDraftModel:
     @classmethod
     def save(cls, draft_id: str, data: dict[str, Any]) -> None:
         cls.purge_expired()
+        stored = dict(data)
+        requested = str(stored.get("requested_scenario_id") or stored.get("scenario_id") or "").strip()
+        if not requested:
+            raise ValueError("requested_scenario_id is required")
+        stored["requested_scenario_id"] = requested
+        stored["scenario_id"] = requested
         cls.collection.replace_one(
             {"draft_id": draft_id},
-            {"draft_id": draft_id, "data": data, "created_at": datetime.now(timezone.utc)},
+            {"draft_id": draft_id, "requested_scenario_id": requested or None, "data": stored, "created_at": datetime.now(timezone.utc)},
             upsert=True,
         )
 

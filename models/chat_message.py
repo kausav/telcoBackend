@@ -12,10 +12,20 @@ class ChatMessageModel:
     @classmethod
     def ensure_indexes(cls) -> None:
         cls.collection.create_index([("conversation_id", 1), ("created_at", 1)])
+        cls.collection.create_index([("requested_scenario_id", 1), ("created_at", 1)])
 
     @classmethod
-    def add(cls, conversation_id: str, role: str, content: str) -> None:
-        cls.collection.insert_one({"conversation_id": conversation_id, "role": role, "content": content, "created_at": time.time()})
+    def add(cls, conversation_id: str, role: str, content: str, requested_scenario_id: str | None = None) -> None:
+        requested = str(requested_scenario_id or "").strip()
+        if not requested:
+            raise ValueError("requested_scenario_id is required")
+        cls.collection.insert_one({
+            "conversation_id": conversation_id,
+            "requested_scenario_id": requested,
+            "role": role,
+            "content": content,
+            "created_at": time.time(),
+        })
 
 
 ChatMessageModel.ensure_indexes()

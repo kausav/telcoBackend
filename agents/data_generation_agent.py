@@ -10,6 +10,8 @@ import logging
 import math
 import os
 import ast
+from dataclasses import dataclass
+from functools import lru_cache
 import re
 import random
 import uuid
@@ -574,11 +576,40 @@ def _recent_datetime(params: dict, _rec: dict) -> str:
     return _format_datetime(base, params)
 
 
+def _temporal_output_params(params: dict | None, generator: str) -> dict:
+    """Keep enough serialized timestamp precision to preserve declared temporal offsets."""
+    result = dict(params or {})
+    fmt = _normalize_timestamp_format(result)
+    if "%S" in fmt:
+        return result
+    gen = str(generator or "").strip().lower()
+    if gen == "ts_offset":
+        try:
+            min_sec = int(result.get("min_sec", result.get("min_seconds", 0)) or 0)
+            max_sec = int(result.get("max_sec", result.get("max_seconds", min_sec)) or min_sec)
+        except (TypeError, ValueError):
+            min_sec, max_sec = 0, 1
+        min_sec, max_sec = min(min_sec, max_sec), max(min_sec, max_sec)
+        # A variable/fractional-minute offset cannot be represented by minute-only output.
+        if min_sec != max_sec or min_sec % 60 != 0:
+            result["timestamp_format"] = "dd/mm/yyyy hh:mm:ss a"
+    elif gen == "ts_add_field":
+        # The runtime add_seconds field is data-dependent, so its precision is unknown here.
+        result["timestamp_format"] = "dd/mm/yyyy hh:mm:ss a"
+    return result
+
+
 def _ts_offset(params: dict, rec: dict) -> str:
-    base_str = rec.get(params["base_field"], datetime.now(timezone.utc).isoformat())
+    base_field = str(params.get("base_field") or params.get("source_field") or "").strip()
+    if not base_field:
+        raise ValueError("ts_offset requires 'base_field' (or legacy alias 'source_field')")
+    base_str = rec.get(base_field, datetime.now(timezone.utc).isoformat())
     base = _parse_dt(base_str)
-    offset = timedelta(seconds=random.randint(params["min_sec"], params["max_sec"]))
-    return _format_datetime(base + offset, params)
+    min_sec = int(params.get("min_sec", params.get("min_seconds", 0)))
+    max_sec = int(params.get("max_sec", params.get("max_seconds", min_sec)))
+    min_sec, max_sec = min(min_sec, max_sec), max(min_sec, max_sec)
+    offset = timedelta(seconds=random.randint(min_sec, max_sec))
+    return _format_datetime(base + offset, _temporal_output_params(params, "ts_offset"))
 
 
 def _ts_add_field(params: dict, rec: dict) -> str:
@@ -637,12 +668,32 @@ def _tx_id(params: dict, rec: dict) -> str:
     return f"{params['prefix']}{date_part}-{rand_part}"
 
 
+def _coerce_formula_result(value: Any, field_def: dict[str, Any] | None = None) -> Any:
+    """Normalize formula results to the field contract.
+
+    Datetime subtraction naturally yields timedelta; numeric duration fields must receive
+    seconds so downstream validation and CSV serialization stay type-correct.
+    """
+    if not isinstance(value, timedelta):
+        return value
+    field_def = field_def or {}
+    dtype = str(field_def.get("dtype") or "").strip().lower()
+    if dtype in _NUMERIC_DTYPES:
+        params = field_def.get("params") if isinstance(field_def.get("params"), dict) else {}
+        try:
+            precision = int(params.get("precision", 2) or 2)
+        except (TypeError, ValueError):
+            precision = 2
+        return round(value.total_seconds(), precision)
+    return value
+
+
 def _formula(var: dict, rec: dict):
     """Evaluate a constrained formula language against the current record."""
     expr = str(var.get("formula", "") or "").strip()
     if not expr:
         return None
-    return _safe_formula(expr, rec)
+    return _coerce_formula_result(_safe_formula(expr, rec), var)
 
 
 DEFAULT_TIMESTAMP_FORMAT = "%d/%m/%Y %I:%M %p"
@@ -706,6 +757,19 @@ def _format_datetime(dt: datetime, params: dict | None = None) -> str:
     except (TypeError, ValueError):
         return dt.strftime(DEFAULT_TIMESTAMP_FORMAT)
 
+
+def _format_datetime_for_variable(dt: datetime, var: dict) -> str:
+    """Format a datetime without discarding precision needed by declared temporal offsets.
+
+    Standalone timestamps keep the configured client format (default: minute precision).
+    Relational generators such as ``ts_offset``/``ts_add_field`` may encode sub-minute
+    differences; in that case seconds are retained so formulas and temporal validators
+    continue to match the serialized values exactly.
+    """
+    params = _temporal_output_params(var.get("params") or {}, str(var.get("gen") or ""))
+    return _format_datetime(dt, params)
+
+
 def _format_datetime_fields(rec: dict, variables: list[dict]) -> dict:
     """Serialize all datetime fields according to their confirmed contract format.
 
@@ -722,7 +786,7 @@ def _format_datetime_fields(rec: dict, variables: list[dict]) -> dict:
             continue
         dt = _qa_parse_dt(out.get(name))
         if dt is not None:
-            out[name] = _format_datetime(dt, var.get("params") or {})
+            out[name] = _format_datetime_for_variable(dt, var)
     return out
 
 def _parse_dt(s: str) -> datetime:
@@ -1027,14 +1091,27 @@ def _formula_from_rules(field_name: str, rules: dict | None):
     return None
 
 
+@lru_cache(maxsize=4096)
 def _formula_dependencies(expression: str) -> set[str]:
-    """Extract field names referenced by a simple formula expression."""
+    """Extract field names referenced by a simple formula expression.
+
+    Formula text is immutable for a confirmed scenario, so parsing/AST walking is cached
+    across records instead of repeated for every row and every repair pass.
+    """
     try:
         tree = ast.parse(expression, mode="eval")
         return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
-                and node.id not in {"round", "min", "max", "abs", "sum", "True", "False", "None"}}
+                and node.id not in {"round", "min", "max", "abs", "sum", "True", "False", "None", "DATE"}}
     except Exception:
         return set()
+
+
+@dataclass(frozen=True)
+class _GenerationPlan:
+    ordered: tuple[dict, ...]
+    cyclic: frozenset[str]
+    known_fields: frozenset[str]
+    formula_by_name: dict[str, str]
 
 
 def _variable_dependency_order(
@@ -1042,21 +1119,17 @@ def _variable_dependency_order(
     selected_names: set[str] | None = None,
     rules: dict | None = None,
 ) -> tuple[list[dict], set[str]]:
-    """Return variables in dependency order and identify dependency cycles.
-
-    Scenario dependencies may point forward.  A topological pass makes those definitions
-    executable regardless of row order.  Cycles cannot be solved deterministically;
-    callers can generate a seed value for cyclic formula fields and let downstream
-    formulas derive from it.
-    """
+    """Return variables in stable dependency order with O(n) position lookups."""
     by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    position = {name: idx for idx, name in enumerate(by_name)}
     selected = set(selected_names or by_name) & set(by_name)
     changed = True
     while changed:
         changed = False
         for name in tuple(selected):
-            dep_names = list(by_name[name].get("depends_on", []) or [])
-            expr = by_name[name].get("formula") or _formula_from_rules(name, rules)
+            var = by_name[name]
+            dep_names = list(var.get("depends_on", []) or [])
+            expr = var.get("formula") or _formula_from_rules(name, rules)
             if expr:
                 for dep in _formula_dependencies(str(expr)):
                     if dep not in dep_names:
@@ -1069,8 +1142,9 @@ def _variable_dependency_order(
     indegree = {name: 0 for name in selected}
     outgoing = {name: [] for name in selected}
     for name in selected:
-        dep_names = list(by_name[name].get("depends_on", []) or [])
-        expr = by_name[name].get("formula") or _formula_from_rules(name, rules)
+        var = by_name[name]
+        dep_names = list(var.get("depends_on", []) or [])
+        expr = var.get("formula") or _formula_from_rules(name, rules)
         if expr:
             for dep in _formula_dependencies(str(expr)):
                 if dep not in dep_names:
@@ -1079,8 +1153,8 @@ def _variable_dependency_order(
             if dep in selected:
                 indegree[name] += 1
                 outgoing[dep].append(name)
-    queue = [name for name in selected if indegree[name] == 0]
-    queue.sort(key=lambda n: list(by_name).index(n))
+
+    queue = sorted((name for name in selected if indegree[name] == 0), key=position.__getitem__)
     ordered_names: list[str] = []
     while queue:
         name = queue.pop(0)
@@ -1089,30 +1163,49 @@ def _variable_dependency_order(
             indegree[child] -= 1
             if indegree[child] == 0:
                 queue.append(child)
-        queue.sort(key=lambda n: list(by_name).index(n))
+        if len(queue) > 1:
+            queue.sort(key=position.__getitem__)
+
     cyclic = selected - set(ordered_names)
     ordered = [by_name[name] for name in ordered_names]
-    # Keep cyclic variables at the end so their generators can provide a seed.
     ordered.extend(by_name[name] for name in by_name if name in cyclic)
     return ordered, cyclic
 
 
-def _generate_record(variables: list[dict], rules: dict | None = None) -> dict:
+def _build_generation_plan(
+    variables: list[dict],
+    selected_names: set[str] | None = None,
+    rules: dict | None = None,
+) -> _GenerationPlan:
+    ordered, cyclic = _variable_dependency_order(variables, selected_names, rules)
+    formula_by_name: dict[str, str] = {}
+    for var in variables:
+        name = str(var.get("name") or "")
+        expr = var.get("formula") or _formula_from_rules(name, rules)
+        if name and expr:
+            formula_by_name[name] = str(expr)
+    return _GenerationPlan(
+        ordered=tuple(ordered),
+        cyclic=frozenset(cyclic),
+        known_fields=frozenset(str(v.get("name")) for v in variables if v.get("name")),
+        formula_by_name=formula_by_name,
+    )
+
+def _generate_record(variables: list[dict], rules: dict | None = None, plan: _GenerationPlan | None = None, apply_repairs: bool = True) -> dict:
     """Generate one record in dependency order, while safely handling cycles."""
     rec: dict = {}
-    ordered, cyclic = _variable_dependency_order(variables, rules=rules)
-    known_fields = {str(v.get("name")) for v in variables if v.get("name")}
+    plan = plan or _build_generation_plan(variables, rules=rules)
+    ordered, cyclic, known_fields = plan.ordered, plan.cyclic, plan.known_fields
     for var in ordered:
         gen_type = var["gen"]
         effective_var = var
         # A formula is authoritative when it can be evaluated.  For a dependency
         # cycle, seed the cyclic field from its declared generator so the remaining
         # fields can still be generated and QA can evaluate any resolvable formulas.
-        rule_formula = None if var["name"] in cyclic else (var.get("formula") or _formula_from_rules(var["name"], rules))
+        rule_formula = None if var["name"] in cyclic else plan.formula_by_name.get(var["name"])
         if rule_formula:
             deps = _formula_dependencies(str(rule_formula))
-            available = known_fields | set(rec.keys())
-            if deps and any(dep not in available for dep in deps):
+            if deps and any(dep not in known_fields and dep not in rec for dep in deps):
                 # Keep the declared generator when formula text references symbolic
                 # tokens that are not schema fields (common in human-readable scenario definitions).
                 rule_formula = None
@@ -1122,24 +1215,28 @@ def _generate_record(variables: list[dict], rules: dict | None = None) -> dict:
             effective_var["formula"] = str(rule_formula)
         generator = _GENERATORS.get(effective_var.get("gen"))
         if generator:
-            helper_rec = dict(rec)
-            helper_rec["__current_field__"] = var["name"]
-            value = generator(effective_var, helper_rec)
+            rec["__current_field__"] = var["name"]
+            try:
+                value = generator(effective_var, rec)
+            finally:
+                rec.pop("__current_field__", None)
         else:
             value = None
         rec[var["name"]] = _apply_generation_constraint(var, value, rec, rules)
-    rec = _apply_conditional_rules(rec, rules)
-    rec = _apply_scenario_semantics(rec, rules)
-    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-    rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
-    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-    rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
-    rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
-    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-    rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
-    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-    rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
-    return _format_datetime_fields(rec, variables)
+    if apply_repairs:
+        rec = _apply_conditional_rules(rec, rules)
+        rec = _apply_scenario_semantics(rec, rules)
+        rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+        rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+        rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
+        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+        rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+        rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
+        rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+        rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
+        return _format_datetime_fields(rec, variables)
+    return rec
 
 
 def _generate_selected_record(
@@ -1147,21 +1244,22 @@ def _generate_selected_record(
     selected_names: set[str],
     base: dict | None = None,
     rules: dict | None = None,
+    plan: _GenerationPlan | None = None,
+    apply_repairs: bool = True,
 ) -> dict:
-    """Generate selected variables plus dependencies in dependency order."""
+    """Generate selected variables plus dependencies using a precomputed dependency plan."""
     rec = dict(base or {})
-    ordered, cyclic = _variable_dependency_order(variables, selected_names, rules=rules)
-    known_fields = {str(v.get("name")) for v in variables if v.get("name")}
+    plan = plan or _build_generation_plan(variables, selected_names, rules)
+    ordered, cyclic, known_fields = plan.ordered, plan.cyclic, plan.known_fields
     for var in ordered:
         name = var["name"]
         if name in rec:
             continue
         effective_var = var
-        rule_formula = None if name in cyclic else (var.get("formula") or _formula_from_rules(name, rules))
+        rule_formula = None if name in cyclic else plan.formula_by_name.get(name)
         if rule_formula:
             deps = _formula_dependencies(str(rule_formula))
-            available = known_fields | set(rec.keys())
-            if deps and any(dep not in available for dep in deps):
+            if deps and any(dep not in known_fields and dep not in rec for dep in deps):
                 rule_formula = None
         if rule_formula:
             effective_var = dict(var)
@@ -1169,9 +1267,11 @@ def _generate_selected_record(
             effective_var["formula"] = str(rule_formula)
         generator = _GENERATORS.get(effective_var.get("gen"))
         if generator:
-            helper_rec = dict(rec)
-            helper_rec["__current_field__"] = name
-            value = generator(effective_var, helper_rec)
+            rec["__current_field__"] = name
+            try:
+                value = generator(effective_var, rec)
+            finally:
+                rec.pop("__current_field__", None)
         else:
             value = None
 
@@ -1185,18 +1285,20 @@ def _generate_selected_record(
         except (TypeError, ValueError, OverflowError):
             pass
         rec[name] = _apply_generation_constraint(var, value, rec, rules)
-    rec = _apply_conditional_rules(rec, rules)
-    rec = _apply_scenario_semantics(rec, rules)
-    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-    rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
-    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-    rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
-    rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
-    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-    rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
-    rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-    rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
-    return _format_datetime_fields(rec, variables)
+    if apply_repairs:
+        rec = _apply_conditional_rules(rec, rules)
+        rec = _apply_scenario_semantics(rec, rules)
+        rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+        rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+        rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
+        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+        rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+        rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
+        rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
+        rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
+        return _format_datetime_fields(rec, variables)
+    return rec
 
 
 # -- Transactional/user-history generation helpers -----------------------------
@@ -1288,7 +1390,7 @@ def _enforce_mandatory_telecom_identity(
 
 def _transactional_records(compiled, user_count: int, records_per_user: int = 10,
                             rules: dict | None = None, record_errors_out: list[dict] | None = None,
-                            country: str | None = None) -> list[dict]:
+                            country: str | None = None, fixes_out: list[int] | None = None) -> list[dict]:
     """Generate a fixed-length recent history for each user/entity.
 
     Stable user-context variables are generated once and copied into each row.
@@ -1303,10 +1405,14 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
     used_entity_keys=set()
     used_identity_values={name:set() for name in ("subscriber_id", "account_id", "msisdn")}
     used_resource_ids={name:set() for name in ("bucket_id", "topupbalance_id", "topup_transaction_id")}
+    user_field_names = set(compiled.user_fields)
+    record_field_names = set(compiled.record_fields)
+    user_plan = _build_generation_plan(variables, user_field_names, rules)
+    record_plan = _build_generation_plan(variables, record_field_names, rules)
 
     for user_index in range(user_count):
         try:
-            user_context=_generate_selected_record(variables,set(compiled.user_fields),rules=rules)
+            user_context=_generate_selected_record(variables,user_field_names,rules=rules,plan=user_plan)
             if entity_key and entity_key not in user_context:
                 # Ensure the entity key is generated even if inferred user context omitted it.
                 key_var=compiled.variable_by_name.get(entity_key)
@@ -1405,7 +1511,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     if timestamp_field:
                         # One authoritative transaction timestamp anchors the complete row.
                         base[timestamp_field]=timestamps[record_index].isoformat()
-                    row=_generate_selected_record(variables,set(compiled.record_fields),base=base,rules=rules)
+                    row=_generate_selected_record(variables,record_field_names,base=base,rules=rules,plan=record_plan,apply_repairs=False)
                     if timestamp_field and timestamp_field not in row:
                         row[timestamp_field]=timestamps[record_index].isoformat()
 
@@ -1454,9 +1560,14 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                                 if ref_name in row:
                                     row[ref_name] = None
 
-                    # Fail closed before the row is counted as generated.
-                    _strict_validate_record(row, variables, rules=rules)
-                    generated.append(row)
+                    # Run the full validator once per successful attempt. This replaces the
+                    # previous strict-validation pass plus a second batch validation pass.
+                    repaired, issues = _validate_record(
+                        row, variables, list(compiled.field_order), True, rules=rules
+                    )
+                    generated.append(repaired)
+                    if fixes_out is not None:
+                        fixes_out.append(len(issues))
                     last_exc = None
                     break
                 except Exception as exc:
@@ -1491,8 +1602,40 @@ def _qa_parse_dt(value: Any) -> datetime | None:
 
 
 
+_FORMULA_ALLOWED_NODES = (
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult,
+    ast.Div, ast.Mod, ast.Pow, ast.USub, ast.UAdd, ast.Constant,
+    ast.Name, ast.Call, ast.Load, ast.Tuple, ast.List,
+    ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+    ast.BoolOp, ast.And, ast.Or, ast.Not, ast.IfExp,
+)
+_ALLOWED_FORMULA_FUNCS = {"round", "min", "max", "abs", "sum", "DATE"}
+
+@lru_cache(maxsize=4096)
+def _compile_safe_formula(expr: str):
+    try:
+        tree = ast.parse(expr, mode="eval")
+        for node in ast.walk(tree):
+            if not isinstance(node, _FORMULA_ALLOWED_NODES):
+                return None
+            if isinstance(node, ast.Name) and node.id not in _ALLOWED_FORMULA_FUNCS:
+                # Actual field names are checked dynamically by _safe_formula.
+                continue
+            if isinstance(node, ast.Call) and (
+                not isinstance(node.func, ast.Name) or node.func.id not in _ALLOWED_FORMULA_FUNCS
+            ):
+                return None
+        return compile(tree, "<scenario-formula>", "eval")
+    except Exception:
+        return None
+
+
 def _safe_formula(expr: str, rec: dict):
-    """Evaluate the same small arithmetic expression language used by the generator."""
+    """Evaluate a constrained formula language against the current record.
+
+    The validated Python expression is compiled once per distinct formula and reused across
+    every generated record. Field names and datetime coercion remain record-specific.
+    """
     def DATE(value):
         if isinstance(value, datetime):
             return value.date()
@@ -1506,8 +1649,10 @@ def _safe_formula(expr: str, rec: dict):
         except Exception:
             return None
 
-    allowed_funcs = {"round": round, "min": min, "max": max, "abs": abs, "DATE": DATE}
-    names = {}
+    code = _compile_safe_formula(str(expr))
+    if code is None:
+        return None
+    names: dict[str, Any] = {}
     for k, v in rec.items():
         if k == "__current_field__" or v is None:
             continue
@@ -1516,27 +1661,16 @@ def _safe_formula(expr: str, rec: dict):
             names[k] = parsed if parsed is not None else v
         else:
             names[k] = v
+    names.update({
+        "round": round,
+        "min": min,
+        "max": max,
+        "abs": abs,
+        "sum": sum,
+    })
+    names["DATE"] = DATE
     try:
-        tree = ast.parse(expr, mode="eval")
-        allowed_nodes = (
-            ast.Expression, ast.BinOp, ast.UnaryOp, ast.Add, ast.Sub, ast.Mult,
-            ast.Div, ast.Mod, ast.Pow, ast.USub, ast.UAdd, ast.Constant,
-            ast.Name, ast.Call, ast.Load, ast.Tuple, ast.List,
-            ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
-            ast.BoolOp, ast.And, ast.Or, ast.Not,
-            ast.IfExp,
-        )
-        for node in ast.walk(tree):
-            if not isinstance(node, allowed_nodes):
-                return None
-            if isinstance(node, ast.Name) and node.id not in names and node.id not in allowed_funcs:
-                return None
-            if isinstance(node, ast.Call) and (not isinstance(node.func, ast.Name) or node.func.id not in allowed_funcs):
-                return None
-        result = eval(compile(tree, "<formula>", "eval"), {"__builtins__": {}}, {**names, **allowed_funcs})
-        if isinstance(result, timedelta):
-            return result.total_seconds()
-        return result
+        return eval(code, {"__builtins__": {}}, names)
     except Exception:
         return None
 
@@ -1718,7 +1852,7 @@ def _enforce_authoritative_formulas(
         deps = _formula_dependencies(expr)
         if any(rec.get(dep) is None for dep in deps):
             continue
-        expected = _safe_formula(expr, rec)
+        expected = _coerce_formula_result(_safe_formula(expr, rec), field_def)
         if expected is None:
             continue
         actual = rec.get(field)
@@ -2907,7 +3041,8 @@ def _strict_validate_record(rec: dict, variables: list[dict], rules: dict | None
         deps = _formula_dependencies(expr)
         if any(rec.get(dep) is None for dep in deps):
             raise ValueError(f"formula field '{field}' is missing dependencies")
-        expected = _safe_formula(expr, rec)
+        field_def = variable_by_name.get(field) or {}
+        expected = _coerce_formula_result(_safe_formula(expr, rec), field_def)
         if expected is None:
             raise ValueError(f"formula field '{field}' could not be evaluated")
         actual = rec.get(field)
@@ -3177,7 +3312,7 @@ def _validate_record(
         if any(rec.get(dep) is None for dep in deps):
             issues.append(f"{field} formula could not be evaluated; missing dependencies")
             continue
-        expected = _safe_formula(expr, rec)
+        expected = _coerce_formula_result(_safe_formula(expr, rec), field_def)
         if expected is None:
             issues.append(f"{field} formula could not be evaluated")
             continue
@@ -3211,7 +3346,7 @@ def _validate_record(
         deps = _formula_dependencies(expr)
         if any(rec.get(dep) is None for dep in deps):
             continue
-        expected = _safe_formula(expr, rec)
+        expected = _coerce_formula_result(_safe_formula(expr, rec), field_def)
         if expected is None:
             continue
         actual = rec.get(field)
@@ -3345,6 +3480,7 @@ def run_deterministic_agentic_generation(
 
     if type_of_data == "transactional":
         compiled = compile_scenario(scenario)
+        transactional_fixes: list[int] = []
         state.raw_records = _transactional_records(
             compiled,
             state.count,
@@ -3352,29 +3488,38 @@ def run_deterministic_agentic_generation(
             rules=state.rules,
             record_errors_out=state.record_errors,
             country=state.country,
+            fixes_out=transactional_fixes,
         )
     else:
+        transactional_fixes = []
+        aggregate_plan = _build_generation_plan(variables, rules=state.rules)
         for index in range(state.count):
             try:
-                state.raw_records.append(_generate_record(variables, rules=state.rules))
+                state.raw_records.append(_generate_record(variables, rules=state.rules, plan=aggregate_plan, apply_repairs=False))
             except Exception as exc:
                 state.record_errors.append({"record_index": index, "error": str(exc), "record": {}})
 
     checked: list[dict] = []
     fixes = 0
-    for record_index, record in enumerate(state.raw_records):
-        try:
-            repaired, issues = _validate_record(
-                record,
-                variables,
-                state.field_order,
-                type_of_data == "transactional",
-                rules=state.rules,
-            )
-            checked.append(repaired)
-            fixes += len(issues)
-        except Exception as exc:
-            state.record_errors.append({"record_index": record_index, "error": str(exc), "record": dict(record)})
+    if type_of_data == "transactional":
+        # _transactional_records now runs the complete validator exactly once for every
+        # accepted row, including its final strict validation boundary. Re-validating the
+        # same rows here only duplicated the most expensive work.
+        checked = list(state.raw_records)
+    else:
+        for record_index, record in enumerate(state.raw_records):
+            try:
+                repaired, issues = _validate_record(
+                    record,
+                    variables,
+                    state.field_order,
+                    False,
+                    rules=state.rules,
+                )
+                checked.append(repaired)
+                fixes += len(issues)
+            except Exception as exc:
+                state.record_errors.append({"record_index": record_index, "error": str(exc), "record": dict(record)})
 
     state.final_records = checked
     state.validation_report = {
@@ -3383,7 +3528,7 @@ def run_deterministic_agentic_generation(
         "total_dropped": len(state.record_errors),
         "record_errors": len(state.record_errors),
         "recovered": 0,
-        "algo_fixes": fixes,
+        "algo_fixes": fixes + sum(transactional_fixes),
         "llm_fixes": 0,
         "llm_issues": 0,
         "deterministic_checks": [
@@ -3429,10 +3574,11 @@ class DataGenerationAgent:
         else:
             state.field_order = list(csv_field_order)
             records = []
+            aggregate_plan = _build_generation_plan(variables, rules=state.rules)
             for index in range(state.count):
                 rec = {}
                 try:
-                    rec = _generate_record(variables, rules=state.rules)
+                    rec = _generate_record(variables, rules=state.rules, plan=aggregate_plan)
                     records.append(rec)
                 except Exception as exc:
                     state.record_errors.append({"record_index": index, "error": str(exc), "record": dict(rec)})
