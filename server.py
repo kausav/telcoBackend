@@ -124,7 +124,7 @@ async def request_id_middleware(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_origins=["*"],
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
 )
@@ -643,7 +643,10 @@ def generate_scenario(req: GenerateRequest):
         user_field_names.add(entity_key)
         for entity_value,rows in grouped.items():
             # Newest first, with the user-level context outside the history rows.
-            timestamp_field=next((f for f in ("record_timestamp","transaction_timestamp","timestamp","created_at","updated_at") if f in rows[0]),None)
+            timestamp_field=next((f for f in (
+                "topup_requested_date_time", "topupbalance_requested_date", "topupbalance_requesteddate",
+                "recharge_timestamp", "transaction_timestamp", "record_timestamp", "timestamp", "created_at", "updated_at"
+            ) if f in rows[0]),None)
             if timestamp_field:
                 rows=sorted(rows,key=lambda r: _timestamp_sort_key(r.get(timestamp_field)), reverse=True)
             latest=rows[0] if rows else {}

@@ -59,6 +59,20 @@ def classify_outcome_mode(
     decline_terms = ("customer decline", "declined", "no response", "no-response", "customer reject", "rejected")
     concurrent_terms = ("concurrent", "priority", "competing", "no clear priority", "cross-journey", "cross journey")
 
+    # Compound/verbose scenario types (for example "Recharge Failure" or
+    # "Customer Declines - No Response") must still resolve to the intended mode.
+    # Exact scenario IDs are never required; semantic keywords in scenarioType are enough.
+    if any(term in mode for term in suppression_terms):
+        return "suppression"
+    if any(term in mode for term in decline_terms):
+        return "decline_or_no_response"
+    if any(term in mode for term in concurrent_terms):
+        return "concurrent"
+    if any(term in mode for term in negative_terms):
+        return "negative"
+    if any(term in mode for term in positive_terms):
+        return "positive"
+
     outcome_text = " ".join(norm(x) for x in (expected_outcome, business_response)).strip()
     scenario_text = " ".join(norm(x) for x in (business_scenario,)).strip()
     if any(term in outcome_text for term in suppression_terms):

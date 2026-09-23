@@ -171,6 +171,17 @@ def _repair_legacy_variables(variables: list[dict[str, Any]]) -> list[dict[str, 
             var["gen"] = "weighted_choice"
             var["params"] = {"choices": [False, True], "weights": [0.5, 0.5]}
 
+        # Unit/denomination fields are always textual. Older confirmed drafts could
+        # accidentally classify names such as ``topup_amount_currency_unit`` as numeric
+        # because they also contain ``amount``; normalize them before generation.
+        if any(token in norm_name for token in ("unit", "units", "currencyunit", "usageunit")):
+            var["dtype"] = "string"
+            if gen in {"uniform", "uniform_int", "range", "segment_range", "generic"}:
+                var["gen"] = "semantic_string"
+                var["params"] = {}
+            dtype = "string"
+            gen = str(var.get("gen") or "").strip().lower()
+
         # Normalize JSON/OpenAPI's "date-time" format so it can never be used as a literal strftime mask.
         if dtype == "datetime" and str(params.get("format") or "").strip().lower() in {"date-time", "datetime", "timestamp"}:
             params.pop("format", None)

@@ -41,6 +41,8 @@ class SchemaCompiler:
         "decline_reason",
         "recharge_outcome",
         "priority_resolution",
+        "recharge_plan_code",
+        "recharge_plan_validity_days",
     }
 
     @classmethod
@@ -430,6 +432,11 @@ class SchemaCompiler:
             or bool(re.match(r"^(?:is|has)[a-z]", n))
         ):
             return "boolean"
+        # Unit/currency-unit fields describe denominations, not numeric amounts.
+        # Check them before the broad ``_amount`` heuristic so names such as
+        # ``topup_amount_currency_unit`` remain strings.
+        if n.endswith(("_unit", "_units")) or "currency_unit" in n or "usage_unit" in n:
+            return "string"
         if any(token in n for token in ("_amount", "_balance", "_quota", "_score", "_rate", "_percentage", "_percent")):
             return "float"
         if any(token in n for token in ("_count", "_days", "_months", "_hours", "_minutes", "number_of", "num_")):
@@ -498,6 +505,8 @@ class SchemaCompiler:
         if dtype in {"boolean", "bool"}:
             return "weighted_choice", "boolean", {"choices": [False, True], "weights": [0.5, 0.5]}
 
+        if name.strip().lower() == "recharge_plan_validity_days":
+            return "uniform_int", "integer", {"min": 1, "max": 84, "precision": 0}
         if dtype in {"integer", "int"} or role == "metric":
             return "uniform_int", "integer", {"min": 0, "max": 100, "precision": 0}
         if dtype in {"float", "decimal", "number", "numeric"} or role == "measurement":
@@ -513,6 +522,8 @@ class SchemaCompiler:
                 choices = ["APP", "SMS", "WEB", "USSD", "WHATSAPP", "IVR", "RETAIL"]
             elif "payment" in lower and ("instrument" in lower or "method" in lower):
                 choices = ["UPI", "CREDIT_CARD", "DEBIT_CARD", "WALLET", "CASH", "AUTO_DEBIT"]
+            elif "recharge_plan_code" in name.lower() or ("plan" in lower and "code" in lower):
+                choices = ["PREPAID_1D", "PREPAID_7D", "PREPAID_14D", "PREPAID_28D", "PREPAID_30D", "PREPAID_56D", "PREPAID_84D"]
             elif "offer" in lower:
                 choices = ["EXTRA_DATA", "CASH_BACK", "VALIDITY_BOOSTER", "DISCOUNT_VOUCHER"]
             elif "segment" in lower:
@@ -547,6 +558,16 @@ class SchemaCompiler:
 
         if enum_values:
             return "weighted_choice", "categorical", {"choices": enum_values, "weights": [1.0] * len(enum_values)}
+
+        # Some official Swagger string definitions encode a constrained vocabulary only
+        # in their descriptions (for example RelatedTopupBalance.role = parent/child).
+        # Materialize those explicit source-described choices instead of falling back to
+        # generic semantic strings.
+        description = str(spec.get("description") or "")
+        explicit = SchemaCompiler._description_choices(description)
+        path_lower = str(spec.get("path") or "").lower()
+        if explicit and (path_lower.endswith(".role") or "valid values" in description.lower()):
+            return "weighted_choice", "categorical", {"choices": explicit, "weights": [1.0] * len(explicit)}
         if dtype in {"boolean", "bool"}:
             return "weighted_choice", "boolean", {"choices": [False, True], "weights": [0.5, 0.5]}
         if fmt in {"date-time", "datetime", "timestamp"} or dtype in {"date-time", "datetime", "timestamp"}:
@@ -597,6 +618,7 @@ class SchemaCompiler:
         include_all_registry_scalars: bool = True,
         include_all_json_source_scalars: bool = False,
     ) -> list[GeneratedSchemaField]:
+        normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
         raw_ideas = [idea.model_dump() for idea in intent.candidate_variables]
         ideas: list[dict[str, object]] = []
         seen_idea_keys: set[str] = set()
@@ -657,7 +679,17 @@ class SchemaCompiler:
                         else "identity" if str(spec.get("path") or "").lower().endswith(".id")
                         else "other"
                     ),
-                    "grain": str(spec.get("model_grain") or "transaction"),
+                    "grain": (
+                        "transaction"
+                        if normalized_type == "transactional"
+                        and str(spec.get("model_grain") or "transaction") == "entity"
+                        and any(token in str(spec.get("path") or "").lower() for token in (
+                            "remainingvalue.amount", "reservedvalue.amount",
+                            "requesteddatetime", "confirmationdatetime",
+                            "requesteddate", "confirmationdate",
+                        ))
+                        else str(spec.get("model_grain") or "transaction")
+                    ),
                     "dtype": (
                         "integer" if dtype in {"integer", "int"}
                         else "float" if dtype in {"number", "float", "double", "decimal"}
@@ -674,6 +706,12 @@ class SchemaCompiler:
                     "_registry_nullable": not bool(spec.get("required")),
                 }, preserve_name=True)
 
+        # Keep LLM-proposed scenario variables even when their names are similar to official
+        # attributes. The official scalar catalog is already de-duplicated by exact field name,
+        # while scenario-derived analytics such as ``balance_remaining_amount`` and
+        # ``topup_recharge_amount`` can intentionally coexist with their source-backed fields.
+        # Fuzzy suppression previously removed legitimate scenario variables and narrowed the
+        # generated schema below the requested business scope.
         for idea in raw_ideas:
             add_idea(idea)
         if entity_key:
@@ -920,9 +958,30 @@ class SchemaCompiler:
         intent: ScenarioIntent,
         scenario_mode: str,
     ) -> None:
-        """Guarantee that different behavioral modes remain visible in the schema even when the LLM is repetitive."""
+        """Guarantee scenario-specific analytical fields and normalize LLM candidates that could conflict with the mode."""
         existing = {self._normalize_variable_name(v.name) for v in intent.candidate_variables}
         additions: list[dict[str, object]] = []
+
+        # Scenario-derived outcomes are controlled by the current scenario context. An LLM
+        # candidate with a generic/positive outcome vocabulary must not silently override the
+        # requested mode.
+        outcome_descriptions = {
+            "suppression": "Outcome of the recharge associated with a suppressed intervention. Valid values are COMPLETED, CANCELLED.",
+            "decline_or_no_response": "Outcome of the recharge/retention intervention. Valid values are DECLINED, NO_RESPONSE, REJECTED.",
+            "negative": "Outcome of the recharge operation. Valid values are FAILED, REJECTED, CANCELLED.",
+            "positive": "Outcome of the recharge operation. Valid values are COMPLETED, APPROVED, ACCEPTED.",
+            "concurrent": "Outcome/resolution of the recharge intervention. Valid values are PENDING_PRIORITY, CONFLICT, NO_CLEAR_PRIORITY.",
+            "mixed": "Outcome of the recharge operation. Valid values are COMPLETED, FAILED, CANCELLED.",
+        }
+        normalized_outcome_name = self._normalize_variable_name("recharge_outcome")
+        for idx, idea in enumerate(intent.candidate_variables):
+            if self._normalize_variable_name(idea.name) == normalized_outcome_name:
+                intent.candidate_variables[idx] = idea.model_copy(update={
+                    "description": outcome_descriptions.get(scenario_mode, outcome_descriptions["mixed"]),
+                    "role": "status",
+                    "grain": "transaction",
+                    "dtype": "categorical",
+                })
 
         if scenario_mode == "suppression":
             if "intervention_suppression_state" not in existing:
@@ -971,6 +1030,25 @@ class SchemaCompiler:
                     "description": "Resolution of competing interventions. Valid values are NO_CLEAR_PRIORITY, CONFLICT, PENDING_PRIORITY.",
                     "role": "decision", "grain": "transaction", "dtype": "categorical", "depends_on": [],
                 })
+
+        if "recharge_outcome" not in existing:
+            additions.append({
+                "name": "recharge_outcome",
+                "description": outcome_descriptions.get(scenario_mode, outcome_descriptions["mixed"]),
+                "role": "status", "grain": "transaction", "dtype": "categorical", "depends_on": [],
+            })
+        if "recharge_plan_code" not in existing:
+            additions.append({
+                "name": "recharge_plan_code",
+                "description": "Synthetic prepaid recharge plan identifier. Valid values are PREPAID_1D, PREPAID_7D, PREPAID_14D, PREPAID_28D, PREPAID_30D, PREPAID_56D, PREPAID_84D.",
+                "role": "configuration", "grain": "transaction", "dtype": "categorical", "depends_on": [],
+            })
+        if "recharge_plan_validity_days" not in existing:
+            additions.append({
+                "name": "recharge_plan_validity_days",
+                "description": "Synthetic prepaid recharge plan validity duration in days used to derive the TopupBalance validFor end date.",
+                "role": "measurement", "grain": "transaction", "dtype": "integer", "depends_on": ["recharge_plan_code"],
+            })
 
         if additions:
             from core.agentic_models import VariableIdea

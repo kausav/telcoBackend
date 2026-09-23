@@ -121,12 +121,31 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
         if field in constraints and preferred:
             constraints[field]["preferred_values"] = preferred
 
+    scenario_mode = str(semantics.get("outcome_mode") or "mixed")
+    domain = str(getattr(state, "domain", "") or "").strip()
     return {
         "scenario_summary": "Confirmed scenario schema with deterministic scenario-context semantics; no scenario-ID lookup.",
+        "domain": domain,
+        "scenario_type": str(getattr(state, "scenario_type", "") or "").strip(),
+        "use_case": str(getattr(state, "use_case", "") or "").strip(),
+        "type_of_data": str(getattr(state, "type_of_data", "") or "").strip().lower(),
+        "entity_key": str(getattr(state, "entity_key", "") or "").strip() or None,
+        "scenario_mode": scenario_mode,
         "business_rules": [
             "Entity, field and relationship vocabulary is frozen to the approved compiled schema.",
             "Unknown fields, values and relationships are non-executable.",
+            "Generate coherent business events first; do not independently randomize causally related fields.",
+            "Every source-backed reference field must preserve the semantic type of the referenced resource.",
+            "Every paired start/end period must satisfy start <= end.",
+            "Every request/confirmation lifecycle must satisfy request <= confirmation when confirmation exists.",
+            "Values describing the same transaction, entity, or balance snapshot must be mutually consistent.",
         ],
+        "domain_invariants": [
+            "Low Balance & Top-up records must keep subscriber/account/msisdn stable across a subscriber history.",
+            "Low Balance & Top-up balances, usage types, units, top-up amounts, statuses, and timestamps must describe the same recharge lifecycle.",
+            "Low Balance & Top-up validity windows must be derived from the recharge/plan timeline rather than independently sampled.",
+            "Scenario-specific outcome fields may extend the official source model, but they must remain consistent with official status and transaction state fields.",
+        ] if "low balance" in domain.lower() else [],
         "field_constraints": {
             name: {
                 "description": str(var.get("description", "")),
