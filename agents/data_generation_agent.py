@@ -3041,7 +3041,7 @@ def _strict_validate_record(rec: dict, variables: list[dict], rules: dict | None
         deps = _formula_dependencies(expr)
         if any(rec.get(dep) is None for dep in deps):
             raise ValueError(f"formula field '{field}' is missing dependencies")
-        field_def = variable_by_name.get(field) or {}
+        field_def = by_name.get(field) or {}
         expected = _coerce_formula_result(_safe_formula(expr, rec), field_def)
         if expected is None:
             raise ValueError(f"formula field '{field}' could not be evaluated")
