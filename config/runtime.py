@@ -51,6 +51,18 @@ CORS_ALLOW_ORIGINS = [
 
 MAX_CSV_BYTES = int(os.getenv("MAX_CSV_BYTES", str(10 * 1024 * 1024)))
 
+# Schema breadth is quality-gated rather than "include everything". The maximum is a
+# preference: mandatory application/identity contracts are never dropped for size.
+SCHEMA_MAX_VARIABLES = int(os.getenv("SCHEMA_MAX_VARIABLES", "100"))
+SCHEMA_MIN_VARIABLE_SCORE = float(os.getenv("SCHEMA_MIN_VARIABLE_SCORE", "42"))
+
+# Generation is a durable MongoDB-backed queue. API instances only enqueue work; dedicated
+# worker processes claim jobs and execute the complete validation pipeline.
+GENERATION_JOB_TTL_SECONDS = int(os.getenv("GENERATION_JOB_TTL_SECONDS", "86400"))
+GENERATION_JOB_LEASE_SECONDS = int(os.getenv("GENERATION_JOB_LEASE_SECONDS", "900"))
+GENERATION_WORKER_POLL_SECONDS = float(os.getenv("GENERATION_WORKER_POLL_SECONDS", "2"))
+GENERATION_MAX_ATTEMPTS = int(os.getenv("GENERATION_MAX_ATTEMPTS", "3"))
+
 # Official source sync behavior: auto downloads when a source is not already cached.
 # Set OFFICIAL_STANDARDS_SYNC=disabled when an operator supplies REGISTRY_STANDARDS_DIR.
 OFFICIAL_STANDARDS_SYNC = os.getenv("OFFICIAL_STANDARDS_SYNC", "auto").strip().lower()

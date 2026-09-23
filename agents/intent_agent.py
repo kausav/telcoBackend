@@ -49,7 +49,7 @@ IMPORTANT BOUNDARIES:
 - Treat scenarioType as a behavioral mode and make the variable set materially reflect it. For a Normal scenario in a transactional top-up workflow, prioritize completed/successful operational states and coherent lifecycle timing; do not introduce pending/failed operation outcomes unless the business scenario explicitly asks for adverse outcomes.
 - Cover only concepts justified by the current business scenario and domain.
 - The telecom registry is grounding information for normal registry-grounded requests, not a variable template. Do not dump catalog attributes.
-- For Low Balance & Top-up, the supplied machine-readable TMF654/TMF629 Swagger catalog is the authoritative standards source. The backend can flatten all materializable scalar leaves inside the primary resources and their referenced objects; do not assume only top-level fields are available. Scenario-specific analytical fields may be proposed only when they are clearly derived from the business scenario and must not be misrepresented as TM Forum fields.
+- For Low Balance & Top-up, the supplied machine-readable TMF654/TMF629 Swagger catalog is the authoritative standards source. The backend can inspect all materializable scalar leaves inside the primary resources and their referenced objects, but do NOT enumerate transport/reference/display metadata merely to increase schema width. Prefer one canonical business concept over aliases or duplicate representations. Scenario-specific analytical fields may be proposed only when they are clearly derived from the business scenario and must not be misrepresented as TM Forum fields.
 - Do not propose unsupported nested/object fields when a flat synthetic dataset cannot deterministically
   populate their nested structure.
 
@@ -268,9 +268,10 @@ class GeminiIntentAgent:
             f"Selected industry: {industry_type}\n"
             f"Business domain: {domain_query or '<none>'}\n"
             f"Country: {country or '<none>'}\n\n"
-            "Create a comprehensive fresh scenario intent. There is NO artificial variable-count target or maximum. "
-            "Prefer the maximum set of relevant variables supported by the approved grounding catalog and scenario semantics. "
-            "Never truncate for count. " + mandatory_line + "\n"
+            "Create a comprehensive fresh scenario intent. There is NO artificial variable-count target. "
+            "Prefer the widest set of DISTINCT, analytically useful variables supported by the approved grounding and scenario semantics. "
+            "Do not pad the candidate list with API href/referredType/reference metadata, display-only name/description fields, or semantic aliases. "
+            "Prefer one canonical field per business concept and include additional fields only when they add independent analytical, causal, temporal, relational, or segmentation value. " + mandatory_line + "\n"
             "Do not invent unsupported telecom entities or fields; the compiler will ground only relevant selected concepts from the approved registry. "
             "Return JSON only."
         )

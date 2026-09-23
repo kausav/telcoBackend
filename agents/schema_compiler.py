@@ -8,6 +8,8 @@ import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
 from core.json_domain_policy import LOW_BALANCE_MAIN_MODEL_IDS, LOW_BALANCE_SOURCE_IDS, expanded_scalar_catalog, is_json_grounded_domain
+from core.variable_quality import VariableQualityEngine
+from config.runtime import SCHEMA_MAX_VARIABLES, SCHEMA_MIN_VARIABLE_SCORE
 
 
 def _tokens(value: str) -> list[str]:
@@ -351,7 +353,22 @@ class SchemaCompiler:
                     attr_overlap >= 2
                     or (attr_overlap >= 1 and ratio >= 0.50 and entity_overlap >= 1)
                 )
-                if exact or (strong_semantic and score >= 8.0):
+                # Never satisfy an explicit business role with a merely related technical
+                # attribute. In particular, outcome/decision/status ideas must resolve to
+                # status/decision/result/reason concepts rather than usage/unit/reference fields.
+                role_text = f"{attr.name} {attr.description}".lower()
+                role_specific_ok = True
+                if role in {"status", "decision"} or any(token in idea_name for token in ("outcome", "decision", "result")):
+                    role_specific_ok = any(
+                        token in role_text
+                        for token in ("status", "state", "outcome", "decision", "result", "reason", "eligible", "suppression")
+                    )
+                elif role in {"measurement", "metric"}:
+                    role_specific_ok = any(
+                        token in role_text
+                        for token in ("amount", "balance", "quantity", "value", "volume", "measure", "rate", "percentage")
+                    ) or attr_dtype in {"float", "decimal", "number", "numeric", "int", "integer"}
+                if exact or (strong_semantic and score >= 8.0 and role_specific_ok):
                     candidates.append((score, entity.canonical_id, attr.name, entity, attr))
         if not candidates:
             return None
@@ -617,6 +634,7 @@ class SchemaCompiler:
         max_variables: int | None = None,
         include_all_registry_scalars: bool = True,
         include_all_json_source_scalars: bool = False,
+        context_text: str | None = None,
     ) -> list[GeneratedSchemaField]:
         normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
         raw_ideas = [idea.model_dump() for idea in intent.candidate_variables]
@@ -702,6 +720,8 @@ class SchemaCompiler:
                     "depends_on": [],
                     "_json_source_spec": spec,
                     "_json_source": True,
+                    "_registry_entity": f"{spec.get('source_id', '')}__{spec.get('model', '')}",
+                    "_registry_entity_name": str(spec.get("model") or ""),
                     "_registry_required": bool(spec.get("required")),
                     "_registry_nullable": not bool(spec.get("required")),
                 }, preserve_name=True)
@@ -767,6 +787,7 @@ class SchemaCompiler:
                         ),
                         "depends_on": list(attr.depends_on),
                         "_registry_entity": entity.canonical_id,
+                        "_registry_entity_name": entity.name,
                         "_registry_required": bool(attr.required),
                         "_registry_nullable": bool(attr.nullable),
                         "_registry_exact": True,
@@ -779,8 +800,34 @@ class SchemaCompiler:
                 if self._normalize_variable_name(str(item.get("name") or "")) not in self.REDUNDANT_MSISDN_FIELDS
             ]
 
-        # Intentionally do not truncate candidate variables. ``max_variables`` remains only
-        # for backward compatibility with older callers and is deliberately ignored.
+        # Quality-gate the broad candidate pool before converting it into executable fields.
+        # ``max_variables`` remains an optional caller override; otherwise the environment
+        # default applies. The selector removes semantic duplicates and low-information API
+        # metadata without dropping mandatory/application contracts.
+        quality_engine = VariableQualityEngine(
+            max_variables=max_variables if max_variables is not None else SCHEMA_MAX_VARIABLES,
+            min_score=SCHEMA_MIN_VARIABLE_SCORE,
+        )
+        selection_context = context_text or " ".join(
+            str(value or "")
+            for value in (
+                intent.industry_type, intent.domain, intent.subdomain, intent.scenario_type,
+                intent.type_of_data, intent.use_case, intent.entity_key,
+                business_scenario if "business_scenario" in locals() else "",
+            )
+        )
+        ideas, quality_report = quality_engine.select(
+            ideas,
+            context_text=selection_context,
+            entity_key=entity_key,
+        )
+        dependency_aliases = quality_report.get("dependency_aliases", {})
+        if dependency_aliases:
+            for idea in ideas:
+                idea["depends_on"] = [
+                    dependency_aliases.get(self._normalize_variable_name(str(dep)), str(dep))
+                    for dep in (idea.get("depends_on") or [])
+                ]
 
         fields: list[GeneratedSchemaField] = []
         used_names: set[str] = set()
@@ -915,6 +962,16 @@ class SchemaCompiler:
 
             role = str(idea.get("role") or "other")
             grain = str(idea.get("grain") or ("entity" if original_name == entity_key else "transaction"))
+            raw_dependencies = [str(dep) for dep in (idea.get("depends_on") or []) if str(dep).strip()]
+            unresolved_dependencies = [
+                dep for dep in raw_dependencies
+                if self._normalize_variable_name(dep) not in name_map
+                and self._normalize_variable_name(dependency_aliases.get(self._normalize_variable_name(dep), dep)) not in name_map
+            ]
+            if unresolved_dependencies:
+                # A selected field with an unrepresentable prerequisite cannot produce a faithful
+                # executable contract. Drop it rather than silently weakening its dependency chain.
+                continue
             deps = self._merge_dependencies(idea, name_map, grain, entity_key)
             if original_name == entity_key or original_name in self.REQUIRED_TELECOM_FIELDS:
                 grain = "entity"
@@ -933,6 +990,8 @@ class SchemaCompiler:
                 "source_json_model": source_spec.get("model") if source_from_json else None,
                 "source_json_path": source_spec.get("path") if source_from_json else None,
                 "grain": grain,
+                "quality_score": quality_engine.score(idea, selection_context, entity_key).score,
+                "quality_reasons": list(quality_engine.score(idea, selection_context, entity_key).reasons),
             }
             fields.append(GeneratedSchemaField(
                 name=fresh,
@@ -1050,6 +1109,38 @@ class SchemaCompiler:
                 "role": "measurement", "grain": "transaction", "dtype": "integer", "depends_on": ["recharge_plan_code"],
             })
 
+        # Retention-intervention outcome is a scenario-level analytical concept, not a TMF
+        # balance usage/type enum. Normalize it before compilation so a generic/incorrect LLM
+        # candidate can never inherit unrelated official choices.
+        intervention_outcome_choices = {
+            "suppression": ["SUPPRESSED", "NOT_SENT"],
+            "decline_or_no_response": ["DECLINED", "NO_RESPONSE"],
+            "negative": ["FAILED", "NOT_CONVERTED"],
+            "positive": ["CONVERTED", "NOT_CONVERTED"],
+            "concurrent": ["CONFLICT", "PENDING", "NO_CLEAR_PRIORITY"],
+            "mixed": ["CONVERTED", "NOT_CONVERTED", "NO_RESPONSE"],
+        }.get(scenario_mode, ["CONVERTED", "NOT_CONVERTED", "NO_RESPONSE"])
+        intervention_description = (
+            "Scenario-derived outcome of the proactive retention intervention. Valid values are "
+            + ", ".join(intervention_outcome_choices) + "."
+        )
+        normalized_intervention = self._normalize_variable_name("retention_intervention_outcome")
+        for idx, idea in enumerate(intent.candidate_variables):
+            if self._normalize_variable_name(idea.name) == normalized_intervention:
+                intent.candidate_variables[idx] = idea.model_copy(update={
+                    "description": intervention_description,
+                    "role": "derived",
+                    "grain": "transaction",
+                    "dtype": "categorical",
+                })
+
+        if not any(self._normalize_variable_name(v.name) == normalized_intervention for v in intent.candidate_variables):
+            additions.append({
+                "name": "retention_intervention_outcome",
+                "description": intervention_description,
+                "role": "derived", "grain": "transaction", "dtype": "categorical", "depends_on": [],
+            })
+
         if additions:
             from core.agentic_models import VariableIdea
             intent.candidate_variables.extend(VariableIdea.model_validate(item) for item in additions)
@@ -1105,6 +1196,12 @@ class SchemaCompiler:
             max_variables=None,
             include_all_registry_scalars=False,
             include_all_json_source_scalars=True,
+            context_text=" ".join(
+                str(value or "") for value in (
+                    intent.industry_type, intent.domain, intent.subdomain, normalized_scenario,
+                    normalized_type, country or "", use_case or "", business_scenario,
+                )
+            ),
         )
         field_names = [f.name for f in fields]
         if not fields:
@@ -1137,7 +1234,7 @@ class SchemaCompiler:
         hard_constraints = [
             "scenarioId is identifier-only and does not select variables or business rules.",
             "Low Balance & Top-up standards grounding is restricted to the supplied TMF654 Prepay Balance Management and TMF629 Customer Management Swagger/OpenAPI artifacts.",
-            "The Low Balance & Top-up compiler includes all materializable scalar leaves from the supplied TMF654/TMF629 Swagger models, including scalar leaves inside referenced objects.",
+            "The Low Balance & Top-up compiler evaluates all materializable scalar leaves from the supplied TMF654/TMF629 Swagger models, but includes only high-quality, scenario-relevant, non-redundant variables within the configured quality budget.",
             "One-to-many array properties are excluded from the flat record contract rather than converted into fake scalar values.",
             "Standard-backed enum values are copied from the official Swagger definitions and cannot be replaced with invented values.",
             "Scenario-derived analytical variables are explicitly synthetic extensions and are not represented as TM Forum fields.",
@@ -1266,6 +1363,14 @@ class SchemaCompiler:
             type_of_data=type_of_data,
             scenario_mode=scenario_mode,
             max_variables=max_variables,
+            context_text=" ".join(
+                str(value or "") for value in (
+                    requested.industry_type, requested.domain, requested.subdomain,
+                    scenario_type or requested.scenario_type, type_of_data or requested.type_of_data,
+                    use_case or requested.use_case, entity_key or "", business_scenario or "",
+                    business_response or "", expected_outcome or "", country or "",
+                )
+            ),
         )
         field_names = [f.name for f in fields]
         if not fields:
@@ -1295,7 +1400,7 @@ class SchemaCompiler:
         hard_constraints = [
             "scenarioId is identifier-only and does not select variables or business rules.",
             "The proposal is a fresh semantic variable set derived from the current scenario context; it is not a replay of a fixed scenario template.",
-            "There is no artificial variable-count target or maximum; schema width is determined by the current scenario and approved registry grounding. All materializable scalar attributes on resolved entities are eligible for inclusion.",
+            "Schema width is quality-gated: the compiler maximizes scenario-relevant analytical coverage up to the configured variable budget, removes semantic duplicates and low-value transport metadata, and never drops mandatory contracts for size.",
             "Each semantic variable is compiled into a deterministic executable generator contract.",
             "Transactional entity-grain variables are stable across the entity history; transaction/event/derived variables are regenerated per transaction/event.",
             "Generated records must pass deterministic type, choice, dependency, temporal, formula and scenario-semantic validation.",
@@ -1305,7 +1410,7 @@ class SchemaCompiler:
             hard_constraints.append(f"'{entity_key}' is the authoritative entity key for transactional grouping.")
         if (requested.industry_type or "telecom").strip().lower() in {"telecom", "telecommunications"}:
             hard_constraints.append("subscriber_id, account_id and msisdn are mandatory non-null entity-level fields in telecom scenario schemas.")
-            hard_constraints.append("Schema width is comprehensive over scalar attributes on the resolved scenario registry graph, with no fixed variable-count cap; unsupported nested object/array structures are excluded from the flat record contract.")
+            hard_constraints.append("Schema width is broad but quality-gated over scalar attributes on the resolved scenario registry graph; semantic duplicates and low-value API metadata are deprioritized, while unsupported nested object/array structures are excluded from the flat record contract.")
         warnings = [
             "Scenario IDs are identifiers only; variables and generation rules are derived from the current request, registry grounding, and scenario semantics.",
         ]

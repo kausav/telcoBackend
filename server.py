@@ -11,8 +11,6 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Literal
 
-from core.pipeline import run_pipeline
-from agents.data_generation_agent import run_deterministic_agentic_generation
 from core.dynamic_scenarios import (
     add_feedback,
     confirm_scenario,
@@ -38,6 +36,8 @@ from core.telecom_registry import RegistryError, get_registry
 from core.scenario_variable_store import upsert_recommended, get_recommended, set_user_variables, get_user_variables, get_user_variable_records, delete_user_variable
 from models.database import ping as ping_mongodb
 from models.model_registry import ensure_indexes as ensure_model_indexes
+from models.generation_job import GenerationJobModel
+from core.generation_jobs import submit_generation_job
 
 
 
@@ -85,6 +85,7 @@ async def lifespan(_app: FastAPI):
             "Standards registry ready: standards=%s entities=%s attributes=%s relationships=%s",
             health["standards"], health["entities"], health["attributes"], health["relationships"],
         )
+        GenerationJobModel.ensure_indexes()
     except Exception:
         logger.exception("Application startup validation failed")
         raise
@@ -93,7 +94,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.4.0",
+    version="2.6.0",
     lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse},
@@ -124,7 +125,7 @@ async def request_id_middleware(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
 )
@@ -154,6 +155,29 @@ class GenerateResponse(BaseModel):
     errors: list[str]
     record_errors: list[dict] = Field(default_factory=list)
 
+
+class GenerateAcceptedResponse(BaseModel):
+    success: bool = True
+    status: Literal["queued", "running"] = "queued"
+    jobId: str
+    scenario_id: str
+    draft_id: str | None = None
+    totalCount: int
+    recordsPerUser: int
+
+
+class GenerateJobResponse(BaseModel):
+    success: bool = True
+    status: Literal["queued", "running", "completed", "failed"]
+    jobId: str
+    scenario_id: str | None = None
+    draft_id: str | None = None
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    failed_at: datetime | None = None
+    error: str | None = None
+    result: GenerateResponse | None = None
 
 
 class VariableEdit(BaseModel):
@@ -586,90 +610,67 @@ def _timestamp_sort_key(value):
     return dt.astimezone(timezone.utc)
 
 
-@app.post("/scenario/generate", response_model=GenerateResponse)
+@app.post("/scenario/generate", response_model=GenerateAcceptedResponse, status_code=202)
 def generate_scenario(req: GenerateRequest):
-    """Generate flat records, grouped directly by user/entity for transactional histories."""
-    scenario_id=req.scenario
+    """Queue scenario generation and return immediately; full deterministic QA runs in a worker."""
+    scenario_id = req.scenario
     if req.draftId:
-        resolved=resolve_scenario_id_from_draft(req.draftId)
-        if resolved is None: raise HTTPException(404,detail={"error":f"Unknown or unconfirmed draftId '{req.draftId}'"})
-        if req.scenario and req.scenario!=resolved:
-            raise HTTPException(400,detail={"error":f"draftId '{req.draftId}' does not match scenario '{req.scenario}'","draft_scenario_id":resolved})
-        scenario_id=resolved
-    if not scenario_id: raise HTTPException(400,detail={"error":"Either 'scenario' or 'draftId' is required"})
-    if not scenario_exists(scenario_id): raise HTTPException(400,detail={"error":f"Unknown scenario '{scenario_id}'"})
-    scenario_context=resolve_scenario_context(scenario_id)
-    try:
-        # Confirmed agentic schemas are immutable after HITL approval. Use the fast deterministic
-        # path so /scenario/generate does not construct Gemini clients or invoke LLM stages.
-        if scenario_context.get("agentic"):
-            state = run_deterministic_agentic_generation(
-                scenario=scenario_id,
-                count=req.count,
-                industry=scenario_context.get("industry", "telecom"),
-                country=scenario_context.get("country"),
-                type_of_data=scenario_context.get("type_of_data", resolve_data_type(scenario_id)),
-                scenario_context=scenario_context,
-                records_per_user=req.recordsPerUser,
-            )
-        else:
-            state=run_pipeline(
-                scenario=scenario_id,count=req.count,industry=scenario_context.get("industry","generic"),country=scenario_context.get("country"),
-                type_of_data=scenario_context.get("type_of_data",resolve_data_type(scenario_id)),scenario_context=scenario_context,
-                records_per_user=req.recordsPerUser,
-            )
-    except ValueError as exc:
-        raise HTTPException(status_code=400,detail={"error":str(exc)}) from exc
-    if state.errors and not state.final_records and not state.record_errors:
-        raise HTTPException(500,detail={"errors":state.errors})
-    meta=resolve_scenario_meta(scenario_id) or {}
-    final_records=state.final_records
-    entity_key=meta.get("entity_key")
-    response_records=final_records
-    total_count=len(final_records); total_records=len(final_records)
-    records_per_user=req.recordsPerUser
+        resolved = resolve_scenario_id_from_draft(req.draftId)
+        if resolved is None:
+            raise HTTPException(404, detail={"error": f"Unknown or unconfirmed draftId '{req.draftId}'"})
+        if req.scenario and req.scenario != resolved:
+            raise HTTPException(400, detail={
+                "error": f"draftId '{req.draftId}' does not match scenario '{req.scenario}'",
+                "draft_scenario_id": resolved,
+            })
+        scenario_id = resolved
+    if not scenario_id:
+        raise HTTPException(400, detail={"error": "Either 'scenario' or 'draftId' is required"})
+    if not scenario_exists(scenario_id):
+        raise HTTPException(400, detail={"error": f"Unknown scenario '{scenario_id}'"})
 
-    if state.type_of_data=="transactional":
-        if not entity_key: raise HTTPException(500,detail={"error":"Transactional scenario is missing entity_key"})
-        grouped={}
-        for row in final_records:
-            value=row.get(entity_key)
-            if value in (None,""): continue
-            grouped.setdefault(str(value),[]).append(row)
-        entity_records=[]
-        resolved_vars,_ = resolve_variables(scenario_id) or ([],[])
-        user_fields, _record_fields = infer_history_field_sets(resolved_vars, entity_key)
-        user_field_names=set(user_fields)
-        user_field_names.add(entity_key)
-        for entity_value,rows in grouped.items():
-            # Newest first, with the user-level context outside the history rows.
-            timestamp_field=next((f for f in (
-                "topup_requested_date_time", "topupbalance_requested_date", "topupbalance_requesteddate",
-                "recharge_timestamp", "transaction_timestamp", "record_timestamp", "timestamp", "created_at", "updated_at"
-            ) if f in rows[0]),None)
-            if timestamp_field:
-                rows=sorted(rows,key=lambda r: _timestamp_sort_key(r.get(timestamp_field)), reverse=True)
-            latest=rows[0] if rows else {}
-            ordered_user_fields=[]
-            for name in user_fields:
-                if name in latest and name not in ordered_user_fields:
-                    ordered_user_fields.append(name)
-            if entity_key and entity_key in latest and entity_key not in ordered_user_fields:
-                ordered_user_fields.append(entity_key)
-            user_output={name: latest.get(name) for name in ordered_user_fields}
-            user_output[entity_key]=entity_value
-            clean_history=[]
-            for row in rows[:records_per_user]:
-                clean_history.append({k:v for k,v in dict(row).items() if k not in user_field_names})
-            user_output["records"]=clean_history
-            entity_records.append(user_output)
-        response_records=entity_records
-        total_count=len(entity_records)
-        total_records=sum(len(x.get("records",[])) for x in entity_records)
-
-    return GenerateResponse(
-        success=True,scenario_id=scenario_id,requested_scenario_id=meta.get("requested_scenario_id", meta.get("label", scenario_id)),
-        typeOfData=state.type_of_data,entityKey=entity_key,totalCount=total_count,recordsPerUser=records_per_user,
-        draft_id=req.draftId,scenario_label=meta.get("label",scenario_id),fields=state.field_order or ((resolve_variables(scenario_id) or ([],[]))[1]),
-        total_records=total_records,validation_report=state.validation_report,records=response_records,errors=state.errors,record_errors=state.record_errors,
+    payload = {
+        "scenario": scenario_id,
+        "draftId": req.draftId,
+        "count": req.count,
+        "recordsPerUser": req.recordsPerUser,
+    }
+    job = submit_generation_job(payload)
+    return GenerateAcceptedResponse(
+        success=True,
+        status="queued",
+        jobId=job["job_id"],
+        scenario_id=scenario_id,
+        draft_id=req.draftId,
+        totalCount=req.count,
+        recordsPerUser=req.recordsPerUser,
     )
+
+
+@app.get("/scenario/generate/{job_id}", response_model=GenerateJobResponse)
+def get_generation_job(job_id: str):
+    """Return generation-job status and the fully validated result when complete."""
+    job = GenerationJobModel.get(job_id)
+    if job is None:
+        raise HTTPException(404, detail={"error": f"Unknown generation job '{job_id}'"})
+
+    result = None
+    if job.get("status") == "completed":
+        payload = GenerationJobModel.result(job_id)
+        if payload is not None:
+            result = GenerateResponse.model_validate(payload)
+
+    return GenerateJobResponse(
+        success=job.get("status") != "failed",
+        status=job.get("status", "failed"),
+        jobId=job_id,
+        scenario_id=job.get("scenario_id"),
+        draft_id=job.get("draft_id"),
+        created_at=job.get("created_at"),
+        started_at=job.get("started_at"),
+        completed_at=job.get("completed_at"),
+        failed_at=job.get("failed_at"),
+        error=job.get("error"),
+        result=result,
+    )
+

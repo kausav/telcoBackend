@@ -75,7 +75,7 @@ class AgenticSchemaWorkflow:
     @staticmethod
     def _cache_key(req: ScenarioProposeRequest) -> tuple:
         return (
-            "agentic_proposal_v12_low_balance_json_expanded_scalars",
+            "agentic_proposal_v13_quality_gated_schema",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -147,9 +147,9 @@ class AgenticSchemaWorkflow:
             f"Data type: {req.type_of_data}\n"
             f"Country: {req.country}\n"
             f"Business scenario: {prompt}\n\n"
-            "Variable-design requirement: propose a fresh semantic variable set with NO artificial count target or maximum. "
+            "Variable-design requirement: propose a broad fresh semantic variable set without an artificial minimum count. Maximize DISTINCT analytical coverage rather than raw field count. "
             + grounding_requirement + " "
-            "Do not copy reference CSV variable names. Include every variable genuinely needed to represent the business scenario. "
+            "Do not copy reference CSV variable names. Include every variable genuinely needed to represent the business scenario, but do not add API href/referredType/reference metadata, display-only name/description fields, or semantic aliases solely to increase width. Prefer one canonical variable per business concept. "
             "Scenario type is a hard semantic signal: two requests with different scenarioType values must not be forced into the same variable set. "
             "Select variables that make the behavioral difference observable; do not use scenarioId to achieve that difference. "
             "Use ALL request inputs except scenarioId and entityKey as semantic/context signals: scenarioType, industryType, domain, "
