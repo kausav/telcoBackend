@@ -634,6 +634,7 @@ class SchemaCompiler:
         max_variables: int | None = None,
         include_all_registry_scalars: bool = True,
         include_all_json_source_scalars: bool = False,
+        business_scenario: str | None = None,
         context_text: str | None = None,
     ) -> list[GeneratedSchemaField]:
         normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
@@ -838,7 +839,7 @@ class SchemaCompiler:
             for value in (
                 intent.industry_type, intent.domain, intent.subdomain, intent.scenario_type,
                 intent.type_of_data, intent.use_case, intent.entity_key,
-                business_scenario if "business_scenario" in locals() else "",
+                business_scenario or "",
             )
         )
         ideas, quality_report = quality_engine.select(
@@ -1230,6 +1231,7 @@ class SchemaCompiler:
             max_variables=None,
             include_all_registry_scalars=False,
             include_all_json_source_scalars=True,
+            business_scenario=business_scenario,
             context_text=" ".join(
                 str(value or "") for value in (
                     intent.industry_type, intent.domain, intent.subdomain, normalized_scenario,
@@ -1397,6 +1399,7 @@ class SchemaCompiler:
             type_of_data=type_of_data,
             scenario_mode=scenario_mode,
             max_variables=max_variables,
+            business_scenario=business_scenario,
             context_text=" ".join(
                 str(value or "") for value in (
                     requested.industry_type, requested.domain, requested.subdomain,
