@@ -744,6 +744,22 @@ class SchemaCompiler:
                 "depends_on": [],
             }, force_name=entity_key)
 
+        # Subscriber is the canonical telecom subscriber identity for proposal generation.
+        # A separate customer_id is redundant in the flat scenario contract unless the caller
+        # explicitly requested customer_id as the transactional entity key. Suppress it before
+        # quality scoring so it cannot consume the variable budget or be reintroduced by
+        # standards expansion.
+        has_subscriber_anchor = any(
+            self._normalize_variable_name(str(item.get("name") or "")) == "subscriber_id"
+            for item in ideas
+        )
+        explicit_customer_entity_key = self._normalize_variable_name(entity_key or "") == "customer_id"
+        if has_subscriber_anchor and not explicit_customer_entity_key:
+            ideas = [
+                item for item in ideas
+                if self._normalize_variable_name(str(item.get("name") or "")) != "customer_id"
+            ]
+
         if include_all_registry_scalars:
             # Generic registry-grounded domains retain broad scalar coverage. Domain-specific
             # grounded flows can disable this and compile only the scenario's selected ideas.
@@ -757,6 +773,15 @@ class SchemaCompiler:
                     attr_name = str(attr.name or "")
                     attr_key = self._normalize_variable_name(attr_name)
                     if not attr_key:
+                        continue
+                    # subscriber_id is the canonical telecom subscriber identity. Do not add
+                    # a second customer_id column to a subscriber-anchored proposal unless the
+                    # caller explicitly selected customer_id as the transactional entity key.
+                    if (
+                        has_subscriber_anchor
+                        and not explicit_customer_entity_key
+                        and attr_key == "customer_id"
+                    ):
                         continue
                     if attr_key in self.REDUNDANT_MSISDN_FIELDS and any(
                         self._normalize_variable_name(str(item.get("name") or "")) == "msisdn"
@@ -821,6 +846,15 @@ class SchemaCompiler:
             context_text=selection_context,
             entity_key=entity_key,
         )
+
+        # Defensive post-selection guard for the same redundancy rule. This prevents any
+        # future quality-engine dependency closure change from reintroducing customer_id into
+        # a subscriber-anchored telecom proposal.
+        if has_subscriber_anchor and not explicit_customer_entity_key:
+            ideas = [
+                item for item in ideas
+                if self._normalize_variable_name(str(item.get("name") or "")) != "customer_id"
+            ]
         dependency_aliases = quality_report.get("dependency_aliases", {})
         if dependency_aliases:
             for idea in ideas:
@@ -1403,6 +1437,7 @@ class SchemaCompiler:
             "Schema width is quality-gated: the compiler maximizes scenario-relevant analytical coverage up to the configured variable budget, removes semantic duplicates and low-value transport metadata, and never drops mandatory contracts for size.",
             "Each semantic variable is compiled into a deterministic executable generator contract.",
             "Transactional entity-grain variables are stable across the entity history; transaction/event/derived variables are regenerated per transaction/event.",
+            "When subscriber_id is the telecom identity anchor, customer_id is excluded as a redundant proposal field unless customer_id is explicitly requested as the transactional entity key.",
             "Generated records must pass deterministic type, choice, dependency, temporal, formula and scenario-semantic validation.",
             f"Scenario outcome mode is derived dynamically from the complete request context: {scenario_mode}.",
         ]
