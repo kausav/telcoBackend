@@ -199,27 +199,47 @@ class AgenticSchemaWorkflow:
             )
             set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
 
-        # Persisted scenario configuration is layered on top of the current LLM proposal.
-        # The base LLM proposal remains cacheable and user-independent; only the merge is user-specific.
+        # Persisted scenario configuration is always layered on top of the current
+        # LLM/standards proposal. `requested_scenario_id` is the source of truth.
+        # If persisted recommendations exist, they are mandatory and override an
+        # LLM field with the same name. If none exist, the LLM/standards proposal
+        # is returned unchanged (apart from normal source attribution).
         requested_scenario_id = req.requested_scenario_id.strip()
-        if is_json_grounded_domain(req.domain):
-            # Standards-grounded domain proposals must remain reproducible from the approved
-            # source artifacts; do not overlay unrelated persisted recommendations.
-            schema, variable_sources = schema, {}
-        else:
-            recommended = get_recommended(requested_scenario_id, 1)
-            user_selected = get_user_variables(req.user_id.strip(), requested_scenario_id, 1) if req.user_id and req.user_id.strip() else []
-            schema, variable_sources = self._merge_persisted_variables(schema, recommended, user_selected)
+        recommended = get_recommended(requested_scenario_id, 1)
+        user_selected = (
+            get_user_variables(
+                req.user_id.strip(),
+                requested_scenario_id,
+                1,
+            )
+            if req.user_id and req.user_id.strip()
+            else []
+        )
+        schema, variable_sources = self._merge_persisted_variables(
+            schema,
+            recommended,
+            user_selected,
+        )
 
         unresolved_questions = self.compiler.approval_questions(intent, schema)
         variables, field_order = self._schema_to_variables(schema)
         for variable in variables:
             key = str(variable.get("name") or "").strip().lower()
-            if is_json_grounded_domain(req.domain):
-                field = next((candidate for candidate in schema.fields if candidate.name == variable.get("name")), None)
+            persisted_source = variable_sources.get(key)
+            if persisted_source in {"DB_RECOMMENDED", "USER_SELECTED"}:
+                # Persisted scenario/user selections are authoritative over a fresh LLM proposal.
+                variable["source"] = persisted_source
+            elif is_json_grounded_domain(req.domain):
+                field = next(
+                    (candidate for candidate in schema.fields if candidate.name == variable.get("name")),
+                    None,
+                )
                 if key in {"subscriber_id", "account_id", "msisdn"}:
                     variable["source"] = "APPLICATION_REQUIRED"
-                elif field and (field.provenance.get("source_registry_attribute") or field.provenance.get("source_json_id")):
+                elif field and (
+                    field.provenance.get("source_registry_attribute")
+                    or field.provenance.get("source_json_id")
+                ):
                     variable["source"] = "OFFICIAL_JSON_GROUNDED"
                 else:
                     variable["source"] = "SCENARIO_DERIVED"
