@@ -27,6 +27,90 @@ _ALLOWED_CONTEXT_PREFIXES = {
     "transaction",
 }
 
+# Low Balance rows should maximize analytical coverage without reproducing transport/display
+# metadata or customer PII. These exclusions are based only on the supplied TMF654/TMF629
+# scalar catalog; they do not introduce any new business vocabulary.
+LOW_BALANCE_REQUIRED_FIELDS = ("customer_id", "account_id", "msisdn")
+LOW_BALANCE_DB_REQUIRED_FIELDS = ("account_id", "msisdn")
+_LOW_BALANCE_TECHNICAL_SUFFIXES = ("_href", "_description", "_referred_type")
+_LOW_BALANCE_PII_NAMES = {
+    "customer_name",
+    "customer_engaged_party_name",
+    "topupbalance_requestor_name",
+}
+_LOW_BALANCE_DISPLAY_NAMES = {"bucket_remaining_value_name"}
+
+
+def is_material_low_balance_spec(spec: dict[str, Any]) -> bool:
+    """Return whether an official scalar leaf is analytically useful for Low Balance.
+
+    The function only filters low-value metadata/PII from the supplied official JSON catalog.
+    Every retained field remains traceable to TMF654/TMF629.
+    """
+    name = _normalize_name(spec.get("name"))
+    if not name:
+        return False
+    if name in _LOW_BALANCE_PII_NAMES or name in _LOW_BALANCE_DISPLAY_NAMES:
+        return False
+    if name.endswith(_LOW_BALANCE_TECHNICAL_SUFFIXES):
+        return False
+    dtype = str(spec.get("dtype") or "string").strip().lower()
+    return dtype not in {"object", "array"}
+
+
+def material_low_balance_catalog() -> tuple[dict[str, Any], ...]:
+    """Return the broad, quality-safe official Low Balance variable catalog."""
+    rows = [dict(row) for row in expanded_scalar_catalog() if is_material_low_balance_spec(row)]
+    rows.sort(key=lambda item: (str(item.get("model") or ""), str(item.get("path") or ""), str(item.get("name") or "")))
+    return tuple(rows)
+
+
+def validate_low_balance_required_identity_sources(db_variables: list[dict[str, Any]]) -> None:
+    """Require the exact DB-only telecom identity fields that are absent from the two Swagger files.
+
+    ``customer_id`` exists in the official TMF629 catalog. ``account_id`` and ``msisdn`` do not, so
+    Low Balance must receive those exact names from MongoDB. The policy intentionally refuses to
+    synthesize aliases or application-level replacements.
+    """
+    normalized = {
+        _normalize_name(item.get("name")): item
+        for item in (db_variables or [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    missing = [name for name in LOW_BALANCE_DB_REQUIRED_FIELDS if _normalize_name(name) not in normalized]
+    if missing:
+        raise ValueError(
+            "Low Balance & Top-up requires the exact DB variables "
+            + ", ".join(missing)
+            + ". They are not present in the supplied TMF654/TMF629 Swagger scalar catalog and must not be invented by the LLM or another generator."
+        )
+
+    customer = normalized.get("customer_id")
+    if customer is not None:
+        validate_db_definition(customer)
+        if str(customer.get("scope") or "").strip().lower() != "entity":
+            raise ValueError("MongoDB customer_id must have scope='entity' for Low Balance & Top-up.")
+        gen = str(customer.get("gen") or "").strip().lower()
+        params = customer.get("params") if isinstance(customer.get("params"), dict) else {}
+        try:
+            customer_digits = int(params.get("digits", 0) or 0)
+        except (TypeError, ValueError):
+            customer_digits = 0
+        if gen != "prefixed_int" or str(params.get("prefix") or "") != "cust-" or customer_digits != 8:
+            raise ValueError(
+                "MongoDB customer_id is authoritative but its definition does not satisfy the required "
+                "Low Balance contract: gen='prefixed_int', prefix='cust-', digits=8. Update the DB definition; the application will not rewrite it."
+            )
+
+    for name in LOW_BALANCE_DB_REQUIRED_FIELDS:
+        item = normalized[_normalize_name(name)]
+        if str(item.get("scope") or "").strip().lower() != "entity":
+            raise ValueError(f"MongoDB {name} must have scope='entity' for Low Balance & Top-up.")
+        if not bool(item.get("required")) or bool(item.get("nullable")):
+            raise ValueError(f"MongoDB {name} must be required=true and nullable=false for Low Balance & Top-up.")
+    if customer is not None and (not bool(customer.get("required")) or bool(customer.get("nullable"))):
+        raise ValueError("MongoDB customer_id must be required=true and nullable=false for Low Balance & Top-up.")
+
 # Synonyms are deliberately narrow. This is only the deterministic backstop for
 # the LLM's duplicate review; it must not become a second semantic registry.
 _TOKEN_ALIASES = {
@@ -575,6 +659,32 @@ def validate_low_balance_variable_sources(
             "Low Balance & Top-up executable variables must come only from the supplied TMF654/TMF629 Swagger scalar catalog or MongoDB variables. "
             + "Invalid variables: " + ", ".join(sorted(set(invalid)))
         )
+
+    by_name = {
+        _normalize_name(raw.get("name")): raw
+        for raw in (variables or [])
+        if isinstance(raw, dict) and str(raw.get("name") or "").strip()
+    }
+    required = {_normalize_name(name) for name in LOW_BALANCE_REQUIRED_FIELDS}
+    missing = sorted(name for name in required if name not in by_name)
+    if missing:
+        raise ValueError(
+            "Low Balance & Top-up requires customer_id, account_id, and msisdn in every executable schema. "
+            "Missing: " + ", ".join(missing)
+        )
+    for name in required:
+        var = by_name[name]
+        if str(var.get("scope") or "").strip().lower() != "entity":
+            raise ValueError(f"Low Balance identity variable '{name}' must have scope='entity'.")
+        if not bool(var.get("required")) or bool(var.get("nullable")):
+            raise ValueError(f"Low Balance identity variable '{name}' must be required=true and nullable=false.")
+
+    if sources.get("account_id") not in allowed_db:
+        raise ValueError("Low Balance account_id must come from MongoDB; it is not present in the supplied TMF654/TMF629 catalog.")
+    if sources.get("msisdn") not in allowed_db:
+        raise ValueError("Low Balance msisdn must come from MongoDB; it is not present in the supplied TMF654/TMF629 catalog.")
+    if sources.get("customer_id") not in {allowed_official, *allowed_db}:
+        raise ValueError("Low Balance customer_id must come from TMF629 JSON or MongoDB.")
 
 
 def validate_db_definition(variable: dict[str, Any]) -> dict[str, Any]:

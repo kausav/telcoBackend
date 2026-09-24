@@ -155,9 +155,20 @@ def expanded_scalar_catalog() -> list[dict[str, Any]]:
     return result
 
 
+def _material_scalar_for_low_balance(row: dict[str, Any]) -> bool:
+    name = re.sub(r"[^a-z0-9]+", "_", str(row.get("name") or "").strip().lower()).strip("_")
+    if not name:
+        return False
+    if name.endswith(("_href", "_description", "_referred_type")):
+        return False
+    if name in {"customer_name", "customer_engaged_party_name", "topupbalance_requestor_name", "bucket_remaining_value_name"}:
+        return False
+    return str(row.get("dtype") or "string").lower() not in {"object", "array"}
+
+
 def catalog_for_request() -> dict[str, Any]:
-    """Return the broad source catalog exposed to the Low Balance intent agent."""
-    payload = expanded_scalar_catalog()
+    """Return the broad, business-useful official catalog exposed to the Low Balance intent agent."""
+    payload = [row for row in expanded_scalar_catalog() if _material_scalar_for_low_balance(row)]
     for row in payload:
         row["model_role"] = {
             "Bucket": "Balance bucket state",
@@ -169,7 +180,7 @@ def catalog_for_request() -> dict[str, Any]:
         "sources": source_manifest(),
         "models": payload,
         "notes": [
-            "The catalog includes all materializable scalar leaves from TMF654 Bucket/TopupBalance and TMF629 Customer, including scalar leaves inside referenced objects.",
+            "The catalog includes all quality-safe materializable scalar leaves from TMF654 Bucket/TopupBalance and TMF629 Customer, including scalar leaves inside referenced objects; transport/display metadata and obvious customer/requestor name fields are excluded.",
             "One-to-many array relationships are intentionally excluded from the flat row contract rather than collapsed into a fake scalar.",
             "Swagger metadata fields beginning with @ are excluded because they are implementation/type-system metadata rather than useful business dimensions.",
             "The executable variable boundary is strict: a variable must be an exact scalar leaf from the supplied TMF654/TMF629 Swagger catalog or be explicitly supplied from MongoDB. The LLM may select/review variables but may not create executable variables.",

@@ -141,10 +141,10 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
             "Values describing the same transaction, entity, or balance snapshot must be mutually consistent.",
         ],
         "domain_invariants": [
-            "Low Balance & Top-up records must keep subscriber/account/msisdn stable across a subscriber history.",
+            "Low Balance & Top-up records must keep customer_id/account_id/msisdn stable across a customer history.",
             "Low Balance & Top-up balances, usage types, units, top-up amounts, statuses, and timestamps must describe the same recharge lifecycle.",
             "Low Balance & Top-up validity windows must be derived from the recharge/plan timeline rather than independently sampled.",
-            "Scenario-specific outcome fields may extend the official source model, but they must remain consistent with official status and transaction state fields.",
+            "MongoDB-supplied Low Balance fields may extend the official source model, but they must remain consistent with official status and transaction state fields.",
         ] if "low balance" in domain.lower() else [],
         "field_constraints": {
             name: {

@@ -1324,6 +1324,7 @@ def _enforce_mandatory_telecom_identity(
     *,
     country: str | None = None,
     used_values: dict[str, set[str]] | None = None,
+    low_balance: bool = False,
 ) -> dict:
     """Repair mandatory telecom identity anchors before transactional grouping.
 
@@ -1335,8 +1336,9 @@ def _enforce_mandatory_telecom_identity(
     out=dict(user_context)
     names={str(v.get("name")) for v in variables if v.get("name")}
     used_values = used_values if used_values is not None else {
-        "subscriber_id": set(), "account_id": set(), "msisdn": set()
+        "subscriber_id": set(), "account_id": set(), "msisdn": set(), "customer_id": set()
     }
+    used_values.setdefault("customer_id", set())
 
     def unique_prefixed(prefix: str, digits: int, field: str) -> str:
         for _ in range(1000):
@@ -1354,15 +1356,35 @@ def _enforce_mandatory_telecom_identity(
             used_values["subscriber_id"].add(current)
         out["subscriber_id"]=current
 
-    if "account_id" in names:
-        subscriber=str(out.get("subscriber_id") or "")
-        suffix=re.search(r"([0-9]+)$", subscriber)
-        current=f"ACC-{suffix.group(1)}" if suffix else ""
-        if (not current) or current in used_values["account_id"]:
-            current=unique_prefixed("ACC-", 10, "account_id")
+    if "customer_id" in names:
+        current=str(out.get("customer_id") or "")
+        if not re.fullmatch(r"cust-[0-9]{8}", current) or current in used_values["customer_id"]:
+            current=unique_prefixed("cust-", 8, "customer_id")
         else:
+            used_values["customer_id"].add(current)
+        out["customer_id"]=current
+
+    if "account_id" in names:
+        if low_balance:
+            current=str(out.get("account_id") or "")
+            if (not current) or current in used_values["account_id"]:
+                generated = _generate_selected_record(variables, {"account_id"}, base=out)
+                current=str(generated.get("account_id") or "")
+            if not current:
+                raise RuntimeError("Low Balance account_id DB variable generated an empty value")
+            if current in used_values["account_id"]:
+                raise RuntimeError("Low Balance account_id DB variable produced a duplicate value")
             used_values["account_id"].add(current)
-        out["account_id"]=current
+            out["account_id"]=current
+        else:
+            subscriber=str(out.get("subscriber_id") or "")
+            suffix=re.search(r"([0-9]+)$", subscriber)
+            current=f"ACC-{suffix.group(1)}" if suffix else ""
+            if (not current) or current in used_values["account_id"]:
+                current=unique_prefixed("ACC-", 10, "account_id")
+            else:
+                used_values["account_id"].add(current)
+            out["account_id"]=current
 
     if "msisdn" in names:
         iso=str(country or "IN").strip().upper()
@@ -1372,16 +1394,27 @@ def _enforce_mandatory_telecom_identity(
         }
         dial=dial_codes.get(iso, iso if iso.startswith("+") else "+"+iso)
         current=str(out.get("msisdn") or "")
-        # Require an E.164-like value for the public MSISDN contract.
-        valid=bool(re.fullmatch(r"\+[1-9][0-9]{6,14}", current))
-        if (not valid) or current in used_values["msisdn"]:
-            for _ in range(1000):
-                candidate=_e164_phone({"country_codes":[dial], "country":iso}, out)
-                if candidate not in used_values["msisdn"]:
-                    current=candidate
-                    break
-            else:
-                raise RuntimeError("Unable to generate a unique msisdn")
+        # In Low Balance, the DB definition is authoritative. If the generated value is missing
+        # or collides, rerun that DB field's own generator instead of substituting an application
+        # generated phone contract. For other telecom domains retain the historical normalization.
+        if low_balance:
+            if (not current) or current in used_values["msisdn"]:
+                generated = _generate_selected_record(variables, {"msisdn"}, base=out)
+                current=str(generated.get("msisdn") or "")
+            if not current:
+                raise RuntimeError("Low Balance msisdn DB variable generated an empty value")
+            if current in used_values["msisdn"]:
+                raise RuntimeError("Low Balance msisdn DB variable produced a duplicate value")
+        else:
+            valid=bool(re.fullmatch(r"\+[1-9][0-9]{6,14}", current))
+            if (not valid) or current in used_values["msisdn"]:
+                for _ in range(1000):
+                    candidate=_e164_phone({"country_codes":[dial], "country":iso}, out)
+                    if candidate not in used_values["msisdn"]:
+                        current=candidate
+                        break
+                else:
+                    raise RuntimeError("Unable to generate a unique msisdn")
         used_values["msisdn"].add(current)
         out["msisdn"]=current
 
@@ -1403,7 +1436,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
     timestamp_field=_pick_timestamp_field(variables)
     generated=[]
     used_entity_keys=set()
-    used_identity_values={name:set() for name in ("subscriber_id", "account_id", "msisdn")}
+    used_identity_values={name:set() for name in ("subscriber_id", "account_id", "msisdn", "customer_id")}
     used_resource_ids={name:set() for name in ("bucket_id", "topupbalance_id", "topup_transaction_id")}
     user_field_names = set(compiled.user_fields)
     record_field_names = set(compiled.record_fields)
@@ -1421,11 +1454,13 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
             # Repair application-level telecom identity anchors before grouping. This is
             # intentionally independent of the confirmed draft's stored generators so old
             # scenarios cannot collapse all requested users into a single subscriber.
+            low_balance_domain = "low balance" in str((rules or {}).get("domain") or "").lower() and "top" in str((rules or {}).get("domain") or "").lower()
             user_context=_enforce_mandatory_telecom_identity(
                 user_context,
                 variables,
                 country=country,
                 used_values=used_identity_values,
+                low_balance=low_balance_domain,
             )
             # Establish stable entity-level domain context before transaction rows are created.
             user_context, _ = _enforce_low_balance_topup_consistency(user_context, variables, rules=rules)
@@ -1443,7 +1478,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
             # This prevents response grouping from collapsing multiple requested users into
             # one object when a legacy/edited draft contains constant placeholder generators.
             variable_names={str(v.get("name")) for v in variables if v.get("name")}
-            for identity_name in ("subscriber_id", "account_id", "msisdn"):
+            for identity_name in ("subscriber_id", "account_id", "msisdn", "customer_id"):
                 if identity_name not in variable_names:
                     continue
                 identity_value=str(user_context.get(identity_name) or "")
@@ -2249,13 +2284,8 @@ def _enforce_low_balance_topup_consistency(
         customer_label = f"Prepaid Subscriber {suffix.group(1)}"
     if "customer_name" in by_name and "customer_name" in rec:
         _lb_set(rec, variables, "customer_name", customer_label, issues, "customer name linked to subscriber context")
-    if "customer_id" in rec and rec.get("subscriber_id") is not None:
-        customer_value = f"CUSTOMER-{suffix.group(1)}" if suffix else f"CUSTOMER-{random.randint(1000000000, 9999999999)}"
-        _lb_set(rec, variables, "customer_id", customer_value, issues, "customer id deterministically linked to subscriber identity")
-        if "customer_href" in rec:
-            _lb_set(rec, variables, "customer_href", f"https://example.test/telecom/customer/{customer_value}", issues, "customer href synchronized with customer id")
-        if "customer_engaged_party_id" in rec:
-            _lb_set(rec, variables, "customer_engaged_party_id", rec.get("subscriber_id"), issues, "customer engaged party synchronized with subscriber identity")
+    # customer_id is an immutable source-backed identity field. Do not derive or rewrite it from
+    # subscriber_id (Low Balance no longer permits an application-generated subscriber alias).
 
     # Balance amounts are one snapshot, not independent random columns.
     remaining_names = [n for n in by_name if ("remaining" in n and "amount" in n) and str(by_name[n].get("dtype", "")).lower() in _NUMERIC_DTYPES]
@@ -2884,11 +2914,9 @@ def _assert_low_balance_topup_consistency(rec: dict, variables: list[dict], rule
         msisdn = str(rec["msisdn"])
         if not re.fullmatch(r"\+91[0-9]{10}", msisdn):
             errors.append("msisdn is not a valid synthetic India +91 number")
-    if "customer_id" in rec and "subscriber_id" in rec:
-        suffix = re.search(r"([0-9]+)$", str(rec.get("subscriber_id") or ""))
-        expected_customer = f"CUSTOMER-{suffix.group(1)}" if suffix else None
-        if expected_customer and str(rec.get("customer_id")) != expected_customer:
-            errors.append("customer_id is not linked to subscriber_id")
+    if "customer_id" in rec and rec.get("customer_id") is not None:
+        if not re.fullmatch(r"cust-[0-9]{8}", str(rec.get("customer_id"))):
+            errors.append("customer_id must match the Low Balance contract cust-<8 digits>")
 
     # Requestor must describe the same actor represented by the auto-top-up state.
     if "topupbalance_requestor_role" in rec and "topupbalance_requestor_referred_type" in rec:

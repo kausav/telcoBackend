@@ -8,7 +8,7 @@ import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
 from core.json_domain_policy import LOW_BALANCE_MAIN_MODEL_IDS, LOW_BALANCE_SOURCE_IDS, expanded_scalar_catalog, is_json_grounded_domain
-from core.low_balance_variable_policy import official_catalog_by_name
+from core.low_balance_variable_policy import official_catalog_by_name, material_low_balance_catalog
 from core.variable_quality import VariableQualityEngine
 from config.runtime import SCHEMA_MAX_VARIABLES, SCHEMA_MIN_VARIABLE_SCORE
 
@@ -566,6 +566,11 @@ class SchemaCompiler:
         if enum_values:
             return "weighted_choice", "categorical", {"choices": enum_values, "weights": [1.0] * len(enum_values)}
 
+        # Low Balance has an explicit public customer identity contract. The source field is
+        # still TMF629 Customer.id; only the deterministic synthetic representation is fixed here.
+        if SchemaCompiler._normalize_variable_name(str(spec.get("name") or "")) == "customer_id":
+            return "prefixed_int", "string", {"prefix": "cust-", "digits": 8}
+
         # Some official Swagger string definitions encode a constrained vocabulary only
         # in their descriptions (for example RelatedTopupBalance.role = parent/child).
         # Materialize those explicit source-described choices instead of falling back to
@@ -1077,40 +1082,75 @@ class SchemaCompiler:
             business_scenario=business_scenario,
         )
 
-        # Gemini is a selector only for this source-bound domain. Normalize every
-        # selected idea to an exact leaf from TMF654/TMF629 and discard any model-
-        # invented field before executable contracts are constructed.
+        # Gemini is a selector/reviewer only for this source-bound domain. Its selected names are
+        # used to prioritize ordering, while the deterministic breadth guard adds every material
+        # official scalar leaf from the two supplied Swagger files. This prevents the final width
+        # from depending on how many fields Gemini happened to mention while keeping the source
+        # boundary strict.
         catalog = official_catalog_by_name()
+        llm_selected_names = [
+            self._normalize_variable_name(idea.name)
+            for idea in intent.candidate_variables
+            if self._normalize_variable_name(idea.name) in catalog
+        ]
+        ordered_names: list[str] = []
+        seen_names: set[str] = set()
+        for name in llm_selected_names + [
+            self._normalize_variable_name(row.get("name"))
+            for row in material_low_balance_catalog()
+        ]:
+            if name and name in catalog and name not in seen_names:
+                seen_names.add(name)
+                ordered_names.append(name)
+
         selected_source_ideas: list[dict[str, object]] = []
         clean_selected_ideas: list[VariableIdea] = []
-        for idea in intent.candidate_variables:
-            spec = catalog.get(self._normalize_variable_name(idea.name))
-            if not spec:
-                continue
-
-            # Keep the Pydantic-facing intent model clean. The compiler needs internal
-            # source metadata to build an executable JSON-backed contract, but those
-            # private keys must never be pushed back through VariableIdea(extra="forbid").
-            clean_selected_ideas.append(VariableIdea.model_validate({
-                **idea.model_dump(),
+        for name in ordered_names:
+            spec = catalog[name]
+            clean_idea = VariableIdea.model_validate({
                 "name": str(spec["name"]),
-                "description": str(spec.get("description") or idea.description or "")[:500],
-            }))
+                "description": str(spec.get("description") or "")[:500],
+                "role": (
+                    "timing" if str(spec.get("format") or "").lower() == "date-time" or str(spec.get("dtype") or "").lower() in {"date", "datetime", "timestamp"}
+                    else "measurement" if str(spec.get("dtype") or "").lower() in {"integer", "number", "float", "double", "decimal"}
+                    else "status" if spec.get("enum_values") and any(token in str(spec.get("path") or "").lower() for token in ("status", "state", "reason"))
+                    else "identity" if str(spec.get("path") or "").lower().endswith(".id")
+                    else "configuration" if any(token in str(spec.get("path") or "").lower() for token in ("isautotopup", "recurringperiod", "numberofperiods"))
+                    else "profile" if str(spec.get("model") or "").lower() == "customer"
+                    else "other"
+                ),
+                "grain": (
+                    "entity" if str(spec.get("model") or "").lower() == "customer"
+                    else "transaction"
+                ),
+                "dtype": (
+                    "integer" if str(spec.get("dtype") or "").lower() in {"integer", "int"}
+                    else "float" if str(spec.get("dtype") or "").lower() in {"number", "float", "double", "decimal"}
+                    else "datetime" if str(spec.get("format") or "").lower() in {"date-time", "datetime", "timestamp"} or str(spec.get("dtype") or "").lower() in {"date-time", "datetime", "timestamp"}
+                    else "date" if str(spec.get("dtype") or "").lower() == "date"
+                    else "categorical" if spec.get("enum_values")
+                    else "boolean" if str(spec.get("dtype") or "").lower() in {"boolean", "bool"}
+                    else "string"
+                ),
+                "depends_on": [],
+            })
+            clean_selected_ideas.append(clean_idea)
             selected_source_ideas.append({
-                **clean_selected_ideas[-1].model_dump(),
+                **clean_idea.model_dump(),
                 "name": str(spec["name"]),
-                "description": str(spec.get("description") or idea.description or "")[:500],
+                "description": str(spec.get("description") or "")[:500],
                 "_json_source_spec": dict(spec),
                 "_json_source": True,
                 "_preserve_name": True,
+                "_force_include": True,
                 "_registry_entity": f"{spec.get('source_id', '')}__{spec.get('model', '')}",
                 "_registry_entity_name": str(spec.get("model") or ""),
                 "_registry_required": bool(spec.get("required")),
                 "_registry_nullable": not bool(spec.get("required")),
             })
 
-        # Persist only the clean semantic selection on the intent. Source metadata is
-        # passed separately to _build_fresh_fields and never enters VariableIdea.
+        # Persist only the clean semantic selection on the intent. Source metadata is passed
+        # separately to _build_fresh_fields and never enters VariableIdea.
         intent = intent.model_copy(update={"candidate_variables": clean_selected_ideas})
 
         # Low Balance is intentionally compiled from the three primary resources only.
@@ -1138,7 +1178,7 @@ class SchemaCompiler:
             country=normalized_country,
             type_of_data=normalized_type,
             scenario_mode=scenario_mode,
-            max_variables=None,
+            max_variables=max(len(selected_source_ideas), SCHEMA_MAX_VARIABLES),
             include_all_registry_scalars=False,
             include_all_json_source_scalars=False,
             include_application_telecom_anchors=False,

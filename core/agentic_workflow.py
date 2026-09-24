@@ -23,6 +23,7 @@ from core.low_balance_variable_policy import (
     dedupe_schema_fields_against_db,
     validate_db_definition,
     validate_low_balance_variable_sources,
+    validate_low_balance_required_identity_sources,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,7 +139,7 @@ class AgenticSchemaWorkflow:
         canonical_db = json.dumps(db_variables or [], sort_keys=True, separators=(",", ":"), default=str)
         fingerprint = hashlib.sha256(canonical_db.encode("utf-8")).hexdigest()
         return (
-            "agentic_proposal_v19_low_balance_clean_intent_source_metadata",
+            "agentic_proposal_v20_low_balance_source_locked_broad_catalog",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -237,6 +238,10 @@ class AgenticSchemaWorkflow:
                 )
 
         db_variables = self._merge_db_variable_sources(recommended, user_selected)
+        if json_grounded:
+            # Low Balance has two source families only. account_id and msisdn are absent from
+            # the bundled TMF654/TMF629 catalog, so the exact DB variables are mandatory.
+            validate_low_balance_required_identity_sources(db_variables)
         protected_names = self._variable_name_keys(db_variables)
         protected_name_set = set(protected_names)
         agent_prompt = (
@@ -470,6 +475,8 @@ class AgenticSchemaWorkflow:
         fields_by_name = {field.name: field for field in schema.fields}
 
         mandatory_telecom = {"subscriber_id", "account_id", "msisdn"}
+        if is_json_grounded_domain(draft.get("domain")):
+            mandatory_telecom = {"customer_id", "account_id", "msisdn"}
         for name in delete:
             if name not in fields_by_name:
                 raise ValueError(f"HITL cannot delete unknown agentic field '{name}'")
