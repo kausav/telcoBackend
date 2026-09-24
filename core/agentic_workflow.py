@@ -101,6 +101,34 @@ class AgenticSchemaWorkflow:
         }
         return tuple(sorted(names))
 
+    @staticmethod
+    def _finalize_low_balance_schema(schema: ScenarioSchema, variables: list[dict[str, Any]]) -> ScenarioSchema:
+        """Remove source-stage false positives once DB-backed executable variables are overlaid.
+
+        The compiler evaluates official JSON variables before the Mongo overlay exists. A proposal
+        can therefore legitimately compile with zero *new* official fields even though the final
+        merged schema contains many executable DB variables. The persisted draft must represent the
+        final executable state, not an intermediate compiler observation.
+        """
+        executable_names = {
+            str(item.get("name") or "").strip().casefold()
+            for item in (variables or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        }
+        if not executable_names:
+            return schema
+        stale_markers = {
+            "the low balance & top-up scenario did not yield any usable semantic variables.",
+            "the scenario did not yield any usable semantic variables.",
+        }
+        unresolved = [
+            item for item in schema.unresolved_items
+            if str(item).strip().casefold() not in stale_markers
+        ]
+        if unresolved == list(schema.unresolved_items):
+            return schema
+        return schema.model_copy(update={"unresolved_items": unresolved})
+
     @classmethod
     def _merge_db_variable_sources(
         cls,
@@ -372,6 +400,7 @@ class AgenticSchemaWorkflow:
                 variable_sources,
                 db_variable_names=db_variable_names,
             )
+            schema = self._finalize_low_balance_schema(schema, variables)
         for variable in variables:
             key = str(variable.get("name") or "").strip().lower()
             persisted_source = variable_sources.get(key)
@@ -520,6 +549,10 @@ class AgenticSchemaWorkflow:
                 schema = schema.model_copy(update={"fields": rebuilt_fields})
 
         # Concept labels are soft hints. Only genuinely executable unresolved requirements block confirmation.
+        # Reconcile compiler-stage diagnostics against the already merged executable variable set
+        # before evaluating anything as a blocking confirmation requirement.
+        if is_json_grounded_domain(draft.get("domain")):
+            schema = AgenticSchemaWorkflow._finalize_low_balance_schema(schema, draft_variables)
         external_db_names = set(draft_db_names)
         proposed_names = {
             str(item.get("name") or "").strip().casefold()
@@ -645,6 +678,7 @@ class AgenticSchemaWorkflow:
                 draft_source_by_name,
                 db_variable_names=draft_db_names,
             )
+            schema = AgenticSchemaWorkflow._finalize_low_balance_schema(schema, variables)
 
         if draft.get("type_of_data") == "transactional" and draft.get("entity_key") not in field_order:
             raise ValueError("HITL changes would remove the transactional entity key")

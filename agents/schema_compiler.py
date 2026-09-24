@@ -1241,13 +1241,18 @@ class SchemaCompiler:
                 "missing executable official fields: " + ", ".join(missing_official)
             )
         field_names = [f.name for f in fields]
-        if not fields:
-            unresolved.append("The Low Balance & Top-up scenario did not yield any usable semantic variables.")
+        # A JSON-grounded compile may intentionally produce zero new official fields when the
+        # complete usable variable set is supplied by MongoDB. External variables are executable
+        # schema fields for this lifecycle, so an empty *official* selection is not the same as an
+        # empty *final* variable set. Do not persist a false unresolved requirement that /scenario/confirm
+        # will later reject after the DB overlay has already supplied executable fields.
         external_keys = {
             self._normalize_variable_name(name)
             for name in (external_variable_names or set())
             if self._normalize_variable_name(name)
         }
+        if not fields and not external_keys:
+            unresolved.append("The Low Balance & Top-up scenario did not yield any usable semantic variables.")
         if (
             entity_key
             and self._normalize_variable_name(entity_key) not in {self._normalize_variable_name(n) for n in field_names}
