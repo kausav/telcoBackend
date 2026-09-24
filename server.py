@@ -33,7 +33,10 @@ from config.industry_profiles import COUNTRY_BASE
 from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES
 from core.agentic_workflow import AgenticSchemaWorkflow, get_agentic_workflow
 from core.json_domain_policy import is_json_grounded_domain
-from core.low_balance_variable_policy import validate_low_balance_variable_sources
+from core.low_balance_variable_policy import (
+    validate_low_balance_variable_sources,
+    reconcile_low_balance_executable_variables,
+)
 from core.telecom_registry import RegistryError, get_registry
 from core.scenario_variable_store import upsert_recommended, get_recommended, set_user_variables, get_user_variables, get_user_variable_records, delete_user_variable
 from models.database import ping as ping_mongodb
@@ -516,13 +519,22 @@ def confirm_scenario_route(req: ConfirmRequest):
             cleaned=_clean_dict(new_var); name=cleaned.get("name")
             if not _is_placeholder(name): by_name[str(name)]=cleaned
         variables=list(by_name.values()); field_order=[str(v["name"]) for v in variables if v.get("name")]
+    variable_sources = draft.get("variable_sources") or {}
+    db_variable_names = set(draft.get("db_variable_names") or [])
     if is_json_grounded_domain(draft.get("domain")):
         try:
+            variables, variable_sources, db_variable_names, _ = reconcile_low_balance_executable_variables(
+                variables,
+                variable_sources,
+                db_variable_names,
+                field_order,
+            )
             validate_low_balance_variable_sources(
                 variables,
-                draft.get("variable_sources") or {},
-                db_variable_names=set(draft.get("db_variable_names") or []),
+                variable_sources,
+                db_variable_names=db_variable_names,
             )
+            field_order = [str(v.get("name")) for v in variables if v.get("name")]
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
@@ -546,10 +558,10 @@ def confirm_scenario_route(req: ConfirmRequest):
         # without modifying DB-owned variable definitions.
         "variable_sources": {
             str(name).strip().casefold(): str(source).strip().upper()
-            for name, source in (draft.get("variable_sources") or {}).items()
+            for name, source in (variable_sources or {}).items()
             if str(name).strip() and str(source).strip()
         },
-        "db_variable_names": sorted(str(name).strip().casefold() for name in (draft.get("db_variable_names") or []) if str(name).strip()),
+        "db_variable_names": sorted(str(name).strip().casefold() for name in (db_variable_names or set()) if str(name).strip()),
     }
     try:
         scenario_id, scenario_id_reassigned = confirm_scenario(

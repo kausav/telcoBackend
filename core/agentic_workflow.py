@@ -24,6 +24,9 @@ from core.low_balance_variable_policy import (
     validate_db_definition,
     validate_low_balance_variable_sources,
     validate_low_balance_required_identity_sources,
+    filter_incompatible_low_balance_db_customer_overrides,
+    reconcile_low_balance_schema,
+    reconcile_low_balance_executable_variables,
     semantic_signature,
     official_catalog_by_name,
 )
@@ -144,7 +147,7 @@ class AgenticSchemaWorkflow:
             json.dumps(source_manifest(), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
         return (
-            "agentic_proposal_v27_low_balance_source_locked_scenario_ranked_catalog",
+            "agentic_proposal_v28_low_balance_customer_override_reconciled_scenario_ranked_catalog",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -234,6 +237,14 @@ class AgenticSchemaWorkflow:
             else []
         )
         if json_grounded:
+            recommended, user_selected, quarantined_customer_names = filter_incompatible_low_balance_db_customer_overrides(
+                recommended, user_selected
+            )
+            if quarantined_customer_names:
+                logger.warning(
+                    "Low Balance quarantined incompatible MongoDB customer_id override(s); TMF629 Customer.id remains authoritative: %s",
+                    quarantined_customer_names,
+                )
             recommended, user_selected, suppressed_db_names = dedupe_db_variable_sources(
                 recommended, user_selected
             )
@@ -465,6 +476,25 @@ class AgenticSchemaWorkflow:
             for item in (draft.get("variables") or [])
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         }
+
+        # Reconcile legacy Low Balance drafts before unresolved-requirement checks. This is a
+        # local executable-schema migration only: an incompatible DB customer_id is replaced by
+        # the bundled TMF629 contract, while all unrelated Mongo variables remain unchanged.
+        if is_json_grounded_domain(draft.get("domain")):
+            schema, reconciled_variables, draft_source_by_name, reconciled_db_names, _ = reconcile_low_balance_schema(
+                schema,
+                list(draft_raw_by_name.values()),
+                draft_source_by_name,
+                set(draft.get("db_variable_names") or []),
+                list(draft.get("field_order") or []),
+            )
+            draft_raw_by_name = {
+                str(item.get("name") or "").strip().casefold(): dict(item)
+                for item in reconciled_variables
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            }
+        else:
+            reconciled_db_names = set(draft.get("db_variable_names") or [])
         # Concept names extracted by the LLM are soft semantic hints. They may not have
         # one-to-one registry entities and must never block HITL confirmation. Only hard
         # executable failures (no usable fields / requested entity key not represented)
@@ -473,12 +503,12 @@ class AgenticSchemaWorkflow:
         blocking_unresolved = []
         external_db_names = {
             str(name).strip().casefold()
-            for name in (draft.get("db_variable_names") or [])
+            for name in reconciled_db_names
             if str(name).strip()
         }
         proposed_names = {
             str(item.get("name") or "").strip().casefold()
-            for item in (draft.get("variables") or [])
+            for item in draft_raw_by_name.values()
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         }
         for item in schema.unresolved_items:

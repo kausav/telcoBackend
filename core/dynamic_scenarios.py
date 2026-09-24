@@ -6,7 +6,10 @@ from models.scenario import ScenarioModel
 from models.scenario_draft import ScenarioDraftModel
 from models.scenario_feedback import ScenarioFeedbackModel
 from core.json_domain_policy import is_json_grounded_domain
-from core.low_balance_variable_policy import validate_low_balance_variable_sources
+from core.low_balance_variable_policy import (
+    validate_low_balance_variable_sources,
+    reconcile_low_balance_executable_variables,
+)
 
 def next_scenario_id() -> str:
     return ScenarioModel.next_id()
@@ -204,20 +207,28 @@ def resolve_variables(requested_scenario_id: str) -> tuple[list[dict[str, Any]],
     domain = meta.get("domain") or meta.get("journey") or ""
 
     if is_json_grounded_domain(domain):
-        # Low Balance is source-locked. Never apply the generic legacy-repair layer here:
-        # DB definitions must remain unchanged and official JSON variables must remain exactly
-        # the source-backed contract selected during proposal/confirmation.
-        validate_low_balance_variable_sources(
+        # Low Balance is source-locked. Reconcile legacy confirmed state locally before the
+        # fail-closed source validator so an old/incompatible Mongo customer_id cannot break
+        # generation. MongoDB is never rewritten; unrelated DB extension variables remain exact.
+        variables, normalized_sources, normalized_db_names, normalized_order = reconcile_low_balance_executable_variables(
             raw_variables,
             meta.get("variable_sources") or {},
             db_variable_names=set(meta.get("db_variable_names") or []),
+            field_order=list(dyn.get("field_order") or []),
         )
-        variables = raw_variables
+        validate_low_balance_variable_sources(
+            variables,
+            normalized_sources,
+            db_variable_names=normalized_db_names,
+        )
     else:
         variables = _repair_legacy_variables(raw_variables)
 
     allowed = {str(v.get("name")) for v in variables if isinstance(v, dict) and v.get("name")}
-    field_order = [name for name in list(dyn.get("field_order") or []) if str(name) in allowed]
+    if is_json_grounded_domain(domain):
+        field_order = [name for name in normalized_order if str(name) in allowed]
+    else:
+        field_order = [name for name in list(dyn.get("field_order") or []) if str(name) in allowed]
     return variables, field_order
 
 
