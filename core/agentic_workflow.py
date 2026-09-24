@@ -24,6 +24,7 @@ from core.low_balance_variable_policy import (
     validate_db_definition,
     validate_low_balance_variable_sources,
     validate_low_balance_required_identity_sources,
+    normalize_low_balance_db_identity_variables,
     filter_incompatible_low_balance_db_customer_overrides,
     reconcile_low_balance_schema,
     reconcile_low_balance_executable_variables,
@@ -147,7 +148,7 @@ class AgenticSchemaWorkflow:
             json.dumps(source_manifest(), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
         return (
-            "agentic_proposal_v28_low_balance_customer_override_reconciled_scenario_ranked_catalog",
+            "agentic_proposal_v29_low_balance_identity_contract_normalized_scenario_ranked_catalog",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -257,7 +258,15 @@ class AgenticSchemaWorkflow:
         db_variables = self._merge_db_variable_sources(recommended, user_selected)
         if json_grounded:
             # Low Balance has two source families only. account_id and msisdn are absent from
-            # the bundled TMF654/TMF629 catalog, so the exact DB variables are mandatory.
+            # the bundled TMF654/TMF629 catalog, so the exact DB variables are mandatory. Their
+            # generator/name/params remain DB-owned; only stale identity-grain flags are normalized
+            # for the executable contract.
+            db_variables, adjusted_identity_names = normalize_low_balance_db_identity_variables(db_variables)
+            if adjusted_identity_names:
+                logger.warning(
+                    "Low Balance normalized stale Mongo identity contract flags at runtime: %s; MongoDB definitions were not modified",
+                    adjusted_identity_names,
+                )
             validate_low_balance_required_identity_sources(db_variables)
         protected_name_set = set(self._variable_name_keys(db_variables))
         if json_grounded and db_variables:
@@ -382,8 +391,8 @@ class AgenticSchemaWorkflow:
             key = str(variable.get("name") or "").strip().lower()
             persisted_source = variable_sources.get(key)
             if persisted_source:
-                # Low Balance keeps DB definitions unchanged and records provenance separately
-                # in the draft; other domains retain the legacy per-variable source annotation.
+                # Low Balance preserves DB generator semantics and source provenance; mandatory identity
+                # grain flags may have been normalized locally for the executable contract.
                 if not json_grounded:
                     variable["source"] = persisted_source
                 continue
@@ -610,8 +619,9 @@ class AgenticSchemaWorkflow:
         for field in remaining:
             key = field.name.strip().casefold()
             if draft_source_by_name.get(key) in {"DB_RECOMMENDED", "USER_SELECTED"} and key in draft_raw_by_name:
-                # Preserve the DB-owned definition as-is unless the user explicitly edited it.
-                # Even then, only the already-allowed HITL keys are applied.
+                # Preserve the DB-owned generator/name/params contract unless the user explicitly edited an
+                # allowed key; mandatory Low Balance identity flags have already been normalized
+                # at the executable boundary.
                 data = dict(draft_raw_by_name[key])
                 changes = applied_edits.get(key) or {}
                 if "description" in changes:

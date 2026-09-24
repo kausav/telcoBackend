@@ -181,9 +181,8 @@ def reconcile_low_balance_executable_variables(
         if not name:
             continue
         source = normalized_sources.get(name, "")
-        is_db_customer = name == "customer_id" and (
-            source in {"DB_RECOMMENDED", "USER_SELECTED"} or name in normalized_db_names
-        )
+        is_db_source = source in {"DB_RECOMMENDED", "USER_SELECTED"} or name in normalized_db_names
+        is_db_customer = name == "customer_id" and is_db_source
 
         if name == "customer_id":
             if customer_seen:
@@ -205,10 +204,11 @@ def reconcile_low_balance_executable_variables(
                 item = official_customer_id_definition()
                 normalized_sources[name] = "OFFICIAL_JSON"
                 normalized_db_names.discard(name)
-            else:
-                # A compatible Mongo definition already satisfies the canonical contract; keep
-                # the DB-owned executable definition unchanged.
-                pass
+        elif name in LOW_BALANCE_DB_REQUIRED_FIELDS and is_db_source:
+            # account_id/msisdn are DB-only fields. Keep their generator contract exactly as
+            # stored, but repair only the stable identity-grain flags required by this journey.
+            item, _ = normalize_low_balance_db_identity_definition(item)
+
         normalized_variables.append(item)
 
     if not customer_seen:
@@ -250,6 +250,9 @@ def reconcile_low_balance_schema(
         name = _normalize_name(item.get("name"))
         if name == "customer_id":
             rebuilt_fields.append(official_customer_id_field())
+            continue
+        if name in LOW_BALANCE_DB_REQUIRED_FIELDS:
+            rebuilt_fields.append(GeneratedSchemaField.model_validate(item))
             continue
         existing = existing_fields.get(name)
         rebuilt_fields.append(existing if existing is not None else GeneratedSchemaField.model_validate(item))
@@ -327,12 +330,59 @@ def material_low_balance_catalog() -> tuple[dict[str, Any], ...]:
     return tuple(rows)
 
 
+def normalize_low_balance_db_identity_definition(variable: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Return the executable Low Balance contract for a DB-backed identity field.
+
+    MongoDB remains the source of truth for the variable's semantic generator definition,
+    name, dtype and parameters. The application overlays only the Low Balance identity-grain
+    contract at runtime because historical DB rows may predate the journey's stable-entity
+    requirement. The stored Mongo document is never modified.
+    """
+    item = dict(variable)
+    name = _normalize_name(item.get("name"))
+    if name not in LOW_BALANCE_DB_REQUIRED_FIELDS:
+        return item, False
+
+    changed = (
+        str(item.get("scope") or "").strip().lower() != "entity"
+        or bool(item.get("required")) is not True
+        or bool(item.get("nullable")) is not False
+    )
+    if changed:
+        item["scope"] = "entity"
+        item["required"] = True
+        item["nullable"] = False
+    return item, changed
+
+
+def normalize_low_balance_db_identity_variables(
+    db_variables: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Normalize only mandatory DB identity fields for executable Low Balance state.
+
+    DB-only extension variables remain byte-for-byte equivalent dict copies. Their scope and
+    nullable/required semantics are deliberately not changed.
+    """
+    normalized: list[dict[str, Any]] = []
+    changed_names: list[str] = []
+    for raw in db_variables or []:
+        if not isinstance(raw, dict):
+            normalized.append(raw)
+            continue
+        item, changed = normalize_low_balance_db_identity_definition(raw)
+        normalized.append(item)
+        if changed:
+            changed_names.append(str(item.get("name") or "").strip())
+    return normalized, sorted(set(name for name in changed_names if name))
+
+
 def validate_low_balance_required_identity_sources(db_variables: list[dict[str, Any]]) -> None:
     """Require the exact DB-only telecom identity fields that are absent from the two Swagger files.
 
     ``customer_id`` exists in the official TMF629 catalog. ``account_id`` and ``msisdn`` do not, so
-    Low Balance must receive those exact names from MongoDB. The policy intentionally refuses to
-    synthesize aliases or application-level replacements.
+    Low Balance must receive those exact names from MongoDB. Their executable identity-grain contract
+    is normalized before this validation; this function therefore checks presence, not historical
+    DB metadata that may legitimately be stale.
     """
     normalized = {
         _normalize_name(item.get("name")): item
@@ -346,20 +396,6 @@ def validate_low_balance_required_identity_sources(db_variables: list[dict[str, 
             + ", ".join(missing)
             + ". They are not present in the supplied TMF654/TMF629 Swagger scalar catalog and must not be invented by the LLM or another generator."
         )
-
-    # customer_id is NOT a DB-only requirement. It exists in the bundled TMF629 catalog, so an
-    # incompatible Mongo copy must not suppress the official JSON field. The proposal/generation
-    # reconciliation layer quarantines such a DB override locally and never rewrites MongoDB.
-    # customer_id is not DB-only. Incompatible Mongo copies are quarantined by the proposal
-    # boundary and repaired locally for legacy confirmed scenarios; they must not make proposal
-    # fail merely because an old DB row exists. A compatible copy is accepted unchanged.
-
-    for name in LOW_BALANCE_DB_REQUIRED_FIELDS:
-        item = normalized[_normalize_name(name)]
-        if str(item.get("scope") or "").strip().lower() != "entity":
-            raise ValueError(f"MongoDB {name} must have scope='entity' for Low Balance & Top-up.")
-        if not bool(item.get("required")) or bool(item.get("nullable")):
-            raise ValueError(f"MongoDB {name} must be required=true and nullable=false for Low Balance & Top-up.")
 # Synonyms are deliberately narrow. This is only the deterministic backstop for
 # the LLM's duplicate review; it must not become a second semantic registry.
 _TOKEN_ALIASES = {
