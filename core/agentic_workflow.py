@@ -144,7 +144,7 @@ class AgenticSchemaWorkflow:
             json.dumps(source_manifest(), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
         return (
-            "agentic_proposal_v26_low_balance_source_locked_scenario_ranked_catalog",
+            "agentic_proposal_v27_low_balance_source_locked_scenario_ranked_catalog",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -333,6 +333,7 @@ class AgenticSchemaWorkflow:
                 expected_outcome="",
                 country=req.country,
                 excluded_field_names=list(protected_names),
+                external_variable_names=set(protected_name_set),
             )
             set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
 
@@ -470,18 +471,29 @@ class AgenticSchemaWorkflow:
         # block confirmation. This also makes older drafts containing legacy
         # ``Unknown concept ...`` items confirmable without requiring a re-proposal.
         blocking_unresolved = []
+        external_db_names = {
+            str(name).strip().casefold()
+            for name in (draft.get("db_variable_names") or [])
+            if str(name).strip()
+        }
+        proposed_names = {
+            str(item.get("name") or "").strip().casefold()
+            for item in (draft.get("variables") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        }
         for item in schema.unresolved_items:
             text = str(item).strip()
             lower = text.lower()
             if lower.startswith("unknown concept ") or lower.startswith("unknown requested concept "):
                 continue
-            # subscriber_id/account_id/msisdn are application-level mandatory anchors,
-            # not required literal attribute names in every official telecom model.
-            # The compiler supplies executable fallbacks for them, so legacy/current
-            # drafts containing this historical unresolved marker remain confirmable.
             if ("entity key '" in lower or "requested entity key '" in lower):
                 marker = lower.split("entity key '", 1)[-1]
-                candidate = marker.split("'", 1)[0].strip()
+                candidate = marker.split("'", 1)[0].strip().casefold()
+                # A requested entity key may legitimately be supplied by MongoDB even when
+                # it is absent from the official JSON source catalog. Once it is present in
+                # the proposed/draft variable set, the requirement is executable.
+                if candidate in external_db_names or candidate in proposed_names:
+                    continue
                 if SchemaCompiler.is_mandatory_telecom_field(candidate):
                     continue
             blocking_unresolved.append(text)

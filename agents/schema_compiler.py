@@ -1092,6 +1092,7 @@ class SchemaCompiler:
         entity_key: str | None,
         scenario_type: str | None = None,
         excluded_field_names: list[str] | None = None,
+        external_variable_names: set[str] | None = None,
     ) -> ScenarioSchema:
         """Compile Low Balance & Top-up from TMF654 + TMF629 Swagger-backed registry concepts."""
         normalized_country = str(country or "IN").strip().upper()
@@ -1242,9 +1243,15 @@ class SchemaCompiler:
         field_names = [f.name for f in fields]
         if not fields:
             unresolved.append("The Low Balance & Top-up scenario did not yield any usable semantic variables.")
+        external_keys = {
+            self._normalize_variable_name(name)
+            for name in (external_variable_names or set())
+            if self._normalize_variable_name(name)
+        }
         if (
             entity_key
             and self._normalize_variable_name(entity_key) not in {self._normalize_variable_name(n) for n in field_names}
+            and self._normalize_variable_name(entity_key) not in external_keys
             and not self.is_mandatory_telecom_field(entity_key)
         ):
             unresolved.append(f"Requested entity key '{entity_key}' could not be represented by the proposed variables")
@@ -1319,6 +1326,7 @@ class SchemaCompiler:
         expected_outcome: str | None = None,
         country: str | None = None,
         excluded_field_names: list[str] | None = None,
+        external_variable_names: set[str] | None = None,
     ) -> ScenarioSchema:
         requested = intent
         normalized_industry = (industry_type or intent.industry_type or "telecom").strip().lower()
@@ -1336,6 +1344,7 @@ class SchemaCompiler:
                 entity_key=entity_key,
                 scenario_type=scenario_type,
                 excluded_field_names=excluded_field_names,
+                external_variable_names=external_variable_names,
             )
         if selected_entities is not None:
             normalized: list[str] = []
