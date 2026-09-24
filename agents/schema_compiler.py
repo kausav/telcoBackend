@@ -1153,11 +1153,12 @@ class SchemaCompiler:
         # separately to _build_fresh_fields and never enters VariableIdea.
         intent = intent.model_copy(update={"candidate_variables": clean_selected_ideas})
 
-        # Low Balance is intentionally compiled from the three primary resources only.
+        # Low Balance is intentionally compiled from the two primary business resources only.
         # Create/Update/Event/Ref schemas describe API transport shapes, not the business
-        # entities we want as flat synthetic-data columns. Restricting the entity pool here
-        # also prevents the same attribute name from matching a transport model instead of the
-        # canonical Bucket/TopupBalance/Customer model.
+        # entities we want as flat synthetic-data columns. Bucket is deliberately excluded from
+        # the Low Balance output variable universe; the journey focuses on customer + top-up.
+        # Restricting the entity pool here also prevents transport models from surfacing duplicate
+        # or bucket-only fields.
         entities: list[EntityDef] = []
         unresolved: list[str] = []
         for canonical_id in LOW_BALANCE_MAIN_MODEL_IDS:
@@ -1222,7 +1223,7 @@ class SchemaCompiler:
         standards = self.registry.standards_for_entities([e.canonical_id for e in entities])
         hard_constraints = [
             "scenarioId is identifier-only and does not select variables or business rules.",
-            "Low Balance & Top-up standards grounding is restricted to the supplied TMF654 Prepay Balance Management and TMF629 Customer Management Swagger/OpenAPI artifacts.",
+            "Low Balance & Top-up standards grounding is restricted to the supplied TMF654 Prepay Balance Management and TMF629 Customer Management Swagger/OpenAPI artifacts; bucket-scoped fields are excluded from the flat output contract.",
             "The Low Balance & Top-up compiler permits executable variables only when they are exact scalar leaves from the supplied TMF654/TMF629 Swagger models or are explicitly layered in from MongoDB after proposal generation.",
             "One-to-many array properties are excluded from the flat record contract rather than converted into fake scalar values.",
             "Standard-backed enum values are copied from the official Swagger definitions and cannot be replaced with invented values.",

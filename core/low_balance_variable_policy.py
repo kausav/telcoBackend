@@ -41,6 +41,22 @@ _LOW_BALANCE_PII_NAMES = {
 _LOW_BALANCE_DISPLAY_NAMES = {"bucket_remaining_value_name"}
 
 
+def is_bucket_variable_name(value: Any) -> bool:
+    """Return True for fields that expose balance-bucket context rather than the top-up/customer journey itself."""
+    name = _normalize_name(value)
+    if not name:
+        return False
+    tokens = name.split("_")
+    return (
+        name.startswith("bucket_")
+        or name.startswith("balance_bucket_")
+        or "_bucket_" in name
+        or name.endswith("_bucket")
+        or name == "bucket"
+        or (tokens and tokens[0] == "bucket")
+    )
+
+
 def is_material_low_balance_spec(spec: dict[str, Any]) -> bool:
     """Return whether an official scalar leaf is analytically useful for Low Balance.
 
@@ -51,6 +67,11 @@ def is_material_low_balance_spec(spec: dict[str, Any]) -> bool:
     if not name:
         return False
     if name in _LOW_BALANCE_PII_NAMES or name in _LOW_BALANCE_DISPLAY_NAMES:
+        return False
+    # Bucket-scoped balance state is intentionally excluded from the Low Balance & Top-up
+    # flat journey variable set. The journey models customer + top-up behavior; bucket
+    # internals can remain in the standards catalog but must not become output columns.
+    if is_bucket_variable_name(name) or str(spec.get("model") or "").strip().casefold() == "bucket":
         return False
     if name.endswith(_LOW_BALANCE_TECHNICAL_SUFFIXES):
         return False
@@ -278,9 +299,13 @@ def semantic_signature(variable: dict[str, Any] | GeneratedSchemaField) -> tuple
     return context, f"{concept}::{dtype_key}"
 
 def official_catalog() -> tuple[dict[str, Any], ...]:
-    """Return the immutable official scalar catalog from the two bundled Swagger files."""
+    """Return the immutable official Low Balance scalar catalog from the two bundled Swagger files.
+
+    The catalog is restricted to material journey fields; bucket-scoped and transport/display
+    metadata are intentionally excluded from the Low Balance executable variable universe.
+    """
     rows = []
-    for row in expanded_scalar_catalog():
+    for row in material_low_balance_catalog():
         item = dict(row)
         item["name"] = _normalize_name(item.get("name"))
         rows.append(item)
