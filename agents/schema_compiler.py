@@ -1,13 +1,14 @@
 """Deterministic schema compiler and HITL proposal builder."""
 from __future__ import annotations
 
-from core.agentic_models import GeneratedSchemaField, ResolvedConcept, ScenarioIntent, ScenarioSchema, SchemaRelationship
+from core.agentic_models import GeneratedSchemaField, ResolvedConcept, ScenarioIntent, ScenarioSchema, SchemaRelationship, VariableIdea
 from core.telecom_registry import EntityDef, TelecomRegistry
 from config.industry_profiles import get_profile
 import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
 from core.json_domain_policy import LOW_BALANCE_MAIN_MODEL_IDS, LOW_BALANCE_SOURCE_IDS, expanded_scalar_catalog, is_json_grounded_domain
+from core.low_balance_variable_policy import official_catalog_by_name
 from core.variable_quality import VariableQualityEngine
 from config.runtime import SCHEMA_MAX_VARIABLES, SCHEMA_MIN_VARIABLE_SCORE
 
@@ -36,17 +37,6 @@ class SchemaCompiler:
         "telephonenumber", "subscriber_phone", "subscriber_mobile",
     }
     UNSUPPORTED_NESTED_DTYPES = {"object", "array"}
-    LOW_BALANCE_SCENARIO_DERIVED_FIELDS = {
-        "intervention_suppression_state",
-        "intervention_eligibility",
-        "customer_decision",
-        "decline_reason",
-        "recharge_outcome",
-        "priority_resolution",
-        "recharge_plan_code",
-        "recharge_plan_validity_days",
-    }
-
     @classmethod
     def is_mandatory_telecom_field(cls, name: str | None) -> bool:
         normalized = cls._normalize_variable_name(name or "")
@@ -634,9 +624,11 @@ class SchemaCompiler:
         max_variables: int | None = None,
         include_all_registry_scalars: bool = True,
         include_all_json_source_scalars: bool = False,
+        include_application_telecom_anchors: bool = True,
         excluded_field_names: list[str] | None = None,
         business_scenario: str | None = None,
         context_text: str | None = None,
+        candidate_variables_override: list[dict[str, object]] | None = None,
     ) -> list[GeneratedSchemaField]:
         normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
         excluded_keys = {
@@ -644,7 +636,11 @@ class SchemaCompiler:
             for name in (excluded_field_names or [])
             if self._normalize_variable_name(name)
         }
-        raw_ideas = [idea.model_dump() for idea in intent.candidate_variables]
+        raw_ideas = (
+            [dict(idea) for idea in candidate_variables_override]
+            if candidate_variables_override is not None
+            else [idea.model_dump() for idea in intent.candidate_variables]
+        )
         ideas: list[dict[str, object]] = []
         seen_idea_keys: set[str] = set()
 
@@ -668,7 +664,7 @@ class SchemaCompiler:
         # Mandatory telecom anchors first so they keep their exact public names and stable
         # entity grain. When the official registry does not expose a literal ``subscriber``
         # entity, the compiler still emits these application-contract fields deterministically.
-        if (intent.industry_type or "telecom").strip().lower() in {"telecom", "telecommunications"}:
+        if include_application_telecom_anchors and (intent.industry_type or "telecom").strip().lower() in {"telecom", "telecommunications"}:
             mandatory_defs = {
                 "subscriber_id": ("subscriber", "subscriber_id", "Stable subscriber identifier."),
                 "account_id": ("subscriber", "account_id", "Stable subscriber account identifier."),
@@ -929,7 +925,7 @@ class SchemaCompiler:
                     if attr is not None:
                         matched = (subscriber, attr)
             normalized_original_name = self._normalize_variable_name(original_name)
-            if source_spec is None and normalized_original_name not in self.LOW_BALANCE_SCENARIO_DERIVED_FIELDS:
+            if source_spec is None:
                 matched = self._match_registry_attribute(idea, entities, used_registry)
             role = str(idea.get("role") or "other").lower()
             idea_text = f"{original_name} {idea.get('description', '')}".lower()
@@ -1058,139 +1054,6 @@ class SchemaCompiler:
             ))
         return fields
 
-    def _ensure_low_balance_scenario_ideas(
-        self,
-        intent: ScenarioIntent,
-        scenario_mode: str,
-    ) -> None:
-        """Guarantee scenario-specific analytical fields and normalize LLM candidates that could conflict with the mode."""
-        existing = {self._normalize_variable_name(v.name) for v in intent.candidate_variables}
-        additions: list[dict[str, object]] = []
-
-        # Scenario-derived outcomes are controlled by the current scenario context. An LLM
-        # candidate with a generic/positive outcome vocabulary must not silently override the
-        # requested mode.
-        outcome_descriptions = {
-            "suppression": "Outcome of the recharge associated with a suppressed intervention. Valid values are COMPLETED, CANCELLED.",
-            "decline_or_no_response": "Outcome of the recharge/retention intervention. Valid values are DECLINED, NO_RESPONSE, REJECTED.",
-            "negative": "Outcome of the recharge operation. Valid values are FAILED, REJECTED, CANCELLED.",
-            "positive": "Outcome of the recharge operation. Valid values are COMPLETED, APPROVED, ACCEPTED.",
-            "concurrent": "Outcome/resolution of the recharge intervention. Valid values are PENDING_PRIORITY, CONFLICT, NO_CLEAR_PRIORITY.",
-            "mixed": "Outcome of the recharge operation. Valid values are COMPLETED, FAILED, CANCELLED.",
-        }
-        normalized_outcome_name = self._normalize_variable_name("recharge_outcome")
-        for idx, idea in enumerate(intent.candidate_variables):
-            if self._normalize_variable_name(idea.name) == normalized_outcome_name:
-                intent.candidate_variables[idx] = idea.model_copy(update={
-                    "description": outcome_descriptions.get(scenario_mode, outcome_descriptions["mixed"]),
-                    "role": "status",
-                    "grain": "transaction",
-                    "dtype": "categorical",
-                })
-
-        if scenario_mode == "suppression":
-            if "intervention_suppression_state" not in existing:
-                additions.append({
-                    "name": "intervention_suppression_state",
-                    "description": "Retention intervention suppression decision. Valid values are SUPPRESSED, NOT_SENT, HELD.",
-                    "role": "decision", "grain": "transaction", "dtype": "categorical", "depends_on": [],
-                })
-            if "intervention_eligibility" not in existing:
-                additions.append({
-                    "name": "intervention_eligibility",
-                    "description": "Whether the subscriber is eligible for the proactive retention intervention.",
-                    "role": "decision", "grain": "transaction", "dtype": "boolean", "depends_on": [],
-                })
-        elif scenario_mode == "decline_or_no_response":
-            if "customer_decision" not in existing:
-                additions.append({
-                    "name": "customer_decision",
-                    "description": "Customer response to the top-up/retention intervention. Valid values are DECLINED, NO_RESPONSE, REJECTED.",
-                    "role": "decision", "grain": "transaction", "dtype": "categorical", "depends_on": [],
-                })
-            if "decline_reason" not in existing:
-                additions.append({
-                    "name": "decline_reason",
-                    "description": "Primary reason associated with a declined or unanswered top-up intervention. Valid values are PRICE, NOT_NEEDED, TRUST, PAYMENT_CONCERN, TIMING.",
-                    "role": "other", "grain": "transaction", "dtype": "categorical", "depends_on": [],
-                })
-        elif scenario_mode == "negative":
-            if "recharge_outcome" not in existing:
-                additions.append({
-                    "name": "recharge_outcome",
-                    "description": "Outcome of the recharge operation. Valid values are FAILED, REJECTED, CANCELLED.",
-                    "role": "status", "grain": "transaction", "dtype": "categorical", "depends_on": [],
-                })
-        elif scenario_mode == "positive":
-            if "recharge_outcome" not in existing:
-                additions.append({
-                    "name": "recharge_outcome",
-                    "description": "Outcome of the recharge operation. Valid values are COMPLETED, APPROVED, ACCEPTED.",
-                    "role": "status", "grain": "transaction", "dtype": "categorical", "depends_on": [],
-                })
-        elif scenario_mode == "concurrent":
-            if "priority_resolution" not in existing:
-                additions.append({
-                    "name": "priority_resolution",
-                    "description": "Resolution of competing interventions. Valid values are NO_CLEAR_PRIORITY, CONFLICT, PENDING_PRIORITY.",
-                    "role": "decision", "grain": "transaction", "dtype": "categorical", "depends_on": [],
-                })
-
-        if "recharge_outcome" not in existing:
-            additions.append({
-                "name": "recharge_outcome",
-                "description": outcome_descriptions.get(scenario_mode, outcome_descriptions["mixed"]),
-                "role": "status", "grain": "transaction", "dtype": "categorical", "depends_on": [],
-            })
-        if "recharge_plan_code" not in existing:
-            additions.append({
-                "name": "recharge_plan_code",
-                "description": "Synthetic prepaid recharge plan identifier. Valid values are PREPAID_1D, PREPAID_7D, PREPAID_14D, PREPAID_28D, PREPAID_30D, PREPAID_56D, PREPAID_84D.",
-                "role": "configuration", "grain": "transaction", "dtype": "categorical", "depends_on": [],
-            })
-        if "recharge_plan_validity_days" not in existing:
-            additions.append({
-                "name": "recharge_plan_validity_days",
-                "description": "Synthetic prepaid recharge plan validity duration in days used to derive the TopupBalance validFor end date.",
-                "role": "measurement", "grain": "transaction", "dtype": "integer", "depends_on": ["recharge_plan_code"],
-            })
-
-        # Retention-intervention outcome is a scenario-level analytical concept, not a TMF
-        # balance usage/type enum. Normalize it before compilation so a generic/incorrect LLM
-        # candidate can never inherit unrelated official choices.
-        intervention_outcome_choices = {
-            "suppression": ["SUPPRESSED", "NOT_SENT"],
-            "decline_or_no_response": ["DECLINED", "NO_RESPONSE"],
-            "negative": ["FAILED", "NOT_CONVERTED"],
-            "positive": ["CONVERTED", "NOT_CONVERTED"],
-            "concurrent": ["CONFLICT", "PENDING", "NO_CLEAR_PRIORITY"],
-            "mixed": ["CONVERTED", "NOT_CONVERTED", "NO_RESPONSE"],
-        }.get(scenario_mode, ["CONVERTED", "NOT_CONVERTED", "NO_RESPONSE"])
-        intervention_description = (
-            "Scenario-derived outcome of the proactive retention intervention. Valid values are "
-            + ", ".join(intervention_outcome_choices) + "."
-        )
-        normalized_intervention = self._normalize_variable_name("retention_intervention_outcome")
-        for idx, idea in enumerate(intent.candidate_variables):
-            if self._normalize_variable_name(idea.name) == normalized_intervention:
-                intent.candidate_variables[idx] = idea.model_copy(update={
-                    "description": intervention_description,
-                    "role": "derived",
-                    "grain": "transaction",
-                    "dtype": "categorical",
-                })
-
-        if not any(self._normalize_variable_name(v.name) == normalized_intervention for v in intent.candidate_variables):
-            additions.append({
-                "name": "retention_intervention_outcome",
-                "description": intervention_description,
-                "role": "derived", "grain": "transaction", "dtype": "categorical", "depends_on": [],
-            })
-
-        if additions:
-            from core.agentic_models import VariableIdea
-            intent.candidate_variables.extend(VariableIdea.model_validate(item) for item in additions)
-
     def _compile_low_balance_json_grounded(
         self,
         intent: ScenarioIntent,
@@ -1213,7 +1076,42 @@ class SchemaCompiler:
             business_response="",
             business_scenario=business_scenario,
         )
-        self._ensure_low_balance_scenario_ideas(intent, scenario_mode)
+
+        # Gemini is a selector only for this source-bound domain. Normalize every
+        # selected idea to an exact leaf from TMF654/TMF629 and discard any model-
+        # invented field before executable contracts are constructed.
+        catalog = official_catalog_by_name()
+        selected_source_ideas: list[dict[str, object]] = []
+        clean_selected_ideas: list[VariableIdea] = []
+        for idea in intent.candidate_variables:
+            spec = catalog.get(self._normalize_variable_name(idea.name))
+            if not spec:
+                continue
+
+            # Keep the Pydantic-facing intent model clean. The compiler needs internal
+            # source metadata to build an executable JSON-backed contract, but those
+            # private keys must never be pushed back through VariableIdea(extra="forbid").
+            clean_selected_ideas.append(VariableIdea.model_validate({
+                **idea.model_dump(),
+                "name": str(spec["name"]),
+                "description": str(spec.get("description") or idea.description or "")[:500],
+            }))
+            selected_source_ideas.append({
+                **clean_selected_ideas[-1].model_dump(),
+                "name": str(spec["name"]),
+                "description": str(spec.get("description") or idea.description or "")[:500],
+                "_json_source_spec": dict(spec),
+                "_json_source": True,
+                "_preserve_name": True,
+                "_registry_entity": f"{spec.get('source_id', '')}__{spec.get('model', '')}",
+                "_registry_entity_name": str(spec.get("model") or ""),
+                "_registry_required": bool(spec.get("required")),
+                "_registry_nullable": not bool(spec.get("required")),
+            })
+
+        # Persist only the clean semantic selection on the intent. Source metadata is
+        # passed separately to _build_fresh_fields and never enters VariableIdea.
+        intent = intent.model_copy(update={"candidate_variables": clean_selected_ideas})
 
         # Low Balance is intentionally compiled from the three primary resources only.
         # Create/Update/Event/Ref schemas describe API transport shapes, not the business
@@ -1236,14 +1134,16 @@ class SchemaCompiler:
         fields = self._build_fresh_fields(
             intent,
             entities,
-            entity_key=entity_key,
+            entity_key=None,
             country=normalized_country,
             type_of_data=normalized_type,
             scenario_mode=scenario_mode,
             max_variables=None,
             include_all_registry_scalars=False,
-            include_all_json_source_scalars=True,
+            include_all_json_source_scalars=False,
+            include_application_telecom_anchors=False,
             excluded_field_names=excluded_field_names,
+            candidate_variables_override=selected_source_ideas,
             business_scenario=business_scenario,
             context_text=" ".join(
                 str(value or "") for value in (
@@ -1283,18 +1183,17 @@ class SchemaCompiler:
         hard_constraints = [
             "scenarioId is identifier-only and does not select variables or business rules.",
             "Low Balance & Top-up standards grounding is restricted to the supplied TMF654 Prepay Balance Management and TMF629 Customer Management Swagger/OpenAPI artifacts.",
-            "The Low Balance & Top-up compiler evaluates all materializable scalar leaves from the supplied TMF654/TMF629 Swagger models, but includes only high-quality, scenario-relevant, non-redundant variables within the configured quality budget.",
+            "The Low Balance & Top-up compiler permits executable variables only when they are exact scalar leaves from the supplied TMF654/TMF629 Swagger models or are explicitly layered in from MongoDB after proposal generation.",
             "One-to-many array properties are excluded from the flat record contract rather than converted into fake scalar values.",
             "Standard-backed enum values are copied from the official Swagger definitions and cannot be replaced with invented values.",
-            "Scenario-derived analytical variables are explicitly synthetic extensions and are not represented as TM Forum fields.",
+            "The LLM cannot create scenario-derived executable variables. Variables absent from the two Swagger sources must be supplied through MongoDB.",
             f"Scenario outcome mode is derived from scenarioType and the business scenario: {scenario_mode}.",
             "Transactional entity-level fields remain stable across a subscriber history; transaction/event fields are regenerated per record.",
         ]
         if entity_key:
             hard_constraints.append(f"'{entity_key}' is the authoritative entity key for transactional grouping.")
-        hard_constraints.append("subscriber_id, account_id and msisdn are mandatory application-level synthetic anchors.")
         warnings = [
-            "TMF654/TMF629 do not define explicit retention-intervention suppression/decline semantics; those analytical concepts are modeled as clearly marked scenario-derived fields when required.",
+            "Any additional non-TMF business variable must be provided through MongoDB; it is never invented by the LLM.",
         ]
         return ScenarioSchema(
             domain=intent.domain,

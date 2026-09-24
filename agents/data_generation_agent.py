@@ -1789,7 +1789,7 @@ def _enforce_temporal_consistency(
                 continue
 
             child_var = by_name.get(child_name, {})
-            rec[child_name] = _format_datetime(desired, child_var.get("params") or {})
+            rec[child_name] = _format_datetime_for_variable(desired, child_var)
             issues.append(reason)
             changed = True
         if not changed:
@@ -2320,7 +2320,7 @@ def _enforce_low_balance_topup_consistency(
     trigger_field = _lb_first_name(variables, ("low_balance_trigger_timestamp",), "low", "balance", "trigger", "timestamp")
     if trigger_field and trigger_field in rec:
         trigger_dt = request_dt - timedelta(minutes=random.randint(5, 120))
-        _lb_set(rec, variables, trigger_field, _format_datetime(trigger_dt, by_name[trigger_field].get("params") or {}), issues, "low-balance trigger placed before recharge request")
+        _lb_set(rec, variables, trigger_field, _format_datetime_for_variable(trigger_dt, by_name[trigger_field]), issues, "low-balance trigger placed before recharge request")
 
     desired_status = "completed"
     if outcome_mode == "negative":
@@ -2340,25 +2340,25 @@ def _enforce_low_balance_topup_consistency(
     # All request-like and confirmation-like timestamps in the same transaction share one
     # authoritative event pair; they are never independently sampled.
     for name in request_fields:
-        _lb_set(rec, variables, name, _format_datetime(request_dt, by_name[name].get("params") or {}), issues, f"{name} synchronized to the transaction request event")
+        _lb_set(rec, variables, name, _format_datetime_for_variable(request_dt, by_name[name]), issues, f"{name} synchronized to the transaction request event")
     for name in confirmation_fields:
         if success_state and confirmation_dt is not None:
-            _lb_set(rec, variables, name, _format_datetime(confirmation_dt, by_name[name].get("params") or {}), issues, f"{name} synchronized to the transaction confirmation event")
+            _lb_set(rec, variables, name, _format_datetime_for_variable(confirmation_dt, by_name[name]), issues, f"{name} synchronized to the transaction confirmation event")
         elif by_name[name].get("nullable", True):
             _lb_set(rec, variables, name, None, issues, f"{name} cleared because the transaction did not complete")
 
     recharge_timestamp = _lb_first_name(variables, ("recharge_timestamp",), "recharge", "timestamp")
     if recharge_timestamp and recharge_timestamp in rec:
         recharge_dt = confirmation_dt or request_dt
-        _lb_set(rec, variables, recharge_timestamp, _format_datetime(recharge_dt, by_name[recharge_timestamp].get("params") or {}), issues, "recharge timestamp linked to transaction lifecycle")
+        _lb_set(rec, variables, recharge_timestamp, _format_datetime_for_variable(recharge_dt, by_name[recharge_timestamp]), issues, "recharge timestamp linked to transaction lifecycle")
 
     topup_req = _lb_first_name(variables, ("topupbalance_requested_date", "topupbalance_requesteddate"), "topup", "requested")
     topup_conf = _lb_first_name(variables, ("topupbalance_confirmation_date", "topupbalance_confirmationdate"), "topup", "confirmation")
     if topup_req:
-        _lb_set(rec, variables, topup_req, _format_datetime(request_dt, by_name[topup_req].get("params") or {}), issues, "TopupBalance requestedDate linked to transaction request")
+        _lb_set(rec, variables, topup_req, _format_datetime_for_variable(request_dt, by_name[topup_req]), issues, "TopupBalance requestedDate linked to transaction request")
     if topup_conf:
         if confirmation_dt is not None:
-            _lb_set(rec, variables, topup_conf, _format_datetime(confirmation_dt, by_name[topup_conf].get("params") or {}), issues, "TopupBalance confirmationDate linked to transaction confirmation")
+            _lb_set(rec, variables, topup_conf, _format_datetime_for_variable(confirmation_dt, by_name[topup_conf]), issues, "TopupBalance confirmationDate linked to transaction confirmation")
         elif by_name[topup_conf].get("nullable", True):
             _lb_set(rec, variables, topup_conf, None, issues, "TopupBalance confirmationDate cleared for unsuccessful transaction")
 
@@ -2396,9 +2396,9 @@ def _enforce_low_balance_topup_consistency(
             if success_state and confirmation_dt is not None:
                 start_dt = confirmation_dt
                 end_dt = start_dt + timedelta(days=duration_days)
-                _lb_set(rec, variables, start_name, _format_datetime(start_dt, by_name[start_name].get("params") or {}), issues, f"{start_name} derived from recharge confirmation")
+                _lb_set(rec, variables, start_name, _format_datetime_for_variable(start_dt, by_name[start_name]), issues, f"{start_name} derived from recharge confirmation")
                 if end_name and end_name in rec:
-                    _lb_set(rec, variables, end_name, _format_datetime(end_dt, by_name[end_name].get("params") or {}), issues, f"{end_name} derived from plan validity duration")
+                    _lb_set(rec, variables, end_name, _format_datetime_for_variable(end_dt, by_name[end_name]), issues, f"{end_name} derived from plan validity duration")
             elif by_name[start_name].get("nullable", True):
                 _lb_set(rec, variables, start_name, None, issues, f"{start_name} cleared because no successful recharge validity was created")
                 if end_name and by_name[end_name].get("nullable", True):
@@ -2416,10 +2416,10 @@ def _enforce_low_balance_topup_consistency(
             stable_end = now + timedelta(days=365)
             for name in starts:
                 if str(by_name[name].get("scope") or "").lower() == "entity" and name in rec:
-                    _lb_set(rec, variables, name, _format_datetime(stable_start, by_name[name].get("params") or {}), issues, f"{name} aligned to stable entity validity window")
+                    _lb_set(rec, variables, name, _format_datetime_for_variable(stable_start, by_name[name]), issues, f"{name} aligned to stable entity validity window")
             for name in ends:
                 if str(by_name[name].get("scope") or "").lower() == "entity" and name in rec:
-                    _lb_set(rec, variables, name, _format_datetime(stable_end, by_name[name].get("params") or {}), issues, f"{name} aligned to stable entity validity window")
+                    _lb_set(rec, variables, name, _format_datetime_for_variable(stable_end, by_name[name]), issues, f"{name} aligned to stable entity validity window")
 
     # Monetary movement is one transaction-level quantity. Keep all amount aliases equal.
     amount_fields = [n for n in by_name if "topup" in n and "amount" in n and "unit" not in n and str(by_name[n].get("dtype", "")).lower() in _NUMERIC_DTYPES]
@@ -2730,7 +2730,7 @@ def _enforce_low_balance_topup_consistency(
         start_dt = _qa_parse_dt(rec.get(start_name))
         end_dt = _qa_parse_dt(rec.get(end_name))
         if start_dt is not None and end_dt is not None and end_dt < start_dt:
-            _lb_set(rec, variables, end_name, _format_datetime(start_dt, by_name[end_name].get("params") or {}), issues, f"{end_name} corrected to be on/after {start_name}")
+            _lb_set(rec, variables, end_name, _format_datetime_for_variable(start_dt, by_name[end_name]), issues, f"{end_name} corrected to be on/after {start_name}")
 
     return rec, issues
 

@@ -32,6 +32,8 @@ from core.csv_scenario import infer_type_of_data, parse_definition_csv
 from config.industry_profiles import COUNTRY_BASE
 from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES
 from core.agentic_workflow import AgenticSchemaWorkflow, get_agentic_workflow
+from core.json_domain_policy import is_json_grounded_domain
+from core.low_balance_variable_policy import validate_low_balance_variable_sources
 from core.telecom_registry import RegistryError, get_registry
 from core.scenario_variable_store import upsert_recommended, get_recommended, set_user_variables, get_user_variables, get_user_variable_records, delete_user_variable
 from models.database import ping as ping_mongodb
@@ -207,6 +209,7 @@ class ConfirmResponse(BaseModel):
     field_order: list[str]
     typeOfData: Literal["transactional", "aggregational"]
     entityKey: str | None = None
+    variableSources: dict[str, str] = Field(default_factory=dict, description="Internal provenance for Low Balance variables")
 
 
 @app.get("/")
@@ -401,7 +404,19 @@ def import_scenario_csv(
 
     This path remains intentionally separate from /scenario/propose so clients can
     choose between an explicit CSV schema definition and agentic schema proposal.
+    Low Balance & Top-up is intentionally source-locked to TMF654/TMF629 or MongoDB
+    variables, so CSV cannot become a third variable source for that domain.
     """
+    if is_json_grounded_domain(domain):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": (
+                    "Low Balance & Top-up variables cannot be defined through CSV. "
+                    "Use the supplied TMF654/TMF629 Swagger variables or MongoDB variables."
+                )
+            },
+        )
     csv_text = _read_csv_upload(file)
 
     try:
@@ -501,6 +516,16 @@ def confirm_scenario_route(req: ConfirmRequest):
             cleaned=_clean_dict(new_var); name=cleaned.get("name")
             if not _is_placeholder(name): by_name[str(name)]=cleaned
         variables=list(by_name.values()); field_order=[str(v["name"]) for v in variables if v.get("name")]
+    if is_json_grounded_domain(draft.get("domain")):
+        try:
+            validate_low_balance_variable_sources(
+                variables,
+                draft.get("variable_sources") or {},
+                db_variable_names=set(draft.get("db_variable_names") or []),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
     type_of_data=draft.get("type_of_data","aggregational")
 
     entity_key=draft.get("entity_key") if type_of_data=="transactional" else None
@@ -517,6 +542,14 @@ def confirm_scenario_route(req: ConfirmRequest):
         "industry":draft.get("industry_type","generic"),"country":draft.get("country"),"requested_scenario_id":requested_scenario_id,
         "type_of_data":type_of_data,"entity_key":entity_key,"records_per_user":10,
         "agentic": bool(draft.get("agentic", False)),
+        # Preserve the source boundary through confirmation so generation can enforce it
+        # without modifying DB-owned variable definitions.
+        "variable_sources": {
+            str(name).strip().casefold(): str(source).strip().upper()
+            for name, source in (draft.get("variable_sources") or {}).items()
+            if str(name).strip() and str(source).strip()
+        },
+        "db_variable_names": sorted(str(name).strip().casefold() for name in (draft.get("db_variable_names") or []) if str(name).strip()),
     }
     try:
         scenario_id, scenario_id_reassigned = confirm_scenario(
@@ -542,6 +575,7 @@ def confirm_scenario_route(req: ConfirmRequest):
         field_order=field_order,
         typeOfData=type_of_data,
         entityKey=entity_key,
+        variableSources=meta.get("variable_sources") or {},
     )
 
 

@@ -18,6 +18,12 @@ from core.errors import LLMUpstreamError
 from core.runtime_cache import get_proposal, set_proposal
 from core.scenario_variable_store import get_recommended, get_user_variables, save_proposal
 from core.json_domain_policy import is_json_grounded_domain, source_manifest
+from core.low_balance_variable_policy import (
+    dedupe_db_variable_sources,
+    dedupe_schema_fields_against_db,
+    validate_db_definition,
+    validate_low_balance_variable_sources,
+)
 
 logger = logging.getLogger(__name__)
 from agents.intent_agent import GeminiIntentAgent
@@ -63,40 +69,76 @@ class AgenticSchemaWorkflow:
         return next((name for name in preferred if name in names), next(iter(field_names), None))
 
     @staticmethod
-    def _schema_to_variables(schema: ScenarioSchema) -> tuple[list[dict[str, Any]], list[str]]:
+    def _schema_to_variables(
+        schema: ScenarioSchema,
+        raw_persisted_by_name: dict[str, dict[str, Any]] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         variables: list[dict[str, Any]] = []
         field_order: list[str] = []
+        persisted = raw_persisted_by_name or {}
         for field in schema.fields:
-            item = field.model_dump()
-            item.pop("provenance", None)
+            key = field.name.strip().casefold()
+            if key in persisted:
+                # DB-owned variable definitions are returned exactly as stored.
+                item = dict(persisted[key])
+            else:
+                item = field.model_dump()
+                item.pop("provenance", None)
             variables.append(item)
             field_order.append(field.name)
         return variables, field_order
 
     @staticmethod
-    def _recommendation_name_keys(recommended: list[dict[str, Any]]) -> tuple[str, ...]:
+    def _variable_name_keys(variables: list[dict[str, Any]]) -> tuple[str, ...]:
         names = {
             str(item.get("name") or "").strip().casefold()
-            for item in (recommended or [])
+            for item in (variables or [])
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         }
         return tuple(sorted(names))
 
     @classmethod
+    def _merge_db_variable_sources(
+        cls,
+        recommended: list[dict[str, Any]],
+        user_selected: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return DB variables with user selection overriding an exact-name recommendation.
+
+        Validation is strict and non-mutating: the stored Mongo definition is used unchanged
+        after it has been checked for executability.
+        """
+        ordered: list[dict[str, Any]] = []
+        positions: dict[str, int] = {}
+        for raw in [*(recommended or []), *(user_selected or [])]:
+            if not isinstance(raw, dict):
+                raise ValueError(f"Invalid MongoDB scenario variable: {raw!r}")
+            validate_db_definition(raw)
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                raise ValueError("MongoDB scenario variable is missing its name")
+            key = name.casefold()
+            item = dict(raw)
+            if key in positions:
+                ordered[positions[key]] = item
+            else:
+                positions[key] = len(ordered)
+                ordered.append(item)
+        return ordered
+
+    @classmethod
     def _cache_key(
         cls,
         req: ScenarioProposeRequest,
-        recommended: list[dict[str, Any]],
+        db_variables: list[dict[str, Any]],
     ) -> tuple:
-        # The LLM output depends on which scenario-level variables are already protected
-        # in Mongo. Include a deterministic fingerprint in the cache key so a changed
-        # recommendation set never reuses a proposal generated for a different set.
-        recommendation_names = cls._recommendation_name_keys(recommended)
-        fingerprint = hashlib.sha256(
-            "\n".join(recommendation_names).encode("utf-8")
-        ).hexdigest()
+        # The LLM output depends on the complete DB definitions because it must suppress
+        # semantic duplicates, not merely exact-name duplicates. Hash the full definitions
+        # deterministically so a changed DB definition cannot reuse a stale proposal.
+        canonical_db = json.dumps(db_variables or [], sort_keys=True, separators=(",", ":"), default=str)
+        fingerprint = hashlib.sha256(canonical_db.encode("utf-8")).hexdigest()
         return (
-            "agentic_proposal_v15_db_recommendation_aware",
+            "agentic_proposal_v19_low_balance_clean_intent_source_metadata",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -108,41 +150,55 @@ class AgenticSchemaWorkflow:
         )
 
     @staticmethod
-    def _merge_persisted_variables(schema: ScenarioSchema, recommended: list[dict[str, Any]], user_selected: list[dict[str, Any]]) -> tuple[ScenarioSchema, dict[str, str]]:
+    def _merge_persisted_variables(
+        schema: ScenarioSchema,
+        recommended: list[dict[str, Any]],
+        user_selected: list[dict[str, Any]],
+    ) -> tuple[ScenarioSchema, dict[str, str], dict[str, dict[str, Any]]]:
         """Merge DB-controlled variables without allowing duplicate field names.
 
         Precedence: user-selected > DB-recommended > LLM-generated.
         """
         source_by_name: dict[str, str] = {}
+        raw_persisted_by_name: dict[str, dict[str, Any]] = {}
         ordered: list[GeneratedSchemaField] = []
         by_name: dict[str, GeneratedSchemaField] = {}
 
-        def add(items: list[dict[str, Any]], source: str, replace: bool = False):
+        def add_schema_fields(items: list[GeneratedSchemaField]) -> None:
+            for field in items or []:
+                key = field.name.strip().casefold()
+                if not key or key in by_name:
+                    continue
+                ordered.append(field)
+                by_name[key] = field
+                generated_from = str(field.provenance.get("generated_from") or "").strip().lower()
+                source_by_name[key] = "OFFICIAL_JSON" if generated_from == "official_json_source" else "LLM_GENERATED"
+
+        def add_persisted(items: list[dict[str, Any]], source: str) -> None:
             for raw in items or []:
-                try:
-                    field = GeneratedSchemaField.model_validate(raw)
-                except Exception:
-                    logger.warning("Ignoring invalid persisted scenario variable '%s'", raw.get("name") if isinstance(raw, dict) else raw)
-                    continue
-                key = field.name.strip().lower()
+                if not isinstance(raw, dict):
+                    raise ValueError(f"Invalid MongoDB scenario variable: {raw!r}")
+                validate_db_definition(raw)
+                key = str(raw.get("name") or "").strip().casefold()
                 if not key:
-                    continue
-                if key in by_name and not replace:
-                    continue
-                if key in by_name and replace:
-                    idx = next(i for i, existing in enumerate(ordered) if existing.name.strip().lower() == key)
+                    raise ValueError("MongoDB scenario variable is missing its name")
+                field = GeneratedSchemaField.model_validate(raw)
+                if key in by_name:
+                    idx = next(i for i, existing in enumerate(ordered) if existing.name.strip().casefold() == key)
                     ordered[idx] = field
                 else:
                     ordered.append(field)
                 by_name[key] = field
                 source_by_name[key] = source
+                # Keep the actual Mongo definition byte-for-byte at the dictionary level so
+                # it can be persisted/returned without silently stripping DB-owned metadata.
+                raw_persisted_by_name[key] = dict(raw)
 
-        # Start with the LLM/registry schema, then overlay DB recommendations, then user choices.
-        add([field.model_dump() for field in schema.fields], "LLM_GENERATED")
-        add(recommended, "DB_RECOMMENDED", replace=True)
-        add(user_selected, "USER_SELECTED", replace=True)
+        add_schema_fields(list(schema.fields))
+        add_persisted(recommended, "DB_RECOMMENDED")
+        add_persisted(user_selected, "USER_SELECTED")
         merged = schema.model_copy(update={"fields": ordered})
-        return merged, source_by_name
+        return merged, source_by_name, raw_persisted_by_name
 
     def propose(self, req: ScenarioProposeRequest) -> ScenarioImportResponse:
         prompt = req.business_scenario.strip()
@@ -156,17 +212,32 @@ class AgenticSchemaWorkflow:
 
         json_grounded = is_json_grounded_domain(req.domain)
         grounding_requirement = (
-            "JSON-SOURCE REQUIREMENT: because this domain is Low Balance & Top-up, use the supplied TMF654 and TMF629 v4.0.0 Swagger/OpenAPI artifacts as the official standards grounding. "
-            "Do not use PDFs, unrelated telecom standards, templates, CSV examples, memory, or general telecom knowledge as standards evidence. "
-            "Standard-backed variables must come from those machine-readable models. Scenario-specific analytical variables may be added only when required by the business scenario and must be clearly treated as scenario-derived. "
+            "JSON-SOURCE REQUIREMENT: because this domain is Low Balance & Top-up, use ONLY the supplied TMF654 and TMF629 v4.0.0 Swagger/OpenAPI artifacts for official variable selection. "
+            "Do not use PDFs, unrelated telecom standards, templates, CSV examples, memory, generic telecom knowledge, or application-specific hardcoded variables as a variable source. "
+            "Every non-DB executable variable must be an exact scalar leaf from the supplied machine-readable catalog. The LLM is a selector/reviewer only; it cannot invent, rename, alias, or derive new executable variable names. "
             if json_grounded
             else "Use all relevant concepts from the complete approved telecom standards registry context, across all registered source URLs. "
         )
-        # Scenario-level recommendations are protected inputs to the LLM path.
-        # Fetch them before checking the proposal cache because the protected set changes
-        # what Gemini is allowed to propose and therefore changes the semantic proposal.
+        # Mongo variables are authoritative inputs to the Low Balance variable set. Fetch both
+        # scenario recommendations and the user's selected variables before the LLM/cache step.
         recommended = get_recommended(requested_scenario_id, 1)
-        protected_names = self._recommendation_name_keys(recommended)
+        user_selected = (
+            get_user_variables(req.user_id.strip(), requested_scenario_id, 1)
+            if req.user_id and req.user_id.strip()
+            else []
+        )
+        if json_grounded:
+            recommended, user_selected, suppressed_db_names = dedupe_db_variable_sources(
+                recommended, user_selected
+            )
+            if suppressed_db_names:
+                logger.info(
+                    "Low Balance suppressed duplicate MongoDB variables before proposal: %s",
+                    suppressed_db_names,
+                )
+
+        db_variables = self._merge_db_variable_sources(recommended, user_selected)
+        protected_names = self._variable_name_keys(db_variables)
         protected_name_set = set(protected_names)
         agent_prompt = (
             f"Industry: {req.industry_type}\n"
@@ -183,12 +254,12 @@ class AgenticSchemaWorkflow:
             "Select variables that make the behavioral difference observable; do not use requestedScenarioId to achieve that difference. "
             "Use ALL request inputs except requestedScenarioId and entityKey as semantic/context signals: scenarioType, industryType, domain, "
             "businessScenario, typeOfData, country, and useCase must materially constrain the variable set, field parameters, scope, "
-            "and generation behavior. Return the widest relevant schema supported by the approved grounding, excluding the protected persisted variables above."
+            "and generation behavior. For Low Balance & Top-up, return only complementary official JSON variables from the supplied catalog; persisted MongoDB variables are supplied separately and must never be recreated or renamed."
         )
 
         cid = ensure_conversation(requested_scenario_id, req.user_id, requested_scenario_id)
         append_message(cid, "user", agent_prompt, requested_scenario_id=requested_scenario_id)
-        cache_key = self._cache_key(req, recommended)
+        cache_key = self._cache_key(req, db_variables)
         cached = get_proposal(cache_key)
         if cached is not None:
             intent = ScenarioIntent.model_validate(cached["intent"])
@@ -201,6 +272,7 @@ class AgenticSchemaWorkflow:
                 industry_type=industry_key,
                 domain_query=req.domain,
                 excluded_variable_names=list(protected_names),
+                persisted_variables=db_variables,
             )
             intent.industry_type = industry_key
             intent.domain = req.domain
@@ -242,39 +314,49 @@ class AgenticSchemaWorkflow:
             )
             set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
 
-        # Persisted scenario configuration is layered on top of the current LLM proposal.
-        # The DB-recommended variables are mandatory for every domain, including JSON-grounded domains.
-        user_selected = (
-            get_user_variables(req.user_id.strip(), requested_scenario_id, 1)
-            if req.user_id and req.user_id.strip()
-            else []
-        )
-        schema, variable_sources = self._merge_persisted_variables(
+        # For Low Balance, remove only official JSON fields that duplicate an authoritative DB
+        # variable by business use. DB fields are never modified or removed.
+        if json_grounded:
+            filtered_fields, duplicate_names = dedupe_schema_fields_against_db(
+                list(schema.fields), db_variables
+            )
+            if duplicate_names:
+                logger.info(
+                    "Low Balance removed JSON variables duplicated by MongoDB definitions: %s",
+                    duplicate_names,
+                )
+            schema = schema.model_copy(update={"fields": filtered_fields})
+
+        schema, variable_sources, raw_persisted_by_name = self._merge_persisted_variables(
             schema,
             recommended,
             user_selected,
         )
 
+        if json_grounded:
+            # Final executable boundary: nothing outside the official catalog or MongoDB may
+            # survive the proposal stage. This catches future code paths that bypass the compiler.
+            validate_low_balance_variable_sources(
+                self._schema_to_variables(schema, raw_persisted_by_name)[0],
+                variable_sources,
+            )
+
         unresolved_questions = self.compiler.approval_questions(intent, schema)
-        variables, field_order = self._schema_to_variables(schema)
+        variables, field_order = self._schema_to_variables(schema, raw_persisted_by_name)
         for variable in variables:
             key = str(variable.get("name") or "").strip().lower()
             persisted_source = variable_sources.get(key)
             if persisted_source:
-                # Persisted scenario configuration remains explicit in provenance, even for
-                # JSON-grounded domains. This makes DB authority visible to downstream consumers.
-                variable["source"] = persisted_source
+                # Low Balance keeps DB definitions unchanged and records provenance separately
+                # in the draft; other domains retain the legacy per-variable source annotation.
+                if not json_grounded:
+                    variable["source"] = persisted_source
                 continue
             if is_json_grounded_domain(req.domain):
-                field = next((candidate for candidate in schema.fields if candidate.name == variable.get("name")), None)
-                if key in {"subscriber_id", "account_id", "msisdn"}:
-                    variable["source"] = "APPLICATION_REQUIRED"
-                elif field and (field.provenance.get("source_registry_attribute") or field.provenance.get("source_json_id")):
-                    variable["source"] = "OFFICIAL_JSON_GROUNDED"
-                else:
-                    variable["source"] = "SCENARIO_DERIVED"
-            else:
-                variable["source"] = "LLM_GENERATED"
+                # Do not add an application/LLM/derived variable source to Low Balance fields.
+                # Every such field has already been proven to exist in the supplied JSON catalog.
+                continue
+            variable["source"] = "LLM_GENERATED"
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
         entity_key = self._entity_key(req.entity_key, field_order, type_of_data)
 
@@ -306,6 +388,9 @@ class AgenticSchemaWorkflow:
             "approval_questions": unresolved_questions,
             "source_policy": "bundled_official_swagger_only" if json_grounded else "approved_telecom_standards_registry",
             "source_documents": source_manifest() if json_grounded else [],
+            "variable_sources": variable_sources,
+            "db_variable_names": sorted(raw_persisted_by_name.keys()) if json_grounded else [],
+            "db_variable_definitions": raw_persisted_by_name if json_grounded else {},
         }
         save_draft(draft_id, draft)
         save_proposal(
@@ -313,7 +398,14 @@ class AgenticSchemaWorkflow:
             user_id=req.user_id.strip() if req.user_id else None,
             requested_scenario_id=requested_scenario_id,
             scenario_version=1,
-            payload={"scenario_id": req.requested_scenario_id, "requested_scenario_id": requested_scenario_id, "variables": variables, "field_order": field_order, "intent": intent.model_dump()},
+            payload={
+                "scenario_id": req.requested_scenario_id,
+                "requested_scenario_id": requested_scenario_id,
+                "variables": variables,
+                "field_order": field_order,
+                "intent": intent.model_dump(),
+                "variable_sources": variable_sources,
+            },
         )
         append_message(cid, "assistant", json.dumps({"intent": intent.model_dump(), "action": "schema_proposed"}, sort_keys=True), requested_scenario_id=requested_scenario_id)
         return ScenarioImportResponse(
@@ -327,6 +419,7 @@ class AgenticSchemaWorkflow:
             field_order=field_order,
             typeOfData=type_of_data,
             entityKey=entity_key,
+            variableSources=variable_sources,
         )
 
     @staticmethod
@@ -338,6 +431,16 @@ class AgenticSchemaWorkflow:
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Apply safe HITL changes to an agentic draft. No new semantics can be introduced."""
         schema = ScenarioSchema.model_validate(draft["schema"])
+        draft_source_by_name = {
+            str(name).strip().casefold(): str(source).strip().upper()
+            for name, source in (draft.get("variable_sources") or {}).items()
+            if str(name).strip() and str(source).strip()
+        }
+        draft_raw_by_name = {
+            str(item.get("name") or "").strip().casefold(): dict(item)
+            for item in (draft.get("variables") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        }
         # Concept names extracted by the LLM are soft semantic hints. They may not have
         # one-to-one registry entities and must never block HITL confirmation. Only hard
         # executable failures (no usable fields / requested entity key not represented)
@@ -386,11 +489,18 @@ class AgenticSchemaWorkflow:
             raise ValueError(f"Agentic HITL cannot add duplicate field '{name}'; revise existing fields instead")
 
         allowed_override_keys = {"nullable", "description", "params"}
+        applied_edits: dict[str, dict[str, Any]] = {}
         for edit in edit:
             name = edit.name if hasattr(edit, "name") else str(edit.get("name") or "")
             changes = edit.changes if hasattr(edit, "changes") else dict(edit.get("changes") or {})
             if name not in fields_by_name:
                 raise ValueError(f"HITL cannot edit unknown agentic field '{name}'")
+            source_key = name.strip().casefold()
+            if draft_source_by_name.get(source_key) in {"DB_RECOMMENDED", "USER_SELECTED"} and changes:
+                raise ValueError(
+                    f"MongoDB variable '{name}' is authoritative and cannot be renamed or edited; "
+                    "change its DB definition instead"
+                )
             unknown = sorted(set(changes) - allowed_override_keys)
             if unknown:
                 raise ValueError(f"Agentic HITL cannot change executable schema semantics for '{name}': {unknown}")
@@ -409,6 +519,7 @@ class AgenticSchemaWorkflow:
                 if unknown_params:
                     raise ValueError(f"HITL cannot introduce generation parameters for '{name}': {unknown_params}")
                 target.params = {**target.params, **params}
+            applied_edits[name.strip().casefold()] = dict(changes)
 
         remaining = [field for field in schema.fields if field.name not in set(delete)]
         # Registry dependencies may reference entity canonical IDs (for example
@@ -430,10 +541,35 @@ class AgenticSchemaWorkflow:
         variables: list[dict[str, Any]] = []
         field_order: list[str] = []
         for field in remaining:
-            data = field.model_dump()
-            data.pop("provenance", None)
+            key = field.name.strip().casefold()
+            if draft_source_by_name.get(key) in {"DB_RECOMMENDED", "USER_SELECTED"} and key in draft_raw_by_name:
+                # Preserve the DB-owned definition as-is unless the user explicitly edited it.
+                # Even then, only the already-allowed HITL keys are applied.
+                data = dict(draft_raw_by_name[key])
+                changes = applied_edits.get(key) or {}
+                if "description" in changes:
+                    data["description"] = field.description
+                if "nullable" in changes:
+                    data["nullable"] = field.nullable
+                if "params" in changes:
+                    data["params"] = dict(field.params or {})
+            else:
+                data = field.model_dump()
+                data.pop("provenance", None)
             variables.append(data)
             field_order.append(field.name)
+
+        if is_json_grounded_domain(draft.get("domain")):
+            source_by_name = {
+                name: source
+                for name, source in draft_source_by_name.items()
+                if name in {str(v.get("name") or "").strip().casefold() for v in variables if isinstance(v, dict)}
+            }
+            validate_low_balance_variable_sources(
+                variables,
+                source_by_name,
+                db_variable_names=set(draft_raw_by_name),
+            )
 
         if draft.get("type_of_data") == "transactional" and draft.get("entity_key") not in field_order:
             raise ValueError("HITL changes would remove the transactional entity key")

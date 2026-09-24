@@ -172,7 +172,7 @@ def catalog_for_request() -> dict[str, Any]:
             "The catalog includes all materializable scalar leaves from TMF654 Bucket/TopupBalance and TMF629 Customer, including scalar leaves inside referenced objects.",
             "One-to-many array relationships are intentionally excluded from the flat row contract rather than collapsed into a fake scalar.",
             "Swagger metadata fields beginning with @ are excluded because they are implementation/type-system metadata rather than useful business dimensions.",
-            "Scenario-specific analytical fields may be proposed when they are not standard attributes; those fields are marked SCENARIO_DERIVED and receive deterministic synthetic contracts.",
+            "The executable variable boundary is strict: a variable must be an exact scalar leaf from the supplied TMF654/TMF629 Swagger catalog or be explicitly supplied from MongoDB. The LLM may select/review variables but may not create executable variables.",
         ],
     }
 

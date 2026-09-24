@@ -5,6 +5,8 @@ from typing import Any
 from models.scenario import ScenarioModel
 from models.scenario_draft import ScenarioDraftModel
 from models.scenario_feedback import ScenarioFeedbackModel
+from core.json_domain_policy import is_json_grounded_domain
+from core.low_balance_variable_policy import validate_low_balance_variable_sources
 
 def next_scenario_id() -> str:
     return ScenarioModel.next_id()
@@ -192,13 +194,30 @@ def _repair_legacy_variables(variables: list[dict[str, Any]]) -> list[dict[str, 
     return repaired
 
 def resolve_variables(requested_scenario_id: str) -> tuple[list[dict[str, Any]], list[str]] | None:
-    """Return repaired variables and a field order consistent with the repaired contract."""
+    """Return the confirmed executable variables without rewriting Low Balance DB definitions."""
     dyn = get_confirmed(requested_scenario_id)
     if not dyn:
         return None
-    variables = _repair_legacy_variables(dyn["variables"])
+
+    raw_variables = [dict(v) for v in (dyn.get("variables") or []) if isinstance(v, dict)]
+    meta = dyn.get("meta") or {}
+    domain = meta.get("domain") or meta.get("journey") or ""
+
+    if is_json_grounded_domain(domain):
+        # Low Balance is source-locked. Never apply the generic legacy-repair layer here:
+        # DB definitions must remain unchanged and official JSON variables must remain exactly
+        # the source-backed contract selected during proposal/confirmation.
+        validate_low_balance_variable_sources(
+            raw_variables,
+            meta.get("variable_sources") or {},
+            db_variable_names=set(meta.get("db_variable_names") or []),
+        )
+        variables = raw_variables
+    else:
+        variables = _repair_legacy_variables(raw_variables)
+
     allowed = {str(v.get("name")) for v in variables if isinstance(v, dict) and v.get("name")}
-    field_order = [name for name in list(dyn["field_order"]) if str(name) in allowed]
+    field_order = [name for name in list(dyn.get("field_order") or []) if str(name) in allowed]
     return variables, field_order
 
 
