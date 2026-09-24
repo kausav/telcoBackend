@@ -243,6 +243,9 @@ def resolve_scenario_context(requested_scenario_id: str) -> dict[str, Any]:
         "entity_key": meta.get("entity_key"),
         "records_per_user": int(meta.get("records_per_user", 10) or 10),
         "agentic": bool(meta.get("agentic", False)),
+        "variable_sources": dict(meta.get("variable_sources") or {}),
+        "db_variable_names": sorted(set(meta.get("db_variable_names") or [])),
+        "db_variable_definitions": dict(meta.get("db_variable_definitions") or {}),
     }
 
 

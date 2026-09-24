@@ -1009,14 +1009,30 @@ def validate_low_balance_variable_sources(
     source_by_name: dict[str, str] | None = None,
     db_variable_names: set[str] | None = None,
 ) -> None:
-    """Enforce the Low Balance executable-source boundary at proposal, confirmation, and generation time."""
+    """Enforce the Low Balance executable-source boundary at every lifecycle stage.
+
+    Every executable field must have explicit provenance:
+      * OFFICIAL_JSON and exact name in the supplied TMF654/TMF629 scalar catalog, or
+      * DB_RECOMMENDED / USER_SELECTED and exact name in the persisted DB set.
+
+    No unlabelled, LLM_GENERATED, application-derived, CSV, or generic-registry field can enter
+    the Low Balance executable contract. This is intentionally fail-closed.
+    """
     catalog = official_catalog_by_name()
-    sources = {str(k).strip().casefold(): str(v).strip().upper() for k, v in (source_by_name or {}).items()}
-    normalized_db_names = {_normalize_name(name) for name in (db_variable_names or set()) if str(name).strip()}
+    sources = {
+        _normalize_name(k): str(v).strip().upper()
+        for k, v in (source_by_name or {}).items()
+        if str(k).strip()
+    }
+    normalized_db_names = {
+        _normalize_name(name) for name in (db_variable_names or set()) if str(name).strip()
+    }
     allowed_db = {"DB_RECOMMENDED", "USER_SELECTED"}
     allowed_official = "OFFICIAL_JSON"
     invalid: list[str] = []
+    seen_names: set[str] = set()
     seen_signatures: dict[tuple[str, str], str] = {}
+
     for raw in variables or []:
         if not isinstance(raw, dict):
             invalid.append("<invalid-variable>")
@@ -1025,30 +1041,39 @@ def validate_low_balance_variable_sources(
         if not name:
             invalid.append("<missing-name>")
             continue
-        source = sources.get(name, "")
-        if source in allowed_db:
-            if normalized_db_names and name not in normalized_db_names:
-                invalid.append(name)
-                continue
-        elif source and source != allowed_official:
-            invalid.append(name)
+        if name in seen_names:
+            invalid.append(f"{name} (duplicate exact variable name)")
             continue
-        elif name not in catalog:
-            invalid.append(name)
+        seen_names.add(name)
+
+        source = sources.get(name, "")
+        if not source:
+            invalid.append(f"{name} (missing source provenance)")
+            continue
+        if source in allowed_db:
+            if name not in normalized_db_names:
+                invalid.append(f"{name} (DB source is not present in the persisted DB variable set)")
+                continue
+        elif source == allowed_official:
+            if name not in catalog:
+                invalid.append(f"{name} (not present in the supplied TMF654/TMF629 catalog)")
+                continue
+        else:
+            invalid.append(f"{name} (unsupported source {source})")
             continue
 
         signature = semantic_signature(raw)
         prior = seen_signatures.get(signature)
         if prior and _normalize_name(prior) != name:
-            invalid.append(
-                f"{name} (duplicate business use of {prior})"
-            )
+            invalid.append(f"{name} (duplicate business use of {prior})")
         else:
             seen_signatures[signature] = name
+
     if invalid:
         raise ValueError(
             "Low Balance & Top-up executable variables must come only from the supplied TMF654/TMF629 Swagger scalar catalog or MongoDB variables. "
-            + "Invalid variables: " + ", ".join(sorted(set(invalid)))
+            "Each field must also carry explicit source provenance. Invalid variables: "
+            + ", ".join(sorted(set(invalid)))
         )
 
     by_name = {
@@ -1076,6 +1101,20 @@ def validate_low_balance_variable_sources(
         raise ValueError("Low Balance msisdn must come from MongoDB; it is not present in the supplied TMF654/TMF629 catalog.")
     if sources.get("customer_id") not in {allowed_official, *allowed_db}:
         raise ValueError("Low Balance customer_id must come from TMF629 JSON or MongoDB.")
+
+    customer = by_name["customer_id"]
+    if sources.get("customer_id") in allowed_db:
+        params = customer.get("params") if isinstance(customer.get("params"), dict) else {}
+        if (
+            str(customer.get("gen") or "").strip().lower() != "prefixed_int"
+            or str(params.get("prefix") or "") != "cust-"
+            or int(params.get("digits", 0) or 0) != 8
+            or str(customer.get("dtype") or "").strip().lower() != "string"
+        ):
+            raise ValueError(
+                "MongoDB customer_id is authoritative but its definition does not satisfy the required Low Balance contract: "
+                "gen='prefixed_int', prefix='cust-', digits=8, dtype='string'. Update the DB definition; the application will not rewrite it."
+            )
 
 
 def validate_db_definition(variable: dict[str, Any]) -> dict[str, Any]:

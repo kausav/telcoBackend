@@ -838,10 +838,13 @@ class SchemaCompiler:
                 if self._normalize_variable_name(str(item.get("name") or "")) not in self.REDUNDANT_MSISDN_FIELDS
             ]
 
-        # Quality-gate the broad candidate pool before converting it into executable fields.
-        # ``max_variables`` remains an optional caller override; otherwise the environment
-        # default applies. The selector removes semantic duplicates and low-information API
-        # metadata without dropping mandatory/application contracts.
+        # Generic domains use the quality engine as a second candidate-pruning gate.
+        # Low Balance is different: candidate_variables_override is already the output of the
+        # dedicated deterministic TMF654/TMF629 relevance selector. Running the generic quality
+        # engine again would silently narrow that source-grounded selection and can discard valid
+        # Bucket/party/requestor fields before the Low Balance integrity assertion runs.
+        # Preserve the selected official set and use the quality engine only for per-field scoring
+        # and provenance below.
         quality_engine = VariableQualityEngine(
             max_variables=max_variables if max_variables is not None else SCHEMA_MAX_VARIABLES,
             min_score=SCHEMA_MIN_VARIABLE_SCORE,
@@ -854,11 +857,26 @@ class SchemaCompiler:
                 business_scenario or "",
             )
         )
-        ideas, quality_report = quality_engine.select(
-            ideas,
-            context_text=selection_context,
-            entity_key=entity_key,
-        )
+        if candidate_variables_override is not None and all(
+            isinstance(item.get("_json_source_spec"), dict) for item in ideas
+        ):
+            quality_report = {
+                "candidate_count": len(ideas),
+                "selected_count": len(ideas),
+                "maximum": max_variables if max_variables is not None else SCHEMA_MAX_VARIABLES,
+                "minimum_quality_score": SCHEMA_MIN_VARIABLE_SCORE,
+                "semantic_duplicates_removed": 0,
+                "low_quality_candidates_removed": 0,
+                "quality_budget_truncated": 0,
+                "dependency_closure_added": 0,
+                "dependency_aliases": {},
+            }
+        else:
+            ideas, quality_report = quality_engine.select(
+                ideas,
+                context_text=selection_context,
+                entity_key=entity_key,
+            )
 
         # Defensive post-selection guard for the same redundancy rule. This prevents any
         # future quality-engine dependency closure change from reintroducing customer_id into
@@ -1025,8 +1043,12 @@ class SchemaCompiler:
                 deps = []
             registry_required = bool(idea.get("_registry_required")) if idea.get("_registry_required") is not None else False
             registry_nullable = bool(idea.get("_registry_nullable")) if idea.get("_registry_nullable") is not None else True
-            required = original_name == entity_key or original_name in self.REQUIRED_TELECOM_FIELDS or registry_required
+            low_balance_customer = is_json_grounded_domain(intent.domain) and self._normalize_variable_name(original_name) == "customer_id"
+            required = original_name == entity_key or original_name in self.REQUIRED_TELECOM_FIELDS or low_balance_customer or registry_required
             nullable = False if required else registry_nullable
+            if low_balance_customer:
+                grain = "entity"
+                deps = []
             description = str(idea.get("description") or "").strip() or f"Scenario-specific {role.replace('_', ' ')} attribute for {intent.domain}."
             source_from_json = isinstance(source_spec, dict)
             provenance = {

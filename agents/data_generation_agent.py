@@ -88,6 +88,10 @@ that deterministic result overrides an LLM judgement. Never invent missing busin
 a record look valid.
 
 Return JSON with keys: valid_records, dropped_records, fixes_applied, issues_found.
+Each input record contains an internal `__qa_id`. Preserve that exact ID on every returned valid
+record. Never create, modify, duplicate, or reuse a `__qa_id`. If a record must be dropped, put its
+exact `__qa_id` in dropped_records. The deterministic application will reconcile IDs and reject
+unknown or duplicated identifiers.
 
 Schema/business rules:
 {rules}
@@ -1205,10 +1209,11 @@ def _generate_record(variables: list[dict], rules: dict | None = None, plan: _Ge
         rule_formula = None if var["name"] in cyclic else plan.formula_by_name.get(var["name"])
         if rule_formula:
             deps = _formula_dependencies(str(rule_formula))
-            if deps and any(dep not in known_fields and dep not in rec for dep in deps):
-                # Keep the declared generator when formula text references symbolic
-                # tokens that are not schema fields (common in human-readable scenario definitions).
-                rule_formula = None
+            missing_deps = sorted(dep for dep in deps if dep not in known_fields and dep not in rec)
+            if missing_deps:
+                raise ValueError(
+                    f"Formula for '{var['name']}' references unknown field(s): {', '.join(missing_deps)}"
+                )
         if rule_formula:
             effective_var = dict(var)
             effective_var["gen"] = "formula"
@@ -1259,8 +1264,11 @@ def _generate_selected_record(
         rule_formula = None if name in cyclic else plan.formula_by_name.get(name)
         if rule_formula:
             deps = _formula_dependencies(str(rule_formula))
-            if deps and any(dep not in known_fields and dep not in rec for dep in deps):
-                rule_formula = None
+            missing_deps = sorted(dep for dep in deps if dep not in known_fields and dep not in rec)
+            if missing_deps:
+                raise ValueError(
+                    f"Formula for '{name}' references unknown field(s): {', '.join(missing_deps)}"
+                )
         if rule_formula:
             effective_var = dict(var)
             effective_var["gen"] = "formula"
@@ -1318,6 +1326,32 @@ def _pick_timestamp_field(variables: list[dict]) -> str | None:
     return None
 
 
+def _declared_db_variable_names(rules: dict | None) -> set[str]:
+    return {
+        str(name) for name in ((rules or {}).get("db_variable_names") or []) if str(name).strip()
+    }
+
+
+def _regenerate_declared_field(
+    variables: list[dict],
+    field_name: str,
+    base: dict | None = None,
+    *,
+    rules: dict | None = None,
+) -> Any:
+    """Regenerate one declared field using its persisted/compiled generator.
+
+    The target field is removed from the base first; otherwise _generate_selected_record treats
+    the existing value as authoritative and returns it unchanged, making collision retries a no-op.
+    """
+    candidate_base = dict(base or {})
+    candidate_base.pop(field_name, None)
+    generated = _generate_selected_record(
+        variables, {field_name}, base=candidate_base, rules=rules, apply_repairs=False
+    )
+    return generated.get(field_name)
+
+
 def _enforce_mandatory_telecom_identity(
     user_context: dict,
     variables: list[dict],
@@ -1325,6 +1359,7 @@ def _enforce_mandatory_telecom_identity(
     country: str | None = None,
     used_values: dict[str, set[str]] | None = None,
     low_balance: bool = False,
+    rules: dict | None = None,
 ) -> dict:
     """Repair mandatory telecom identity anchors before transactional grouping.
 
@@ -1359,6 +1394,9 @@ def _enforce_mandatory_telecom_identity(
     if "customer_id" in names:
         current=str(out.get("customer_id") or "")
         if not re.fullmatch(r"cust-[0-9]{8}", current) or current in used_values["customer_id"]:
+            # The Low Balance customer_id contract is fixed by policy. Whether the field is
+            # source-grounded in TMF629 or supplied by MongoDB, its executable representation
+            # is exactly cust- + 8 digits. Do not substitute any other identifier format.
             current=unique_prefixed("cust-", 8, "customer_id")
         else:
             used_values["customer_id"].add(current)
@@ -1368,8 +1406,8 @@ def _enforce_mandatory_telecom_identity(
         if low_balance:
             current=str(out.get("account_id") or "")
             if (not current) or current in used_values["account_id"]:
-                generated = _generate_selected_record(variables, {"account_id"}, base=out)
-                current=str(generated.get("account_id") or "")
+                generated = _regenerate_declared_field(variables, "account_id", out, rules=rules)
+                current=str(generated or "")
             if not current:
                 raise RuntimeError("Low Balance account_id DB variable generated an empty value")
             if current in used_values["account_id"]:
@@ -1399,8 +1437,8 @@ def _enforce_mandatory_telecom_identity(
         # generated phone contract. For other telecom domains retain the historical normalization.
         if low_balance:
             if (not current) or current in used_values["msisdn"]:
-                generated = _generate_selected_record(variables, {"msisdn"}, base=out)
-                current=str(generated.get("msisdn") or "")
+                generated = _regenerate_declared_field(variables, "msisdn", out, rules=rules)
+                current=str(generated or "")
             if not current:
                 raise RuntimeError("Low Balance msisdn DB variable generated an empty value")
             if current in used_values["msisdn"]:
@@ -1461,6 +1499,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                 country=country,
                 used_values=used_identity_values,
                 low_balance=low_balance_domain,
+                rules=rules,
             )
             # Establish stable entity-level domain context before transaction rows are created.
             user_context, _ = _enforce_low_balance_topup_consistency(user_context, variables, rules=rules)
@@ -1484,14 +1523,16 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                 identity_value=str(user_context.get(identity_name) or "")
                 attempts=0
                 while identity_value in used_identity_values[identity_name] and attempts < 100:
-                    if identity_name == "account_id":
+                    if identity_name == "account_id" and low_balance_domain:
+                        regenerated = _regenerate_declared_field(variables, "account_id", user_context, rules=rules)
+                        user_context["account_id"] = regenerated
+                    elif identity_name == "account_id":
                         user_context=_generate_selected_record(
                             variables,{"subscriber_id","account_id"},base=user_context,rules=rules
                         )
                     else:
-                        user_context=_generate_selected_record(
-                            variables,{identity_name},base=user_context,rules=rules
-                        )
+                        regenerated = _regenerate_declared_field(variables, identity_name, user_context, rules=rules)
+                        user_context[identity_name] = regenerated
                     identity_value=str(user_context.get(identity_name) or "")
                     attempts+=1
                 if identity_value:
@@ -1502,13 +1543,24 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
             if "bucket_id" in variable_names:
                 bucket_id_value = str(user_context.get("bucket_id") or "")
                 if (not bucket_id_value) or bucket_id_value in used_resource_ids["bucket_id"]:
-                    for _ in range(1000):
-                        candidate = _prefixed_int({"prefix": "BUCKET-", "digits": 10}, user_context)
-                        if candidate not in used_resource_ids["bucket_id"]:
-                            bucket_id_value = candidate
-                            break
+                    db_names = _declared_db_variable_names(rules)
+                    if "bucket_id" in db_names:
+                        for _ in range(100):
+                            generated = _regenerate_declared_field(variables, "bucket_id", user_context, rules=rules)
+                            candidate = str(generated or "")
+                            if candidate and candidate not in used_resource_ids["bucket_id"]:
+                                bucket_id_value = candidate
+                                break
+                        else:
+                            raise RuntimeError("MongoDB/declared generator could not produce a unique bucket_id")
                     else:
-                        raise RuntimeError("Unable to generate a unique bucket_id")
+                        for _ in range(1000):
+                            candidate = _prefixed_int({"prefix": "BUCKET-", "digits": 10}, user_context)
+                            if candidate not in used_resource_ids["bucket_id"]:
+                                bucket_id_value = candidate
+                                break
+                        else:
+                            raise RuntimeError("Unable to generate a unique bucket_id")
                     user_context["bucket_id"] = bucket_id_value
                 used_resource_ids["bucket_id"].add(bucket_id_value)
                 # All bucket references are synchronized later, but the stable user context
@@ -1553,17 +1605,27 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     # TopupBalance.id and topup_transaction_id identify concrete transaction
                     # resources. Guarantee uniqueness across the generated dataset instead of
                     # relying on the stochastic semantic_string generator.
+                    db_names = _declared_db_variable_names(rules)
                     for id_name,prefix in (("topupbalance_id","TOPUPBALANCE-"),("topup_transaction_id","TOPUP_TRANSACTION-")):
                         if id_name in row:
                             candidate=str(row.get(id_name) or "")
                             if (not candidate) or candidate in used_resource_ids[id_name]:
-                                for _ in range(1000):
-                                    generated_id=_prefixed_int({"prefix":prefix,"digits":10},row)
-                                    if generated_id not in used_resource_ids[id_name]:
-                                        candidate=generated_id
-                                        break
+                                if id_name in db_names:
+                                    for _ in range(100):
+                                        generated_id = _regenerate_declared_field(variables, id_name, row, rules=rules)
+                                        candidate = str(generated_id or "")
+                                        if candidate and candidate not in used_resource_ids[id_name]:
+                                            break
+                                    else:
+                                        raise RuntimeError(f"MongoDB/declared generator could not produce a unique {id_name}")
                                 else:
-                                    raise RuntimeError(f"Unable to generate a unique {id_name}")
+                                    for _ in range(1000):
+                                        generated_id=_prefixed_int({"prefix":prefix,"digits":10},row)
+                                        if generated_id not in used_resource_ids[id_name]:
+                                            candidate=generated_id
+                                            break
+                                    else:
+                                        raise RuntimeError(f"Unable to generate a unique {id_name}")
                                 row[id_name]=candidate
                             # Keep the resource href synchronized when the stochastic id had to
                             # be replaced for uniqueness.
@@ -1575,7 +1637,11 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     # real earlier transaction in this subscriber's history. The first event has
                     # no earlier top-up and therefore leaves the optional reference null.
                     if "topupbalance_balance_topup_id" in row and "topupbalance_id" in row:
-                        previous_topup_id = generated[-1].get("topupbalance_id") if generated and generated[-1].get("subscriber_id") == row.get("subscriber_id") else None
+                        previous_topup_id = (
+                            generated[-1].get("topupbalance_id")
+                            if generated and generated[-1].get(entity_key) == row.get(entity_key)
+                            else None
+                        )
                         if previous_topup_id and str(previous_topup_id) != str(row.get("topupbalance_id")):
                             row["topupbalance_balance_topup_id"] = previous_topup_id
                             row["topupbalance_balance_topup_href"] = f"https://example.test/telecom/topupBalance/{previous_topup_id}" if "topupbalance_balance_topup_href" in row else row.get("topupbalance_balance_topup_href")
@@ -2927,8 +2993,13 @@ def _assert_low_balance_topup_consistency(rec: dict, variables: list[dict], rule
             errors.append("account_id does not mirror subscriber_id")
     if "msisdn" in rec and rec.get("msisdn") is not None:
         msisdn = str(rec["msisdn"])
-        if not re.fullmatch(r"\+91[0-9]{10}", msisdn):
-            errors.append("msisdn is not a valid synthetic India +91 number")
+        country = str((rules or {}).get("country") or "IN").strip().upper()
+        if country == "IN":
+            valid_msisdn = bool(re.fullmatch(r"\+91[0-9]{10}", msisdn))
+        else:
+            valid_msisdn = bool(re.fullmatch(r"\+[1-9][0-9]{6,14}", msisdn))
+        if not valid_msisdn:
+            errors.append(f"msisdn is not a valid synthetic {country or 'global'} number")
     if "customer_id" in rec and rec.get("customer_id") is not None:
         if not re.fullmatch(r"cust-[0-9]{8}", str(rec.get("customer_id"))):
             errors.append("customer_id must match the Low Balance contract cust-<8 digits>")
@@ -3674,18 +3745,56 @@ class DataGenerationAgent:
             for i in range(0, len(checked), _CHUNK):
                 chunk = checked[i:i + _CHUNK]
                 try:
+                    qa_chunk = []
+                    original_by_id: dict[str, dict] = {}
+                    for offset, original in enumerate(chunk):
+                        qa_id = f"{i + offset}"
+                        tagged = dict(original)
+                        tagged["__qa_id"] = qa_id
+                        qa_chunk.append(tagged)
+                        original_by_id[qa_id] = dict(original)
+                    # Re-run the request with internal IDs; the IDs are provenance metadata, not schema fields.
                     result = self._llm.generate_json(
                         system_prompt,
                         f"Scenario: {state.scenario}\nIndustry: {state.industry}\nCountry: {state.country or 'GLOBAL'}\n"
                         f"Domain: {state.domain}\nBusiness scenario: {state.business_scenario}\n"
                         f"Business response: {state.business_response or ''}\nExpected outcome: {state.expected_outcome or ''}\n"
-                        f"Use case: {state.use_case or ''}\nScenario type: {state.scenario_type or ''}\nRecords to validate:\n{json.dumps(chunk, default=str)}",
+                        f"Use case: {state.use_case or ''}\nScenario type: {state.scenario_type or ''}\nRecords to validate:\n{json.dumps(qa_chunk, default=str)}",
                         temperature=0.1,
                     )
-                    validated = result.get("valid_records", chunk)
-                    valid_all.extend([{k: r[k] for k in state.field_order if k in r} for r in validated if isinstance(r, dict)])
+                    validated = result.get("valid_records", qa_chunk)
                     dropped = result.get("dropped_records", []) or []
-                    dropped_all.extend(dropped)
+                    returned: dict[str, dict] = {}
+                    invalid_qa = False
+                    for item in validated if isinstance(validated, list) else []:
+                        if not isinstance(item, dict) or "__qa_id" not in item:
+                            invalid_qa = True
+                            break
+                        qa_id = str(item.get("__qa_id") or "")
+                        if qa_id not in original_by_id or qa_id in returned:
+                            invalid_qa = True
+                            break
+                        cleaned = {k: item[k] for k in state.field_order if k in item}
+                        returned[qa_id] = cleaned
+                    dropped_ids = {
+                        str(item.get("__qa_id") if isinstance(item, dict) else item)
+                        for item in dropped if isinstance(item, (dict, str, int))
+                    }
+                    if not dropped_ids.issubset(original_by_id.keys()) or (set(returned) & dropped_ids):
+                        invalid_qa = True
+                    if invalid_qa:
+                        logger.warning("[QA] Chunk %d returned invalid record identities; deterministic chunk retained", i)
+                        state.errors.append(f"QA chunk {i} returned invalid record identities; deterministic records retained")
+                        valid_all.extend(chunk)
+                    else:
+                        # Missing IDs must be retained unless explicitly dropped. This prevents LLM QA
+                        # from silently shrinking the dataset.
+                        for qa_id, original in original_by_id.items():
+                            if qa_id in returned:
+                                valid_all.append(returned[qa_id])
+                            elif qa_id not in dropped_ids:
+                                valid_all.append(original)
+                        dropped_all.extend(sorted(dropped_ids))
                     llm_fixes += int(result.get("fixes_applied", 0))
                     llm_issues += int(result.get("issues_found", 0))
                 except Exception as exc:

@@ -24,6 +24,8 @@ from core.low_balance_variable_policy import (
     validate_db_definition,
     validate_low_balance_variable_sources,
     validate_low_balance_required_identity_sources,
+    semantic_signature,
+    official_catalog_by_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -137,9 +139,12 @@ class AgenticSchemaWorkflow:
         # semantic duplicates, not merely exact-name duplicates. Hash the full definitions
         # deterministically so a changed DB definition cannot reuse a stale proposal.
         canonical_db = json.dumps(db_variables or [], sort_keys=True, separators=(",", ":"), default=str)
-        fingerprint = hashlib.sha256(canonical_db.encode("utf-8")).hexdigest()
+        db_fingerprint = hashlib.sha256(canonical_db.encode("utf-8")).hexdigest()
+        source_fingerprint = hashlib.sha256(
+            json.dumps(source_manifest(), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
         return (
-            "agentic_proposal_v22_low_balance_source_locked_scenario_ranked_catalog",
+            "agentic_proposal_v26_low_balance_source_locked_scenario_ranked_catalog",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -147,7 +152,8 @@ class AgenticSchemaWorkflow:
             req.type_of_data,
             req.use_case.strip().lower(),
             " ".join(req.business_scenario.split()).strip().lower(),
-            fingerprint,
+            db_fingerprint,
+            source_fingerprint,
         )
 
     @staticmethod
@@ -242,8 +248,19 @@ class AgenticSchemaWorkflow:
             # Low Balance has two source families only. account_id and msisdn are absent from
             # the bundled TMF654/TMF629 catalog, so the exact DB variables are mandatory.
             validate_low_balance_required_identity_sources(db_variables)
-        protected_names = self._variable_name_keys(db_variables)
-        protected_name_set = set(protected_names)
+        protected_name_set = set(self._variable_name_keys(db_variables))
+        if json_grounded and db_variables:
+            # Do semantic DB-vs-JSON deduplication BEFORE the deterministic breadth budget.
+            # Otherwise a JSON alias such as topupbalance_is_auto_topup can consume one of the
+            # maximum official slots, only to be removed later when is_automatic_topup wins.
+            db_signatures = {
+                semantic_signature(item) for item in db_variables if isinstance(item, dict)
+            }
+            protected_name_set.update({
+                name for name, spec in official_catalog_by_name().items()
+                if semantic_signature(spec) in db_signatures
+            })
+        protected_names = tuple(sorted(protected_name_set))
         agent_prompt = (
             f"Industry: {req.industry_type}\n"
             f"Business domain: {req.domain}\n"
@@ -344,6 +361,7 @@ class AgenticSchemaWorkflow:
             validate_low_balance_variable_sources(
                 self._schema_to_variables(schema, raw_persisted_by_name)[0],
                 variable_sources,
+                db_variable_names=set(raw_persisted_by_name),
             )
 
         unresolved_questions = self.compiler.approval_questions(intent, schema)
