@@ -33,52 +33,20 @@ class ScenarioVariableModel:
             key = str(normalized.get("name") or "").strip()
             if not key:
                 continue
-
-            # Canonicalize the variable key so the same scenario/version/variable
-            # is always updated instead of creating a duplicate due to casing.
-            canonical_key = key.lower()
-            version = int(scenario_version)
-            base_filter = {
-                "requested_scenario_id": requested,
-                "scenario_version": version,
-            }
-
-            # Prefer the canonical key. If an older record was stored with a
-            # different casing, reuse that document instead of inserting another.
-            existing = cls.collection.find_one({
-                **base_filter,
-                "variable_key": canonical_key,
-            }, {"_id": 1})
-            if existing is None:
-                import re
-                existing = cls.collection.find_one({
-                    **base_filter,
-                    "variable_key": {"$regex": f"^{re.escape(key)}$", "$options": "i"},
-                }, {"_id": 1})
-
-            update = {
-                "$set": {
+            cls.collection.update_one(
+                {"requested_scenario_id": requested, "scenario_version": int(scenario_version), "variable_key": key},
+                {"$set": {
                     "requested_scenario_id": requested,
                     "scenario_key": requested,
-                    "variable_key": canonical_key,
                     "display_name": key,
                     "definition": normalized,
                     "source": "DB_RECOMMENDED",
                     "enabled": True,
                     "updated_at": now,
                     "updated_by": actor,
-                },
-                "$setOnInsert": {"created_at": now, "created_by": actor},
-            }
-
-            if existing and existing.get("_id") is not None:
-                cls.collection.update_one({"_id": existing["_id"]}, update, upsert=False)
-            else:
-                cls.collection.update_one(
-                    {**base_filter, "variable_key": canonical_key},
-                    update,
-                    upsert=True,
-                )
+                }, "$setOnInsert": {"created_at": now, "created_by": actor}},
+                upsert=True,
+            )
             count += 1
         return count
 

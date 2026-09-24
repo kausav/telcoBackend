@@ -634,10 +634,16 @@ class SchemaCompiler:
         max_variables: int | None = None,
         include_all_registry_scalars: bool = True,
         include_all_json_source_scalars: bool = False,
+        excluded_field_names: list[str] | None = None,
         business_scenario: str | None = None,
         context_text: str | None = None,
     ) -> list[GeneratedSchemaField]:
         normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
+        excluded_keys = {
+            self._normalize_variable_name(name)
+            for name in (excluded_field_names or [])
+            if self._normalize_variable_name(name)
+        }
         raw_ideas = [idea.model_dump() for idea in intent.candidate_variables]
         ideas: list[dict[str, object]] = []
         seen_idea_keys: set[str] = set()
@@ -669,6 +675,8 @@ class SchemaCompiler:
                 "msisdn": ("subscriber", "msisdn", "Subscriber MSISDN / mobile telephone number."),
             }
             for field_name in self.REQUIRED_TELECOM_FIELDS:
+                if self._normalize_variable_name(field_name) in excluded_keys:
+                    continue
                 _, _, desc = mandatory_defs[field_name]
                 add_idea({
                     "name": field_name,
@@ -685,8 +693,9 @@ class SchemaCompiler:
             # properties inside referenced objects, while keeping arrays out of the flat row.
             for spec in expanded_scalar_catalog():
                 model = str(spec.get("model") or "")
+                field_key = self._normalize_variable_name(str(spec.get("name") or ""))
                 dtype = str(spec.get("dtype") or "string").lower()
-                if dtype in self.UNSUPPORTED_NESTED_DTYPES:
+                if dtype in self.UNSUPPORTED_NESTED_DTYPES or field_key in excluded_keys:
                     continue
                 add_idea({
                     "name": str(spec["name"]),
@@ -778,6 +787,8 @@ class SchemaCompiler:
                     # subscriber_id is the canonical telecom subscriber identity. Do not add
                     # a second customer_id column to a subscriber-anchored proposal unless the
                     # caller explicitly selected customer_id as the transactional entity key.
+                    if attr_key in excluded_keys:
+                        continue
                     if (
                         has_subscriber_anchor
                         and not explicit_customer_entity_key
@@ -1190,6 +1201,7 @@ class SchemaCompiler:
         type_of_data: str | None,
         entity_key: str | None,
         scenario_type: str | None = None,
+        excluded_field_names: list[str] | None = None,
     ) -> ScenarioSchema:
         """Compile Low Balance & Top-up from TMF654 + TMF629 Swagger-backed registry concepts."""
         normalized_country = str(country or "IN").strip().upper()
@@ -1231,6 +1243,7 @@ class SchemaCompiler:
             max_variables=None,
             include_all_registry_scalars=False,
             include_all_json_source_scalars=True,
+            excluded_field_names=excluded_field_names,
             business_scenario=business_scenario,
             context_text=" ".join(
                 str(value or "") for value in (
@@ -1318,6 +1331,7 @@ class SchemaCompiler:
         business_response: str | None = None,
         expected_outcome: str | None = None,
         country: str | None = None,
+        excluded_field_names: list[str] | None = None,
     ) -> ScenarioSchema:
         requested = intent
         normalized_industry = (industry_type or intent.industry_type or "telecom").strip().lower()
@@ -1334,6 +1348,7 @@ class SchemaCompiler:
                 type_of_data=type_of_data or requested.type_of_data,
                 entity_key=entity_key,
                 scenario_type=scenario_type,
+                excluded_field_names=excluded_field_names,
             )
         if selected_entities is not None:
             normalized: list[str] = []
@@ -1399,6 +1414,7 @@ class SchemaCompiler:
             type_of_data=type_of_data,
             scenario_mode=scenario_mode,
             max_variables=max_variables,
+            excluded_field_names=excluded_field_names,
             business_scenario=business_scenario,
             context_text=" ".join(
                 str(value or "") for value in (

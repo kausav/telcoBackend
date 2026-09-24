@@ -69,8 +69,9 @@ def set_proposal(key: tuple, value: dict[str, Any], ttl_seconds: int | None = No
 def clear_scenario(scenario_id: str) -> None:
     """Clear generation caches associated with a persisted scenario.
 
-    Proposal caches are intentionally not cleared by scenario ID because they are
-    semantic-request caches and must remain identifier-agnostic.
+    Proposal caches are intentionally not cleared by raw scenario ID. They are keyed by
+    semantic request inputs plus a fingerprint of the persisted recommendation names, so
+    recommendation-set changes naturally select a different cache entry.
     """
     with _LOCK:
         for cache in (_SCHEMA, _ORCHESTRATOR):

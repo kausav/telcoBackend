@@ -6,6 +6,7 @@ HITL approval/edit action; scenario/generate executes only confirmed scenarios.
 from __future__ import annotations
 
 from typing import Any
+import hashlib
 import json
 import logging
 
@@ -73,9 +74,29 @@ class AgenticSchemaWorkflow:
         return variables, field_order
 
     @staticmethod
-    def _cache_key(req: ScenarioProposeRequest) -> tuple:
+    def _recommendation_name_keys(recommended: list[dict[str, Any]]) -> tuple[str, ...]:
+        names = {
+            str(item.get("name") or "").strip().casefold()
+            for item in (recommended or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        }
+        return tuple(sorted(names))
+
+    @classmethod
+    def _cache_key(
+        cls,
+        req: ScenarioProposeRequest,
+        recommended: list[dict[str, Any]],
+    ) -> tuple:
+        # The LLM output depends on which scenario-level variables are already protected
+        # in Mongo. Include a deterministic fingerprint in the cache key so a changed
+        # recommendation set never reuses a proposal generated for a different set.
+        recommendation_names = cls._recommendation_name_keys(recommended)
+        fingerprint = hashlib.sha256(
+            "\n".join(recommendation_names).encode("utf-8")
+        ).hexdigest()
         return (
-            "agentic_proposal_v14_subscriber_identity_rule",
+            "agentic_proposal_v15_db_recommendation_aware",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -83,6 +104,7 @@ class AgenticSchemaWorkflow:
             req.type_of_data,
             req.use_case.strip().lower(),
             " ".join(req.business_scenario.split()).strip().lower(),
+            fingerprint,
         )
 
     @staticmethod
@@ -124,6 +146,7 @@ class AgenticSchemaWorkflow:
 
     def propose(self, req: ScenarioProposeRequest) -> ScenarioImportResponse:
         prompt = req.business_scenario.strip()
+        requested_scenario_id = req.requested_scenario_id.strip()
         industry_key = match_industry_key(req.industry_type)
         if industry_key != "telecom":
             raise ValueError(
@@ -139,6 +162,12 @@ class AgenticSchemaWorkflow:
             if json_grounded
             else "Use all relevant concepts from the complete approved telecom standards registry context, across all registered source URLs. "
         )
+        # Scenario-level recommendations are protected inputs to the LLM path.
+        # Fetch them before checking the proposal cache because the protected set changes
+        # what Gemini is allowed to propose and therefore changes the semantic proposal.
+        recommended = get_recommended(requested_scenario_id, 1)
+        protected_names = self._recommendation_name_keys(recommended)
+        protected_name_set = set(protected_names)
         agent_prompt = (
             f"Industry: {req.industry_type}\n"
             f"Business domain: {req.domain}\n"
@@ -154,12 +183,12 @@ class AgenticSchemaWorkflow:
             "Select variables that make the behavioral difference observable; do not use requestedScenarioId to achieve that difference. "
             "Use ALL request inputs except requestedScenarioId and entityKey as semantic/context signals: scenarioType, industryType, domain, "
             "businessScenario, typeOfData, country, and useCase must materially constrain the variable set, field parameters, scope, "
-            "and generation behavior. Return the widest relevant schema supported by the approved grounding; do not truncate it."
+            "and generation behavior. Return the widest relevant schema supported by the approved grounding, excluding the protected persisted variables above."
         )
 
-        cid = ensure_conversation(req.requested_scenario_id, req.user_id, req.requested_scenario_id)
-        append_message(cid, "user", agent_prompt, requested_scenario_id=req.requested_scenario_id)
-        cache_key = self._cache_key(req)
+        cid = ensure_conversation(requested_scenario_id, req.user_id, requested_scenario_id)
+        append_message(cid, "user", agent_prompt, requested_scenario_id=requested_scenario_id)
+        cache_key = self._cache_key(req, recommended)
         cached = get_proposal(cache_key)
         if cached is not None:
             intent = ScenarioIntent.model_validate(cached["intent"])
@@ -171,6 +200,7 @@ class AgenticSchemaWorkflow:
                 country=req.country,
                 industry_type=industry_key,
                 domain_query=req.domain,
+                excluded_variable_names=list(protected_names),
             )
             intent.industry_type = industry_key
             intent.domain = req.domain
@@ -183,6 +213,18 @@ class AgenticSchemaWorkflow:
             intent.type_of_data = req.type_of_data
             intent.entity_key = req.entity_key or ""
             intent.use_case = req.use_case
+
+            # Defensive post-LLM pruning: exact persisted field names are already covered
+            # by Mongo and must not enter compilation even if the provider ignores the
+            # exclusion instruction. This reduces downstream work and prevents duplicate
+            # candidate processing without weakening the final DB-overlay authority.
+            if protected_names:
+                intent.candidate_variables = [
+                    idea
+                    for idea in intent.candidate_variables
+                    if str(idea.name or "").strip().casefold() not in protected_name_set
+                ]
+
             schema = self.compiler.compile(
                 intent,
                 max_variables=None,
@@ -196,22 +238,14 @@ class AgenticSchemaWorkflow:
                 business_response="",
                 expected_outcome="",
                 country=req.country,
+                excluded_field_names=list(protected_names),
             )
             set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
 
-        # Persisted scenario configuration is always layered on top of the current
-        # LLM/standards proposal. `requested_scenario_id` is the source of truth.
-        # If persisted recommendations exist, they are mandatory and override an
-        # LLM field with the same name. If none exist, the LLM/standards proposal
-        # is returned unchanged (apart from normal source attribution).
-        requested_scenario_id = req.requested_scenario_id.strip()
-        recommended = get_recommended(requested_scenario_id, 1)
+        # Persisted scenario configuration is layered on top of the current LLM proposal.
+        # The DB-recommended variables are mandatory for every domain, including JSON-grounded domains.
         user_selected = (
-            get_user_variables(
-                req.user_id.strip(),
-                requested_scenario_id,
-                1,
-            )
+            get_user_variables(req.user_id.strip(), requested_scenario_id, 1)
             if req.user_id and req.user_id.strip()
             else []
         )
@@ -226,25 +260,21 @@ class AgenticSchemaWorkflow:
         for variable in variables:
             key = str(variable.get("name") or "").strip().lower()
             persisted_source = variable_sources.get(key)
-            if persisted_source in {"DB_RECOMMENDED", "USER_SELECTED"}:
-                # Persisted scenario/user selections are authoritative over a fresh LLM proposal.
+            if persisted_source:
+                # Persisted scenario configuration remains explicit in provenance, even for
+                # JSON-grounded domains. This makes DB authority visible to downstream consumers.
                 variable["source"] = persisted_source
-            elif is_json_grounded_domain(req.domain):
-                field = next(
-                    (candidate for candidate in schema.fields if candidate.name == variable.get("name")),
-                    None,
-                )
+                continue
+            if is_json_grounded_domain(req.domain):
+                field = next((candidate for candidate in schema.fields if candidate.name == variable.get("name")), None)
                 if key in {"subscriber_id", "account_id", "msisdn"}:
                     variable["source"] = "APPLICATION_REQUIRED"
-                elif field and (
-                    field.provenance.get("source_registry_attribute")
-                    or field.provenance.get("source_json_id")
-                ):
+                elif field and (field.provenance.get("source_registry_attribute") or field.provenance.get("source_json_id")):
                     variable["source"] = "OFFICIAL_JSON_GROUNDED"
                 else:
                     variable["source"] = "SCENARIO_DERIVED"
             else:
-                variable["source"] = variable_sources.get(key, "LLM_GENERATED")
+                variable["source"] = "LLM_GENERATED"
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
         entity_key = self._entity_key(req.entity_key, field_order, type_of_data)
 

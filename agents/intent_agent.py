@@ -234,10 +234,22 @@ class GeminiIntentAgent:
         country: str | None = None,
         industry_type: str = "telecom",
         domain_query: str | None = None,
+        excluded_variable_names: list[str] | None = None,
     ) -> ScenarioIntent:
         json_grounded = is_json_grounded_domain(domain_query)
+        excluded_names = {
+            str(name).strip().casefold()
+            for name in (excluded_variable_names or [])
+            if str(name).strip()
+        }
         if json_grounded:
             catalog = catalog_for_request()
+            if excluded_names:
+                catalog = dict(catalog)
+                catalog["models"] = [
+                    row for row in (catalog.get("models") or [])
+                    if str(row.get("name") or "").strip().casefold() not in excluded_names
+                ]
             catalog_text = json.dumps(catalog, separators=(",", ":"), sort_keys=True)
             grounding_header = (
                 "SUPPLIED MACHINE-READABLE GROUNDING (authoritative for this domain):\n"
@@ -272,7 +284,14 @@ class GeminiIntentAgent:
             "Prefer the widest set of DISTINCT, analytically useful variables supported by the approved grounding and scenario semantics. "
             "Do not pad the candidate list with API href/referredType/reference metadata, display-only name/description fields, or semantic aliases. "
             "Prefer one canonical field per business concept and include additional fields only when they add independent analytical, causal, temporal, relational, or segmentation value. " + mandatory_line + "\n"
-            "Do not invent unsupported telecom entities or fields; the compiler will ground only relevant selected concepts from the approved registry. "
+            + (
+                "PERSISTED SCENARIO VARIABLES THAT ARE ALREADY COVERED AND MUST NOT BE RE-PROPOSED:\n"
+                + "- " + "\n- ".join(sorted(excluded_names)) + "\n"
+                + "Return only complementary candidate variables; do not recreate these fields or semantic equivalents.\n"
+                if excluded_names
+                else ""
+            )
+            + "Do not invent unsupported telecom entities or fields; the compiler will ground only relevant selected concepts from the approved registry. "
             "Return JSON only."
         )
 
