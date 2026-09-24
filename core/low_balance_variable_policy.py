@@ -61,6 +61,8 @@ def is_material_low_balance_spec(spec: dict[str, Any]) -> bool:
     """Return whether an official scalar leaf is analytically useful for Low Balance.
 
     The function only filters low-value metadata/PII from the supplied official JSON catalog.
+    Material Bucket state is deliberately allowed through so scenario policy can decide whether it
+    adds independent value.
     Every retained field remains traceable to TMF654/TMF629.
     """
     name = _normalize_name(spec.get("name"))
@@ -68,11 +70,18 @@ def is_material_low_balance_spec(spec: dict[str, Any]) -> bool:
         return False
     if name in _LOW_BALANCE_PII_NAMES or name in _LOW_BALANCE_DISPLAY_NAMES:
         return False
-    # Bucket-scoped balance state is intentionally excluded from the Low Balance & Top-up
-    # flat journey variable set. The journey models customer + top-up behavior; bucket
-    # internals can remain in the standards catalog but must not become output columns.
-    if is_bucket_variable_name(name) or str(spec.get("model") or "").strip().casefold() == "bucket":
+    if name in {
+        "bucket_name",
+        "bucket_requested_date",
+        "bucket_confirmation_date",
+        "bucket_party_account_id",
+        "bucket_party_account_name",
+        "bucket_party_account_status",
+        "bucket_remaining_value_name",
+    }:
         return False
+    # Bucket is a legitimate Low Balance business resource. Its material state fields are
+    # eligible for selection; scenario-specific policy below removes low-value bucket metadata.
     if name.endswith(_LOW_BALANCE_TECHNICAL_SUFFIXES):
         return False
     dtype = str(spec.get("dtype") or "string").strip().lower()
@@ -298,11 +307,368 @@ def semantic_signature(variable: dict[str, Any] | GeneratedSchemaField) -> tuple
     concept = concept_group or "_".join(tokens or ["field"])
     return context, f"{concept}::{dtype_key}"
 
+
+LOW_BALANCE_OFFICIAL_MAX_FIELDS = 45
+
+
+def _lb_norm_text(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _lb_scenario_tokens(value: object) -> set[str]:
+    """Return exact normalized scenario tokens; avoids substring false positives such as data/dataset."""
+    return {token for token in _lb_norm_text(value).split("_") if token}
+
+
+def _lb_has_scenario_terms(value: object, terms: set[str]) -> bool:
+    tokens = _lb_scenario_tokens(value)
+    normalized = _lb_norm_text(value)
+    return any(term in tokens or ("_" in term and term in normalized) for term in terms)
+
+
+def _low_balance_relevance_profile(outcome_mode: str) -> dict[str, dict[str, float]]:
+    """Return scenario-specific concept weights for official Low Balance fields.
+
+    The selector never creates a field name. It only ranks exact leaves already present in the
+    supplied TMF654/TMF629 catalog. Scenario type changes the ranking so distinct scenarios do not
+    collapse to the same variable set merely because they share the same business description.
+    """
+    common = {
+        "amount": 4.0,
+        "requested": 3.0,
+        "confirmation": 3.0,
+        "status": 4.0,
+        "reason": 4.0,
+        "channel": 3.0,
+        "payment_method": 3.0,
+        "voucher": 2.0,
+        "auto_topup": 3.0,
+        "recurring_period": 2.0,
+        "number_of_periods": 2.0,
+        "usage_type": 2.0,
+        "valid_for": 1.5,
+        "customer_status": 2.0,
+        "customer_status_reason": 2.0,
+        "party_account_status": 2.0,
+        "requestor": 1.5,
+        "id": 1.0,
+        # Bucket state is a legitimate Low Balance signal, but only its independent
+        # analytical measures should rank highly. Transport/reference/display fields
+        # are filtered elsewhere.
+        "remaining": 6.0,
+        "reserved": 3.0,
+        "is_shared": 2.5,
+    }
+    profiles = {
+        "positive": {
+            **common,
+            "amount": 7.0,
+            "requested": 6.0,
+            "confirmation": 7.0,
+            "status": 6.0,
+            "usage_type": 5.0,
+            "channel": 4.5,
+            "payment_method": 4.5,
+            "voucher": 4.0,
+            "auto_topup": 5.5,
+            "recurring_period": 5.0,
+            "number_of_periods": 4.0,
+            "valid_for": 3.0,
+            "reason": 3.0,
+            "remaining": 10.0,
+            "reserved": 4.0,
+            "is_shared": 3.0,
+        },
+        "suppression": {
+            **common,
+            "status": 10.0,
+            "reason": 10.0,
+            "customer_status": 9.0,
+            "customer_status_reason": 9.5,
+            "party_account_status": 8.0,
+            "channel": 7.5,
+            "payment_method": 5.5,
+            "requestor": 5.5,
+            "auto_topup": 6.0,
+            "requested": 4.0,
+            "confirmation": 4.0,
+            "valid_for": 2.5,
+            "amount": 2.0,
+            "usage_type": 1.5,
+            "voucher": 3.0,
+            "amount_units": 0.5,
+            "remaining": 12.0,
+            "reserved": 5.0,
+            "is_shared": 4.0,
+        },
+        "negative": {
+            **common,
+            "status": 9.0,
+            "reason": 8.5,
+            "customer_status": 6.0,
+            "customer_status_reason": 6.5,
+            "party_account_status": 6.0,
+            "requested": 5.0,
+            "confirmation": 6.0,
+            "amount": 5.0,
+            "channel": 5.0,
+            "payment_method": 5.0,
+            "requestor": 4.0,
+            "voucher": 3.0,
+            "auto_topup": 3.0,
+            "remaining": 11.0,
+            "reserved": 5.0,
+            "is_shared": 3.0,
+        },
+        "decline_or_no_response": {
+            **common,
+            "status": 8.0,
+            "reason": 7.5,
+            "channel": 6.5,
+            "requested": 6.0,
+            "confirmation": 4.0,
+            "customer_status": 6.0,
+            "customer_status_reason": 6.0,
+            "party_account_status": 5.0,
+            "payment_method": 5.0,
+            "requestor": 4.0,
+            "amount": 3.0,
+            "auto_topup": 4.0,
+            "voucher": 3.0,
+            "remaining": 11.0,
+            "reserved": 4.0,
+            "is_shared": 3.0,
+        },
+        "concurrent": {
+            **common,
+            "status": 7.0,
+            "reason": 5.0,
+            "channel": 6.0,
+            "payment_method": 5.0,
+            "requestor": 5.0,
+            "customer_status": 5.0,
+            "party_account_status": 5.0,
+            "amount": 4.0,
+            "requested": 4.0,
+            "confirmation": 4.0,
+            "auto_topup": 4.0,
+            "remaining": 10.0,
+            "reserved": 4.0,
+            "is_shared": 3.0,
+        },
+    }
+    return profiles.get(outcome_mode, common)
+
+
+
+def _low_balance_profile_exclusions(outcome_mode: str, business_scenario: str = "") -> set[str]:
+    """Exclude source fields that add little independent signal for the requested scenario.
+
+    These are quality filters over the approved TMF654/TMF629 catalog, not source restrictions.
+    MongoDB variables are handled separately and are never removed here.
+    """
+    mode = str(outcome_mode or "").strip().lower()
+    scenario_text = _lb_norm_text(business_scenario)
+    exclusions = {
+        "customer_engaged_party_id",
+        "customer_engaged_party_role",
+        "topupbalance_balance_topup_id",
+        "topupbalance_balance_topup_name",
+        "topupbalance_balance_topup_role",
+        "topupbalance_party_account_name",
+        # The TopupBalance bucket reference is a transport-level pointer. The direct Bucket
+        # resource below provides the useful balance-state facts, so reference labels are not
+        # duplicated in the flat row.
+        "topupbalance_bucket_id",
+        "topupbalance_bucket_name",
+        # Low-value bucket metadata/display fields.
+        "bucket_name",
+        "bucket_requested_date",
+        "bucket_confirmation_date",
+        "bucket_party_account_id",
+        "bucket_party_account_name",
+        "bucket_party_account_status",
+        "bucket_remaining_value_name",
+    }
+
+    has_reservation = _lb_has_scenario_terms(scenario_text, {
+        "reserved", "reservation", "reserve", "hold"
+    })
+    has_shared = _lb_has_scenario_terms(scenario_text, {
+        "shared", "family", "multi_device", "multidevice"
+    })
+    has_validity = _lb_has_scenario_terms(scenario_text, {
+        "expiry", "expire", "expiration", "validity", "valid_for", "validity_period"
+    })
+    has_usage = _lb_has_scenario_terms(scenario_text, {
+        "usage", "data", "voice", "sms", "monetary", "currency"
+    })
+
+    if not has_reservation:
+        exclusions.update({"bucket_reserved_value_amount", "bucket_reserved_value_units"})
+    if not has_shared:
+        exclusions.add("bucket_is_shared")
+    if not has_validity:
+        exclusions.update({"bucket_valid_for_start_date_time", "bucket_valid_for_end_date_time"})
+    if mode in {"suppression", "negative", "decline_or_no_response", "concurrent"} and not has_usage:
+        exclusions.add("bucket_usage_type")
+
+    if mode == "suppression":
+        # Recurrence configuration is only useful when the suppression scenario explicitly
+        # discusses recurring/automatic top-up behavior.
+        scenario_tokens = _lb_scenario_tokens(scenario_text)
+        if not scenario_tokens.intersection({"recurring", "periodic", "automatic", "autotopup"}) and not "auto_topup" in scenario_text:
+            exclusions.update({"topupbalance_recurring_period", "topupbalance_number_of_periods"})
+        if not scenario_tokens.intersection({"usage", "data", "voice", "sms"}):
+            exclusions.add("topupbalance_usage_type")
+
+    return exclusions
+
+
+def low_balance_official_relevance_score(
+    row: dict[str, Any],
+    *,
+    outcome_mode: str,
+    business_scenario: str = "",
+    scenario_type: str = "",
+) -> float:
+    """Score an exact official scalar by scenario relevance without inventing any field."""
+    name = _lb_norm_text(row.get("name"))
+    description = _lb_norm_text(row.get("description"))
+    text = f"{name} {description}"
+    profile = _low_balance_relevance_profile(outcome_mode)
+    score = 45.0
+
+    if name == "customer_id":
+        score += 18.0
+    if str(row.get("model") or "").lower() == "topupbalance":
+        score += 7.0
+    elif str(row.get("model") or "").lower() == "customer":
+        score += 4.0
+
+    for token, weight in profile.items():
+        if token in text:
+            score += weight
+
+    # Scenario language is an additional weak signal, never a source of new field names.
+    scenario_text = f"{_lb_norm_text(scenario_type)} {_lb_norm_text(business_scenario)}"
+    for token in ("retention", "intervention", "trigger", "recharge", "topup", "balance", "customer"):
+        if token in scenario_text and token in text:
+            score += 1.5
+    if outcome_mode == "suppression":
+        if any(token in text for token in ("name", "role")):
+            score -= 3.0
+        if "balance_topup" in text:
+            score -= 5.0
+    elif outcome_mode == "positive":
+        if "balance_topup" in text:
+            score -= 3.0
+        if "customer_engaged_party" in text:
+            score -= 2.0
+
+    # Names/roles are relation context rather than the primary behavioral signal. Keep them only
+    # when they clear the scenario-specific quality threshold or are required by dependencies.
+    if name.endswith("_name"):
+        score -= 4.0
+    if name.endswith("_role"):
+        score -= 3.0
+    if name.endswith("_units"):
+        score -= 1.0
+    return score
+
+
+def select_low_balance_official_catalog(
+    *,
+    outcome_mode: str,
+    business_scenario: str = "",
+    scenario_type: str = "",
+    excluded_names: set[str] | None = None,
+    preferred_names: set[str] | None = None,
+    max_fields: int = LOW_BALANCE_OFFICIAL_MAX_FIELDS,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select the widest high-quality scenario-specific official field set.
+
+    Only exact fields from the supplied TMF654/TMF629 material catalog are returned. The LLM can
+    influence priority through ``preferred_names`` but cannot force unrelated/low-quality fields.
+    """
+    excluded = {_lb_norm_text(name) for name in (excluded_names or set()) if _lb_norm_text(name)}
+    excluded.update(_low_balance_profile_exclusions(outcome_mode, business_scenario))
+    preferred = {_lb_norm_text(name) for name in (preferred_names or set()) if _lb_norm_text(name)}
+    rows = [
+        dict(row) for row in material_low_balance_catalog()
+        if _lb_norm_text(row.get("name")) not in excluded
+    ]
+
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+    for index, row in enumerate(rows):
+        name = _lb_norm_text(row.get("name"))
+        score = low_balance_official_relevance_score(
+            row,
+            outcome_mode=outcome_mode,
+            business_scenario=business_scenario,
+            scenario_type=scenario_type,
+        )
+        if name in preferred:
+            score += 3.0
+        scored.append((score, index, row))
+
+    # Core journey facts are always useful when present. Everything else must earn inclusion through
+    # the scenario-specific score, which is what creates meaningful differences between Normal,
+    # Suppression, Failure, etc. instead of returning the entire catalog for every scenario.
+    core_names = {
+        "topupbalance_id",
+        "topupbalance_requested_date",
+        "topupbalance_confirmation_date",
+        "topupbalance_status",
+        "topupbalance_amount_amount",
+        "customer_id",
+        # Current bucket state is central to a Low Balance journey. Optional bucket dimensions
+        # are added only when the scenario context supports them.
+        "bucket_id",
+        "bucket_remaining_value_amount",
+        "bucket_remaining_value_units",
+        "bucket_status",
+    }
+    scenario_text = _lb_norm_text(business_scenario)
+    if outcome_mode == "positive" or _lb_has_scenario_terms(
+        scenario_text, {"usage", "data", "voice", "sms", "monetary", "currency"}
+    ):
+        core_names.add("bucket_usage_type")
+    core: list[tuple[float, int, dict[str, Any]]] = [item for item in scored if _lb_norm_text(item[2].get("name")) in core_names]
+    core_keys = {_lb_norm_text(item[2].get("name")) for item in core}
+    ranked = sorted(scored, key=lambda item: (-item[0], item[1], _lb_norm_text(item[2].get("name"))))
+
+    selected: list[dict[str, Any]] = []
+    selected_keys: set[str] = set()
+    for item in core + ranked:
+        score, _index, row = item
+        name = _lb_norm_text(row.get("name"))
+        if name in selected_keys:
+            continue
+        if name not in core_keys and score < 47.0:
+            continue
+        if len(selected) >= max(1, int(max_fields)):
+            break
+        selected.append(row)
+        selected_keys.add(name)
+
+    report = {
+        "candidate_count": len(rows),
+        "selected_count": len(selected),
+        "max_fields": int(max_fields),
+        "outcome_mode": outcome_mode,
+        "preferred_names_used": sorted(preferred & selected_keys),
+        "selected_names": [str(row.get("name") or "") for row in selected],
+    }
+    return selected, report
+
+
 def official_catalog() -> tuple[dict[str, Any], ...]:
     """Return the immutable official Low Balance scalar catalog from the two bundled Swagger files.
 
-    The catalog is restricted to material journey fields; bucket-scoped and transport/display
-    metadata are intentionally excluded from the Low Balance executable variable universe.
+    The catalog contains material journey fields from TMF654 TopupBalance, TMF654 Bucket, and
+    TMF629 Customer. Bucket transport/display/reference noise is filtered, while materially useful
+    balance-state fields remain available for scenario-aware selection.
     """
     rows = []
     for row in material_low_balance_catalog():

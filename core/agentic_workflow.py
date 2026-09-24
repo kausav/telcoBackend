@@ -139,7 +139,7 @@ class AgenticSchemaWorkflow:
         canonical_db = json.dumps(db_variables or [], sort_keys=True, separators=(",", ":"), default=str)
         fingerprint = hashlib.sha256(canonical_db.encode("utf-8")).hexdigest()
         return (
-            "agentic_proposal_v20_low_balance_source_locked_broad_catalog",
+            "agentic_proposal_v22_low_balance_source_locked_scenario_ranked_catalog",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),

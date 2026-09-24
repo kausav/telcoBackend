@@ -8,7 +8,7 @@ import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
 from core.json_domain_policy import LOW_BALANCE_MAIN_MODEL_IDS, LOW_BALANCE_SOURCE_IDS, expanded_scalar_catalog, is_json_grounded_domain
-from core.low_balance_variable_policy import official_catalog_by_name, material_low_balance_catalog
+from core.low_balance_variable_policy import official_catalog_by_name, select_low_balance_official_catalog
 from core.variable_quality import VariableQualityEngine
 from config.runtime import SCHEMA_MAX_VARIABLES, SCHEMA_MIN_VARIABLE_SCORE
 
@@ -1082,26 +1082,34 @@ class SchemaCompiler:
             business_scenario=business_scenario,
         )
 
-        # Gemini is a selector/reviewer only for this source-bound domain. Its selected names are
-        # used to prioritize ordering, while the deterministic breadth guard adds every material
-        # official scalar leaf from the two supplied Swagger files. This prevents the final width
-        # from depending on how many fields Gemini happened to mention while keeping the source
-        # boundary strict.
+        # Gemini selects/reviews exact official names, but it must not determine breadth by itself.
+        # The deterministic selector ranks the complete supplied TMF654/TMF629 catalog according to
+        # scenarioType/businessScenario and keeps the widest high-quality relevant set. This is what
+        # makes Normal and Suppression materially different even when the business description is the
+        # same.
         catalog = official_catalog_by_name()
-        llm_selected_names = [
+        llm_selected_names = {
             self._normalize_variable_name(idea.name)
             for idea in intent.candidate_variables
             if self._normalize_variable_name(idea.name) in catalog
-        ]
-        ordered_names: list[str] = []
-        seen_names: set[str] = set()
-        for name in llm_selected_names + [
+        }
+        excluded_names = {
+            self._normalize_variable_name(name)
+            for name in (excluded_field_names or [])
+            if self._normalize_variable_name(name)
+        }
+        selected_catalog, selection_report = select_low_balance_official_catalog(
+            outcome_mode=scenario_mode,
+            business_scenario=business_scenario,
+            scenario_type=normalized_scenario,
+            excluded_names=excluded_names,
+            preferred_names=llm_selected_names,
+        )
+        ordered_names = [
             self._normalize_variable_name(row.get("name"))
-            for row in material_low_balance_catalog()
-        ]:
-            if name and name in catalog and name not in seen_names:
-                seen_names.add(name)
-                ordered_names.append(name)
+            for row in selected_catalog
+            if self._normalize_variable_name(row.get("name")) in catalog
+        ]
 
         selected_source_ideas: list[dict[str, object]] = []
         clean_selected_ideas: list[VariableIdea] = []
@@ -1142,23 +1150,20 @@ class SchemaCompiler:
                 "_json_source_spec": dict(spec),
                 "_json_source": True,
                 "_preserve_name": True,
-                "_force_include": True,
                 "_registry_entity": f"{spec.get('source_id', '')}__{spec.get('model', '')}",
                 "_registry_entity_name": str(spec.get("model") or ""),
                 "_registry_required": bool(spec.get("required")),
                 "_registry_nullable": not bool(spec.get("required")),
             })
 
-        # Persist only the clean semantic selection on the intent. Source metadata is passed
-        # separately to _build_fresh_fields and never enters VariableIdea.
+        # Persist only the clean scenario-specific semantic selection on the intent. Source metadata
+        # is passed separately to _build_fresh_fields and never enters VariableIdea.
         intent = intent.model_copy(update={"candidate_variables": clean_selected_ideas})
 
-        # Low Balance is intentionally compiled from the two primary business resources only.
-        # Create/Update/Event/Ref schemas describe API transport shapes, not the business
-        # entities we want as flat synthetic-data columns. Bucket is deliberately excluded from
-        # the Low Balance output variable universe; the journey focuses on customer + top-up.
-        # Restricting the entity pool here also prevents transport models from surfacing duplicate
-        # or bucket-only fields.
+        # Low Balance is compiled from the TMF654 TopupBalance + Bucket business resources and the
+        # TMF629 Customer resource. Create/Update/Event/Ref schemas are transport shapes, not flat
+        # synthetic-data columns. Bucket fields are exposed to the scenario-aware selector, which
+        # keeps only independent balance-state fields that materially support the requested scenario.
         entities: list[EntityDef] = []
         unresolved: list[str] = []
         for canonical_id in LOW_BALANCE_MAIN_MODEL_IDS:
@@ -1170,7 +1175,7 @@ class SchemaCompiler:
                 entities.append(ent)
 
         if not entities:
-            unresolved.append("The Low Balance & Top-up Swagger sources did not yield the expected Bucket, TopupBalance, or Customer models.")
+            unresolved.append("The Low Balance & Top-up Swagger sources did not yield the expected TopupBalance or Customer models.")
 
         fields = self._build_fresh_fields(
             intent,
@@ -1179,6 +1184,9 @@ class SchemaCompiler:
             country=normalized_country,
             type_of_data=normalized_type,
             scenario_mode=scenario_mode,
+            # The deterministic Low Balance selector defines breadth. The quality engine may
+            # deduplicate true semantic duplicates, but it must not reduce this source-grounded
+            # selection merely because Gemini returned a narrower candidate list.
             max_variables=max(len(selected_source_ideas), SCHEMA_MAX_VARIABLES),
             include_all_registry_scalars=False,
             include_all_json_source_scalars=False,
@@ -1193,6 +1201,22 @@ class SchemaCompiler:
                 )
             ),
         )
+        # Fail closed if an official field selected by the deterministic Low Balance policy
+        # disappears during executable contract construction. The policy intentionally selects
+        # the widest high-quality scenario-relevant set; silently dropping one would make the
+        # final breadth dependent on downstream heuristics.
+        expected_official = {self._normalize_variable_name(name) for name in ordered_names}
+        actual_official = {
+            self._normalize_variable_name(field.name)
+            for field in fields
+            if str(field.provenance.get("generated_from") or "") == "official_json_source"
+        }
+        missing_official = sorted(expected_official - actual_official)
+        if missing_official:
+            raise ValueError(
+                "Low Balance official-variable selection was narrowed during compilation; "
+                "missing executable official fields: " + ", ".join(missing_official)
+            )
         field_names = [f.name for f in fields]
         if not fields:
             unresolved.append("The Low Balance & Top-up scenario did not yield any usable semantic variables.")
@@ -1223,8 +1247,9 @@ class SchemaCompiler:
         standards = self.registry.standards_for_entities([e.canonical_id for e in entities])
         hard_constraints = [
             "scenarioId is identifier-only and does not select variables or business rules.",
-            "Low Balance & Top-up standards grounding is restricted to the supplied TMF654 Prepay Balance Management and TMF629 Customer Management Swagger/OpenAPI artifacts; bucket-scoped fields are excluded from the flat output contract.",
-            "The Low Balance & Top-up compiler permits executable variables only when they are exact scalar leaves from the supplied TMF654/TMF629 Swagger models or are explicitly layered in from MongoDB after proposal generation.",
+            "Low Balance & Top-up variables are scenario-ranked from the complete material TMF654/TMF629 scalar catalog; different scenarioType/businessScenario combinations may select different subsets while remaining source-bound.",
+            "Low Balance & Top-up standards grounding is restricted to the supplied TMF654 Prepay Balance Management and TMF629 Customer Management Swagger/OpenAPI artifacts; only scenario-relevant Bucket state fields are admitted to the flat output contract.",
+            "The Low Balance & Top-up compiler permits executable variables only when they are exact scalar leaves from the supplied TMF654/TMF629 Swagger models or are explicitly layered in from MongoDB after proposal generation; scenarioType/businessScenario can change which official leaves are selected.",
             "One-to-many array properties are excluded from the flat record contract rather than converted into fake scalar values.",
             "Standard-backed enum values are copied from the official Swagger definitions and cannot be replaced with invented values.",
             "The LLM cannot create scenario-derived executable variables. Variables absent from the two Swagger sources must be supplied through MongoDB.",

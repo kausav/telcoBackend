@@ -29,6 +29,7 @@ LOW_BALANCE_DOMAIN_ALIASES = {
 LOW_BALANCE_SOURCE_IDS = ("tmf654_v4", "tmf629_v4")
 LOW_BALANCE_MAIN_MODEL_IDS = (
     "tmf654_v4__topup_balance",
+    "tmf654_v4__bucket",
     "tmf629_v4__customer",
 )
 LOW_BALANCE_SOURCE_NAMES = {
@@ -59,7 +60,13 @@ def _load(source_id: str) -> dict[str, Any]:
 
 
 LOW_BALANCE_MAIN_MODELS = {
-    "tmf654_v4": (("TopupBalance", "topupbalance", "transaction"),),
+    "tmf654_v4": (
+        ("TopupBalance", "topupbalance", "transaction"),
+        # Bucket is a first-class balance resource in TMF654. It is exposed to the
+        # Low Balance selector so scenario-aware ranking can retain only materially
+        # useful bucket state (for example remaining balance or expiry).
+        ("Bucket", "bucket", "transaction"),
+    ),
     "tmf629_v4": (("Customer", "customer", "entity"),),
 }
 
@@ -160,15 +167,21 @@ def _material_scalar_for_low_balance(row: dict[str, Any]) -> bool:
         return False
     if name.endswith(("_href", "_description", "_referred_type")):
         return False
-    # Bucket-scoped fields are intentionally outside the Low Balance flat journey contract.
-    if (
-        name.startswith("bucket_")
-        or name.startswith("balance_bucket_")
-        or "_bucket_" in name
-        or name.endswith("_bucket")
-    ):
-        return False
-    if name in {"customer_name", "customer_engaged_party_name", "topupbalance_requestor_name", "bucket_remaining_value_name"}:
+    # Bucket variables are allowed when they describe actual balance state. The selector
+    # decides which ones belong to a specific scenario; this function only removes transport,
+    # display and obvious PII fields from the candidate universe.
+    if name in {
+        "customer_name",
+        "customer_engaged_party_name",
+        "topupbalance_requestor_name",
+        "bucket_remaining_value_name",
+        "bucket_name",
+        "bucket_requested_date",
+        "bucket_confirmation_date",
+        "bucket_party_account_name",
+        "bucket_party_account_id",
+        "bucket_party_account_status",
+    }:
         return False
     return str(row.get("dtype") or "string").lower() not in {"object", "array"}
 
@@ -187,7 +200,7 @@ def catalog_for_request() -> dict[str, Any]:
         "sources": source_manifest(),
         "models": payload,
         "notes": [
-            "The catalog includes all quality-safe materializable scalar leaves from TMF654 TopupBalance and TMF629 Customer, including scalar leaves inside referenced objects; bucket-scoped fields, _href/_description/_referredType transport/display metadata, and obvious customer/requestor name fields are excluded.",
+            "The catalog includes quality-safe materializable scalar leaves from TMF654 TopupBalance and Bucket plus TMF629 Customer, including scalar leaves inside referenced objects. Low-value bucket labels/account-reference metadata are excluded here; scenario selection may retain materially useful bucket state such as remaining/reserved value, status, usage type, sharing, validity, and bucket identity.",
             "One-to-many array relationships are intentionally excluded from the flat row contract rather than collapsed into a fake scalar.",
             "Swagger metadata fields beginning with @ are excluded because they are implementation/type-system metadata rather than useful business dimensions.",
             "The executable variable boundary is strict: a variable must be an exact scalar leaf from the supplied TMF654/TMF629 Low Balance catalog or be explicitly supplied from MongoDB. The LLM may select/review variables but may not create executable variables.",

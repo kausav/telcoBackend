@@ -2191,7 +2191,22 @@ def _lb_sync_reference_fields(rec: dict, variables: list[dict], issues: list[str
     if account_id and account_id in rec:
         _lb_set(rec, variables, "customer_engaged_party_id", rec.get("subscriber_id"), issues, "customer engaged party linked to subscriber")
     if customer_id and customer_id in rec and rec.get(customer_id) is None:
-        _lb_set(rec, variables, customer_id, _prefixed_int({"prefix": "CUSTOMER-", "digits": 10}, rec), issues, "customer identity generated consistently for subscriber")
+        customer_var = by_name.get(customer_id)
+        if customer_var is not None:
+            # Low Balance customer_id is authoritative when supplied by MongoDB. Reuse the
+            # declared generator/parameters rather than inventing a second identifier contract.
+            generator = str(customer_var.get("gen") or "").strip().lower()
+            params = customer_var.get("params") if isinstance(customer_var.get("params"), dict) else {}
+            if generator == "prefixed_int":
+                generated_customer_id = _prefixed_int(params, rec)
+                _lb_set(
+                    rec,
+                    variables,
+                    customer_id,
+                    generated_customer_id,
+                    issues,
+                    "customer identity generated from the authoritative Low Balance variable contract",
+                )
     if topup_id and topup_id in rec:
         topup_value = rec.get(topup_id)
         if topup_value is not None:

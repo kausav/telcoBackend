@@ -274,8 +274,36 @@ class GeminiIntentAgent:
                 "family as automatically sufficient when the scenario spans multiple telecom standards.\n\n"
             )
             mandatory_line = "For transactional telecom scenarios, ALWAYS include subscriber_id, account_id, and msisdn. "
+        scenario_focus = ""
+        # The request context already contains scenario type. Provide a concise deterministic
+        # focus hint so Gemini's review priorities align with the backend's scenario-aware selector.
+        normalized_scenario_type = re.sub(r"[^a-z0-9]+", " ", str(request_context or "").lower())
+        if "suppression" in normalized_scenario_type:
+            scenario_focus = (
+                "Scenario focus: Suppression. Prefer official fields that make suppression observable "
+                "(status/state, reason, customer/account status, channel, payment/requestor context, "
+                "request/confirmation timing, automatic-top-up state, and relevant current bucket state such as "
+                "remaining/reserved balance, usage type, sharing, status, or validity). Do not prioritize recurrence "
+                "configuration unless the request explicitly makes it relevant. Bucket fields are optional: select "
+                "only those that add independent suppression signal.\n\n"
+            )
+        elif any(token in normalized_scenario_type for token in ("failure", "failed", "error", "decline", "no response")):
+            scenario_focus = (
+                "Scenario focus: adverse/decline outcome. Prefer official fields that make failure or "
+                "non-completion observable (status, reason, timestamps, amount, channel/payment/requestor, "
+                "and customer/account state).\n\n"
+            )
+        elif "normal" in normalized_scenario_type or "success" in normalized_scenario_type:
+            scenario_focus = (
+                "Scenario focus: normal/positive top-up lifecycle. Prefer official fields that describe "
+                "execution and outcome (amount, usage, request/confirmation timing, status, channel, "
+                "payment method, voucher, automatic/recurring configuration, and relevant current bucket "
+                "state such as remaining balance, usage type, sharing, status, or validity). Bucket fields are "
+                "optional and must add independent analytical value.\n\n"
+            )
         prompt = (
             grounding_header +
+            scenario_focus +
             f"{catalog_text}\n\n"
             "Authoritative request context:\n"
             f"{request_context}\n\n"
