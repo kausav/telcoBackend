@@ -24,10 +24,7 @@ from core.low_balance_variable_policy import (
     validate_db_definition,
     validate_low_balance_variable_sources,
     validate_low_balance_required_identity_sources,
-    normalize_low_balance_db_identity_variables,
-    filter_incompatible_low_balance_db_customer_overrides,
-    reconcile_low_balance_schema,
-    reconcile_low_balance_executable_variables,
+    reconcile_low_balance_variables,
     semantic_signature,
     official_catalog_by_name,
 )
@@ -148,7 +145,7 @@ class AgenticSchemaWorkflow:
             json.dumps(source_manifest(), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
         return (
-            "agentic_proposal_v29_low_balance_identity_contract_normalized_scenario_ranked_catalog",
+            "agentic_proposal_v30_low_balance_source_boundary",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -238,14 +235,6 @@ class AgenticSchemaWorkflow:
             else []
         )
         if json_grounded:
-            recommended, user_selected, quarantined_customer_names = filter_incompatible_low_balance_db_customer_overrides(
-                recommended, user_selected
-            )
-            if quarantined_customer_names:
-                logger.warning(
-                    "Low Balance quarantined incompatible MongoDB customer_id override(s); TMF629 Customer.id remains authoritative: %s",
-                    quarantined_customer_names,
-                )
             recommended, user_selected, suppressed_db_names = dedupe_db_variable_sources(
                 recommended, user_selected
             )
@@ -258,15 +247,7 @@ class AgenticSchemaWorkflow:
         db_variables = self._merge_db_variable_sources(recommended, user_selected)
         if json_grounded:
             # Low Balance has two source families only. account_id and msisdn are absent from
-            # the bundled TMF654/TMF629 catalog, so the exact DB variables are mandatory. Their
-            # generator/name/params remain DB-owned; only stale identity-grain flags are normalized
-            # for the executable contract.
-            db_variables, adjusted_identity_names = normalize_low_balance_db_identity_variables(db_variables)
-            if adjusted_identity_names:
-                logger.warning(
-                    "Low Balance normalized stale Mongo identity contract flags at runtime: %s; MongoDB definitions were not modified",
-                    adjusted_identity_names,
-                )
+            # the bundled TMF654/TMF629 catalog, so the exact DB variables are mandatory.
             validate_low_balance_required_identity_sources(db_variables)
         protected_name_set = set(self._variable_name_keys(db_variables))
         if json_grounded and db_variables:
@@ -376,23 +357,27 @@ class AgenticSchemaWorkflow:
             user_selected,
         )
 
-        if json_grounded:
-            # Final executable boundary: nothing outside the official catalog or MongoDB may
-            # survive the proposal stage. This catches future code paths that bypass the compiler.
-            validate_low_balance_variable_sources(
-                self._schema_to_variables(schema, raw_persisted_by_name)[0],
-                variable_sources,
-                db_variable_names=set(raw_persisted_by_name),
-            )
-
         unresolved_questions = self.compiler.approval_questions(intent, schema)
         variables, field_order = self._schema_to_variables(schema, raw_persisted_by_name)
+        if json_grounded:
+            variables, variable_sources, db_variable_names, field_order = reconcile_low_balance_variables(
+                variables,
+                variable_sources,
+                db_variable_names=set(raw_persisted_by_name),
+                field_order=field_order,
+                db_variable_definitions=raw_persisted_by_name,
+            )
+            validate_low_balance_variable_sources(
+                variables,
+                variable_sources,
+                db_variable_names=db_variable_names,
+            )
         for variable in variables:
             key = str(variable.get("name") or "").strip().lower()
             persisted_source = variable_sources.get(key)
             if persisted_source:
-                # Low Balance preserves DB generator semantics and source provenance; mandatory identity
-                # grain flags may have been normalized locally for the executable contract.
+                # Low Balance keeps DB definitions unchanged and records provenance separately
+                # in the draft; other domains retain the legacy per-variable source annotation.
                 if not json_grounded:
                     variable["source"] = persisted_source
                 continue
@@ -472,68 +457,86 @@ class AgenticSchemaWorkflow:
         add: list[dict[str, Any]],
         edit: list[Any],
         delete: list[str],
-    ) -> tuple[list[dict[str, Any]], list[str]]:
-        """Apply safe HITL changes to an agentic draft. No new semantics can be introduced."""
+    ) -> tuple[list[dict[str, Any]], list[str], dict[str, str], set[str]]:
+        """Apply HITL edits while preserving the single Low Balance source boundary."""
         schema = ScenarioSchema.model_validate(draft["schema"])
+        draft_variables = [
+            dict(item)
+            for item in (draft.get("variables") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
         draft_source_by_name = {
             str(name).strip().casefold(): str(source).strip().upper()
             for name, source in (draft.get("variable_sources") or {}).items()
             if str(name).strip() and str(source).strip()
         }
-        draft_raw_by_name = {
-            str(item.get("name") or "").strip().casefold(): dict(item)
-            for item in (draft.get("variables") or [])
-            if isinstance(item, dict) and str(item.get("name") or "").strip()
-        }
-
-        # Reconcile legacy Low Balance drafts before unresolved-requirement checks. This is a
-        # local executable-schema migration only: an incompatible DB customer_id is replaced by
-        # the bundled TMF629 contract, while all unrelated Mongo variables remain unchanged.
-        if is_json_grounded_domain(draft.get("domain")):
-            schema, reconciled_variables, draft_source_by_name, reconciled_db_names, _ = reconcile_low_balance_schema(
-                schema,
-                list(draft_raw_by_name.values()),
-                draft_source_by_name,
-                set(draft.get("db_variable_names") or []),
-                list(draft.get("field_order") or []),
-            )
-            draft_raw_by_name = {
-                str(item.get("name") or "").strip().casefold(): dict(item)
-                for item in reconciled_variables
-                if isinstance(item, dict) and str(item.get("name") or "").strip()
-            }
-        else:
-            reconciled_db_names = set(draft.get("db_variable_names") or [])
-        # Concept names extracted by the LLM are soft semantic hints. They may not have
-        # one-to-one registry entities and must never block HITL confirmation. Only hard
-        # executable failures (no usable fields / requested entity key not represented)
-        # block confirmation. This also makes older drafts containing legacy
-        # ``Unknown concept ...`` items confirmable without requiring a re-proposal.
-        blocking_unresolved = []
-        external_db_names = {
+        draft_db_names = {
             str(name).strip().casefold()
-            for name in reconciled_db_names
+            for name in (draft.get("db_variable_names") or [])
             if str(name).strip()
         }
+        draft_db_names.update(
+            str(name).strip().casefold()
+            for name in (draft.get("db_variable_definitions") or {}).keys()
+            if str(name).strip()
+        )
+
+        if is_json_grounded_domain(draft.get("domain")):
+            draft_variables, draft_source_by_name, draft_db_names, draft_order = reconcile_low_balance_variables(
+                draft_variables,
+                draft_source_by_name,
+                db_variable_names=draft_db_names,
+                field_order=list(draft.get("field_order") or []),
+                db_variable_definitions=draft.get("db_variable_definitions") or {},
+            )
+            # Legacy drafts can have DB variables that are missing from the compiled schema.
+            # Add the exact stored definitions as schema fields so confirmation operates on
+            # the complete executable variable set instead of manufacturing replacements.
+            existing_fields = {field.name.strip().casefold(): field for field in schema.fields}
+            field_by_key = dict(existing_fields)
+            for raw in draft_variables:
+                key = str(raw.get("name") or "").strip().casefold()
+                if key and key not in field_by_key:
+                    field_by_key[key] = GeneratedSchemaField.model_validate(raw)
+            rebuilt_fields: list[GeneratedSchemaField] = []
+            seen_keys: set[str] = set()
+            for name in draft_order:
+                key = str(name).strip().casefold()
+                field = field_by_key.get(key)
+                if field is not None and key not in seen_keys:
+                    rebuilt_fields.append(field)
+                    seen_keys.add(key)
+            for field in schema.fields:
+                key = field.name.strip().casefold()
+                if key not in seen_keys:
+                    rebuilt_fields.append(field)
+                    seen_keys.add(key)
+            for raw in draft_variables:
+                key = str(raw.get("name") or "").strip().casefold()
+                if key not in seen_keys:
+                    rebuilt_fields.append(GeneratedSchemaField.model_validate(raw))
+                    seen_keys.add(key)
+            if rebuilt_fields != list(schema.fields):
+                schema = schema.model_copy(update={"fields": rebuilt_fields})
+
+        # Concept labels are soft hints. Only genuinely executable unresolved requirements block confirmation.
+        external_db_names = set(draft_db_names)
         proposed_names = {
             str(item.get("name") or "").strip().casefold()
-            for item in draft_raw_by_name.values()
+            for item in draft_variables
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         }
+        proposed_names.update(field.name.strip().casefold() for field in schema.fields if field.name.strip())
+        blocking_unresolved = []
         for item in schema.unresolved_items:
             text = str(item).strip()
-            lower = text.lower()
+            lower = text.casefold()
             if lower.startswith("unknown concept ") or lower.startswith("unknown requested concept "):
                 continue
-            if ("entity key '" in lower or "requested entity key '" in lower):
+            if "entity key '" in lower or "requested entity key '" in lower:
                 marker = lower.split("entity key '", 1)[-1]
                 candidate = marker.split("'", 1)[0].strip().casefold()
-                # A requested entity key may legitimately be supplied by MongoDB even when
-                # it is absent from the official JSON source catalog. Once it is present in
-                # the proposed/draft variable set, the requirement is executable.
-                if candidate in external_db_names or candidate in proposed_names:
-                    continue
-                if SchemaCompiler.is_mandatory_telecom_field(candidate):
+                if candidate in external_db_names or candidate in proposed_names or SchemaCompiler.is_mandatory_telecom_field(candidate):
                     continue
             blocking_unresolved.append(text)
         if blocking_unresolved:
@@ -541,12 +544,11 @@ class AgenticSchemaWorkflow:
                 "Cannot confirm an agentic draft with unresolved executable requirements: "
                 + "; ".join(blocking_unresolved)
             )
-        fields_by_name = {field.name: field for field in schema.fields}
 
-        mandatory_telecom = {"subscriber_id", "account_id", "msisdn"}
-        if is_json_grounded_domain(draft.get("domain")):
-            mandatory_telecom = {"customer_id", "account_id", "msisdn"}
-        for name in delete:
+        fields_by_name = {field.name: field for field in schema.fields}
+        mandatory_telecom = {"customer_id", "account_id", "msisdn"} if is_json_grounded_domain(draft.get("domain")) else {"subscriber_id", "account_id", "msisdn"}
+        delete_set = {str(name).strip() for name in delete if str(name).strip()}
+        for name in delete_set:
             if name not in fields_by_name:
                 raise ValueError(f"HITL cannot delete unknown agentic field '{name}'")
             if name in mandatory_telecom:
@@ -554,8 +556,6 @@ class AgenticSchemaWorkflow:
             if fields_by_name[name].required:
                 raise ValueError(f"HITL cannot delete required field '{name}'")
 
-        # Agentic additions must reference an existing field contract in the proposed
-        # schema. New entities are intentionally not created during confirmation.
         for item in add:
             name = str(item.get("name") or "").strip()
             if not name:
@@ -566,13 +566,13 @@ class AgenticSchemaWorkflow:
 
         allowed_override_keys = {"nullable", "description", "params"}
         applied_edits: dict[str, dict[str, Any]] = {}
-        for edit in edit:
-            name = edit.name if hasattr(edit, "name") else str(edit.get("name") or "")
-            changes = edit.changes if hasattr(edit, "changes") else dict(edit.get("changes") or {})
+        for item in edit:
+            name = item.name if hasattr(item, "name") else str(item.get("name") or "")
+            changes = item.changes if hasattr(item, "changes") else dict(item.get("changes") or {})
             if name not in fields_by_name:
                 raise ValueError(f"HITL cannot edit unknown agentic field '{name}'")
-            source_key = name.strip().casefold()
-            if draft_source_by_name.get(source_key) in {"DB_RECOMMENDED", "USER_SELECTED"} and changes:
+            key = name.strip().casefold()
+            if draft_source_by_name.get(key) in {"DB_RECOMMENDED", "USER_SELECTED"} and changes:
                 raise ValueError(
                     f"MongoDB variable '{name}' is authoritative and cannot be renamed or edited; "
                     "change its DB definition instead"
@@ -595,33 +595,30 @@ class AgenticSchemaWorkflow:
                 if unknown_params:
                     raise ValueError(f"HITL cannot introduce generation parameters for '{name}': {unknown_params}")
                 target.params = {**target.params, **params}
-            applied_edits[name.strip().casefold()] = dict(changes)
+            applied_edits[key] = dict(changes)
 
-        remaining = [field for field in schema.fields if field.name not in set(delete)]
-        # Registry dependencies may reference entity canonical IDs (for example
-        # subscriber.customer_id -> customer), not column names. Only enforce a
-        # dependency here when the dependency explicitly names another field in
-        # the compiled schema. Entity-level dependencies are validated by the
-        # registry/compiler and are not broken merely because a column was removed.
+        remaining = [field for field in schema.fields if field.name not in delete_set]
         remaining_names = {field.name for field in remaining}
+        original_names = {field.name for field in schema.fields}
         for field in remaining:
-            missing_field_dependencies = sorted(
+            missing = sorted(
                 dep for dep in field.depends_on
-                if dep in {f.name for f in schema.fields} and dep not in remaining_names
+                if dep in original_names and dep not in remaining_names
             )
-            if missing_field_dependencies:
+            if missing:
                 raise ValueError(
-                    f"HITL deletion would break field dependencies for '{field.name}': {missing_field_dependencies}"
+                    f"HITL deletion would break field dependencies for '{field.name}': {missing}"
                 )
 
+        draft_raw_by_name = {
+            str(item.get("name") or "").strip().casefold(): dict(item)
+            for item in draft_variables
+        }
         variables: list[dict[str, Any]] = []
         field_order: list[str] = []
         for field in remaining:
             key = field.name.strip().casefold()
             if draft_source_by_name.get(key) in {"DB_RECOMMENDED", "USER_SELECTED"} and key in draft_raw_by_name:
-                # Preserve the DB-owned generator/name/params contract unless the user explicitly edited an
-                # allowed key; mandatory Low Balance identity flags have already been normalized
-                # at the executable boundary.
                 data = dict(draft_raw_by_name[key])
                 changes = applied_edits.get(key) or {}
                 if "description" in changes:
@@ -637,20 +634,21 @@ class AgenticSchemaWorkflow:
             field_order.append(field.name)
 
         if is_json_grounded_domain(draft.get("domain")):
-            source_by_name = {
-                name: source
-                for name, source in draft_source_by_name.items()
-                if name in {str(v.get("name") or "").strip().casefold() for v in variables if isinstance(v, dict)}
-            }
+            variables, draft_source_by_name, draft_db_names, field_order = reconcile_low_balance_variables(
+                variables,
+                draft_source_by_name,
+                db_variable_names=draft_db_names,
+                field_order=field_order,
+            )
             validate_low_balance_variable_sources(
                 variables,
-                source_by_name,
-                db_variable_names=set(draft_raw_by_name),
+                draft_source_by_name,
+                db_variable_names=draft_db_names,
             )
 
         if draft.get("type_of_data") == "transactional" and draft.get("entity_key") not in field_order:
             raise ValueError("HITL changes would remove the transactional entity key")
-        return variables, field_order
+        return variables, field_order, draft_source_by_name, draft_db_names
 
 _WORKFLOW_SINGLETONS: dict[str, AgenticSchemaWorkflow] = {}
 

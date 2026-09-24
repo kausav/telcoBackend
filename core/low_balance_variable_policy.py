@@ -15,7 +15,7 @@ from functools import lru_cache
 import re
 from typing import Any, Iterable
 
-from core.agentic_models import GeneratedSchemaField, ScenarioSchema
+from core.agentic_models import GeneratedSchemaField
 from core.json_domain_policy import expanded_scalar_catalog
 
 
@@ -32,21 +32,6 @@ _ALLOWED_CONTEXT_PREFIXES = {
 # scalar catalog; they do not introduce any new business vocabulary.
 LOW_BALANCE_REQUIRED_FIELDS = ("customer_id", "account_id", "msisdn")
 LOW_BALANCE_DB_REQUIRED_FIELDS = ("account_id", "msisdn")
-
-# ``customer_id`` is present in the bundled TMF629 catalog. MongoDB may still contain a
-# legacy/recommended variable with the same name, but it is only allowed to override the
-# official JSON contract when its executable definition is fully compatible with the Low Balance
-# entity-identity contract. Incompatible DB copies are quarantined from the executable schema;
-# the stored Mongo document is never modified.
-LOW_BALANCE_CUSTOMER_DB_OVERRIDE_CONTRACT = {
-    "dtype": "string",
-    "gen": "prefixed_int",
-    "prefix": "cust-",
-    "digits": 8,
-    "scope": "entity",
-    "required": True,
-    "nullable": False,
-}
 _LOW_BALANCE_TECHNICAL_SUFFIXES = ("_href", "_description", "_referred_type")
 _LOW_BALANCE_PII_NAMES = {
     "customer_name",
@@ -54,226 +39,6 @@ _LOW_BALANCE_PII_NAMES = {
     "topupbalance_requestor_name",
 }
 _LOW_BALANCE_DISPLAY_NAMES = {"bucket_remaining_value_name"}
-
-
-def is_compatible_low_balance_customer_db_override(variable: dict[str, Any] | None) -> bool:
-    """Return whether a Mongo ``customer_id`` definition may override TMF629 Customer.id.
-
-    This is intentionally a narrow, deterministic compatibility gate. It protects generation
-    integrity without requiring the DB owner to clean up historical recommendation rows first.
-    The function does not mutate the supplied Mongo definition.
-    """
-    if not isinstance(variable, dict):
-        return False
-    name = _normalize_name(variable.get("name"))
-    if name != "customer_id":
-        return True
-    params = variable.get("params") if isinstance(variable.get("params"), dict) else {}
-    try:
-        digits = int(params.get("digits", 0) or 0)
-    except (TypeError, ValueError):
-        digits = 0
-    return (
-        str(variable.get("dtype") or "").strip().lower() == LOW_BALANCE_CUSTOMER_DB_OVERRIDE_CONTRACT["dtype"]
-        and str(variable.get("gen") or "").strip().lower() == LOW_BALANCE_CUSTOMER_DB_OVERRIDE_CONTRACT["gen"]
-        and str(params.get("prefix") or "") == LOW_BALANCE_CUSTOMER_DB_OVERRIDE_CONTRACT["prefix"]
-        and digits == LOW_BALANCE_CUSTOMER_DB_OVERRIDE_CONTRACT["digits"]
-        and str(variable.get("scope") or "").strip().lower() == LOW_BALANCE_CUSTOMER_DB_OVERRIDE_CONTRACT["scope"]
-        and bool(variable.get("required")) is LOW_BALANCE_CUSTOMER_DB_OVERRIDE_CONTRACT["required"]
-        and bool(variable.get("nullable")) is LOW_BALANCE_CUSTOMER_DB_OVERRIDE_CONTRACT["nullable"]
-    )
-
-
-def official_customer_id_definition() -> dict[str, Any]:
-    """Build the canonical executable ``customer_id`` definition from the bundled TMF629 leaf.
-
-    The Swagger source marks ``Customer.id`` optional at the API-schema level; the synthetic
-    Low Balance contract deliberately promotes it to a required stable entity identifier.
-    """
-    spec = dict(official_catalog_by_name().get("customer_id") or {})
-    if not spec:
-        raise ValueError("The bundled TMF629 catalog is missing the required customer_id field")
-    return {
-        "name": "customer_id",
-        "dtype": "string",
-        "description": str(spec.get("description") or "Unique identifier for Customers")[:500],
-        "gen": "prefixed_int",
-        "params": {"prefix": "cust-", "digits": 8},
-        "depends_on": [],
-        "nullable": False,
-        "required": True,
-        "formula": None,
-        "scope": "entity",
-        "useCase": None,
-        "provenance": {
-            "generated_from": "official_json_source",
-            "source_json_id": spec.get("source_id"),
-            "source_json_model": spec.get("model"),
-            "source_json_path": spec.get("path"),
-            "grain": "entity",
-        },
-    }
-
-
-def official_customer_id_field() -> GeneratedSchemaField:
-    """Return the canonical executable Pydantic field for Low Balance ``customer_id``."""
-    return GeneratedSchemaField.model_validate(official_customer_id_definition())
-
-
-def filter_incompatible_low_balance_db_customer_overrides(
-    recommended: list[dict[str, Any]],
-    user_selected: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    """Remove only incompatible Mongo ``customer_id`` overrides from the executable input.
-
-    All other DB variables, including variables that do not exist in the two Swagger sources,
-    pass through unchanged. This is the key source-boundary rule that lets Mongo extend the
-    official catalog without allowing an old ``customer_id`` definition to corrupt the stable
-    entity contract.
-    """
-    suppressed: list[str] = []
-
-    def clean(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        cleaned: list[dict[str, Any]] = []
-        for raw in items or []:
-            if not isinstance(raw, dict):
-                cleaned.append(raw)
-                continue
-            if _normalize_name(raw.get("name")) == "customer_id" and not is_compatible_low_balance_customer_db_override(raw):
-                suppressed.append(str(raw.get("name") or "customer_id"))
-                continue
-            cleaned.append(dict(raw))
-        return cleaned
-
-    return clean(recommended), clean(user_selected), sorted(set(suppressed))
-
-
-def reconcile_low_balance_executable_variables(
-    variables: list[dict[str, Any]],
-    source_by_name: dict[str, str] | None = None,
-    db_variable_names: set[str] | None = None,
-    field_order: list[str] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, str], set[str], list[str]]:
-    """Repair legacy Low Balance executable state without changing MongoDB.
-
-    The current proposal path should already produce this shape, but confirmed scenarios can
-    outlive compiler/policy revisions. This function is therefore also the generation-time
-    migration boundary: an incompatible DB ``customer_id`` is replaced locally by the official
-    TMF629 contract, missing official ``customer_id`` is restored, and all unrelated DB variables
-    remain untouched.
-    """
-    normalized_sources = {
-        _normalize_name(k): str(v).strip().upper()
-        for k, v in (source_by_name or {}).items()
-        if str(k).strip() and str(v).strip()
-    }
-    normalized_db_names = {
-        _normalize_name(name) for name in (db_variable_names or set()) if str(name).strip()
-    }
-    normalized_variables: list[dict[str, Any]] = []
-    customer_seen = False
-
-    for raw in variables or []:
-        if not isinstance(raw, dict):
-            continue
-        item = dict(raw)
-        name = _normalize_name(item.get("name"))
-        if not name:
-            continue
-        source = normalized_sources.get(name, "")
-        is_db_source = source in {"DB_RECOMMENDED", "USER_SELECTED"} or name in normalized_db_names
-        is_db_customer = name == "customer_id" and is_db_source
-
-        if name == "customer_id":
-            if customer_seen:
-                # Confirmed drafts should already have unique names, but legacy rows can contain
-                # duplicate customer_id entries. Keep the first deterministic winner only.
-                continue
-            customer_seen = True
-            # An official-source customer_id is repaired from the bundled source definition if
-            # a legacy confirmed draft contains an incomplete/old executable shape.
-            if source == "OFFICIAL_JSON":
-                item = official_customer_id_definition()
-            elif is_db_customer and not is_compatible_low_balance_customer_db_override(item):
-                item = official_customer_id_definition()
-                normalized_sources[name] = "OFFICIAL_JSON"
-                normalized_db_names.discard(name)
-            elif not source:
-                # Old drafts may lack provenance. The exact public field name is source-grounded
-                # and therefore safely recoverable from the bundled TMF629 catalog.
-                item = official_customer_id_definition()
-                normalized_sources[name] = "OFFICIAL_JSON"
-                normalized_db_names.discard(name)
-        elif name in LOW_BALANCE_DB_REQUIRED_FIELDS and is_db_source:
-            # account_id/msisdn are DB-only fields. Keep their generator contract exactly as
-            # stored, but repair only the stable identity-grain flags required by this journey.
-            item, _ = normalize_low_balance_db_identity_definition(item)
-
-        normalized_variables.append(item)
-
-    if not customer_seen:
-        normalized_variables.append(official_customer_id_definition())
-        normalized_sources["customer_id"] = "OFFICIAL_JSON"
-        normalized_db_names.discard("customer_id")
-
-    normalized_order = [str(name) for name in (field_order or []) if str(name).strip()]
-    present = {_normalize_name(item.get("name")) for item in normalized_variables if isinstance(item, dict)}
-    normalized_order = [name for name in normalized_order if _normalize_name(name) in present]
-    if "customer_id" not in {_normalize_name(name) for name in normalized_order}:
-        customer_position = next((i for i, item in enumerate(normalized_variables) if _normalize_name(item.get("name")) == "customer_id"), None)
-        if customer_position is None:
-            normalized_order.append("customer_id")
-        else:
-            normalized_order.insert(customer_position, "customer_id")
-
-    return normalized_variables, normalized_sources, normalized_db_names, normalized_order
-
-
-def reconcile_low_balance_schema(
-    schema: ScenarioSchema,
-    variables: list[dict[str, Any]],
-    source_by_name: dict[str, str] | None = None,
-    db_variable_names: set[str] | None = None,
-    field_order: list[str] | None = None,
-) -> tuple[ScenarioSchema, list[dict[str, Any]], dict[str, str], set[str], list[str]]:
-    """Align a draft schema with the legacy-safe executable variable reconciliation."""
-    normalized_variables, normalized_sources, normalized_db_names, normalized_order = reconcile_low_balance_executable_variables(
-        variables, source_by_name, db_variable_names, field_order
-    )
-    existing_fields = {
-        _normalize_name(field.name): field
-        for field in schema.fields
-        if isinstance(field, GeneratedSchemaField) and str(field.name).strip()
-    }
-    rebuilt_fields: list[GeneratedSchemaField] = []
-    for item in normalized_variables:
-        name = _normalize_name(item.get("name"))
-        if name == "customer_id":
-            rebuilt_fields.append(official_customer_id_field())
-            continue
-        if name in LOW_BALANCE_DB_REQUIRED_FIELDS:
-            rebuilt_fields.append(GeneratedSchemaField.model_validate(item))
-            continue
-        existing = existing_fields.get(name)
-        rebuilt_fields.append(existing if existing is not None else GeneratedSchemaField.model_validate(item))
-    represented_names = {_normalize_name(field.name) for field in rebuilt_fields}
-    cleaned_unresolved: list[str] = []
-    for item in schema.unresolved_items:
-        text = str(item).strip()
-        lower = text.casefold()
-        if "entity key '" in lower or "requested entity key '" in lower:
-            candidate = lower.split("entity key '", 1)[-1].split("'", 1)[0].strip()
-            if candidate and candidate in represented_names:
-                continue
-        cleaned_unresolved.append(text)
-
-    return (
-        schema.model_copy(update={"fields": rebuilt_fields, "unresolved_items": cleaned_unresolved}),
-        normalized_variables,
-        normalized_sources,
-        normalized_db_names,
-        normalized_order,
-    )
 
 
 def is_bucket_variable_name(value: Any) -> bool:
@@ -330,72 +95,204 @@ def material_low_balance_catalog() -> tuple[dict[str, Any], ...]:
     return tuple(rows)
 
 
-def normalize_low_balance_db_identity_definition(variable: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    """Return the executable Low Balance contract for a DB-backed identity field.
-
-    MongoDB remains the source of truth for the variable's semantic generator definition,
-    name, dtype and parameters. The application overlays only the Low Balance identity-grain
-    contract at runtime because historical DB rows may predate the journey's stable-entity
-    requirement. The stored Mongo document is never modified.
-    """
-    item = dict(variable)
-    name = _normalize_name(item.get("name"))
-    if name not in LOW_BALANCE_DB_REQUIRED_FIELDS:
-        return item, False
-
-    changed = (
-        str(item.get("scope") or "").strip().lower() != "entity"
-        or bool(item.get("required")) is not True
-        or bool(item.get("nullable")) is not False
-    )
-    if changed:
-        item["scope"] = "entity"
-        item["required"] = True
-        item["nullable"] = False
-    return item, changed
-
-
-def normalize_low_balance_db_identity_variables(
-    db_variables: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Normalize only mandatory DB identity fields for executable Low Balance state.
-
-    DB-only extension variables remain byte-for-byte equivalent dict copies. Their scope and
-    nullable/required semantics are deliberately not changed.
-    """
-    normalized: list[dict[str, Any]] = []
-    changed_names: list[str] = []
-    for raw in db_variables or []:
-        if not isinstance(raw, dict):
-            normalized.append(raw)
-            continue
-        item, changed = normalize_low_balance_db_identity_definition(raw)
-        normalized.append(item)
-        if changed:
-            changed_names.append(str(item.get("name") or "").strip())
-    return normalized, sorted(set(name for name in changed_names if name))
-
-
 def validate_low_balance_required_identity_sources(db_variables: list[dict[str, Any]]) -> None:
-    """Require the exact DB-only telecom identity fields that are absent from the two Swagger files.
+    """Require the exact DB extension fields that are absent from the official Swagger catalog.
 
-    ``customer_id`` exists in the official TMF629 catalog. ``account_id`` and ``msisdn`` do not, so
-    Low Balance must receive those exact names from MongoDB. Their executable identity-grain contract
-    is normalized before this validation; this function therefore checks presence, not historical
-    DB metadata that may legitimately be stale.
+    This is a source-availability check only. MongoDB owns the persisted executable definition,
+    including scope, required/nullable flags, generator and parameters; the Low Balance journey
+    must never reinterpret those DB-owned attributes as a different schema contract.
     """
-    normalized = {
-        _normalize_name(item.get("name")): item
+    names = {
+        _normalize_name(item.get("name"))
         for item in (db_variables or [])
         if isinstance(item, dict) and str(item.get("name") or "").strip()
     }
-    missing = [name for name in LOW_BALANCE_DB_REQUIRED_FIELDS if _normalize_name(name) not in normalized]
+    missing = [name for name in LOW_BALANCE_DB_REQUIRED_FIELDS if _normalize_name(name) not in names]
     if missing:
         raise ValueError(
             "Low Balance & Top-up requires the exact DB variables "
             + ", ".join(missing)
             + ". They are not present in the supplied TMF654/TMF629 Swagger scalar catalog and must not be invented by the LLM or another generator."
         )
+
+
+def reconcile_low_balance_variables(
+    variables: list[dict[str, Any]],
+    source_by_name: dict[str, str] | None = None,
+    db_variable_names: set[str] | None = None,
+    field_order: list[str] | None = None,
+    db_variable_definitions: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str], set[str], list[str]]:
+    """Reconcile Low Balance source metadata once, without rewriting any variable definition.
+
+    The lifecycle has two authoritative source families only: the bundled Swagger catalog and
+    explicitly persisted MongoDB variables. DB provenance wins over stale official/LLM metadata
+    for the same exact field name. The function also repairs legacy drafts whose source metadata
+    was incomplete, while preserving every DB-owned definition exactly as supplied.
+    """
+    catalog = official_catalog_by_name()
+    db_names = {
+        _normalize_name(name)
+        for name in (db_variable_names or set())
+        if str(name).strip()
+    }
+    db_definitions = {
+        _normalize_name(name): dict(value)
+        for name, value in (db_variable_definitions or {}).items()
+        if str(name).strip() and isinstance(value, dict)
+    }
+    db_names.update(db_definitions)
+    sources = {
+        _normalize_name(name): str(source).strip().upper()
+        for name, source in (source_by_name or {}).items()
+        if str(name).strip() and str(source).strip()
+    }
+
+    # Normalize exact names once. If an old draft omitted db_variable_names, existing DB
+    # provenance is still sufficient to classify the field as DB-owned.
+    for name, source in list(sources.items()):
+        if source in {"DB_RECOMMENDED", "USER_SELECTED"}:
+            db_names.add(name)
+
+    def source_for(name: str) -> str:
+        existing = sources.get(name, "")
+        if name in db_names:
+            return existing if existing in {"DB_RECOMMENDED", "USER_SELECTED"} else "DB_RECOMMENDED"
+        if existing in {"DB_RECOMMENDED", "USER_SELECTED"}:
+            return existing
+        if name in catalog:
+            return "OFFICIAL_JSON"
+        return existing
+
+    # Deduplicate exact names deterministically. A DB definition always replaces any earlier
+    # schema/LLM copy, but the DB definition itself is never mutated. Definitions saved with a
+    # draft are also rehydrated when a legacy draft's variables array is incomplete.
+    normalized: list[dict[str, Any]] = []
+    positions: dict[str, int] = {}
+    inputs = [dict(raw) for raw in (variables or []) if isinstance(raw, dict)]
+    inputs.extend(db_definitions.values())
+    for raw in inputs:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        name = _normalize_name(item.get("name"))
+        if not name:
+            continue
+        source = source_for(name)
+        if name in positions:
+            if source in {"DB_RECOMMENDED", "USER_SELECTED"}:
+                normalized[positions[name]] = item
+            continue
+        positions[name] = len(normalized)
+        normalized.append(item)
+        if source:
+            sources[name] = source
+
+    # Recover provenance for every retained field from the immutable source boundary. This makes
+    # legacy drafts robust even when their persisted source map is stale or incomplete.
+    for item in normalized:
+        name = _normalize_name(item.get("name"))
+        source = source_for(name)
+        if source:
+            sources[name] = source
+
+    normalized_order: list[str] = []
+    seen_order: set[str] = set()
+    for name in field_order or []:
+        key = _normalize_name(name)
+        if key in positions and key not in seen_order:
+            normalized_order.append(str(name))
+            seen_order.add(key)
+    for item in normalized:
+        name = str(item.get("name") or "")
+        key = _normalize_name(name)
+        if key and key not in seen_order:
+            normalized_order.append(name)
+            seen_order.add(key)
+
+    return normalized, sources, db_names, normalized_order
+
+
+def validate_low_balance_variable_sources(
+    variables: list[dict[str, Any]],
+    source_by_name: dict[str, str] | None = None,
+    db_variable_names: set[str] | None = None,
+) -> None:
+    """Validate the Low Balance source boundary, independent of DB-owned field semantics.
+
+    Official fields must exist in the immutable Swagger catalog. DB fields must exist in the
+    persisted DB-name set. Scope/required/nullable/generator values belong to the source that
+    owns the field and are intentionally not revalidated against a journey-local template.
+    """
+    catalog = official_catalog_by_name()
+    sources = {
+        _normalize_name(name): str(source).strip().upper()
+        for name, source in (source_by_name or {}).items()
+        if str(name).strip() and str(source).strip()
+    }
+    db_names = {
+        _normalize_name(name)
+        for name in (db_variable_names or set())
+        if str(name).strip()
+    }
+    allowed_db = {"DB_RECOMMENDED", "USER_SELECTED"}
+    invalid: list[str] = []
+    seen_names: set[str] = set()
+
+    for raw in variables or []:
+        if not isinstance(raw, dict):
+            invalid.append("<invalid-variable>")
+            continue
+        name = _normalize_name(raw.get("name"))
+        if not name:
+            invalid.append("<missing-name>")
+            continue
+        if name in seen_names:
+            invalid.append(f"{name} (duplicate exact variable name)")
+            continue
+        seen_names.add(name)
+
+        source = sources.get(name, "")
+        # DB membership is the authoritative provenance signal. This also repairs legacy drafts
+        # where the source map was missing or still labeled the DB field as official JSON.
+        if name in db_names:
+            source = source if source in allowed_db else "DB_RECOMMENDED"
+        elif not source and name in catalog:
+            source = "OFFICIAL_JSON"
+
+        if source in allowed_db:
+            if name not in db_names:
+                invalid.append(f"{name} (DB source is not present in the persisted DB variable set)")
+                continue
+        elif source == "OFFICIAL_JSON":
+            if name not in catalog:
+                invalid.append(f"{name} (not present in the supplied TMF654/TMF629 catalog)")
+                continue
+        else:
+            invalid.append(f"{name} (unsupported or missing source provenance)")
+            continue
+
+        if source in allowed_db:
+            try:
+                validate_db_definition(raw)
+            except Exception as exc:
+                invalid.append(f"{name} (invalid MongoDB definition: {exc})")
+
+    required = {_normalize_name(name) for name in LOW_BALANCE_REQUIRED_FIELDS}
+    missing = sorted(required - seen_names)
+    invalid.extend(f"{name} (required Low Balance identity variable is missing)" for name in missing)
+
+    required_db = {_normalize_name(name) for name in LOW_BALANCE_DB_REQUIRED_FIELDS}
+    invalid_db = sorted(required_db - db_names)
+    invalid.extend(f"{name} (required DB identity variable is missing from MongoDB)" for name in invalid_db)
+
+    if invalid:
+        raise ValueError(
+            "Low Balance & Top-up executable variables must come only from the supplied TMF654/TMF629 Swagger scalar catalog or MongoDB variables. "
+            "Invalid variables: " + ", ".join(sorted(set(invalid)))
+        )
+
+
 # Synonyms are deliberately narrow. This is only the deterministic backstop for
 # the LLM's duplicate review; it must not become a second semantic registry.
 _TOKEN_ALIASES = {
@@ -1258,119 +1155,6 @@ def dedupe_schema_fields_against_db(
         result.append(data)
 
     return result, sorted(removed)
-
-def validate_low_balance_variable_sources(
-    variables: list[dict[str, Any]],
-    source_by_name: dict[str, str] | None = None,
-    db_variable_names: set[str] | None = None,
-) -> None:
-    """Enforce the Low Balance executable-source boundary at every lifecycle stage.
-
-    Every executable field must have explicit provenance:
-      * OFFICIAL_JSON and exact name in the supplied TMF654/TMF629 scalar catalog, or
-      * DB_RECOMMENDED / USER_SELECTED and exact name in the persisted DB set.
-
-    No unlabelled, LLM_GENERATED, application-derived, CSV, or generic-registry field can enter
-    the Low Balance executable contract. This is intentionally fail-closed.
-    """
-    catalog = official_catalog_by_name()
-    sources = {
-        _normalize_name(k): str(v).strip().upper()
-        for k, v in (source_by_name or {}).items()
-        if str(k).strip()
-    }
-    normalized_db_names = {
-        _normalize_name(name) for name in (db_variable_names or set()) if str(name).strip()
-    }
-    allowed_db = {"DB_RECOMMENDED", "USER_SELECTED"}
-    allowed_official = "OFFICIAL_JSON"
-    invalid: list[str] = []
-    seen_names: set[str] = set()
-    seen_signatures: dict[tuple[str, str], str] = {}
-
-    for raw in variables or []:
-        if not isinstance(raw, dict):
-            invalid.append("<invalid-variable>")
-            continue
-        name = _normalize_name(raw.get("name"))
-        if not name:
-            invalid.append("<missing-name>")
-            continue
-        if name in seen_names:
-            invalid.append(f"{name} (duplicate exact variable name)")
-            continue
-        seen_names.add(name)
-
-        source = sources.get(name, "")
-        if not source:
-            invalid.append(f"{name} (missing source provenance)")
-            continue
-        if source in allowed_db:
-            if name not in normalized_db_names:
-                invalid.append(f"{name} (DB source is not present in the persisted DB variable set)")
-                continue
-        elif source == allowed_official:
-            if name not in catalog:
-                invalid.append(f"{name} (not present in the supplied TMF654/TMF629 catalog)")
-                continue
-        else:
-            invalid.append(f"{name} (unsupported source {source})")
-            continue
-
-        signature = semantic_signature(raw)
-        prior = seen_signatures.get(signature)
-        if prior and _normalize_name(prior) != name:
-            invalid.append(f"{name} (duplicate business use of {prior})")
-        else:
-            seen_signatures[signature] = name
-
-    if invalid:
-        raise ValueError(
-            "Low Balance & Top-up executable variables must come only from the supplied TMF654/TMF629 Swagger scalar catalog or MongoDB variables. "
-            "Each field must also carry explicit source provenance. Invalid variables: "
-            + ", ".join(sorted(set(invalid)))
-        )
-
-    by_name = {
-        _normalize_name(raw.get("name")): raw
-        for raw in (variables or [])
-        if isinstance(raw, dict) and str(raw.get("name") or "").strip()
-    }
-    required = {_normalize_name(name) for name in LOW_BALANCE_REQUIRED_FIELDS}
-    missing = sorted(name for name in required if name not in by_name)
-    if missing:
-        raise ValueError(
-            "Low Balance & Top-up requires customer_id, account_id, and msisdn in every executable schema. "
-            "Missing: " + ", ".join(missing)
-        )
-    for name in required:
-        var = by_name[name]
-        if str(var.get("scope") or "").strip().lower() != "entity":
-            raise ValueError(f"Low Balance identity variable '{name}' must have scope='entity'.")
-        if not bool(var.get("required")) or bool(var.get("nullable")):
-            raise ValueError(f"Low Balance identity variable '{name}' must be required=true and nullable=false.")
-
-    if sources.get("account_id") not in allowed_db:
-        raise ValueError("Low Balance account_id must come from MongoDB; it is not present in the supplied TMF654/TMF629 catalog.")
-    if sources.get("msisdn") not in allowed_db:
-        raise ValueError("Low Balance msisdn must come from MongoDB; it is not present in the supplied TMF654/TMF629 catalog.")
-    if sources.get("customer_id") not in {allowed_official, *allowed_db}:
-        raise ValueError("Low Balance customer_id must come from TMF629 JSON or MongoDB.")
-
-    customer = by_name["customer_id"]
-    if sources.get("customer_id") in allowed_db:
-        params = customer.get("params") if isinstance(customer.get("params"), dict) else {}
-        if (
-            str(customer.get("gen") or "").strip().lower() != "prefixed_int"
-            or str(params.get("prefix") or "") != "cust-"
-            or int(params.get("digits", 0) or 0) != 8
-            or str(customer.get("dtype") or "").strip().lower() != "string"
-        ):
-            raise ValueError(
-                "MongoDB customer_id is authoritative but its definition does not satisfy the required Low Balance contract: "
-                "gen='prefixed_int', prefix='cust-', digits=8, dtype='string'. Update the DB definition; the application will not rewrite it."
-            )
-
 
 def validate_db_definition(variable: dict[str, Any]) -> dict[str, Any]:
     """Validate a DB variable without changing its semantics or name."""
