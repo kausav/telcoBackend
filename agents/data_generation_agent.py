@@ -1472,7 +1472,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
     variables=list(compiled.variables); entity_key=compiled.entity_key
     records_per_user=max(1,min(50,int(records_per_user or 10)))
     timestamp_field=_pick_timestamp_field(variables)
-    generated=[]
+    generated_records=[]
     used_entity_keys=set()
     used_identity_values={name:set() for name in ("subscriber_id", "account_id", "msisdn", "customer_id")}
     used_resource_ids={name:set() for name in ("bucket_id", "topupbalance_id", "topup_transaction_id")}
@@ -1484,6 +1484,8 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
     for user_index in range(user_count):
         try:
             user_context=_generate_selected_record(variables,user_field_names,rules=rules,plan=user_plan)
+            if not isinstance(user_context, dict):
+                raise TypeError("Transactional user context generator returned a non-object")
             if entity_key and entity_key not in user_context:
                 # Ensure the entity key is generated even if inferred user context omitted it.
                 key_var=compiled.variable_by_name.get(entity_key)
@@ -1546,8 +1548,8 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     db_names = _declared_db_variable_names(rules)
                     if "bucket_id" in db_names:
                         for _ in range(100):
-                            generated = _regenerate_declared_field(variables, "bucket_id", user_context, rules=rules)
-                            candidate = str(generated or "")
+                            regenerated_bucket_id = _regenerate_declared_field(variables, "bucket_id", user_context, rules=rules)
+                            candidate = str(regenerated_bucket_id or "")
                             if candidate and candidate not in used_resource_ids["bucket_id"]:
                                 bucket_id_value = candidate
                                 break
@@ -1599,6 +1601,8 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                         # One authoritative transaction timestamp anchors the complete row.
                         base[timestamp_field]=timestamps[record_index].isoformat()
                     row=_generate_selected_record(variables,record_field_names,base=base,rules=rules,plan=record_plan,apply_repairs=False)
+                    if not isinstance(row, dict):
+                        raise TypeError("Transactional record generator returned a non-object")
                     if timestamp_field and timestamp_field not in row:
                         row[timestamp_field]=timestamps[record_index].isoformat()
 
@@ -1638,8 +1642,8 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     # no earlier top-up and therefore leaves the optional reference null.
                     if "topupbalance_balance_topup_id" in row and "topupbalance_id" in row:
                         previous_topup_id = (
-                            generated[-1].get("topupbalance_id")
-                            if generated and generated[-1].get(entity_key) == row.get(entity_key)
+                            generated_records[-1].get("topupbalance_id")
+                            if generated_records and generated_records[-1].get(entity_key) == row.get(entity_key)
                             else None
                         )
                         if previous_topup_id and str(previous_topup_id) != str(row.get("topupbalance_id")):
@@ -1666,7 +1670,9 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     repaired, issues = _validate_record(
                         row, variables, list(compiled.field_order), True, rules=rules
                     )
-                    generated.append(repaired)
+                    if not isinstance(repaired, dict):
+                        raise TypeError("Transactional validator returned a non-object record")
+                    generated_records.append(repaired)
                     if fixes_out is not None:
                         fixes_out.append(len(issues))
                     last_exc = None
@@ -1677,7 +1683,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                 err={"user_index":user_index,"record_index":record_index,"error":str(last_exc),"record":dict(user_context),"attempts":5}
                 if record_errors_out is not None: record_errors_out.append(err)
                 logger.warning("[DataGeneration] Unable to produce a valid transactional record user=%d record=%d after 5 attempts: %s",user_index,record_index,last_exc)
-    return generated
+    return generated_records
 
 
 def _default_for_dtype(dtype: str):

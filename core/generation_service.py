@@ -6,6 +6,7 @@ changing the response into a queued job.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,6 +21,8 @@ from core.dynamic_scenarios import (
 )
 from agents.data_generation_agent import run_deterministic_agentic_generation
 from core.pipeline import run_pipeline
+
+logger = logging.getLogger(__name__)
 
 
 def _timestamp_sort_key(value: Any):
@@ -99,8 +102,37 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("Generation produced no valid records: " + str(state.record_errors[:10]))
 
     meta = resolve_scenario_meta(requested_scenario_id) or {}
-    final_records = state.final_records
+    raw_final_records = getattr(state, "final_records", None)
+    if isinstance(raw_final_records, dict):
+        candidate_records = raw_final_records.get("records")
+        if candidate_records is None:
+            candidate_records = [raw_final_records]
+    elif isinstance(raw_final_records, (list, tuple)):
+        candidate_records = list(raw_final_records)
+    else:
+        candidate_records = []
+
+    final_records = [row for row in candidate_records if isinstance(row, dict)]
+    malformed_count = len(candidate_records) - len(final_records)
+    if malformed_count:
+        logger.error(
+            "Generation produced %d malformed record(s) for scenario=%s; refusing to serialize a partial dataset",
+            malformed_count,
+            requested_scenario_id,
+        )
+        raise RuntimeError(
+            f"Generation produced {malformed_count} malformed record object(s); refusing to return a partial dataset"
+        )
+    if candidate_records and not final_records:
+        raise RuntimeError("Generation produced no valid record objects")
+
     entity_key = meta.get("entity_key")
+    if state.type_of_data == "transactional":
+        expected_records = max(1, count) * max(1, records_per_user)
+        if len(final_records) != expected_records:
+            raise RuntimeError(
+                f"Generation produced {len(final_records)} of {expected_records} requested transactional records"
+            )
     response_records = final_records
     total_count = len(final_records)
     total_records = len(final_records)
