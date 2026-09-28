@@ -576,7 +576,6 @@ class SchemaCompiler:
             name_map[self._normalize_variable_name(str(idea.get("name") or ""))] = fresh
 
         # No static industry/country profile is used here. Source JSON constraints are authoritative.
-        country_currency = ""
         for idea in ideas:
             original_name = str(idea.get("name") or "scenario_attribute")
             fresh = name_map[self._normalize_variable_name(original_name)]
@@ -591,77 +590,11 @@ class SchemaCompiler:
             if not runtime_generator or not dtype or not isinstance(params, dict):
                 # Fail closed: every source-backed field must have a deterministic generator.
                 continue
-            role = str(idea.get("role") or "other").lower()
-            idea_text = f"{original_name} {idea.get('description', '')}".lower()
-            outcome_semantic = role in {"status", "decision"} or any(token in idea_text for token in ("status", "state", "outcome", "decision", "result"))
-            if source_spec is not None:
-                # Contract was already compiled from the authoritative Swagger leaf above.
-                pass
-            elif source_spec is None and telecom_context and original_name in self.REQUIRED_TELECOM_FIELDS:
-                entity = next((e for e in entities if e.canonical_id == "subscriber"), None)
-                if original_name == "subscriber_id":
-                    runtime_generator, dtype, params = (
-                        "prefixed_int", "string", {"prefix": "SUB-", "digits": 10}
-                    )
-                elif original_name == "account_id":
-                    runtime_generator, dtype, params = (
-                        "id_mirror", "string",
-                        {"prefix": "ACC-", "source_field": "subscriber_id", "source_prefix": "SUB-"}
-                    )
-                else:
-                    iso = str(country or "IN").strip().upper()
-                    dial_codes = {
-                        "IN": "+91", "US": "+1", "CA": "+1", "GB": "+44", "AU": "+61",
-                        "AE": "+971", "SG": "+65", "DE": "+49", "FR": "+33", "IT": "+39",
-                    }
-                    dial = dial_codes.get(iso, iso if iso.startswith("+") else "+" + iso)
-                    runtime_generator, dtype, params = (
-                        "e164_phone", "string", {"country_codes": [dial], "country": iso}
-                    )
-            elif matched is not None:
-                entity, attr = matched
-                used_registry.add((entity.canonical_id, attr.name))
-                exact_registry_name = (
-                    self._normalize_variable_name(attr.name)
-                    == self._normalize_variable_name(original_name)
-                )
-                if exact_registry_name:
-                    params = dict(attr.params or {})
-                    if attr.generator == "msisdn":
-                        params["country"] = str(country or params.get("country") or "IN").upper()
-                    translated = self._runtime_generation_contract(attr, params, country)
-                    if translated is None:
-                        runtime_generator, dtype, params = self._generic_contract_for_idea(idea, country, scenario_mode) or (None, None, None)
-                    else:
-                        runtime_generator, params = translated
-                        dtype = attr.dtype
-                        if attr.generator == "msisdn":
-                            dtype = "string"
-                elif getattr(attr, "enum_values", ()):
-                    # A semantically renamed variable may still map to an official enum field
-                    # (for example topup_status -> TopupBalance.status). Preserve the Swagger
-                    # enum exactly; never substitute scenario-mode values for a standard enum.
-                    choices = list(getattr(attr, "enum_values", ()) or ())
-                    entity = entity or self._choose_entity_for_idea(idea, entities, matched, entity_key)
-                    runtime_generator, dtype, params = (
-                        "weighted_choice",
-                        "categorical",
-                        {"choices": choices, "weights": [1.0] * len(choices)},
-                    )
-                else:
-                    entity = entity or self._choose_entity_for_idea(idea, entities, None, entity_key)
-                    runtime_generator, dtype, params = self._generic_contract_for_idea(idea, country, scenario_mode) or (None, None, None)
-            else:
-                entity = self._choose_entity_for_idea(idea, entities, None, entity_key)
-                runtime_generator, dtype, params = self._generic_contract_for_idea(idea, country, scenario_mode) or (None, None, None)
-
+            # The executable contract is derived exclusively from the selected MongoDB JSON
+            # leaf. No telecom registry, static industry profile, or LLM-invented fallback is
+            # consulted from this path.
             if not runtime_generator or not dtype or not isinstance(params, dict):
-                # Fail closed: a proposal field must have a concrete deterministic generator.
-                continue
-            # A field is executable only when the compiler has a concrete generator.
-            # This is a second safety gate for registry attributes whose official model is
-            # structurally richer than the flat synthetic CSV contract.
-            if runtime_generator is None:
+                # Fail closed: every source-backed field must have a concrete deterministic generator.
                 continue
 
             role = str(idea.get("role") or "other")
