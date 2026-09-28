@@ -301,6 +301,7 @@ def resolve_scenario_context(requested_scenario_id: str) -> dict[str, Any]:
         "agentic": bool(meta.get("agentic", False)),
         "scenario_version": int(meta.get("scenario_version", 1) or 1),
         "variable_sources": dict(meta.get("variable_sources") or {}),
+        "source_policy": str(meta.get("source_policy") or "").strip(),
         "variable_source_ids": {
             str(name).strip().casefold(): str(source_id).strip()
             for name, source_id in (meta.get("variable_source_ids") or {}).items()

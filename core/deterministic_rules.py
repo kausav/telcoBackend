@@ -125,6 +125,8 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
         "country": str(getattr(state, "country", "") or "").strip().upper() or None,
         "variable_sources": dict(getattr(state, "scenario_context", {}).get("variable_sources") or {}),
         "db_variable_names": sorted(set(getattr(state, "scenario_context", {}).get("db_variable_names") or [])),
+        "source_policy": str(getattr(state, "scenario_context", {}).get("source_policy") or "").strip(),
+        "agentic": bool(getattr(state, "scenario_context", {}).get("agentic", False)),
         "scenario_mode": scenario_mode,
         "business_rules": [
             "Entity, field and relationship vocabulary is frozen to the approved compiled schema.",

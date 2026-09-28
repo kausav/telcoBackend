@@ -2539,7 +2539,24 @@ def _strip_unusable_placeholders(rec: dict, variables: list[dict]) -> tuple[dict
 
 
 def _lb_domain(rules: dict | None) -> bool:
-    domain = str((rules or {}).get("domain") or "").strip().lower()
+    """Whether the legacy Low Balance repair/validation layer is enabled.
+
+    New agentic JSON-grounded scenarios already have an executable source-backed contract. The
+    historical Low Balance layer contains broad domain assumptions that can turn independently
+    declared variables into artificial aliases or lifecycle links. Keep it only for legacy/non-agentic
+    scenarios so a newly confirmed scenario cannot be rejected by a rule it never declared.
+    """
+    payload = rules or {}
+    domain = str(payload.get("domain") or "").strip().lower()
+    source_policy = str(payload.get("source_policy") or "").strip()
+    agentic = bool(payload.get("agentic"))
+    # Every newly confirmed agentic scenario must use the persisted executable schema as its
+    # contract. The legacy Low Balance layer is deliberately disabled for the entire agentic path;
+    # otherwise its field-name heuristics can manufacture relationships absent from that contract.
+    if agentic:
+        return False
+    if source_policy == "mongodb_industry_source_documents":
+        return False
     return "low balance" in domain and any(token in domain for token in ("top up", "top-up", "recharge"))
 
 
@@ -2575,6 +2592,38 @@ def _lb_var(variables: list[dict], name: str | None) -> dict:
     if not name:
         return {}
     return _lb_variables_by_name(variables).get(name, {})
+
+
+def _lb_semantic_key(var: dict) -> str:
+    """Return the strongest semantic identity available for a persisted variable."""
+    provenance = var.get("provenance") if isinstance(var.get("provenance"), dict) else {}
+    explicit = (
+        var.get("semantic_key")
+        or provenance.get("source_json_semantic_key")
+        or var.get("canonical_semantic_key")
+    )
+    if explicit:
+        return _normalize(str(explicit))
+    # Without explicit source provenance, the variable name is its identity. Similar words are
+    # deliberately not treated as aliases (e.g. account_id != bucket_party_account_id).
+    return _normalize(str(var.get("name") or ""))
+
+
+def _lb_declared_alias(a: dict, b: dict) -> bool:
+    """Return True only when the confirmed contract explicitly links two values."""
+    if not a or not b:
+        return False
+    a_name = str(a.get("name") or "").strip()
+    b_name = str(b.get("name") or "").strip()
+    if not a_name or not b_name:
+        return False
+    a_sem = _lb_semantic_key(a)
+    b_sem = _lb_semantic_key(b)
+    if a_sem and a_sem == b_sem:
+        return True
+    a_deps = {str(dep).strip() for dep in (a.get("depends_on") or []) if str(dep).strip()}
+    b_deps = {str(dep).strip() for dep in (b.get("depends_on") or []) if str(dep).strip()}
+    return a_name in b_deps or b_name in a_deps
 
 
 def _lb_exact_declared(var: dict, desired: Any) -> Any:
@@ -2711,7 +2760,13 @@ def _lb_sync_reference_fields(rec: dict, variables: list[dict], issues: list[str
     customer_id = _lb_first_name(variables, ("customer_id",), "customer", "id")
     copy(bucket_id, ("topupbalance_bucket_id", "balance_bucket_id"), "top-up/balance bucket references linked to the subscriber bucket")
     copy(bucket_id, ("topupbalance_bucket_href",), "top-up bucket href linked to bucket context")
-    copy(account_id, ("bucket_party_account_id", "topupbalance_party_account_id"), "party-account references linked to the subscriber account")
+    # Party-account fields from different resources are independent unless the confirmed
+    # contract explicitly declares them to be aliases/dependents. Never infer equality from names.
+    for target in ("bucket_party_account_id", "topupbalance_party_account_id"):
+        target_var = by_name.get(target)
+        source_var = by_name.get(account_id) if account_id else None
+        if source_var and target_var and _lb_declared_alias(source_var, target_var):
+            copy(account_id, (target,), "party-account reference linked by the confirmed variable contract")
     if account_id and account_id in rec and rec.get(account_id) is not None:
         account_value = str(rec.get(account_id))
         for target in ("bucket_party_account_href", "topupbalance_party_account_href"):
@@ -2779,9 +2834,9 @@ def _enforce_low_balance_topup_consistency(
     """Build and enforce a coherent Low Balance & Top-up business record.
 
     The official Swagger artifacts define the resource structure and field meanings, but not
-    synthetic behavioral distributions. This layer therefore supplies deterministic modeling
-    conventions while preserving source enum values and declared numeric constraints. It is
-    applied to both newly generated and legacy-confirmed Low Balance scenarios.
+    synthetic behavioral distributions. This function is retained as a compatibility layer for
+    legacy/non-agentic Low Balance scenarios. New agentic scenarios are governed by their persisted
+    executable schema and dependency graph and never enter this heuristic repair path.
     """
     rec = dict(rec)
     if not _lb_domain(rules):
@@ -2911,15 +2966,51 @@ def _enforce_low_balance_topup_consistency(
     success_state = desired_status in {"completed", "approved", "accepted", "success"}
     confirmation_dt = request_dt + timedelta(minutes=random.randint(1, 60)) if success_state else None
 
-    # All request-like and confirmation-like timestamps in the same transaction share one
-    # authoritative event pair; they are never independently sampled.
+    # Synchronize request/confirmation timestamps only inside the same canonical resource family.
+    # Similar lifecycle words across sibling resources do not prove a shared event.
+    request_by_family: dict[str, list[str]] = {}
+    confirmation_by_family: dict[str, list[str]] = {}
     for name in request_fields:
-        _lb_set(rec, variables, name, _format_datetime_for_variable(request_dt, by_name[name]), issues, f"{name} synchronized to the transaction request event")
+        request_by_family.setdefault(normalize_temporal_family(name), []).append(name)
     for name in confirmation_fields:
+        confirmation_by_family.setdefault(normalize_temporal_family(name), []).append(name)
+
+    for family, names_in_family in request_by_family.items():
+        family_request_dt = next((
+            _qa_parse_dt(rec.get(name)) for name in names_in_family
+            if _qa_parse_dt(rec.get(name)) is not None
+        ), request_dt)
+        for name in names_in_family:
+            _lb_set(
+                rec, variables, name,
+                _format_datetime_for_variable(family_request_dt, by_name[name]),
+                issues,
+                f"{name} synchronized within its own resource lifecycle",
+            )
         if success_state and confirmation_dt is not None:
-            _lb_set(rec, variables, name, _format_datetime_for_variable(confirmation_dt, by_name[name]), issues, f"{name} synchronized to the transaction confirmation event")
-        elif by_name[name].get("nullable", True):
-            _lb_set(rec, variables, name, None, issues, f"{name} cleared because the transaction did not complete")
+            family_confirmation_dt = next((
+                _qa_parse_dt(rec.get(name)) for name in confirmation_by_family.get(family, ())
+                if _qa_parse_dt(rec.get(name)) is not None
+            ), confirmation_dt)
+            if family_confirmation_dt < family_request_dt:
+                family_confirmation_dt = family_request_dt + timedelta(minutes=1)
+            for name in confirmation_by_family.get(family, ()):
+                _lb_set(
+                    rec, variables, name,
+                    _format_datetime_for_variable(family_confirmation_dt, by_name[name]),
+                    issues,
+                    f"{name} synchronized within its own resource lifecycle",
+                )
+        else:
+            for name in confirmation_by_family.get(family, ()):
+                if by_name[name].get("nullable", True):
+                    _lb_set(
+                        rec, variables, name, None, issues,
+                        f"{name} cleared because its resource transaction did not complete",
+                    )
+
+    # Confirmation-only resource families remain untouched; this layer never invents an
+    # unrelated lifecycle simply because a confirmation-like field exists.
 
     recharge_timestamp = _lb_first_name(variables, ("recharge_timestamp",), "recharge", "timestamp")
     if recharge_timestamp and recharge_timestamp in rec:
@@ -3356,9 +3447,17 @@ def _assert_low_balance_topup_consistency(rec: dict, variables: list[dict], rule
         ("bucket_id", "topupbalance_bucket_id", "balance_bucket_id"),
     )
     for group in alias_groups:
-        present = [rec[n] for n in group if n in rec and rec.get(n) is not None]
-        if len(present) >= 2 and len({_normalize(x) for x in present}) > 1:
-            errors.append(f"related aliases disagree: {group}")
+        present_names = [n for n in group if n in rec and rec.get(n) is not None and n in by_name]
+        if len(present_names) < 2:
+            continue
+        linked_names: list[str] = [present_names[0]]
+        for candidate in present_names[1:]:
+            if any(_lb_declared_alias(by_name[existing], by_name[candidate]) for existing in linked_names):
+                linked_names.append(candidate)
+        if len(linked_names) >= 2:
+            values = [rec[n] for n in linked_names]
+            if len({_normalize(v) for v in values}) > 1:
+                errors.append(f"related aliases disagree: {tuple(linked_names)}")
 
     # Monetary balance logic.
     rem = _to_finite_float(rec.get("balance_remaining_amount"), None)
@@ -3392,9 +3491,17 @@ def _assert_low_balance_topup_consistency(rec: dict, variables: list[dict], rule
         ("subscriber_id", "customer_engaged_party_id"),
     )
     for group in alias_groups:
-        vals = [rec[n] for n in group if n in rec and rec.get(n) is not None]
-        if len(vals) >= 2 and len({_normalize(v) for v in vals}) > 1:
-            errors.append(f"related aliases disagree: {group}")
+        present_names = [n for n in group if n in rec and rec.get(n) is not None and n in by_name]
+        if len(present_names) < 2:
+            continue
+        linked_names: list[str] = [present_names[0]]
+        for candidate in present_names[1:]:
+            if any(_lb_declared_alias(by_name[existing], by_name[candidate]) for existing in linked_names):
+                linked_names.append(candidate)
+        if len(linked_names) >= 2:
+            vals = [rec[n] for n in linked_names]
+            if len({_normalize(v) for v in vals}) > 1:
+                errors.append(f"related aliases disagree: {tuple(linked_names)}")
 
     # Top-up recurrence is conditional on the auto-top-up flag.
     auto_name = _lb_first_name(variables, ("topupbalance_is_auto_topup", "is_auto_topup_enabled"), "auto", "topup")
