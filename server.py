@@ -123,6 +123,60 @@ app.add_exception_handler(RequestValidationError, request_validation_exception_h
 app.add_exception_handler(Exception, unhandled_exception_handler)
 
 
+# Swagger UI compatibility: FastAPI/Pydantic versions that emit OpenAPI 3.1
+# may describe UploadFile[] with `contentMediaType`, which Swagger UI renders
+# as array<string> text fields in /docs. Keep the actual FastAPI endpoint as
+# list[UploadFile] and normalize only the documented request-body schema to the
+# widely-supported `format: binary` representation for an array of files.
+_default_openapi = app.openapi
+
+
+def _custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = _default_openapi()
+    upload_path = schema.get("paths", {}).get("/industry-sources/upload")
+    if upload_path:
+        operation = upload_path.get("post", {})
+        request_body = operation.get("requestBody", {})
+        multipart = request_body.get("content", {}).get("multipart/form-data")
+        if multipart is not None:
+            multipart["schema"] = {
+                "type": "object",
+                "required": ["industryType", "domain", "file"],
+                "properties": {
+                    "industryType": {
+                        "type": "string",
+                        "title": "Industry Type",
+                        "description": "Industry type for all uploaded JSON sources",
+                    },
+                    "domain": {
+                        "type": "string",
+                        "title": "Domain",
+                        "description": "Domain for all uploaded JSON sources",
+                    },
+                    "file": {
+                        "type": "array",
+                        "title": "JSON Files",
+                        "description": "Select one or more JSON source files for this industry/domain",
+                        "minItems": 1,
+                        "maxItems": 25,
+                        "items": {
+                            "type": "string",
+                            "format": "binary",
+                        },
+                    },
+                },
+            }
+
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = _custom_openapi
+
+
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
     """Assign one bounded correlation id to every request and return it to the client."""
