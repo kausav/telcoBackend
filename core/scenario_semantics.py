@@ -282,21 +282,17 @@ def temporal_role(var: dict) -> str:
 
 
 def temporal_delay_limit_seconds(child: dict, parent: dict) -> int | None:
+    """Return only an explicitly declared upper bound; never invent a scenario-wide ceiling."""
     text = f"{child.get('name','')} {child.get('description','')}".lower()
     match = re.search(r"within\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days)", text)
     if match:
         amount = int(match.group(1))
-        return amount * {"second":1,"seconds":1,"minute":60,"minutes":60,"hour":3600,"hours":3600,"day":86400,"days":86400}[match.group(2)]
+        return amount * {
+            "second": 1, "seconds": 1,
+            "minute": 60, "minutes": 60,
+            "hour": 3600, "hours": 3600,
+            "day": 86400, "days": 86400,
+        }[match.group(2)]
     if "same day" in text or "same-day" in text:
         return 86400
-    child_role = temporal_role(child)
-    parent_role = temporal_role(parent)
-    if child_role == "response" and parent_role == "presentation":
-        return 7 * 86400
-    if child_role == "completion" and parent_role in {"presentation", "dispatch", "response", "start"}:
-        return 30 * 86400
-    if child_role == "dispatch" and parent_role in {"start", "presentation"}:
-        return 7 * 86400
-    if child_role == "end" and parent_role != "generic":
-        return 90 * 86400
-    return 90 * 86400
+    return None

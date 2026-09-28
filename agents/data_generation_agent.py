@@ -24,8 +24,14 @@ from core.dynamic_scenarios import resolve_variables
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
 from core.generator_contracts import SUPPORTED_GENERATORS
-from core.scenario_semantics import temporal_delay_limit_seconds as _temporal_delay_limit_seconds, temporal_role as _temporal_role
+from core.scenario_semantics import temporal_role as _temporal_role
 from core.deterministic_rules import build_deterministic_rules
+from core.temporal_contract import (
+    normalize_temporal_family,
+    is_supported_temporal_rule,
+    source_declared_max_delay_seconds,
+    source_declared_min_delay_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -715,9 +721,14 @@ def _generate_temporal_child_value_for_constraints(
     uppers = [parent_dt + timedelta(seconds=int(max_gap))
               for _parent, parent_dt, max_gap, _min_gap in constraints
               if max_gap is not None]
-    upper = min(uppers) if uppers else lower + timedelta(days=7)
+    upper = min(uppers) if uppers else None
 
-    if upper < lower:
+    # With no source-declared upper bound, there is no hard upper constraint. Pick the earliest
+    # causally valid instant rather than inventing a seven-day window that can later become a
+    # false validation failure.
+    if upper is None:
+        desired = lower
+    elif upper < lower:
         # A model-generated rule set can contain overlapping maximum-delay hints that are
         # impossible to satisfy simultaneously. Do not fabricate a pre-parent event. Preserve
         # the non-negotiable ordering relation and use a conservative causal timestamp.
@@ -742,9 +753,9 @@ def _generate_temporal_child_value(
     """Generate a lifecycle child from an already-generated temporal parent."""
     lower = max(0, int(min_gap or 0))
     try:
-        upper = int(max_gap) if max_gap is not None else lower + 7 * 86400
+        upper = int(max_gap) if max_gap is not None else lower
     except (TypeError, ValueError):
-        upper = lower + 7 * 86400
+        upper = lower
     upper = max(lower, upper)
     gap = random.randint(lower, upper) if upper > lower else lower
     desired = parent_dt + timedelta(seconds=gap)
@@ -1384,6 +1395,24 @@ def _variable_dependency_order(
     return ordered, cyclic
 
 
+def _validate_temporal_plan(relations: list[tuple[str, str, int | None, int]]) -> None:
+    """Reject structurally contradictory executable temporal bounds before record generation."""
+    by_child: dict[str, list[tuple[str, int | None, int]]] = {}
+    for parent, child, max_gap, min_gap in relations:
+        by_child.setdefault(child, []).append((parent, max_gap, min_gap))
+    for child, edges in by_child.items():
+        # Multiple explicit bounds can be valid, but a child cannot have two hard maxima that
+        # are structurally impossible once the parents are generated independently. The runtime
+        # generator handles their intersection per record; no static contradiction exists here.
+        if len(edges) <= 1:
+            continue
+        # Duplicate parent edges are collapsed by the relation builder. Keep this function as a
+        # centralized contract hook rather than adding scenario-specific exceptions.
+        parents = [parent for parent, _max_gap, _min_gap in edges]
+        if len(parents) != len(set(parents)):
+            raise ValueError(f"Conflicting temporal rules for '{child}' contain duplicate parents")
+
+
 def _build_generation_plan(
     variables: list[dict],
     selected_names: set[str] | None = None,
@@ -1396,7 +1425,9 @@ def _build_generation_plan(
         expr = var.get("formula") or _formula_from_rules(name, rules)
         if name and expr:
             formula_by_name[name] = str(expr)
-    temporal_relations = tuple(_infer_temporal_relationships(variables, rules=rules))
+    temporal_relations_list = _infer_temporal_relationships(variables, rules=rules)
+    _validate_temporal_plan(temporal_relations_list)
+    temporal_relations = tuple(temporal_relations_list)
     return _GenerationPlan(
         ordered=tuple(ordered),
         cyclic=frozenset(cyclic),
@@ -2140,26 +2171,22 @@ def _infer_temporal_relationships(
             seen.add(key)
             out.append((parent, child, max_gap, max(0, int(min_gap))))
 
-    # 1) Explicit rules supplied by the confirmed scenario.
+    # 1) Explicit rules supplied by the schema layer. These rules are executable only when the
+    # confirmed schema itself provides structural evidence: an explicit datetime dependency or an
+    # unambiguous same-resource relationship. Cross-resource LLM guesses are deliberately ignored.
     for item in (rules or {}).get("temporal_rules", []) or []:
         if not isinstance(item, dict):
             continue
         parent = str(item.get("before", ""))
         child = str(item.get("after", ""))
-        if not parent or not child:
+        if not parent or not child or parent not in by_name or child not in by_name:
             continue
-        max_gap = None
-        min_gap = 0
-        try:
-            if item.get("max_delay_seconds") is not None:
-                max_gap = max(0, int(float(item.get("max_delay_seconds"))))
-        except (TypeError, ValueError):
-            max_gap = None
-        try:
-            if item.get("min_delay_seconds") is not None:
-                min_gap = max(0, int(float(item.get("min_delay_seconds"))))
-        except (TypeError, ValueError):
-            min_gap = 0
+        if not is_supported_temporal_rule(by_name[parent], by_name[child]):
+            continue
+        # LLM-provided bounds are hints, not executable constraints. Only source-declared
+        # bounds can become hard temporal limits.
+        max_gap = source_declared_max_delay_seconds(by_name[parent], by_name[child])
+        min_gap = source_declared_min_delay_seconds(by_name[parent], by_name[child]) or 0
         add_relation(parent, child, max_gap, min_gap)
 
     # 2) Explicit depends_on edges between datetime fields.
@@ -2168,52 +2195,61 @@ def _infer_temporal_relationships(
             continue
         for dep in child.get("depends_on", []) or []:
             parent_name = str(dep)
-            if parent_name in by_name and str(by_name[parent_name].get("dtype", "")).strip().lower() == "datetime":
-                add_relation(parent_name, child_name, _temporal_delay_limit_seconds(child, by_name[parent_name]), 0)
+            parent = by_name.get(parent_name)
+            if parent and is_supported_temporal_rule(parent, child):
+                add_relation(
+            parent_name,
+            child_name,
+            source_declared_max_delay_seconds(parent, child),
+            source_declared_min_delay_seconds(parent, child) or 0,
+        )
 
-    def add_suffix_pair(start_suffixes: tuple[str, ...], end_suffixes: tuple[str, ...], max_gap: int | None, label_contains: tuple[str, ...] = ()) -> None:
-        for start_name in list(by_name):
-            low = start_name.casefold()
-            matching_suffix = next((suffix for suffix in start_suffixes if low.endswith(suffix)), None)
-            if not matching_suffix:
-                continue
-            prefix = low[:-len(matching_suffix)]
+    def add_suffix_pair(
+        start_suffixes: tuple[str, ...],
+        end_suffixes: tuple[str, ...],
+        max_gap: int | None,
+        label_contains: tuple[str, ...] = (),
+    ) -> None:
+        """Pair lifecycle fields only when their canonical resource families agree.
+
+        Exact prefix matches are preferred. A canonical-family fallback handles harmless naming
+        variants such as ``topupbalance_*`` vs ``topup_balance_*`` without ever pairing different
+        resources such as ``adjust_balance_*`` with ``topupbalance_*``.
+        """
+        starts: list[tuple[str, str]] = []
+        ends: list[tuple[str, str]] = []
+        for name in by_name:
+            low = name.casefold()
             if label_contains and not all(token in low for token in label_contains):
                 continue
-            for end_suffix in end_suffixes:
-                end_name = prefix + end_suffix
-                if end_name in by_name:
-                    add_relation(start_name, end_name, max_gap, 0)
-                    break
+            start_suffix = next((suffix for suffix in start_suffixes if low.endswith(suffix)), None)
+            end_suffix = next((suffix for suffix in end_suffixes if low.endswith(suffix)), None)
+            if start_suffix:
+                starts.append((name, low[:-len(start_suffix)]))
+            if end_suffix:
+                ends.append((name, low[:-len(end_suffix)]))
+
+        for start_name, start_prefix in starts:
+            # First prefer an exact normalized prefix match; this is unambiguous and cheapest.
+            exact = [end_name for end_name, end_prefix in ends if end_prefix == start_prefix]
+            if exact:
+                add_relation(start_name, sorted(exact)[0], max_gap, 0)
+                continue
+
+            family = normalize_temporal_family(start_name)
+            family_matches = [
+                end_name
+                for end_name, _end_prefix in ends
+                if normalize_temporal_family(end_name) == family
+            ]
+            # Only use the fallback when the family has a single target. If multiple target
+            # timestamps exist, ambiguity is safer to leave unconstrained than to invent a link.
+            if len(family_matches) == 1:
+                add_relation(start_name, family_matches[0], max_gap, 0)
 
     # 3) Same-resource lifecycle pairs. Normalize common lifecycle suffixes before matching so
     # ``order_created_at`` and ``order_completed_at`` can be linked while unrelated resources
     # such as ``bucket_*`` and ``topup_*`` remain independent.
-    def temporal_family(name: str) -> str:
-        text = re.sub(r"[^a-z0-9]+", "_", str(name or "").casefold()).strip("_")
-        suffixes = (
-            "_confirmation_date_time", "_confirmation_datetime", "_confirmation_timestamp", "_confirmation_date",
-            "_requested_date_time", "_requested_datetime", "_requested_timestamp", "_requested_date",
-            "_created_date_time", "_created_datetime", "_created_timestamp", "_created_at", "_created_date",
-            "_creation_date_time", "_creation_datetime", "_creation_timestamp", "_creation_at", "_creation_date",
-            "_start_date_time", "_start_datetime", "_start_date", "_start_at",
-            "_end_date_time", "_end_datetime", "_end_date", "_end_at",
-            "_completion_date_time", "_completion_datetime", "_completion_timestamp", "_completion_at", "_completion_date",
-            "_completed_date_time", "_completed_datetime", "_completed_timestamp", "_completed_at", "_completed_date",
-            "_processed_date_time", "_processed_datetime", "_processed_timestamp", "_processed_at",
-            "_settled_date_time", "_settled_datetime", "_settled_timestamp", "_settled_at",
-            "_finished_date_time", "_finished_datetime", "_finished_timestamp", "_finished_at",
-            "_decision_timestamp", "_decision_date", "_decision_at",
-            "_presentation_timestamp", "_presentation_date", "_presentation_at",
-            "_presented_timestamp", "_presented_date", "_presented_at",
-            "_response_timestamp", "_response_date", "_response_at",
-            "_dispatch_timestamp", "_dispatch_date", "_dispatch_at",
-        )
-        for suffix in suffixes:
-            if text.endswith(suffix):
-                return text[:-len(suffix)]
-        return text
-
     lifecycle_pairs = {
         ("presentation", "response"),
         ("dispatch", "response"),
@@ -2226,7 +2262,7 @@ def _infer_temporal_relationships(
         for child in datetime_vars:
             if parent is child:
                 continue
-            if temporal_family(parent.get("name")) != temporal_family(child.get("name")):
+            if normalize_temporal_family(parent.get("name")) != normalize_temporal_family(child.get("name")):
                 continue
             if _temporal_role(parent) == _temporal_role(child):
                 continue
@@ -2234,21 +2270,26 @@ def _infer_temporal_relationships(
                 add_relation(
                     str(parent.get("name")),
                     str(child.get("name")),
-                    _temporal_delay_limit_seconds(child, parent),
-                    0,
+                    source_declared_max_delay_seconds(parent, child),
+                    source_declared_min_delay_seconds(parent, child) or 0,
                 )
 
     # 4) Universal validity windows. Enforce ordering without imposing an arbitrary duration
     # when the source contract does not define one.
     add_suffix_pair(("_start_date_time", "_start_datetime", "_start_date", "_start_at"), ("_end_date_time", "_end_datetime", "_end_date", "_end_at"), None)
 
-    # 5) Request/confirmation lifecycle. Only ordering is universal; use an explicit source/rule
-    # maximum when available instead of fabricating a domain-specific upper bound.
-    add_suffix_pair(("_requested_date_time", "_requested_datetime", "_requested_timestamp", "_requested_date"), ("_confirmation_date_time", "_confirmation_datetime", "_confirmation_timestamp", "_confirmation_date"), None)
+    # 5) Request/confirmation lifecycle. Only pair fields belonging to the SAME canonical
+    # resource family. Shared words like request/confirmation are not evidence that two
+    # different resources form one lifecycle. There is no arbitrary maximum delay here.
+    add_suffix_pair(
+        ("_requested_date_time", "_requested_datetime", "_requested_timestamp", "_requested_date"),
+        ("_confirmation_date_time", "_confirmation_datetime", "_confirmation_timestamp", "_confirmation_date"),
+        None,
+    )
 
-    # 5) Common presentation/decision pair. Only apply when the schema has an unambiguous offer-like
-    # presentation field and an unambiguous decision field; this protects recommendation/offer
-    # journeys across industries without coupling the rule to a particular domain.
+    # 6) Common presentation/decision pair. Again, only pair fields from the same canonical
+    # business resource family. A generic seven-day ceiling caused unrelated offer/decision
+    # timestamps to become hard constraints; ordering is the only universal invariant.
     presentation_fields = [
         name for name, var in by_name.items()
         if str(var.get("dtype", "")).strip().lower() == "datetime"
@@ -2260,7 +2301,9 @@ def _infer_temporal_relationships(
         and any(token in name.casefold() for token in ("decision_timestamp", "decision_date", "decision_at"))
     ]
     if len(presentation_fields) == 1 and len(decision_fields) == 1:
-        add_relation(presentation_fields[0], decision_fields[0], 7 * 86400, 0)
+        parent_name, child_name = presentation_fields[0], decision_fields[0]
+        if normalize_temporal_family(parent_name) == normalize_temporal_family(child_name):
+            add_relation(parent_name, child_name, None, 0)
 
     return out
 
@@ -2275,9 +2318,8 @@ def _enforce_temporal_consistency(
 
     The pass is intentionally iterative because chains such as
     offer -> decision -> processing -> completion can require more than one repair.
-    Explicit min/max delay windows are respected; otherwise CSV datetime dependencies
-    receive conservative, domain-neutral ceilings to prevent absurd month/year gaps.
-    Unrelated timestamps are never reordered.
+    Explicit source-declared min/max delay windows are respected. When no source bound exists,
+    only causal ordering is enforced. Unrelated timestamps are never reordered.
     """
     rec = dict(rec)
     issues: list[str] = []

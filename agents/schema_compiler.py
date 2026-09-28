@@ -557,6 +557,20 @@ class SchemaCompiler:
             name_map[self._normalize_variable_name(str(idea.get("name") or ""))] = fresh
 
         # No static industry/country profile is used here. Source JSON constraints are authoritative.
+        datetime_by_name: dict[str, dict] = {}
+        for candidate in ideas:
+            candidate_name = self._normalize_variable_name(str(candidate.get("name") or ""))
+            candidate_spec = candidate.get("_json_source_spec") if isinstance(candidate.get("_json_source_spec"), dict) else None
+            if candidate_spec is None:
+                continue
+            _candidate_gen, candidate_dtype, _candidate_params = self._json_source_contract(candidate_spec, country)
+            if str(candidate_dtype).strip().lower() == "datetime":
+                datetime_by_name[candidate_name] = {
+                    "name": name_map.get(candidate_name, str(candidate.get("name") or "")),
+                    "dtype": "datetime",
+                    "provenance": {"source_json_model": candidate_spec.get("model")},
+                }
+
         for idea in ideas:
             original_name = str(idea.get("name") or "scenario_attribute")
             fresh = name_map[self._normalize_variable_name(original_name)]
@@ -591,6 +605,23 @@ class SchemaCompiler:
                     f"Source-backed field '{original_name}' has unresolved dependencies: {unresolved_dependencies}"
                 )
             deps = self._merge_dependencies(idea, name_map, grain, entity_key)
+            if str(dtype).strip().lower() == "datetime":
+                safe_deps: list[str] = []
+                child_meta = {
+                    "name": fresh,
+                    "dtype": "datetime",
+                    "provenance": {"source_json_model": source_spec.get("model")},
+                }
+                for dep in deps:
+                    parent_meta = datetime_by_name.get(self._normalize_variable_name(str(dep)))
+                    if parent_meta and not is_supported_temporal_rule(parent_meta, child_meta):
+                        logger.warning(
+                            "[SchemaCompiler] Removed unsafe cross-resource datetime dependency %s -> %s",
+                            dep, original_name,
+                        )
+                        continue
+                    safe_deps.append(dep)
+                deps = safe_deps
             if original_name == entity_key:
                 grain = "entity"
                 deps = []

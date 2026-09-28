@@ -21,6 +21,11 @@ from core.state import WorkflowState
 from core.runtime_cache import get_schema, set_schema
 from core.scenario_semantics import derive_scenario_semantics
 from core.deterministic_rules import build_deterministic_rules
+from core.temporal_contract import (
+    is_supported_temporal_rule,
+    source_declared_max_delay_seconds,
+    source_declared_min_delay_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +70,17 @@ SEMANTIC ACCURACY IS MANDATORY:
 - For every datetime field that depends_on another datetime field, preserve causal chronology:
   the dependent event must not occur before its parent event. Do not invent huge delays between
   causally related events. Use the field descriptions and scenario context to choose a realistic
-  maximum delay; for a customer decision/response after an offer/presentation, prefer hours or
-  a few days, not weeks/months, unless the schema explicitly says otherwise. Encode these in
-  temporal_rules when they are meaningful.
+  maximum delay only when the source/schema actually supports that bound.
+- TEMPORAL RULES MUST BE EVIDENCE-BASED: emit a temporal_rules edge only when the child explicitly
+  depends_on the parent datetime field OR both fields clearly belong to the same business resource
+  and form an unambiguous lifecycle pair (for example the same resource's requestedDate ->
+  confirmationDate or validFor.startDateTime -> validFor.endDateTime). Never connect timestamps from
+  sibling resources such as TopupBalance, AdjustBalance, TransferBalance, Bucket, Customer, etc. merely
+  because their field names both contain request/confirmation/start/end. Never create Cartesian products
+  of all request timestamps against all confirmation timestamps. If the relationship is not structurally
+  supported, omit the temporal rule.
+- A temporal max_delay_seconds is optional. When the source contract or explicit scenario context does
+  not define a bounded delay, omit max_delay_seconds rather than fabricating a window.
 - Perform a VALUE-BY-VALUE INDUSTRY AUDIT before returning rules: every categorical
   value must belong to the target industry's real vocabulary. Do not accept a value
   merely because it is syntactically valid or common in another industry.
@@ -133,6 +146,7 @@ class SchemaAgent:
 
     def _cache_key(self, state: WorkflowState) -> tuple:
         return (
+            "schema-rules-v3",
             state.scenario, state.industry, (state.country or "GLOBAL").upper(), state.type_of_data,
             state.domain or "", state.business_scenario or "", state.business_response or "",
             state.expected_outcome or "", state.scenario_type or "", state.use_case or "",
@@ -313,13 +327,17 @@ class SchemaAgent:
                     continue
                 if str(before_var.get("dtype", "")).lower() != "datetime" or str(after_var.get("dtype", "")).lower() != "datetime":
                     continue
+                if not is_supported_temporal_rule(before_var, after_var):
+                    # LLMs can describe plausible business relationships that are not present in
+                    # the confirmed source schema. They must never become executable constraints.
+                    continue
                 cleaned = {"before": before, "after": after}
-                for key in ("min_delay_seconds", "max_delay_seconds"):
-                    try:
-                        if item.get(key) is not None:
-                            cleaned[key] = max(0, int(float(item.get(key))))
-                    except (TypeError, ValueError):
-                        pass
+                declared_min = source_declared_min_delay_seconds(before_var, after_var)
+                declared_max = source_declared_max_delay_seconds(before_var, after_var)
+                if declared_min is not None:
+                    cleaned["min_delay_seconds"] = declared_min
+                if declared_max is not None:
+                    cleaned["max_delay_seconds"] = declared_max
                 if item.get("reason"):
                     cleaned["reason"] = str(item.get("reason"))[:500]
                 normalized_temporal.append(cleaned)

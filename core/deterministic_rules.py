@@ -8,7 +8,13 @@ from __future__ import annotations
 from typing import Any
 import re
 
-from core.scenario_semantics import derive_scenario_semantics, temporal_delay_limit_seconds, temporal_role
+from core.scenario_semantics import derive_scenario_semantics, temporal_role
+from core.temporal_contract import (
+    is_supported_temporal_rule,
+    normalize_temporal_family,
+    source_declared_max_delay_seconds,
+    source_declared_min_delay_seconds,
+)
 
 
 _RULE_PARAM_KEYS = (
@@ -41,6 +47,10 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
     def add_edge(before: str, after: str, max_delay: int | None, reason: str) -> None:
         if before not in names or after not in names or before == after:
             return
+        before_var = by_name.get(before)
+        after_var = by_name.get(after)
+        if before_var and after_var and not is_supported_temporal_rule(before_var, after_var):
+            return
         key = (before, after)
         if key in seen_edges:
             return
@@ -61,12 +71,12 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
         for dep in child.get("depends_on", []) or []:
             parent_name = str(dep)
             parent = by_name.get(parent_name)
-            if parent and str(parent.get("dtype", "")).lower() == "datetime":
+            if parent and is_supported_temporal_rule(parent, child):
                 add_edge(
                     parent_name,
                     child_name,
-                    temporal_delay_limit_seconds(child, parent),
-                    "Confirmed datetime dependency implies chronological causality.",
+                    source_declared_max_delay_seconds(parent, child),
+                    "Confirmed source-backed datetime dependency implies chronological causality.",
                 )
 
     datetime_vars = [v for v in variables if str(v.get("dtype", "")).lower() == "datetime"]
@@ -75,31 +85,6 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
     # ``bucket_valid_for_start`` -> ``topup_valid_for_end``. Only add lifecycle edges when
     # the fields belong to the same semantic family/resource. Explicit depends_on edges and
     # the suffix-based pairs below remain authoritative.
-    def _temporal_family(name: str) -> str:
-        text = re.sub(r"[^a-z0-9]+", "_", str(name or "").casefold()).strip("_")
-        suffixes = (
-            "_confirmation_date_time", "_confirmation_datetime", "_confirmation_timestamp", "_confirmation_date",
-            "_requested_date_time", "_requested_datetime", "_requested_timestamp", "_requested_date",
-            "_created_date_time", "_created_datetime", "_created_timestamp", "_created_at", "_created_date",
-            "_creation_date_time", "_creation_datetime", "_creation_timestamp", "_creation_at", "_creation_date",
-            "_start_date_time", "_start_datetime", "_start_date", "_start_at",
-            "_end_date_time", "_end_datetime", "_end_date", "_end_at",
-            "_completion_date_time", "_completion_datetime", "_completion_timestamp", "_completion_at", "_completion_date",
-            "_completed_date_time", "_completed_datetime", "_completed_timestamp", "_completed_at", "_completed_date",
-            "_processed_date_time", "_processed_datetime", "_processed_timestamp", "_processed_at",
-            "_settled_date_time", "_settled_datetime", "_settled_timestamp", "_settled_at",
-            "_finished_date_time", "_finished_datetime", "_finished_timestamp", "_finished_at",
-            "_decision_timestamp", "_decision_date", "_decision_at",
-            "_presentation_timestamp", "_presentation_date", "_presentation_at",
-            "_presented_timestamp", "_presented_date", "_presented_at",
-            "_response_timestamp", "_response_date", "_response_at",
-            "_dispatch_timestamp", "_dispatch_date", "_dispatch_at",
-        )
-        for suffix in suffixes:
-            if text.endswith(suffix):
-                return text[:-len(suffix)]
-        return text
-
     lifecycle_pairs = {
         ("presentation", "response"),
         ("dispatch", "response"),
@@ -113,39 +98,14 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
                 continue
             parent_role = temporal_role(parent)
             child_role = temporal_role(child)
-            same_family = _temporal_family(parent.get("name")) == _temporal_family(child.get("name"))
+            same_family = normalize_temporal_family(parent.get("name")) == normalize_temporal_family(child.get("name"))
             if same_family and (parent_role, child_role) in lifecycle_pairs and str(parent.get("scope", "transaction")) == str(child.get("scope", "transaction")):
                 add_edge(
                     str(parent.get("name")),
                     str(child.get("name")),
-                    temporal_delay_limit_seconds(child, parent),
+                    source_declared_max_delay_seconds(parent, child),
                     "Same-resource lifecycle semantics imply chronological order.",
                 )
-
-    # Low Balance & Top-up uses short operational lifecycles. The supplied TMF654
-    # Swagger defines request/confirmation timestamps but does not define a synthetic
-    # latency window, so keep this domain's generated event gaps bounded to one day.
-    domain_text = str(getattr(state, "domain", "") or "").strip().lower()
-    if "low balance" in domain_text and ("top up" in domain_text or "top-up" in domain_text or "recharge" in domain_text):
-        compact = lambda value: re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
-        datetime_names = [str(v.get("name")) for v in variables if str(v.get("dtype", "")).lower() == "datetime" and v.get("name")]
-        requested_fields = [n for n in datetime_names if "request" in compact(n)]
-        confirmation_fields = [n for n in datetime_names if "confirm" in compact(n) or "completion" in compact(n)]
-        for parent in requested_fields:
-            for child in confirmation_fields:
-                add_edge(parent, child, 24 * 3600, "Low Balance top-up lifecycle is bounded to a realistic operational window.")
-
-        # Override broader generic lifecycle ceilings for intervention response timing.
-        # This specifically prevents presentation -> decision examples from drifting into
-        # multi-week/month gaps while leaving unrelated timestamps unconstrained.
-        for item in temporal:
-            parent = compact(item.get("before"))
-            child = compact(item.get("after"))
-            if (
-                ("present" in parent or "offer" in parent or "dispatch" in parent)
-                and ("decision" in child or "declin" in child or "response" in child or "accept" in child)
-            ):
-                item["max_delay_seconds"] = min(int(item.get("max_delay_seconds", 24 * 3600) or 24 * 3600), 24 * 3600)
 
     semantics = derive_scenario_semantics(state, variables)
     for field, preferred in semantics.get("preferred_values", {}).items():
@@ -178,8 +138,9 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
         "generation_policy": [
             "Generate root/independent fields first and all dependent fields from their actual dependencies.",
             "Never independently sample two fields when the confirmed schema or universal semantics imply a relationship.",
-            "Generate temporal pairs and event lifecycles causally; validation is a safety net, not the generation mechanism.",
+            "Generate temporal pairs and event lifecycles causally; never generate parent and child timestamps independently when a relationship is confirmed.",
             "Treat event occurrence and event ordering separately: if scenario semantics indicate that an event did not occur, its nullable event timestamp must be null and must not be fabricated merely to satisfy a temporal rule.",
+            "Only create temporal relationships supported by an explicit datetime dependency or an unambiguous same-resource lifecycle pair; never relate sibling resources merely because they share request/confirmation/start/end terminology.",
             "When a temporal child has multiple causal parents, generate it from the intersection of all applicable lower/upper bounds rather than satisfying only the first parent.",
             "If temporal constraints are mutually incompatible, preserve hard causal ordering and treat optional maximum-delay guidance as soft rather than manufacturing a contradiction.",
             "Apply scenarioType, businessScenario, expectedOutcome, businessResponse, useCase, domain, industry, country, and typeOfData before a record reaches validation.",
