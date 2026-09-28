@@ -62,12 +62,14 @@ def _require_generation_source(
     requested_scenario_id: str,
     scenario_context: dict[str, Any],
 ) -> None:
-    """Fail closed unless the exact industry/domain has JSON sources or scenario_variables.
+    """Validate the confirmed source policy without re-reading large catalogs on the hot path.
 
-    Industry/domain JSON documents are the preferred executable source. The only supported
-    fallback is enabled scenario-level recommendations stored in MongoDB. This check is kept in
-    the generation service itself so every caller, not just the HTTP route, observes the same
-    source-of-truth boundary.
+    Agentic JSON-grounded scenarios are executable contracts already compiled from MongoDB
+    source documents at proposal/confirmation time. Their confirmed definitions are immutable
+    for generation, so checking current source-document IDs here is both a latency cost and an
+    incorrect reproducibility boundary (a source can be replaced/deactivated later).
+
+    Legacy/non-agentic scenarios retain the older live-source guard.
     """
     industry = str(scenario_context.get("industry") or "").strip()
     domain = str(scenario_context.get("domain") or "").strip()
@@ -76,9 +78,54 @@ def _require_generation_source(
             f"Generation is blocked for scenario '{requested_scenario_id}': the confirmed scenario is missing industryType or domain."
         )
 
-    # Avoid reparsing every uploaded Swagger document on every generation call. The confirmed
-    # schema already stores source IDs; generation only needs to verify that those source IDs are
-    # still active. This keeps generate latency independent of source-document size.
+    source_policy = str(scenario_context.get("source_policy") or "").strip()
+    agentic = bool(scenario_context.get("agentic"))
+
+    # Agentic JSON-grounded schemas are already source-bounded and persisted as confirmed
+    # executable fields. Verify provenance labels only; do not require the current registry to
+    # contain the same source_id. This prevents confirmed scenarios from breaking after an
+    # otherwise legitimate standards-source refresh and removes a Mongo query from every generate call.
+    if agentic and source_policy == "mongodb_industry_source_documents":
+        confirmed_variables = scenario_context.get("variables") or []
+        variable_sources = {
+            str(name).strip().casefold(): str(source).strip().upper()
+            for name, source in (scenario_context.get("variable_sources") or {}).items()
+            if str(name).strip() and str(source).strip()
+        }
+        variable_source_ids = {
+            str(name).strip().casefold(): str(source_id).strip()
+            for name, source_id in (scenario_context.get("variable_source_ids") or {}).items()
+            if str(name).strip() and str(source_id).strip()
+        }
+        unknown: list[str] = []
+        for row in confirmed_variables:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            key = name.casefold()
+            provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+            source = str(row.get("source") or variable_sources.get(key) or "").strip().upper()
+            source_id = str(provenance.get("source_json_id") or variable_source_ids.get(key) or "").strip()
+            # Confirmed agentic source-backed fields are allowed either by the preserved
+            # source label or the preserved source document id. DB overlays remain allowed.
+            if source in {"MONGODB_JSON", "DB_RECOMMENDED", "USER_SELECTED"} or source_id:
+                continue
+            # Legacy confirmed agentic rows may predate source metadata preservation. They are
+            # still inside an approved mongodb source-policy contract and were schema-validated
+            # before confirmation, so keep them executable rather than rejecting a valid history.
+            if not source and not source_id:
+                continue
+            unknown.append(name)
+        if unknown:
+            raise ValueError(
+                "Generation is blocked because the confirmed agentic scenario contains variables "
+                "without recognized source provenance: " + ", ".join(sorted(set(unknown))[:25])
+            )
+        return
+
+    # Legacy/non-agentic path: keep the existing live MongoDB boundary check.
     active_sources = list_source_documents(industry_type=industry, domain=domain, active_only=True)
     source_available = bool(active_sources)
     scenario_version = int(scenario_context.get("scenario_version", 1) or 1)
@@ -105,24 +152,30 @@ def _require_generation_source(
             for name, source_id in (scenario_context.get("variable_source_ids") or {}).items()
             if str(name).strip() and str(source_id).strip()
         }
+        variable_sources = {
+            str(name).strip().casefold(): str(source).strip().upper()
+            for name, source in (scenario_context.get("variable_sources") or {}).items()
+            if str(name).strip() and str(source).strip()
+        }
         missing_sources: set[str] = set()
-        unknown = []
+        unknown: list[str] = []
         for row in confirmed_variables:
             if not isinstance(row, dict):
                 continue
             name = str(row.get("name") or "").strip()
             if not name:
                 continue
+            key = name.casefold()
             provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
-            source_id = str(provenance.get("source_json_id") or variable_source_ids.get(name.casefold()) or "").strip()
-            normalized_source = str(row.get("source") or "").strip().upper()
+            source_id = str(provenance.get("source_json_id") or variable_source_ids.get(key) or "").strip()
+            normalized_source = str(row.get("source") or variable_sources.get(key) or "").strip().upper()
             if normalized_source == "MONGODB_JSON" and source_id and source_id not in active_source_ids:
                 missing_sources.add(source_id)
-            elif normalized_source != "MONGODB_JSON" and name.casefold() not in scenario_variable_names and not source_id:
+            elif normalized_source not in {"MONGODB_JSON", "DB_RECOMMENDED", "USER_SELECTED"} and name.casefold() not in scenario_variable_names and not source_id:
                 unknown.append(name)
         if missing_sources:
             raise ValueError(
-                "Generation is blocked because confirmed variables reference inactive or removed source documents: "
+                "Generation is blocked because legacy confirmed variables reference inactive or removed source documents: "
                 + ", ".join(sorted(missing_sources)[:25])
             )
         if unknown:
@@ -130,7 +183,6 @@ def _require_generation_source(
                 "Generation is blocked because the confirmed scenario contains variables outside the current MongoDB source boundary: "
                 + ", ".join(sorted(set(unknown))[:25])
             )
-    return
 
 def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
     """Run the full generation + QA pipeline and build the API response payload."""

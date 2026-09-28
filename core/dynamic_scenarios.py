@@ -209,6 +209,14 @@ def resolve_variables(requested_scenario_id: str) -> tuple[list[dict[str, Any]],
     scenario_version = int(meta.get("scenario_version", 1) or 1)
     source_policy = str(meta.get("source_policy") or "").strip()
 
+    # A confirmed agentic JSON-grounded scenario already contains the immutable executable
+    # source-backed contract selected during proposal/confirmation. Do not re-query the live
+    # source registry on every generation call; a source document may legitimately be
+    # replaced/deactivated after confirmation while the approved scenario must remain
+    # reproducible. Legacy scenarios without this policy continue to use the live check.
+    if bool(meta.get("agentic")) and source_policy == "mongodb_industry_source_documents":
+        source_available = True
+
     # When an exact industry/domain JSON source is not registered, scenario_variables is the
     # only supported alternate variable source. A confirmed scenario may already contain the
     # same definitions (the normal path), but if it does not, use the enabled recommendations
@@ -293,6 +301,11 @@ def resolve_scenario_context(requested_scenario_id: str) -> dict[str, Any]:
         "agentic": bool(meta.get("agentic", False)),
         "scenario_version": int(meta.get("scenario_version", 1) or 1),
         "variable_sources": dict(meta.get("variable_sources") or {}),
+        "variable_source_ids": {
+            str(name).strip().casefold(): str(source_id).strip()
+            for name, source_id in (meta.get("variable_source_ids") or {}).items()
+            if str(name).strip() and str(source_id).strip()
+        },
         "db_variable_names": sorted(set(meta.get("db_variable_names") or []) | set((meta.get("db_variable_definitions") or {}).keys())),
         "db_variable_definitions": dict(meta.get("db_variable_definitions") or {}),
     }

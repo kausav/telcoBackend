@@ -805,6 +805,14 @@ def confirm_scenario_route(req: ConfirmRequest):
         "db_variable_names": sorted(str(name).strip().casefold() for name in (draft.get("db_variable_names") or []) if str(name).strip()),
         "source_policy": draft.get("source_policy", "scenario_variables"),
         "source_documents": list(draft.get("source_documents") or []),
+        # Preserve the immutable JSON source provenance through HITL confirmation.
+        # Generation must rely on the confirmed contract rather than querying live source
+        # document IDs on every request; source IDs remain useful for audit/debugging.
+        "variable_source_ids": {
+            str(name).strip().casefold(): str(source_id).strip()
+            for name, source_id in (draft.get("variable_source_ids") or {}).items()
+            if str(name).strip() and str(source_id).strip()
+        },
     }
     try:
         scenario_id, scenario_id_reassigned = confirm_scenario(
