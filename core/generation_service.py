@@ -21,8 +21,7 @@ from core.dynamic_scenarios import (
 )
 from agents.data_generation_agent import run_deterministic_agentic_generation
 from core.pipeline import run_pipeline
-from core.industry_source_store import catalog_for_request, has_sources
-from core.json_domain_policy import is_low_balance_domain
+from core.industry_source_store import list_source_documents
 from core.scenario_variable_store import get_recommended
 
 logger = logging.getLogger(__name__)
@@ -77,7 +76,11 @@ def _require_generation_source(
             f"Generation is blocked for scenario '{requested_scenario_id}': the confirmed scenario is missing industryType or domain."
         )
 
-    source_available = has_sources(industry, domain)
+    # Avoid reparsing every uploaded Swagger document on every generation call. The confirmed
+    # schema already stores source IDs; generation only needs to verify that those source IDs are
+    # still active. This keeps generate latency independent of source-document size.
+    active_sources = list_source_documents(industry_type=industry, domain=domain, active_only=True)
+    source_available = bool(active_sources)
     scenario_version = int(scenario_context.get("scenario_version", 1) or 1)
     scenario_variables = get_recommended(requested_scenario_id, scenario_version)
     if not source_available and not scenario_variables:
@@ -89,45 +92,43 @@ def _require_generation_source(
             "variables before calling /scenario/generate."
         )
 
-    # Source-backed confirmed variables are validated against the CURRENT MongoDB source catalog.
-    # This prevents a legacy/edited confirmed scenario from smuggling in a field that is no longer
-    # present in the active industry/domain standards. Persisted scenario_variables are the only
-    # permitted exception.
     if source_available:
-        if is_low_balance_domain(domain, industry):
-            # Low Balance source fields are canonicalized from the MongoDB TMF654/TMF629 catalog.
-            # Accept both the new canonical names and legacy raw Swagger names so confirmed
-            # scenarios remain compatible after the de-duplication/naming upgrade.
-            from core.low_balance_variable_policy import official_catalog_aliases, official_catalog_by_name
-            catalog_names = set(official_catalog_by_name()) | set(official_catalog_aliases())
-        else:
-            catalog_names = {
-                str(row.get("name") or "").strip().casefold()
-                for row in (catalog_for_request(industry, domain).get("models") or [])
-                if isinstance(row, dict) and str(row.get("name") or "").strip()
-            }
+        active_source_ids = {str(row.get("source_id") or "").strip() for row in active_sources}
         scenario_variable_names = {
             str(row.get("name") or "").strip().casefold()
             for row in scenario_variables
             if isinstance(row, dict) and str(row.get("name") or "").strip()
         }
         confirmed_variables = scenario_context.get("variables") or []
-        # resolve_scenario_context includes the confirmed variable list. Keep this check exact-name
-        # and deliberately do not attempt fuzzy matching/renaming.
-        unknown = sorted(
-            {
-                str(row.get("name") or "").strip()
-                for row in confirmed_variables
-                if isinstance(row, dict)
-                and str(row.get("name") or "").strip()
-                and str(row.get("name") or "").strip().casefold() not in catalog_names
-                and str(row.get("name") or "").strip().casefold() not in scenario_variable_names
-            }
-        )
+        variable_source_ids = {
+            str(name).strip().casefold(): str(source_id).strip()
+            for name, source_id in (scenario_context.get("variable_source_ids") or {}).items()
+            if str(name).strip() and str(source_id).strip()
+        }
+        missing_sources: set[str] = set()
+        unknown = []
+        for row in confirmed_variables:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            provenance = row.get("provenance") if isinstance(row.get("provenance"), dict) else {}
+            source_id = str(provenance.get("source_json_id") or variable_source_ids.get(name.casefold()) or "").strip()
+            normalized_source = str(row.get("source") or "").strip().upper()
+            if normalized_source == "MONGODB_JSON" and source_id and source_id not in active_source_ids:
+                missing_sources.add(source_id)
+            elif normalized_source != "MONGODB_JSON" and name.casefold() not in scenario_variable_names and not source_id:
+                unknown.append(name)
+        if missing_sources:
+            raise ValueError(
+                "Generation is blocked because confirmed variables reference inactive or removed source documents: "
+                + ", ".join(sorted(missing_sources)[:25])
+            )
         if unknown:
             raise ValueError(
                 "Generation is blocked because the confirmed scenario contains variables outside the current MongoDB source boundary: "
-                + ", ".join(unknown[:25])
+                + ", ".join(sorted(set(unknown))[:25])
             )
     return
 

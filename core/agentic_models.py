@@ -139,4 +139,4 @@ class ScenarioImportResponse(BaseModel):
     field_order: list[str]
     typeOfData: Literal["transactional", "aggregational"]
     entityKey: str | None = None
-    variableSources: dict[str, str] = Field(default_factory=dict, description="Internal provenance for Low Balance variables")
+    variableSources: dict[str, str] = Field(default_factory=dict, description="Internal provenance for source-backed scenario variables")

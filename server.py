@@ -3,11 +3,15 @@ import logging
 import re
 import secrets
 import uuid
+from time import perf_counter
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import ORJSONResponse
+from starlette.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Literal
@@ -46,6 +50,7 @@ from core.industry_source_store import (
     save_source_document,
     set_source_active,
     generate_internal_source_id,
+    invalidate_catalog_cache,
 )
 
 
@@ -95,8 +100,9 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.8.0",
+    version="2.9.0",
     lifespan=lifespan,
+    default_response_class=ORJSONResponse,
     responses={
         400: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
@@ -185,6 +191,9 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-Request-ID", "X-Industry-Source-Token"],
 )
 
+# Compress large JSON generation/proposal responses to reduce transfer time without changing payload semantics.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+
 
 class GenerateRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
@@ -264,7 +273,7 @@ class ConfirmResponse(BaseModel):
     field_order: list[str]
     typeOfData: Literal["transactional", "aggregational"]
     entityKey: str | None = None
-    variableSources: dict[str, str] = Field(default_factory=dict, description="Internal provenance for Low Balance variables")
+    variableSources: dict[str, str] = Field(default_factory=dict, description="Internal provenance for source-backed scenario variables")
 
 
 class IndustrySourceStatusRequest(BaseModel):
@@ -593,6 +602,8 @@ def upload_industry_sources(
                 "error": str(exc),
             })
 
+    if uploaded_sources:
+        invalidate_catalog_cache(industryType, domain)
     if not uploaded_sources and errors:
         raise HTTPException(status_code=400, detail={
             "error": "No source files were uploaded successfully",
@@ -613,6 +624,7 @@ def update_industry_source(source_id: str, req: IndustrySourceStatusRequest, req
     _require_industry_source_admin_token(request)
     if not set_source_active(source_id, req.active):
         raise HTTPException(404, detail={"error": f"Unknown industry source '{source_id}'"})
+    invalidate_catalog_cache()
     source = get_source_document(source_id)
     return {"success": True, "source": source}
 
@@ -622,6 +634,7 @@ def remove_industry_source(source_id: str, request: Request):
     _require_industry_source_admin_token(request)
     if not delete_source_document(source_id):
         raise HTTPException(404, detail={"error": f"Unknown industry source '{source_id}'"})
+    invalidate_catalog_cache()
     return {"success": True, "sourceId": source_id, "deleted": True}
 
 
@@ -756,7 +769,7 @@ def confirm_scenario_route(req: ConfirmRequest):
             cleaned=_clean_dict(new_var); name=cleaned.get("name")
             if not _is_placeholder(name): by_name[str(name)]=cleaned
         variables=list(by_name.values()); field_order=[str(v["name"]) for v in variables if v.get("name")]
-    if is_low_balance_domain(draft.get("domain"), draft.get("industry_type")):
+    if is_low_balance_domain(draft.get("domain"), draft.get("industry_type")) and not draft.get("agentic"):
         try:
             validate_low_balance_variable_sources(
                 variables,
@@ -822,14 +835,17 @@ def confirm_scenario_route(req: ConfirmRequest):
 
 
 @app.post("/scenario/propose", response_model=ScenarioImportResponse)
-def propose_scenario(req: ScenarioProposeRequest):
+async def propose_scenario(req: ScenarioProposeRequest):
     """Create a standards-backed dynamic schema draft from the JSON request body.
 
     The response intentionally preserves the former scenario-import response contract so the existing frontend
     can reuse the same HITL review screen and call /scenario/confirm unchanged.
     """
+    started = perf_counter()
     try:
-        return get_agentic_workflow().propose(req)
+        result = await run_in_threadpool(get_agentic_workflow().propose, req)
+        logger.info("[Latency] /scenario/propose scenario=%s elapsed_ms=%.1f", req.requested_scenario_id, (perf_counter() - started) * 1000.0)
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
     except (RuntimeError, EnvironmentError) as exc:
@@ -869,7 +885,7 @@ def _timestamp_sort_key(value):
 
 
 @app.post("/scenario/generate", response_model=GenerateResponse)
-def generate_scenario(req: GenerateRequest):
+async def generate_scenario(req: GenerateRequest):
     """Generate and return the complete validated dataset synchronously.
 
     The request remains open until deterministic generation and final QA are complete. This
@@ -892,14 +908,25 @@ def generate_scenario(req: GenerateRequest):
     if not scenario_exists(requested_scenario_id):
         raise HTTPException(400, detail={"error": f"Unknown requested scenario '{requested_scenario_id}'"})
 
+    started = perf_counter()
     try:
-        payload = build_generation_response({
+        payload = await run_in_threadpool(build_generation_response, {
             "requested_scenario_id": requested_scenario_id,
             "draftId": req.draftId,
             "count": req.count,
             "recordsPerUser": req.recordsPerUser,
         })
-        return GenerateResponse.model_validate(payload)
+        # build_generation_response performs the full contract/type/semantic validation. Avoid a
+        # second recursive Pydantic traversal of potentially millions of generated values. The
+        # response_model remains the OpenAPI contract; returning a Response bypasses duplicate work.
+        logger.info(
+            "[Latency] /scenario/generate scenario=%s records=%d fields=%d elapsed_ms=%.1f",
+            requested_scenario_id,
+            int(payload.get("total_records", 0) or 0),
+            len(payload.get("fields") or []),
+            (perf_counter() - started) * 1000.0,
+        )
+        return ORJSONResponse(content=payload)
     except ValueError as exc:
         raise HTTPException(400, detail={"error": str(exc)}) from exc
 

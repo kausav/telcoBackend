@@ -362,7 +362,7 @@ def _generic_value(var: dict, rec: dict):
     if dtype == "datetime":
         return _recent_datetime(p, rec)
     if dtype == "date":
-        return _recent_datetime(p, rec)[:10]
+        return _recent_date(p, rec)
     if dtype == "array":
         choices = p.get("choices", p.get("values"))
         if isinstance(choices, (list, tuple)) and choices:
@@ -659,6 +659,15 @@ def _recent_datetime(params: dict, _rec: dict) -> str:
     return _format_datetime(base, params)
 
 
+def _recent_date(params: dict, _rec: dict) -> str:
+    """Generate an ISO-8601 calendar date for fields declared as JSON Schema ``format=date``."""
+    days_back = int(params.get("days_back", 0) or 0)
+    base = datetime.now(timezone.utc).date() - timedelta(
+        days=random.randint(0, max(0, days_back))
+    )
+    return base.isoformat()
+
+
 def _temporal_output_params(params: dict | None, generator: str) -> dict:
     """Keep enough serialized timestamp precision to preserve declared temporal offsets."""
     result = dict(params or {})
@@ -686,8 +695,9 @@ def _ts_offset(params: dict, rec: dict) -> str:
     base_field = str(params.get("base_field") or params.get("source_field") or "").strip()
     if not base_field:
         raise ValueError("ts_offset requires 'base_field' (or legacy alias 'source_field')")
-    base_str = rec.get(base_field, datetime.now(timezone.utc).isoformat())
-    base = _parse_dt(base_str)
+    if base_field not in rec or rec.get(base_field) in (None, ""):
+        raise ValueError(f"ts_offset dependency '{base_field}' is missing")
+    base = _parse_dt(rec[base_field])
     min_sec = int(params.get("min_sec", params.get("min_seconds", 0)))
     max_sec = int(params.get("max_sec", params.get("max_seconds", min_sec)))
     min_sec, max_sec = min(min_sec, max_sec), max(min_sec, max_sec)
@@ -696,21 +706,27 @@ def _ts_offset(params: dict, rec: dict) -> str:
 
 
 def _ts_add_field(params: dict, rec: dict) -> str:
-    base_str = rec.get(params["base_field"], datetime.now(timezone.utc).isoformat())
-    base = _parse_dt(base_str)
+    base_field = str(params.get("base_field") or "").strip()
+    if not base_field or base_field not in rec or rec.get(base_field) in (None, ""):
+        raise ValueError("ts_add_field requires a valid base_field dependency")
+    base = _parse_dt(rec[base_field])
     seconds = int(rec.get(params["add_seconds_field"], 60))
     return _format_datetime(base + timedelta(seconds=seconds), params)
 
 
 def _date_offset(params: dict, rec: dict) -> str:
-    base_str = rec.get(params["base_field"], datetime.now(timezone.utc).isoformat())
-    base = _parse_dt(base_str)
+    base_field = str(params.get("base_field") or "").strip()
+    if not base_field or base_field not in rec or rec.get(base_field) in (None, ""):
+        raise ValueError("date_offset requires a valid base_field dependency")
+    base = _parse_dt(rec[base_field])
     return (base + timedelta(days=params["days"])).date().isoformat()
 
 
 def _date_offset_range(params: dict, rec: dict) -> str:
-    base_str = rec.get(params["base_field"], datetime.now(timezone.utc).isoformat())
-    base = _parse_dt(base_str)
+    base_field = str(params.get("base_field") or "").strip()
+    if not base_field or base_field not in rec or rec.get(base_field) in (None, ""):
+        raise ValueError("date_offset_range requires a valid base_field dependency")
+    base = _parse_dt(rec[base_field])
     min_days = int(params.get("min_days", 0))
     max_days = int(params.get("max_days", min_days))
     offset_days = random.randint(min(min_days, max_days), max(min_days, max_days))
@@ -739,9 +755,9 @@ def _id_mirror(params: dict, rec: dict) -> str:
 
 
 def _prefixed_uuid(params: dict, _rec: dict) -> str:
-    raw = str(uuid.uuid4())           # 8-4-4-4-12
-    suffix = raw[len(params["prefix"]):]
-    return params["prefix"] + suffix
+    """Return the configured prefix followed by the complete UUID value."""
+    prefix = str(params.get("prefix", ""))
+    return prefix + str(uuid.uuid4())
 
 
 def _tx_id(params: dict, rec: dict) -> str:
@@ -873,10 +889,10 @@ def _format_datetime_fields(rec: dict, variables: list[dict]) -> dict:
     return out
 
 def _parse_dt(s: str) -> datetime:
-    """Parse ISO-8601 and common human-readable timestamps to timezone-aware datetime."""
+    """Parse an existing timestamp strictly; invalid values must never become ``now``."""
     parsed = _parse_timestamp_text(str(s))
     if parsed is None:
-        return datetime.now(timezone.utc)
+        raise ValueError(f"Invalid datetime value: {s!r}")
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
@@ -900,6 +916,7 @@ _GENERATORS = {
     "segment_range":  lambda v, rec: _segment_range(v["params"], rec),
     "uniform_bounded":lambda v, rec: _uniform_bounded(v["params"], rec),
     "recent_datetime":lambda v, rec: _recent_datetime(v["params"], rec),
+    "recent_date":    lambda v, rec: _recent_date(v["params"], rec),
     "ts_offset":      lambda v, rec: _ts_offset(v["params"], rec),
     "ts_add_field":   lambda v, rec: _ts_add_field(v["params"], rec),
     "date_offset":    lambda v, rec: _date_offset(v["params"], rec),
@@ -1880,33 +1897,36 @@ def _normalize(v: Any) -> str:
 def _infer_temporal_relationships(
     variables: list[dict], rules: dict | None = None
 ) -> list[tuple[str, str, int | None, int]]:
-    """Return authoritative/derived parent -> child datetime relationships.
+    """Infer safe, domain-neutral temporal relationships from the confirmed schema.
 
-    Sources, in order of authority:
-      1. explicit SchemaAgent temporal_rules;
-      2. confirmed-contract depends_on edges between datetime fields.
-
-    A temporal rule can therefore protect a relationship even when the CSV expresses
-    it in its description/business semantics rather than as depends_on.
+    Explicit temporal rules and datetime depends_on edges remain authoritative. In addition,
+    the generator protects universally meaningful field-name pairs such as start/end and
+    requested/confirmation. These inferred relations are deliberately narrow: unrelated
+    timestamps are never reordered merely because they share a generic word like ``date``.
     """
     by_name = {str(v.get("name")): v for v in variables if v.get("name")}
     out: list[tuple[str, str, int | None, int]] = []
     seen: set[tuple[str, str]] = set()
 
+    def add_relation(parent: str, child: str, max_gap: int | None, min_gap: int = 0) -> None:
+        if parent == child or parent not in by_name or child not in by_name:
+            return
+        if str(by_name[parent].get("dtype", "")).strip().lower() != "datetime":
+            return
+        if str(by_name[child].get("dtype", "")).strip().lower() != "datetime":
+            return
+        key = (parent, child)
+        if key not in seen:
+            seen.add(key)
+            out.append((parent, child, max_gap, max(0, int(min_gap))))
+
+    # 1) Explicit rules supplied by the confirmed scenario.
     for item in (rules or {}).get("temporal_rules", []) or []:
         if not isinstance(item, dict):
             continue
         parent = str(item.get("before", ""))
         child = str(item.get("after", ""))
-        if not parent or not child or parent == child:
-            continue
-        parent_var = by_name.get(parent)
-        child_var = by_name.get(child)
-        if not parent_var or not child_var:
-            continue
-        if str(parent_var.get("dtype", "")).strip().lower() != "datetime":
-            continue
-        if str(child_var.get("dtype", "")).strip().lower() != "datetime":
+        if not parent or not child:
             continue
         max_gap = None
         min_gap = 0
@@ -1920,25 +1940,55 @@ def _infer_temporal_relationships(
                 min_gap = max(0, int(float(item.get("min_delay_seconds"))))
         except (TypeError, ValueError):
             min_gap = 0
-        key = (parent, child)
-        if key not in seen:
-            seen.add(key)
-            out.append((parent, child, max_gap, min_gap))
+        add_relation(parent, child, max_gap, min_gap)
 
-    # CSV dependency edges are causal by construction for datetime dependencies.
+    # 2) Explicit depends_on edges between datetime fields.
     for child_name, child in by_name.items():
         if str(child.get("dtype", "")).strip().lower() != "datetime":
             continue
         for dep in child.get("depends_on", []) or []:
             parent_name = str(dep)
-            parent = by_name.get(parent_name)
-            if not parent or str(parent.get("dtype", "")).strip().lower() != "datetime":
+            if parent_name in by_name and str(by_name[parent_name].get("dtype", "")).strip().lower() == "datetime":
+                add_relation(parent_name, child_name, _temporal_delay_limit_seconds(child, by_name[parent_name]), 0)
+
+    def add_suffix_pair(start_suffixes: tuple[str, ...], end_suffixes: tuple[str, ...], max_gap: int | None, label_contains: tuple[str, ...] = ()) -> None:
+        for start_name in list(by_name):
+            low = start_name.casefold()
+            matching_suffix = next((suffix for suffix in start_suffixes if low.endswith(suffix)), None)
+            if not matching_suffix:
                 continue
-            key = (parent_name, child_name)
-            if key in seen:
+            prefix = low[:-len(matching_suffix)]
+            if label_contains and not all(token in low for token in label_contains):
                 continue
-            seen.add(key)
-            out.append((parent_name, child_name, _temporal_delay_limit_seconds(child, parent), 0))
+            for end_suffix in end_suffixes:
+                end_name = prefix + end_suffix
+                if end_name in by_name:
+                    add_relation(start_name, end_name, max_gap, 0)
+                    break
+
+    # 3) Universal validity windows. A one-year ceiling prevents absurd month/year spans while
+    # remaining broad enough for contractual/customer validity periods.
+    add_suffix_pair(("_start_date_time", "_start_datetime", "_start_date"), ("_end_date_time", "_end_datetime", "_end_date"), 365 * 86400)
+
+    # 4) Request/confirmation lifecycle. A confirmation later than the request is required; a
+    # 30-day cap avoids accidentally creating an unrelated month-long gap while remaining generic.
+    add_suffix_pair(("_requested_date_time", "_requested_datetime", "_requested_timestamp", "_requested_date"), ("_confirmation_date_time", "_confirmation_datetime", "_confirmation_timestamp", "_confirmation_date"), 30 * 86400)
+
+    # 5) Common presentation/decision pair. Only apply when the schema has an unambiguous offer-like
+    # presentation field and an unambiguous decision field; this protects recommendation/offer
+    # journeys across industries without coupling the rule to a particular domain.
+    presentation_fields = [
+        name for name, var in by_name.items()
+        if str(var.get("dtype", "")).strip().lower() == "datetime"
+        and any(token in name.casefold() for token in ("offer_presented", "offer_presentation", "presented_at", "presented_timestamp"))
+    ]
+    decision_fields = [
+        name for name, var in by_name.items()
+        if str(var.get("dtype", "")).strip().lower() == "datetime"
+        and any(token in name.casefold() for token in ("decision_timestamp", "decision_date", "decision_at"))
+    ]
+    if len(presentation_fields) == 1 and len(decision_fields) == 1:
+        add_relation(presentation_fields[0], decision_fields[0], 7 * 86400, 0)
 
     return out
 
@@ -3180,7 +3230,9 @@ def _strict_validate_record(rec: dict, variables: list[dict], rules: dict | None
                 raise ValueError(f"{name} has invalid datetime value")
         elif dtype == "date":
             try:
-                date.fromisoformat(str(value)[:10])
+                parsed_date = date.fromisoformat(str(value))
+                if str(value) != parsed_date.isoformat():
+                    raise ValueError("non-canonical date")
             except Exception:
                 raise ValueError(f"{name} has invalid date value")
 
@@ -3270,10 +3322,29 @@ def _strict_validate_record(rec: dict, variables: list[dict], rules: dict | None
             end_name = name[:-len(suffix)] + "_end_datetime"
             if end_name in by_name:
                 _assert_order(name, end_name, "validity period")
-        if "requested" in low and low.endswith("_date_time"):
-            confirmation_candidates = [n for n in names if n.lower().endswith("_confirmation_date_time") and n.lower().rsplit("_confirmation_date_time",1)[0] == name[:-len("_requested_date_time")]]
-            for end_name in confirmation_candidates:
-                _assert_order(name, end_name, "request/confirmation lifecycle")
+        requested_suffixes = ("_requested_date_time", "_requested_datetime", "_requested_timestamp", "_requested_date")
+        confirmation_suffixes = ("_confirmation_date_time", "_confirmation_datetime", "_confirmation_timestamp", "_confirmation_date")
+        requested_suffix = next((suffix for suffix in requested_suffixes if low.endswith(suffix)), None)
+        if requested_suffix:
+            prefix = low[:-len(requested_suffix)]
+            for confirmation_suffix in confirmation_suffixes:
+                end_name = prefix + confirmation_suffix
+                if end_name in by_name:
+                    _assert_order(name, end_name, "request/confirmation lifecycle")
+                    break
+
+    presentation_fields = [
+        name for name, var in by_name.items()
+        if str(var.get("dtype", "")).strip().lower() == "datetime"
+        and any(token in name.casefold() for token in ("offer_presented", "offer_presentation", "presented_at", "presented_timestamp"))
+    ]
+    decision_fields = [
+        name for name, var in by_name.items()
+        if str(var.get("dtype", "")).strip().lower() == "datetime"
+        and any(token in name.casefold() for token in ("decision_timestamp", "decision_date", "decision_at"))
+    ]
+    if len(presentation_fields) == 1 and len(decision_fields) == 1:
+        _assert_order(presentation_fields[0], decision_fields[0], "presentation/decision lifecycle")
 
     # Formula safety: a final validator may never return a numerically incorrect formula field.
     for field, expr in _collect_formula_specs(variables, rules):
@@ -3491,13 +3562,18 @@ def _validate_record(
                 else: raise ValueError("invalid boolean")
                 issues.append(f"{name} coerced to boolean")
             elif dtype == "datetime" and _qa_parse_dt(value) is None:
-                rec[name] = _format_datetime(datetime.now(timezone.utc), params); issues.append(f"{name} repaired as datetime")
+                raise ValueError(f"{name} has invalid datetime value")
             elif dtype == "date":
-                try: date.fromisoformat(str(value)[:10])
-                except Exception: rec[name] = date.today().isoformat(); issues.append(f"{name} repaired as date")
-        except Exception:
-            rec[name] = _default_for_dtype(dtype)
-            issues.append(f"{name} repaired from invalid type")
+                try:
+                    parsed_date = date.fromisoformat(str(value))
+                    if str(value) != parsed_date.isoformat():
+                        raise ValueError("non-canonical date")
+                except Exception:
+                    raise ValueError(f"{name} has invalid date value")
+        except Exception as exc:
+            # Never replace a generation/contract failure with a dtype default such as 0, False,
+            # or an empty string. Those defaults turn bad records into plausible-looking data.
+            raise ValueError(f"{name} failed confirmed schema validation: {exc}") from exc
 
         if dtype in {"float", "decimal", "number", "numeric"} and isinstance(rec.get(name), (int, float)) and not isinstance(rec.get(name), bool):
             rec[name] = round(float(rec[name]), precision)

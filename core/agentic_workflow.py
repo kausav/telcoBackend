@@ -16,21 +16,13 @@ from core.dynamic_scenarios import new_draft_id, save_draft
 from core.errors import LLMUpstreamError
 from core.runtime_cache import get_proposal, set_proposal
 from core.scenario_variable_store import get_recommended, get_user_variables, save_proposal
-from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain, source_manifest
-from core.low_balance_variable_policy import (
-    dedupe_db_variable_sources,
-    dedupe_schema_fields_against_db,
-    validate_db_definition,
-    validate_low_balance_variable_sources,
-    reconcile_low_balance_variables,
-    semantic_signature,
-    official_catalog_by_name,
-)
+from core.json_domain_policy import is_json_grounded_domain, source_manifest
+from core.low_balance_variable_policy import validate_db_definition
 
 logger = logging.getLogger(__name__)
 from agents.intent_agent import GeminiIntentAgent
 from agents.schema_compiler import SchemaCompiler
-from core.industry_source_store import normalize_industry_key
+from core.industry_source_store import normalize_industry_key, semantic_exclusion_aliases, catalog_for_request
 
 
 class AgenticSchemaWorkflow:
@@ -94,61 +86,65 @@ class AgenticSchemaWorkflow:
         }
         return tuple(sorted(names))
 
-    @staticmethod
-    def _finalize_low_balance_schema(schema: ScenarioSchema, variables: list[dict[str, Any]]) -> ScenarioSchema:
-        """Remove source-stage false positives once DB-backed executable variables are overlaid.
-
-        The compiler evaluates official JSON variables before the Mongo overlay exists. A proposal
-        can therefore legitimately compile with zero *new* official fields even though the final
-        merged schema contains many executable DB variables. The persisted draft must represent the
-        final executable state, not an intermediate compiler observation.
-        """
-        executable_names = {
-            str(item.get("name") or "").strip().casefold()
-            for item in (variables or [])
-            if isinstance(item, dict) and str(item.get("name") or "").strip()
-        }
-        if not executable_names:
-            return schema
-        stale_markers = {
-            "the low balance & top-up scenario did not yield any usable semantic variables.",
-            "the scenario did not yield any usable semantic variables.",
-        }
-        unresolved = [
-            item for item in schema.unresolved_items
-            if str(item).strip().casefold() not in stale_markers
-        ]
-        if unresolved == list(schema.unresolved_items):
-            return schema
-        return schema.model_copy(update={"unresolved_items": unresolved})
-
     @classmethod
     def _merge_db_variable_sources(
         cls,
         recommended: list[dict[str, Any]],
         user_selected: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Return DB variables with user selection overriding an exact-name recommendation.
+        """Merge persisted DB variables by exact or conservative semantic identity.
 
-        Validation is strict and non-mutating: the stored Mongo definition is used unchanged
-        after it has been checked for executability.
+        USER_SELECTED overrides DB_RECOMMENDED. A semantically equivalent DB field is represented
+        once in the executable schema; the stored definition itself is never rewritten.
         """
         ordered: list[dict[str, Any]] = []
-        positions: dict[str, int] = {}
-        for raw in [*(recommended or []), *(user_selected or [])]:
-            if not isinstance(raw, dict):
-                raise ValueError(f"Invalid MongoDB scenario variable: {raw!r}")
-            validate_db_definition(raw)
-            name = str(raw.get("name") or "").strip()
-            if not name:
-                raise ValueError("MongoDB scenario variable is missing its name")
-            key = name.casefold()
-            item = dict(raw)
-            if key in positions:
-                ordered[positions[key]] = item
-            else:
-                positions[key] = len(ordered)
-                ordered.append(item)
+        source_by_index: list[str] = []
+        by_name: dict[str, int] = {}
+        by_alias: dict[str, set[int]] = {}
+
+        def rebuild_alias_index() -> None:
+            by_alias.clear()
+            for index, item in enumerate(ordered):
+                for alias in semantic_exclusion_aliases(item):
+                    by_alias.setdefault(alias, set()).add(index)
+
+        for source_name, items in (("DB_RECOMMENDED", recommended or []), ("USER_SELECTED", user_selected or [])):
+            for raw in items:
+                if not isinstance(raw, dict):
+                    raise ValueError(f"Invalid MongoDB scenario variable: {raw!r}")
+                validate_db_definition(raw)
+                name = str(raw.get("name") or "").strip()
+                if not name:
+                    raise ValueError("MongoDB scenario variable is missing its name")
+                key = name.casefold()
+                item = dict(raw)
+                exact_index = by_name.get(key)
+                alias_matches = sorted({index for alias in semantic_exclusion_aliases(item) for index in by_alias.get(alias, set())})
+                match_indices = [exact_index] if exact_index is not None else alias_matches
+
+                if match_indices:
+                    index = match_indices[0]
+                    # If one DB definition is semantically equivalent to multiple already-stored
+                    # definitions, the input itself is ambiguous. Failing closed is safer than
+                    # letting set/hash iteration choose a different replacement on each process.
+                    if len(set(match_indices)) > 1:
+                        existing_names = sorted(str(ordered[i].get("name") or "") for i in match_indices)
+                        raise ValueError(
+                            f"MongoDB scenario variable '{name}' semantically duplicates multiple existing variables: "
+                            + ", ".join(existing_names)
+                        )
+                    old_key = str(ordered[index].get("name") or "").strip().casefold()
+                    ordered[index] = item
+                    if old_key and old_key != key:
+                        by_name.pop(old_key, None)
+                    by_name[key] = index
+                    source_by_index[index] = source_name
+                else:
+                    index = len(ordered)
+                    ordered.append(item)
+                    source_by_index.append(source_name)
+                    by_name[key] = index
+                rebuild_alias_index()
         return ordered
 
     @classmethod
@@ -156,6 +152,7 @@ class AgenticSchemaWorkflow:
         cls,
         req: ScenarioProposeRequest,
         db_variables: list[dict[str, Any]],
+        source_sources: list[dict[str, Any]] | None = None,
     ) -> tuple:
         # The LLM output depends on the complete DB definitions because it must suppress
         # semantic duplicates, not merely exact-name duplicates. Hash the full definitions
@@ -163,10 +160,10 @@ class AgenticSchemaWorkflow:
         canonical_db = json.dumps(db_variables or [], sort_keys=True, separators=(",", ":"), default=str)
         db_fingerprint = hashlib.sha256(canonical_db.encode("utf-8")).hexdigest()
         source_fingerprint = hashlib.sha256(
-            json.dumps(source_manifest(req.industry_type, req.domain), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            json.dumps(source_sources or source_manifest(req.industry_type, req.domain), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
         return (
-            "agentic_proposal_v30_low_balance_source_boundary",
+            "agentic_proposal_v31_generic_source_semantic_boundary",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -184,14 +181,29 @@ class AgenticSchemaWorkflow:
         recommended: list[dict[str, Any]],
         user_selected: list[dict[str, Any]],
     ) -> tuple[ScenarioSchema, dict[str, str], dict[str, dict[str, Any]]]:
-        """Merge DB-controlled variables without allowing duplicate field names.
+        """Merge DB-controlled variables with semantic precedence over source aliases.
 
-        Precedence: user-selected > DB-recommended > LLM-generated.
+        Precedence: USER_SELECTED > DB_RECOMMENDED > source JSON. A DB definition is never rewritten.
+        When a DB variable represents the same business concept as a source field, the DB definition
+        replaces that source field in-place so the final schema cannot contain two columns that model
+        the same concept under different names.
         """
         source_by_name: dict[str, str] = {}
         raw_persisted_by_name: dict[str, dict[str, Any]] = {}
         ordered: list[GeneratedSchemaField] = []
         by_name: dict[str, GeneratedSchemaField] = {}
+        by_semantic_alias: dict[str, str] = {}
+
+        def rebuild_semantic_index() -> None:
+            by_semantic_alias.clear()
+            for field in ordered:
+                key = field.name.strip().casefold()
+                data = field.model_dump()
+                prov = field.provenance or {}
+                if prov.get("source_json_semantic_key"):
+                    data["semantic_key"] = prov.get("source_json_semantic_key")
+                for alias in semantic_exclusion_aliases(data):
+                    by_semantic_alias.setdefault(alias, key)
 
         def add_schema_fields(items: list[GeneratedSchemaField]) -> None:
             for field in items or []:
@@ -200,8 +212,11 @@ class AgenticSchemaWorkflow:
                     continue
                 ordered.append(field)
                 by_name[key] = field
+            rebuild_semantic_index()
+            for field in ordered:
+                key = field.name.strip().casefold()
                 generated_from = str(field.provenance.get("generated_from") or "").strip().lower()
-                source_by_name[key] = "MONGODB_JSON" if generated_from == "mongodb_json_source" else "LLM_GENERATED"
+                source_by_name.setdefault(key, "MONGODB_JSON" if generated_from == "mongodb_json_source" else "LLM_GENERATED")
 
         def add_persisted(items: list[dict[str, Any]], source: str) -> None:
             for raw in items or []:
@@ -212,16 +227,32 @@ class AgenticSchemaWorkflow:
                 if not key:
                     raise ValueError("MongoDB scenario variable is missing its name")
                 field = GeneratedSchemaField.model_validate(raw)
+                aliases = semantic_exclusion_aliases(raw)
                 if key in by_name:
-                    idx = next(i for i, existing in enumerate(ordered) if existing.name.strip().casefold() == key)
+                    replacement_key = key
+                else:
+                    semantic_matches = sorted({by_semantic_alias[a] for a in aliases if a in by_semantic_alias})
+                    if len(semantic_matches) > 1:
+                        raise ValueError(
+                            f"MongoDB scenario variable '{key}' semantically overlaps multiple source variables: "
+                            + ", ".join(sorted(semantic_matches))
+                        )
+                    replacement_key = semantic_matches[0] if semantic_matches else None
+                if replacement_key and replacement_key in by_name:
+                    idx = next(i for i, existing in enumerate(ordered) if existing.name.strip().casefold() == replacement_key)
+                    old_key = ordered[idx].name.strip().casefold()
                     ordered[idx] = field
+                    by_name.pop(old_key, None)
+                    source_by_name.pop(old_key, None)
+                    by_name[key] = field
+                    source_by_name[key] = source
+                    raw_persisted_by_name[key] = dict(raw)
                 else:
                     ordered.append(field)
-                by_name[key] = field
-                source_by_name[key] = source
-                # Keep the actual Mongo definition byte-for-byte at the dictionary level so
-                # it can be persisted/returned without silently stripping DB-owned metadata.
-                raw_persisted_by_name[key] = dict(raw)
+                    by_name[key] = field
+                    source_by_name[key] = source
+                    raw_persisted_by_name[key] = dict(raw)
+                rebuild_semantic_index()
 
         add_schema_fields(list(schema.fields))
         add_persisted(recommended, "DB_RECOMMENDED")
@@ -233,27 +264,20 @@ class AgenticSchemaWorkflow:
         prompt = req.business_scenario.strip()
         requested_scenario_id = req.requested_scenario_id.strip()
         industry_key = normalize_industry_key(req.industry_type)
-        low_balance = is_low_balance_domain(req.domain, req.industry_type)
-        json_grounded = is_json_grounded_domain(req.domain, industry_key)
-        # Mongo user-selected variables are still supported, but Low Balance proposals must not
-        # pull DB_RECOMMENDED variables. Standards variables for that journey come only from the
-        # active MongoDB industry/domain JSON source catalog.
-        recommended = [] if low_balance else get_recommended(requested_scenario_id, 1)
+        # Resolve the complete source catalog once. This supplies both the source fingerprint and
+        # compiler input, avoiding repeated MongoDB queries/extraction work on the same proposal.
+        source_catalog = catalog_for_request(req.industry_type, req.domain)
+        source_sources = list(source_catalog.get("sources") or [])
+        json_grounded = bool(source_sources)
+        # Persisted MongoDB variables remain authoritative overlays for every domain. The source
+        # selector receives their definitions up front so its breadth budget is spent only on new
+        # source concepts rather than fields that will later be replaced by DB-owned variables.
+        recommended = get_recommended(requested_scenario_id, 1)
         user_selected = (
             get_user_variables(req.user_id.strip(), requested_scenario_id, 1)
             if req.user_id and req.user_id.strip()
             else []
         )
-        if low_balance:
-            recommended, user_selected, suppressed_db_names = dedupe_db_variable_sources(
-                recommended, user_selected
-            )
-            if suppressed_db_names:
-                logger.info(
-                    "Low Balance suppressed duplicate MongoDB variables before proposal: %s",
-                    suppressed_db_names,
-                )
-
         db_variables = self._merge_db_variable_sources(recommended, user_selected)
         if not json_grounded and not db_variables:
             raise ValueError(
@@ -269,17 +293,9 @@ class AgenticSchemaWorkflow:
             "Use only the persisted MongoDB scenario variables supplied to you. Do not invent, rename, alias, or derive executable variable names. "
         )
         protected_name_set = set(self._variable_name_keys(db_variables))
-        if low_balance and db_variables:
-            # Do semantic DB-vs-JSON deduplication BEFORE the deterministic breadth budget.
-            # Otherwise a JSON alias such as topupbalance_is_auto_topup can consume one of the
-            # maximum official slots, only to be removed later when is_automatic_topup wins.
-            db_signatures = {
-                semantic_signature(item) for item in db_variables if isinstance(item, dict)
-            }
-            protected_name_set.update({
-                name for name, spec in official_catalog_by_name().items()
-                if semantic_signature(spec) in db_signatures
-            })
+        # Exact names remain a cheap provider-side exclusion. Semantic aliases are handled by the
+        # deterministic source selector using the full DB definitions, so a source equivalent such
+        # as `topup_balance.amount.amount` cannot consume breadth budget when DB already owns `recharge_amount`.
         protected_names = tuple(sorted(protected_name_set))
         agent_prompt = (
             f"Industry: {req.industry_type}\n"
@@ -296,18 +312,19 @@ class AgenticSchemaWorkflow:
             "Select variables that make the behavioral difference observable; do not use requestedScenarioId to achieve that difference. "
             "Use ALL request inputs except requestedScenarioId and entityKey as semantic/context signals: scenarioType, industryType, domain, "
             "businessScenario, typeOfData, country, and useCase must materially constrain the variable set, field parameters, scope, "
-            "and generation behavior. For Low Balance & Top-up, return only complementary official JSON variables from the supplied catalog; persisted MongoDB variables are supplied separately and must never be recreated or renamed."
+            "and generation behavior. Return only complementary source-backed variables from the supplied catalog; persisted MongoDB variables are supplied separately and must never be recreated or renamed."
         )
 
-        cid = ensure_conversation(requested_scenario_id, req.user_id, requested_scenario_id)
-        append_message(cid, "user", agent_prompt, requested_scenario_id=requested_scenario_id)
-        cache_key = self._cache_key(req, db_variables)
+        cache_key = self._cache_key(req, db_variables, source_sources)
         cached = get_proposal(cache_key)
         if cached is not None:
             intent = ScenarioIntent.model_validate(cached["intent"])
             schema = ScenarioSchema.model_validate(cached["schema"])
+            cid = ensure_conversation(requested_scenario_id, req.user_id, requested_scenario_id)
             logger.info("[AgenticSchemaWorkflow] Proposal cache hit; Gemini skipped.")
         else:
+            cid = ensure_conversation(requested_scenario_id, req.user_id, requested_scenario_id)
+            append_message(cid, "user", agent_prompt, requested_scenario_id=requested_scenario_id)
             intent = self._get_intent_agent().run(
                 agent_prompt,
                 country=req.country,
@@ -315,10 +332,11 @@ class AgenticSchemaWorkflow:
                 domain_query=req.domain,
                 excluded_variable_names=list(protected_names),
                 persisted_variables=db_variables,
+                source_catalog=source_catalog,
             )
             intent.industry_type = industry_key
             intent.domain = req.domain
-            intent.subdomain = req.use_case.strip().lower() if req.use_case.strip() else "unknown"
+            intent.subdomain = "unknown"
             if req.country:
                 intent.country = req.country
             intent.scenario_type = req.scenario_type
@@ -353,6 +371,7 @@ class AgenticSchemaWorkflow:
                     country=req.country,
                     excluded_field_names=list(protected_names),
                     external_variable_names=set(protected_name_set),
+                    external_variable_definitions=db_variables,
                 )
             else:
                 # No JSON source exists for this pair. The only executable definitions allowed
@@ -377,19 +396,6 @@ class AgenticSchemaWorkflow:
                 )
             set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
 
-        # For Low Balance, remove only official JSON fields that duplicate an authoritative DB
-        # variable by business use. DB fields are never modified or removed.
-        if low_balance:
-            filtered_fields, duplicate_names = dedupe_schema_fields_against_db(
-                list(schema.fields), db_variables
-            )
-            if duplicate_names:
-                logger.info(
-                    "Low Balance removed JSON variables duplicated by MongoDB definitions: %s",
-                    duplicate_names,
-                )
-            schema = schema.model_copy(update={"fields": filtered_fields})
-
         schema, variable_sources, raw_persisted_by_name = self._merge_persisted_variables(
             schema,
             recommended,
@@ -398,30 +404,11 @@ class AgenticSchemaWorkflow:
 
         unresolved_questions = self.compiler.approval_questions(intent, schema)
         variables, field_order = self._schema_to_variables(schema, raw_persisted_by_name)
-        if low_balance:
-            variables, variable_sources, db_variable_names, field_order = reconcile_low_balance_variables(
-                variables,
-                variable_sources,
-                db_variable_names=set(raw_persisted_by_name),
-                field_order=field_order,
-                db_variable_definitions=raw_persisted_by_name,
-            )
-            validate_low_balance_variable_sources(
-                variables,
-                variable_sources,
-                db_variable_names=db_variable_names,
-            )
-            schema = self._finalize_low_balance_schema(schema, variables)
         for variable in variables:
             key = str(variable.get("name") or "").strip().lower()
             persisted_source = variable_sources.get(key)
             if persisted_source:
-                # Low Balance keeps DB definitions unchanged and records provenance separately
-                # in the draft; other domains retain the legacy per-variable source annotation.
-                if not low_balance:
-                    variable["source"] = persisted_source
-                continue
-            if low_balance:
+                variable["source"] = persisted_source
                 continue
             if json_grounded:
                 variable["source"] = "MONGODB_JSON"
@@ -429,6 +416,12 @@ class AgenticSchemaWorkflow:
             variable["source"] = "LLM_GENERATED"
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
         entity_key = self._entity_key(req.entity_key, field_order, type_of_data)
+        variable_source_ids = {}
+        for field in schema.fields:
+            provenance = field.provenance if isinstance(field.provenance, dict) else {}
+            source_id = str(provenance.get("source_json_id") or "").strip()
+            if source_id and field.name.strip():
+                variable_source_ids[field.name.strip().casefold()] = source_id
 
         draft_id = new_draft_id()
         description = req.business_scenario
@@ -456,9 +449,10 @@ class AgenticSchemaWorkflow:
             "intent": intent.model_dump(),
             "schema": schema.model_dump(),
             "approval_questions": unresolved_questions,
-            "source_policy": ("mongodb_low_balance_source_documents" if low_balance else "mongodb_industry_source_documents") if json_grounded else "scenario_variables",
-            "source_documents": source_manifest(req.industry_type, req.domain) if json_grounded else [],
+            "source_policy": "mongodb_industry_source_documents" if json_grounded else "scenario_variables",
+            "source_documents": source_sources if json_grounded else [],
             "variable_sources": variable_sources,
+            "variable_source_ids": variable_source_ids,
             "db_variable_names": sorted(raw_persisted_by_name.keys()),
             "db_variable_definitions": raw_persisted_by_name,
         }
@@ -499,7 +493,7 @@ class AgenticSchemaWorkflow:
         edit: list[Any],
         delete: list[str],
     ) -> tuple[list[dict[str, Any]], list[str], dict[str, str], set[str]]:
-        """Apply HITL edits while preserving the single Low Balance source boundary."""
+        """Apply HITL edits while preserving the authoritative source/DB boundaries."""
         schema = ScenarioSchema.model_validate(draft["schema"])
         draft_variables = [
             dict(item)
@@ -522,49 +516,13 @@ class AgenticSchemaWorkflow:
             if str(name).strip()
         )
 
-        if is_low_balance_domain(draft.get("domain"), draft.get("industry_type")):
-            draft_variables, draft_source_by_name, draft_db_names, draft_order = reconcile_low_balance_variables(
-                draft_variables,
-                draft_source_by_name,
-                db_variable_names=draft_db_names,
-                field_order=list(draft.get("field_order") or []),
-                db_variable_definitions=draft.get("db_variable_definitions") or {},
-            )
-            # Legacy drafts can have DB variables that are missing from the compiled schema.
-            # Add the exact stored definitions as schema fields so confirmation operates on
-            # the complete executable variable set instead of manufacturing replacements.
-            existing_fields = {field.name.strip().casefold(): field for field in schema.fields}
-            field_by_key = dict(existing_fields)
-            for raw in draft_variables:
-                key = str(raw.get("name") or "").strip().casefold()
-                if key and key not in field_by_key:
-                    field_by_key[key] = GeneratedSchemaField.model_validate(raw)
-            rebuilt_fields: list[GeneratedSchemaField] = []
-            seen_keys: set[str] = set()
-            for name in draft_order:
-                key = str(name).strip().casefold()
-                field = field_by_key.get(key)
-                if field is not None and key not in seen_keys:
-                    rebuilt_fields.append(field)
-                    seen_keys.add(key)
-            for field in schema.fields:
-                key = field.name.strip().casefold()
-                if key not in seen_keys:
-                    rebuilt_fields.append(field)
-                    seen_keys.add(key)
-            for raw in draft_variables:
-                key = str(raw.get("name") or "").strip().casefold()
-                if key not in seen_keys:
-                    rebuilt_fields.append(GeneratedSchemaField.model_validate(raw))
-                    seen_keys.add(key)
-            if rebuilt_fields != list(schema.fields):
-                schema = schema.model_copy(update={"fields": rebuilt_fields})
+        # The proposal is already canonicalized against its source catalog and DB overlays. Do not
+        # run the legacy Low Balance reconciliation layer here; it would reintroduce telecom-specific
+        # naming and could discard legitimate source-backed fields from other scenarios.
 
         # Concept labels are soft hints. Only genuinely executable unresolved requirements block confirmation.
         # Reconcile compiler-stage diagnostics against the already merged executable variable set
         # before evaluating anything as a blocking confirmation requirement.
-        if is_low_balance_domain(draft.get("domain"), draft.get("industry_type")):
-            schema = AgenticSchemaWorkflow._finalize_low_balance_schema(schema, draft_variables)
         external_db_names = set(draft_db_names)
         proposed_names = {
             str(item.get("name") or "").strip().casefold()
@@ -581,7 +539,7 @@ class AgenticSchemaWorkflow:
             if "entity key '" in lower or "requested entity key '" in lower:
                 marker = lower.split("entity key '", 1)[-1]
                 candidate = marker.split("'", 1)[0].strip().casefold()
-                if candidate in external_db_names or candidate in proposed_names or SchemaCompiler.is_mandatory_telecom_field(candidate):
+                if candidate in external_db_names or candidate in proposed_names or candidate == str(draft.get("entity_key") or "").strip().casefold():
                     continue
             blocking_unresolved.append(text)
         if blocking_unresolved:
@@ -591,18 +549,13 @@ class AgenticSchemaWorkflow:
             )
 
         fields_by_name = {field.name: field for field in schema.fields}
-        telecom_context = normalize_industry_key(draft.get("industry_type")) == "telecom"
-        mandatory_telecom = (
-            {"customer_id", "account_id", "msisdn"}
-            if is_low_balance_domain(draft.get("domain"), draft.get("industry_type"))
-            else ({"subscriber_id", "account_id", "msisdn"} if telecom_context else set())
-        )
+        mandatory_entity_fields = {str(draft.get("entity_key") or "").strip()} - {""}
         delete_set = {str(name).strip() for name in delete if str(name).strip()}
         for name in delete_set:
             if name not in fields_by_name:
                 raise ValueError(f"HITL cannot delete unknown agentic field '{name}'")
-            if name in mandatory_telecom:
-                raise ValueError(f"HITL cannot delete mandatory telecom field '{name}'")
+            if name in mandatory_entity_fields:
+                raise ValueError(f"HITL cannot delete the requested entity key field '{name}'")
             if fields_by_name[name].required:
                 raise ValueError(f"HITL cannot delete required field '{name}'")
 
@@ -682,20 +635,6 @@ class AgenticSchemaWorkflow:
                 data.pop("provenance", None)
             variables.append(data)
             field_order.append(field.name)
-
-        if is_low_balance_domain(draft.get("domain"), draft.get("industry_type")):
-            variables, draft_source_by_name, draft_db_names, field_order = reconcile_low_balance_variables(
-                variables,
-                draft_source_by_name,
-                db_variable_names=draft_db_names,
-                field_order=field_order,
-            )
-            validate_low_balance_variable_sources(
-                variables,
-                draft_source_by_name,
-                db_variable_names=draft_db_names,
-            )
-            schema = AgenticSchemaWorkflow._finalize_low_balance_schema(schema, variables)
 
         if draft.get("type_of_data") == "transactional" and draft.get("entity_key") not in field_order:
             raise ValueError("HITL changes would remove the transactional entity key")

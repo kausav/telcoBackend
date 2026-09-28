@@ -7,3 +7,4 @@ langgraph>=1.0.0
 python-multipart>=0.0.9
 PyYAML>=6.0
 pymongo>=4.10,<5
+orjson>=3.10

@@ -16,10 +16,16 @@ from typing import Any
 from core.agentic_models import ScenarioIntent
 from core.errors import LLMUpstreamError
 from core.llm_client import GeminiClient
-from core.json_domain_policy import catalog_for_request, is_json_grounded_domain, is_low_balance_domain
-from core.industry_source_store import normalize_lookup_key, validate_catalog_selection, dedupe_catalog_against_db, select_json_source_catalog
-from core.low_balance_variable_policy import validate_llm_official_selection, dedupe_against_db
-from config.runtime import JSON_SOURCE_LLM_CATALOG_LIMIT
+from core.json_domain_policy import is_json_grounded_domain
+from core.industry_source_store import (
+    catalog_for_request,
+    normalize_lookup_key,
+    select_json_source_catalog,
+    semantic_exclusion_aliases,
+    validate_catalog_selection,
+    dedupe_catalog_against_db,
+)
+from config.runtime import JSON_SOURCE_LLM_CATALOG_LIMIT, JSON_SOURCE_LLM_FIELDS_PER_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +81,11 @@ IMPORTANT BOUNDARIES:
 - Do not propose unsupported nested/object fields when a flat synthetic dataset cannot deterministically
   populate their nested structure.
 
-Return this JSON shape. For non-telecom industries, set subdomain to "unknown":
+Return this JSON shape. `subdomain` is optional domain context; use "unknown" when the supplied request/source catalog does not define a meaningful subdomain taxonomy.
 {
-  "industry_type": "telecom",
+  "industry_type": "...",
   "domain": "...",
-  "subdomain": "prepaid|postpaid|charging|usage|customer|network|unknown",
+  "subdomain": "unknown",
   "scenario_type": "...",
   "type_of_data": "transactional|aggregational",
   "entity_key": "...",
@@ -201,15 +207,17 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     # These are backend-owned and are overwritten after validation, so invalid model
     # guesses here should never make the provider request or application response fail.
     if not isinstance(normalized.get("industry_type"), str):
-        normalized["industry_type"] = "telecom"
+        normalized["industry_type"] = ""
     if not isinstance(normalized.get("domain"), str):
         normalized["domain"] = ""
     if not isinstance(normalized.get("scenario_type"), str):
         normalized["scenario_type"] = ""
     if not isinstance(normalized.get("type_of_data"), str):
         normalized["type_of_data"] = "transactional"
-    if normalized.get("subdomain") not in {"prepaid", "postpaid", "charging", "usage", "customer", "network", "unknown"}:
+    if not isinstance(normalized.get("subdomain"), str) or not normalized.get("subdomain", "").strip():
         normalized["subdomain"] = "unknown"
+    else:
+        normalized["subdomain"] = str(normalized["subdomain"]).strip()[:100]
     if not isinstance(normalized.get("entity_key"), str):
         normalized["entity_key"] = ""
     if not isinstance(normalized.get("use_case"), str):
@@ -229,6 +237,59 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 normalized[key] = None
 
     return normalized
+
+
+def _compact_source_catalog_for_llm(models: list[dict[str, Any]], max_fields_per_model: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build a compact model-card projection for Gemini.
+
+    Gemini only needs enough source vocabulary to identify relevant business resources. The
+    deterministic compiler subsequently expands the complete canonical MongoDB catalog, so sending
+    thousands of leaf fields here only increases latency without increasing executable fidelity.
+    """
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in models or []:
+        if not isinstance(row, dict):
+            continue
+        model = str(row.get("business_model") or row.get("model") or "").strip()
+        if not model:
+            continue
+        key = (model, str(row.get("source_id") or ""))
+        groups.setdefault(key, []).append(row)
+
+    cards: list[dict[str, Any]] = []
+    for (model, source_id), rows in sorted(groups.items()):
+        rows = sorted(
+            rows,
+            key=lambda r: (
+                0 if r.get("required") else 1,
+                0 if r.get("enum_values") else 1,
+                0 if str(r.get("dtype") or "").lower() in {"datetime", "date", "integer", "number", "float", "boolean"} else 1,
+                -int(r.get("depth", 0) or 0),
+                str(r.get("name") or ""),
+            ),
+        )
+        selected = rows[:max_fields_per_model]
+        cards.append({
+            "model": model,
+            "source_id": source_id,
+            "model_description": str((selected[0] if selected else {}).get("model_description") or "")[:300],
+            "field_count": len(rows),
+            "representative_fields": [
+                {
+                    "name": str(row.get("name") or ""),
+                    "dtype": str(row.get("dtype") or ""),
+                    "required": bool(row.get("required")),
+                    "description": str(row.get("description") or "")[:240],
+                }
+                for row in selected
+            ],
+        })
+    return cards, {
+        "projection_mode": "model_cards",
+        "source_scalar_count": len(models or []),
+        "model_card_count": len(cards),
+        "fields_per_model": max_fields_per_model,
+    }
 
 
 class GeminiIntentAgent:
@@ -257,8 +318,8 @@ class GeminiIntentAgent:
         domain_query: str | None = None,
         excluded_variable_names: list[str] | None = None,
         persisted_variables: list[dict[str, Any]] | None = None,
+        source_catalog: dict[str, Any] | None = None,
     ) -> ScenarioIntent:
-        low_balance = is_low_balance_domain(domain_query, industry_type)
         json_grounded = is_json_grounded_domain(domain_query, industry_type)
         excluded_names = {
             str(name).strip().casefold()
@@ -266,18 +327,28 @@ class GeminiIntentAgent:
             if str(name).strip()
         }
         if json_grounded:
-            catalog = catalog_for_request(industry_type, domain_query or "")
+            catalog = source_catalog or catalog_for_request(industry_type, domain_query or "")
             # The LLM receives a broad, deterministic projection for practical prompt size, while the
-            # final compiler always re-evaluates the COMPLETE MongoDB catalog. There is deliberately no
-            # Low Balance-only selection branch: breadth policy is shared across every industry/domain.
+            # final compiler always re-evaluates the COMPLETE MongoDB catalog. Breadth policy is shared
+            # across every industry and domain; source-model relevance, not a telecom-specific allow-list,
+            # determines which business resources expand.
+            db_semantic_exclusions: set[str] = set()
+            for item in persisted_variables or []:
+                if isinstance(item, dict):
+                    db_semantic_exclusions.update(semantic_exclusion_aliases(item))
             projected, projection_report = select_json_source_catalog(
                 [dict(row) for row in (catalog.get("models") or []) if isinstance(row, dict)],
                 business_context=request_context,
+                excluded_names=excluded_names,
+                excluded_semantic_keys=db_semantic_exclusions,
                 max_fields=JSON_SOURCE_LLM_CATALOG_LIMIT,
             )
+            compact_models, compact_report = _compact_source_catalog_for_llm(
+                projected, JSON_SOURCE_LLM_FIELDS_PER_MODEL
+            )
             prompt_catalog = dict(catalog)
-            prompt_catalog["models"] = projected
-            prompt_catalog["llm_projection"] = projection_report
+            prompt_catalog["models"] = compact_models
+            prompt_catalog["llm_projection"] = {**projection_report, **compact_report}
             catalog_text = json.dumps(prompt_catalog, separators=(",", ":"), sort_keys=True)
             grounding_header = (
                 "MONGODB INDUSTRY-SOURCE GROUNDING (authoritative):\n"
@@ -321,7 +392,6 @@ class GeminiIntentAgent:
             raise ValueError(
                 f"No active JSON source documents and no persisted MongoDB scenario variables exist for industryType='{industry_type}', domain='{domain_query or ''}'."
             )
-        scenario_focus = ""
         prompt = (
             grounding_header +
             f"{catalog_text}\n\n"
@@ -330,16 +400,20 @@ class GeminiIntentAgent:
             f"Selected industry: {industry_type}\n"
             f"Business domain: {domain_query or '<none>'}\n"
             f"Country: {country or '<none>'}\n\n"
-            "Create a RECALL-FIRST official-variable selection for this scenario. Do not return a small representative list. "
-            "Review the supplied catalog and include the largest set of DISTINCT source-backed fields that materially explain the scenario. "
-            "Use a coverage pass across relevant entities/models: identity and relationship anchors, profile/context, events/transactions, "
+            "Create a RECALL-FIRST official-variable relevance selection for this scenario. The numeric maximum is a CEILING, NOT a target: "
+            "never pad a schema with irrelevant, marginal, technical, or semantically duplicated variables just to reach that number. "
+            "Do not attempt to enumerate every field in the catalog. Instead, identify the strongest source-backed business anchors and relevant source models/entities "
+            "that prove what should be expanded. The deterministic compiler will then expand every meaningful scalar field from those relevant models up to the configured ceiling. "
+            "Cover the scenario's relevant business concepts: identity and relationship anchors, profile/context, transactions and events when explicitly relevant, "
             "states/statuses/reasons, timing/timestamps/dates, monetary/quantity/usage measures, decisions/outcomes, configuration/eligibility, "
-            "channels/methods, geography/segments, and other source-backed analytical signals. When a model/resource is clearly relevant, "
-            "include its other meaningful scalar business fields unless they are true semantic duplicates or technical/display metadata. "
-            "Do NOT intentionally keep the candidate list short, do NOT choose an arbitrary handful, and do NOT omit a field merely because "
-            "its name does not repeat the exact business-scenario wording. Never pad with API href/referredType/reference metadata, display-only "
-            "fields, or aliases. The final deterministic compiler uses the complete MongoDB catalog to expand this selection further, so the "
-            "LLM candidate list is a relevance signal, never the final variable-count gate. " + mandatory_line + "\n"
+            "channels/methods, geography/segments, lifecycle, and other source-backed analytical signals. "
+            "When a source model is clearly relevant, prefer its distinct business fields rather than wrapper copies or repeated CRUD/event representations. "
+            "A field is a true duplicate when it represents the same underlying source concept after wrapper/structural normalization; fields with similar types, descriptions, "
+            "or enum values but different business-resource meaning are not automatically duplicates. "
+            "Never pad with API href/referredType/reference metadata, display-only fields, transport plumbing, or privacy-sensitive customer contact fields when the request forbids PII. "
+            "Do not let one generic or ambiguous field (for example status, amount, balance, id, or a single LLM-selected field) make an otherwise unrelated resource relevant. "
+            "Use the scenario's domain, use case, business scenario, scenario type, data type, entity key, and country as relevance evidence. "
+            "The final deterministic compiler evaluates the complete canonical MongoDB source catalog, so this LLM output is a relevance signal only, never the final variable-count gate. " + mandatory_line + "\n"
             + (
                 "PERSISTED MONGODB VARIABLES (IMMUTABLE; NEVER RENAME OR MODIFY):\n"
                 + json.dumps([
@@ -399,37 +473,23 @@ class GeminiIntentAgent:
             payload = _normalize_payload(payload)
             if json_grounded:
                 notes = list(payload.get("notes") or [])
-                if low_balance:
-                    filtered, rejected = validate_llm_official_selection(payload.get("candidate_variables") or [])
-                    filtered, duplicates = dedupe_against_db(filtered, persisted_variables or [])
-                    if rejected:
-                        notes.append(
-                            "LLM-proposed Low Balance variable names outside the active MongoDB scalar catalog were rejected: "
-                            + ", ".join(rejected)
-                        )
-                    if duplicates:
-                        notes.append(
-                            "Official JSON variables semantically duplicated by MongoDB variables were suppressed; DB definitions remain authoritative: "
-                            + ", ".join(duplicates)
-                        )
-                else:
-                    catalog_by_name = {
-                        normalize_lookup_key(row.get("name")): dict(row)
-                        for row in (catalog.get("models") or [])
-                        if normalize_lookup_key(row.get("name"))
-                    }
-                    filtered, rejected = validate_catalog_selection(payload.get("candidate_variables") or [], catalog_by_name)
-                    filtered, duplicates = dedupe_catalog_against_db(filtered, persisted_variables or [])
-                    if rejected:
-                        notes.append(
-                            "LLM-proposed variable names outside the active MongoDB source catalog were rejected: "
-                            + ", ".join(rejected)
-                        )
-                    if duplicates:
-                        notes.append(
-                            "Source-backed variables with exact-name MongoDB duplicates were suppressed; DB definitions remain authoritative: "
-                            + ", ".join(duplicates)
-                        )
+                catalog_by_name = {
+                    normalize_lookup_key(row.get("name")): dict(row)
+                    for row in (catalog.get("models") or [])
+                    if normalize_lookup_key(row.get("name"))
+                }
+                filtered, rejected = validate_catalog_selection(payload.get("candidate_variables") or [], catalog_by_name)
+                filtered, duplicates = dedupe_catalog_against_db(filtered, persisted_variables or [])
+                if rejected:
+                    notes.append(
+                        "LLM-proposed variable names outside the active MongoDB source catalog were rejected: "
+                        + ", ".join(rejected)
+                    )
+                if duplicates:
+                    notes.append(
+                        "Source-backed variables semantically duplicated by MongoDB variables were suppressed; DB definitions remain authoritative: "
+                        + ", ".join(duplicates)
+                    )
                 payload["candidate_variables"] = filtered
                 payload["notes"] = notes[:50]
             intent = ScenarioIntent.model_validate(payload)

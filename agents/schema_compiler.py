@@ -8,9 +8,8 @@ import math
 import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
-from core.json_domain_policy import expanded_scalar_catalog, is_json_grounded_domain, is_low_balance_domain, source_manifest
-from core.industry_source_store import catalog_for_request, normalize_lookup_key, select_json_source_catalog
-from core.low_balance_variable_policy import official_catalog_by_name, select_low_balance_official_catalog
+from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain, source_manifest
+from core.industry_source_store import catalog_for_request, normalize_lookup_key, select_json_source_catalog, canonical_variable_semantic_key, semantic_exclusion_aliases
 from core.variable_quality import VariableQualityEngine
 from config.runtime import SCHEMA_MAX_VARIABLES, SCHEMA_MIN_VARIABLE_SCORE
 
@@ -30,20 +29,7 @@ def _is_entity_catalog_row(spec: dict[str, Any]) -> bool:
 class SchemaCompiler:
     """Compile executable schemas strictly from MongoDB source catalogs or persisted variables."""
 
-    # These fields are part of the public telecom row contract. Keep their exact
-    # names even when the rest of the schema uses fresh
-    # scenario-specific names. They are stable subscriber/account contact anchors.
-    REQUIRED_TELECOM_FIELDS = ("subscriber_id", "account_id", "msisdn")
-    REDUNDANT_MSISDN_FIELDS = {
-        "phonenumber", "mobile_number", "mobilenumber", "telephone_number",
-        "telephonenumber", "subscriber_phone", "subscriber_mobile",
-    }
     UNSUPPORTED_NESTED_DTYPES = {"object", "array"}
-    @classmethod
-    def is_mandatory_telecom_field(cls, name: str | None) -> bool:
-        normalized = cls._normalize_variable_name(name or "")
-        return normalized in {cls._normalize_variable_name(item) for item in cls.REQUIRED_TELECOM_FIELDS}
-
     def __init__(self):
         """Create a compiler whose only industry-standard input is MongoDB."""
 
@@ -197,7 +183,7 @@ class SchemaCompiler:
                 "days_back": 365,
             }
         if dtype == "date":
-            return "recent_datetime", "date", {
+            return "recent_date", "date", {
                 "timezone": "Asia/Kolkata" if country_code == "IN" else "UTC",
                 "days_back": 365,
             }
@@ -254,8 +240,6 @@ class SchemaCompiler:
     def _json_source_contract(
         spec: dict[str, object],
         country: str | None,
-        *,
-        low_balance: bool = False,
     ) -> tuple[str, str, dict]:
         """Create an executable generator contract from a flattened Swagger scalar leaf."""
         dtype = str(spec.get("dtype") or "string").strip().lower()
@@ -266,10 +250,19 @@ class SchemaCompiler:
         if enum_values:
             return "weighted_choice", "categorical", {"choices": enum_values, "weights": [1.0] * len(enum_values)}
 
-        # Low Balance has an explicit public customer identity contract. The source field is
-        # still TMF629 Customer.id; only the deterministic synthetic representation is fixed here.
-        if low_balance and SchemaCompiler._normalize_variable_name(str(spec.get("name") or "")) == "customer_id":
-            return "prefixed_int", "string", {"prefix": "cust-", "digits": 8}
+        # Honor JSON Schema/OpenAPI temporal formats before generic string semantics. Swagger often
+        # declares dates as ``type=string, format=date-time``; treating those as ordinary semantic
+        # strings produces non-dates that later validators cannot reason about chronologically.
+        if fmt in {"date-time", "datetime", "timestamp"} or dtype in {"date-time", "datetime", "timestamp"}:
+            return "recent_datetime", "datetime", {
+                "timezone": "Asia/Kolkata" if str(country or "IN").upper() == "IN" else "UTC",
+                "days_back": 365,
+            }
+        if fmt == "date" or dtype == "date":
+            return "recent_date", "date", {
+                "timezone": "Asia/Kolkata" if str(country or "IN").upper() == "IN" else "UTC",
+                "days_back": 365,
+            }
 
         # Honor standard-defined string formats before generic semantic name heuristics. This is
         # important for non-telecom sources where a field named ``id`` may legally be a UUID/URI.
@@ -311,16 +304,6 @@ class SchemaCompiler:
             return "weighted_choice", "categorical", {"choices": explicit, "weights": [1.0] * len(explicit)}
         if dtype in {"boolean", "bool"}:
             return "weighted_choice", "boolean", {"choices": [False, True], "weights": [0.5, 0.5]}
-        if fmt in {"date-time", "datetime", "timestamp"} or dtype in {"date-time", "datetime", "timestamp"}:
-            return "recent_datetime", "datetime", {
-                "timezone": "Asia/Kolkata" if str(country or "IN").upper() == "IN" else "UTC",
-                "days_back": 365,
-            }
-        if dtype == "date":
-            return "recent_datetime", "date", {
-                "timezone": "Asia/Kolkata" if str(country or "IN").upper() == "IN" else "UTC",
-                "days_back": 365,
-            }
         if dtype in {"integer", "int", "bigint", "smallint"}:
             minimum_raw = spec.get("minimum", 0)
             maximum_raw = spec.get("maximum", 100)
@@ -436,7 +419,6 @@ class SchemaCompiler:
         normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
         normalized_industry = str(intent.industry_type or "generic").strip().lower()
         telecom_context = normalized_industry in {"telecom", "telecommunications", "telecommunication"}
-        low_balance_context = is_low_balance_domain(intent.domain, intent.industry_type)
         excluded_keys = {
             self._normalize_variable_name(name)
             for name in (excluded_field_names or [])
@@ -501,13 +483,11 @@ class SchemaCompiler:
                 if self._normalize_variable_name(str(item.get("name") or "")) != "customer_id"
             ]
 
-        # Generic domains use the quality engine as a second candidate-pruning gate.
-        # Low Balance is different: candidate_variables_override is already the output of the
-        # dedicated deterministic TMF654/TMF629 relevance selector. Running the generic quality
-        # engine again would silently narrow that source-grounded selection and can discard valid
-        # Bucket/party/requestor fields before the Low Balance integrity assertion runs.
-        # Preserve the selected official set and use the quality engine only for per-field scoring
-        # and provenance below.
+        # For JSON-source compilation, candidate_variables_override has already passed through the
+        # deterministic source relevance selector. Running a second quality-based pruning stage would
+        # narrow the authoritative source-backed selection and could discard valid fields after the
+        # source relevance decision has already been made. Preserve the selected source set and use
+        # the quality engine only for per-field scoring and provenance below.
         quality_engine = VariableQualityEngine(
             max_variables=max_variables if max_variables is not None else SCHEMA_MAX_VARIABLES,
             min_score=SCHEMA_MIN_VARIABLE_SCORE,
@@ -586,17 +566,15 @@ class SchemaCompiler:
                     f"Ungrounded executable variable '{original_name}' reached MongoDB JSON compilation"
                 )
             runtime_generator, dtype, params = self._json_source_contract(
-                source_spec, country, low_balance=low_balance_context
+                source_spec, country
             )
             if not runtime_generator or not dtype or not isinstance(params, dict):
-                # Fail closed: every source-backed field must have a deterministic generator.
-                continue
-            # The executable contract is derived exclusively from the selected MongoDB JSON
-            # leaf. No telecom registry, static industry profile, or LLM-invented fallback is
-            # consulted from this path.
-            if not runtime_generator or not dtype or not isinstance(params, dict):
                 # Fail closed: every source-backed field must have a concrete deterministic generator.
-                continue
+                raise ValueError(
+                    f"Source-backed field '{original_name}' has no executable generator contract"
+                )
+            # The executable contract is derived exclusively from the selected MongoDB JSON
+            # leaf. No static industry profile or LLM-invented fallback is consulted here.
 
             role = str(idea.get("role") or "other")
             grain = str(idea.get("grain") or ("entity" if original_name == entity_key else "transaction"))
@@ -608,18 +586,16 @@ class SchemaCompiler:
             ]
             if unresolved_dependencies:
                 # A selected field with an unrepresentable prerequisite cannot produce a faithful
-                # executable contract. Drop it rather than silently weakening its dependency chain.
-                continue
+                # executable contract. Fail confirmation rather than silently weakening the source contract.
+                raise ValueError(
+                    f"Source-backed field '{original_name}' has unresolved dependencies: {unresolved_dependencies}"
+                )
             deps = self._merge_dependencies(idea, name_map, grain, entity_key)
-            if original_name == entity_key or original_name in self.REQUIRED_TELECOM_FIELDS:
+            if original_name == entity_key:
                 grain = "entity"
                 deps = []
-            low_balance_customer = is_low_balance_domain(intent.domain, intent.industry_type) and self._normalize_variable_name(original_name) == "customer_id"
-            required = bool(source_spec.get("required")) or original_name == entity_key or low_balance_customer
+            required = bool(source_spec.get("required")) or original_name == entity_key
             nullable = False if required else bool(source_spec.get("nullable", not bool(source_spec.get("required"))))
-            if low_balance_customer:
-                grain = "entity"
-                deps = []
             description = str(idea.get("description") or "").strip() or f"Scenario-specific {role.replace('_', ' ')} attribute for {intent.domain}."
             source_from_json = isinstance(source_spec, dict)
             provenance = {
@@ -628,6 +604,7 @@ class SchemaCompiler:
                 "source_json_id": source_spec.get("source_id") if source_from_json else None,
                 "source_json_model": source_spec.get("model") if source_from_json else None,
                 "source_json_path": source_spec.get("path") if source_from_json else None,
+                "source_json_semantic_key": source_spec.get("semantic_key") if source_from_json else None,
                 "source_json_paths": list(source_spec.get("source_paths") or []) if source_from_json else [],
                 "source_json_aliases": list(source_spec.get("source_aliases") or []) if source_from_json else [],
                 "grain": grain,
@@ -664,6 +641,7 @@ class SchemaCompiler:
         scenario_type: str | None = None,
         excluded_field_names: list[str] | None = None,
         external_variable_names: set[str] | None = None,
+        external_variable_definitions: list[dict[str, Any]] | None = None,
         max_variables: int | None = None,
     ) -> ScenarioSchema:
         """Compile any MongoDB-backed standards domain without assuming telecom semantics."""
@@ -693,12 +671,19 @@ class SchemaCompiler:
             for name in (excluded_field_names or [])
             if normalize_lookup_key(name)
         }
-        variable_budget = max(1, int(max_variables if max_variables is not None else SCHEMA_MAX_VARIABLES))
+        requested_budget = max(0, int(max_variables if max_variables is not None else SCHEMA_MAX_VARIABLES))
+        db_variable_count = sum(1 for item in (external_variable_definitions or []) if isinstance(item, dict) and str(item.get("name") or "").strip())
+        variable_budget = max(0, requested_budget - db_variable_count)
+        external_semantic_aliases: set[str] = set()
+        for external in external_variable_definitions or []:
+            if isinstance(external, dict):
+                external_semantic_aliases.update(semantic_exclusion_aliases(external))
         selected_rows, selection_report = select_json_source_catalog(
             catalog_rows,
             business_context=business_context,
             preferred_names=preferred_names,
             excluded_names=excluded,
+            excluded_semantic_keys=external_semantic_aliases,
             max_fields=variable_budget,
         )
         selected_names = {normalize_lookup_key(row.get("name")) for row in selected_rows}
@@ -768,10 +753,15 @@ class SchemaCompiler:
             })
 
         working_intent = intent
+        build_entity_key = (
+            resolved_entity_key
+            if resolved_entity_key and normalize_lookup_key(resolved_entity_key) in selected_names
+            else None
+        )
         fields = self._build_fresh_fields(
             working_intent,
             [],
-            entity_key=resolved_entity_key,
+            entity_key=build_entity_key,
             country=country or "GLOBAL",
             type_of_data=normalized_type,
             scenario_mode=str(scenario_type or intent.scenario_type or "mixed"),
@@ -838,224 +828,6 @@ class SchemaCompiler:
             warnings=warnings,
         )
 
-    def _compile_low_balance_json_grounded(
-        self,
-        intent: ScenarioIntent,
-        *,
-        business_scenario: str,
-        use_case: str,
-        country: str | None,
-        type_of_data: str | None,
-        entity_key: str | None,
-        scenario_type: str | None = None,
-        excluded_field_names: list[str] | None = None,
-        external_variable_names: set[str] | None = None,
-        max_variables: int | None = None,
-    ) -> ScenarioSchema:
-        """Compile Low Balance & Top-up from the active MongoDB JSON source catalog."""
-        normalized_country = str(country or "IN").strip().upper()
-        normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
-        normalized_scenario = str(scenario_type or intent.scenario_type or "").strip()
-        scenario_mode = classify_outcome_mode(
-            scenario_type=normalized_scenario,
-            expected_outcome="",
-            business_response="",
-            business_scenario=business_scenario,
-        )
-        variable_budget = max(1, int(max_variables if max_variables is not None else SCHEMA_MAX_VARIABLES))
-
-        # Gemini selects/reviews exact official names, but it must not determine breadth by itself.
-        # The deterministic selector ranks the complete supplied MongoDB source catalog according to
-        # scenarioType/businessScenario and keeps the widest high-quality relevant set. This is what
-        # makes Normal and Suppression materially different even when the business description is the
-        # same.
-        catalog = official_catalog_by_name()
-        llm_selected_names = {
-            self._normalize_variable_name(idea.name)
-            for idea in intent.candidate_variables
-            if self._normalize_variable_name(idea.name) in catalog
-        }
-        excluded_names = {
-            self._normalize_variable_name(name)
-            for name in (excluded_field_names or [])
-            if self._normalize_variable_name(name)
-        }
-        selected_catalog, selection_report = select_low_balance_official_catalog(
-            outcome_mode=scenario_mode,
-            business_scenario=business_scenario,
-            scenario_type=normalized_scenario,
-            excluded_names=excluded_names,
-            preferred_names=llm_selected_names,
-            max_fields=variable_budget,
-        )
-        ordered_names = [
-            self._normalize_variable_name(row.get("name"))
-            for row in selected_catalog
-            if self._normalize_variable_name(row.get("name")) in catalog
-        ]
-
-        selected_source_ideas: list[dict[str, object]] = []
-        clean_selected_ideas: list[VariableIdea] = []
-        for name in ordered_names:
-            spec = catalog[name]
-            clean_idea = VariableIdea.model_validate({
-                "name": str(spec["name"]),
-                "description": str(spec.get("description") or "")[:500],
-                "role": (
-                    "timing" if str(spec.get("format") or "").lower() == "date-time" or str(spec.get("dtype") or "").lower() in {"date", "datetime", "timestamp"}
-                    else "measurement" if str(spec.get("dtype") or "").lower() in {"integer", "number", "float", "double", "decimal"}
-                    else "status" if spec.get("enum_values") and any(token in str(spec.get("path") or "").lower() for token in ("status", "state", "reason"))
-                    else "identity" if str(spec.get("path") or "").lower().endswith(".id")
-                    else "configuration" if any(token in str(spec.get("path") or "").lower() for token in ("isautotopup", "recurringperiod", "numberofperiods"))
-                    else "profile" if str(spec.get("model") or "").lower() == "customer"
-                    else "other"
-                ),
-                "grain": (
-                    "entity" if str(spec.get("model") or "").lower() == "customer"
-                    else "transaction"
-                ),
-                "dtype": (
-                    "integer" if str(spec.get("dtype") or "").lower() in {"integer", "int"}
-                    else "float" if str(spec.get("dtype") or "").lower() in {"number", "float", "double", "decimal"}
-                    else "datetime" if str(spec.get("format") or "").lower() in {"date-time", "datetime", "timestamp"} or str(spec.get("dtype") or "").lower() in {"date-time", "datetime", "timestamp"}
-                    else "date" if str(spec.get("dtype") or "").lower() == "date"
-                    else "categorical" if spec.get("enum_values")
-                    else "boolean" if str(spec.get("dtype") or "").lower() in {"boolean", "bool"}
-                    else "string"
-                ),
-                "depends_on": [],
-            })
-            clean_selected_ideas.append(clean_idea)
-            selected_source_ideas.append({
-                **clean_idea.model_dump(),
-                "name": str(spec["name"]),
-                "description": str(spec.get("description") or "")[:500],
-                "_json_source_spec": dict(spec),
-                "_json_source": True,
-                "_preserve_name": True,
-                "_registry_entity": f"{spec.get('source_id', '')}__{spec.get('model', '')}",
-                "_registry_entity_name": str(spec.get("model") or ""),
-                "_registry_required": bool(spec.get("required")),
-                "_registry_nullable": not bool(spec.get("required")),
-            })
-
-        # Persist only the clean scenario-specific semantic selection on the intent. Source metadata
-        # is passed separately to _build_fresh_fields and never enters VariableIdea.
-        intent = intent.model_copy(update={"candidate_variables": clean_selected_ideas})
-
-        # Source models are already present in the MongoDB catalog. No second registry is consulted.
-        # The flat executable contract is derived directly from the selected scalar source rows.
-        entities: list[Any] = []
-        unresolved: list[str] = []
-        if not ordered_names:
-            unresolved.append("The active MongoDB JSON source catalog contains no usable Low Balance & Top-up scalar variables.")
-
-        fields = self._build_fresh_fields(
-            intent,
-            entities,
-            entity_key=None,
-            country=normalized_country,
-            type_of_data=normalized_type,
-            scenario_mode=scenario_mode,
-            # The deterministic Low Balance selector defines breadth. The quality engine may
-            # deduplicate true semantic duplicates, but it must not reduce this source-grounded
-            # selection merely because Gemini returned a narrower candidate list.
-            max_variables=max(len(selected_source_ideas), variable_budget),
-            include_all_registry_scalars=False,
-            include_all_json_source_scalars=False,
-            include_application_telecom_anchors=False,
-            excluded_field_names=excluded_field_names,
-            candidate_variables_override=selected_source_ideas,
-            business_scenario=business_scenario,
-            context_text=" ".join(
-                str(value or "") for value in (
-                    intent.industry_type, intent.domain, intent.subdomain, normalized_scenario,
-                    normalized_type, country or "", use_case or "", business_scenario,
-                )
-            ),
-        )
-        # Fail closed if an official field selected by the deterministic Low Balance policy
-        # disappears during executable contract construction. The policy intentionally selects
-        # the widest high-quality scenario-relevant set; silently dropping one would make the
-        # final breadth dependent on downstream heuristics.
-        expected_official = {self._normalize_variable_name(name) for name in ordered_names}
-        actual_official = {
-            self._normalize_variable_name(field.name)
-            for field in fields
-            if str(field.provenance.get("generated_from") or "") == "mongodb_json_source"
-        }
-        missing_official = sorted(expected_official - actual_official)
-        if missing_official:
-            raise ValueError(
-                "Low Balance official-variable selection was narrowed during compilation; "
-                "missing executable official fields: " + ", ".join(missing_official)
-            )
-        field_names = [f.name for f in fields]
-        # A JSON-grounded compile may intentionally produce zero new official fields when the
-        # complete usable variable set is supplied by MongoDB. External variables are executable
-        # schema fields for this lifecycle, so an empty *official* selection is not the same as an
-        # empty *final* variable set. Do not persist a false unresolved requirement that /scenario/confirm
-        # will later reject after the DB overlay has already supplied executable fields.
-        external_keys = {
-            self._normalize_variable_name(name)
-            for name in (external_variable_names or set())
-            if self._normalize_variable_name(name)
-        }
-        if not fields and not external_keys:
-            unresolved.append("The Low Balance & Top-up scenario did not yield any usable semantic variables.")
-        if (
-            entity_key
-            and self._normalize_variable_name(entity_key) not in {self._normalize_variable_name(n) for n in field_names}
-            and self._normalize_variable_name(entity_key) not in external_keys
-            and not self.is_mandatory_telecom_field(entity_key)
-        ):
-            unresolved.append(f"Requested entity key '{entity_key}' could not be represented by the proposed variables")
-
-        relationships: list[SchemaRelationship] = []
-        standards = [dict(item) for item in source_manifest(intent.industry_type, intent.domain)]
-        hard_constraints = [
-            "scenarioId is identifier-only and does not select variables or business rules.",
-            "All JSON-grounded executable variables are exact scalar leaves from the active MongoDB industry/domain source documents; scenario context may select a subset but cannot expand the source vocabulary.",
-            "One-to-many array properties are excluded from the flat record contract rather than converted into fake scalar values.",
-            "Source-backed enum values are copied from the active MongoDB JSON definitions and cannot be replaced with invented values.",
-            "The LLM cannot create scenario-derived executable variables. Variables absent from the active MongoDB JSON source catalog must be supplied through MongoDB scenario variables.",
-            f"Scenario outcome mode is derived from scenarioType and the business scenario: {scenario_mode}.",
-            "Transactional entity-level fields remain stable across a subscriber history; transaction/event fields are regenerated per record.",
-        ]
-        if entity_key:
-            hard_constraints.append(f"'{entity_key}' is the authoritative entity key for transactional grouping.")
-        warnings = [
-            "Any additional business variable must be provided through MongoDB; it is never invented by the LLM.",
-        ]
-        return ScenarioSchema(
-            domain=intent.domain,
-            subdomain=intent.subdomain,
-            applicable_standards=standards,
-            entities=[
-                ResolvedConcept(
-                    canonical_id=f"{source_id}__{model}".strip("_"),
-                    name=model or source_id,
-                    source_model=str(source_id),
-                    source_references=[str(source_id)],
-                    selected_attributes=[
-                        str(spec.get("name") or "")
-                        for spec in catalog.values()
-                        if str(spec.get("source_id") or "") == source_id and str(spec.get("model") or "") == model
-                    ],
-                )
-                for source_id, model in sorted({
-                    (str(spec.get("source_id") or ""), str(spec.get("model") or ""))
-                    for spec in catalog.values()
-                    if str(spec.get("source_id") or "") and str(spec.get("model") or "")
-                })
-            ],
-            relationships=relationships,
-            fields=fields,
-            hard_constraints=hard_constraints,
-            unresolved_items=unresolved,
-            warnings=warnings,
-        )
-
     def compile(
         self,
         intent: ScenarioIntent,
@@ -1073,6 +845,7 @@ class SchemaCompiler:
         country: str | None = None,
         excluded_field_names: list[str] | None = None,
         external_variable_names: set[str] | None = None,
+        external_variable_definitions: list[dict[str, Any]] | None = None,
     ) -> ScenarioSchema:
         """Compile only from active MongoDB industry/domain JSON sources."""
         normalized_industry = (industry_type or intent.industry_type or "").strip()
@@ -1081,19 +854,6 @@ class SchemaCompiler:
             raise ValueError(
                 f"No active JSON source documents are registered for industryType='{normalized_industry}', domain='{domain}'. "
                 "Upload at least one industry-standard JSON to MongoDB before compiling this scenario."
-            )
-        if is_low_balance_domain(domain, normalized_industry):
-            return self._compile_low_balance_json_grounded(
-                intent,
-                business_scenario=business_scenario or "",
-                use_case=use_case or intent.use_case or "",
-                country=country,
-                type_of_data=type_of_data or intent.type_of_data,
-                entity_key=entity_key,
-                scenario_type=scenario_type,
-                excluded_field_names=excluded_field_names,
-                external_variable_names=external_variable_names,
-                max_variables=max_variables,
             )
         return self._compile_json_source_grounded(
             intent,
@@ -1107,6 +867,7 @@ class SchemaCompiler:
             scenario_type=scenario_type,
             excluded_field_names=excluded_field_names,
             external_variable_names=external_variable_names,
+            external_variable_definitions=external_variable_definitions,
             max_variables=max_variables,
         )
 

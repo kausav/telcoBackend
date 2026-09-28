@@ -222,7 +222,7 @@ def resolve_variables(requested_scenario_id: str) -> tuple[list[dict[str, Any]],
             raw_variables = recommended_fallback
             source_policy = "scenario_variables"
 
-    if is_low_balance_domain(domain, industry):
+    if is_low_balance_domain(domain, industry) and not source_available:
         db_names = set(meta.get("db_variable_names") or [])
         if recommended_fallback:
             db_names.update(
