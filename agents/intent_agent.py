@@ -490,7 +490,21 @@ class GeminiIntentAgent:
                         "Source-backed variables semantically duplicated by MongoDB variables were suppressed; DB definitions remain authoritative: "
                         + ", ".join(duplicates)
                     )
-                payload["candidate_variables"] = filtered
+                # ``_json_source_spec`` is backend-only compiler metadata added during
+                # source validation. It must never cross the public ScenarioIntent/VariableIdea
+                # boundary because those contracts intentionally reject unknown fields.
+                # The deterministic compiler re-resolves the canonical source contract from the
+                # complete MongoDB catalog, so only the semantic candidate fields belong here.
+                sanitized_candidates: list[dict[str, Any]] = []
+                for candidate in filtered:
+                    if not isinstance(candidate, dict):
+                        continue
+                    sanitized_candidates.append({
+                        key: value
+                        for key, value in candidate.items()
+                        if not str(key).startswith("_")
+                    })
+                payload["candidate_variables"] = sanitized_candidates
                 payload["notes"] = notes[:50]
             intent = ScenarioIntent.model_validate(payload)
         except LLMUpstreamError:
