@@ -17,6 +17,7 @@ from core.agentic_models import ScenarioIntent
 from core.errors import LLMUpstreamError
 from core.llm_client import GeminiClient
 from core.json_domain_policy import catalog_for_request, is_json_grounded_domain, is_low_balance_domain
+from core.low_balance_variable_policy import material_low_balance_catalog
 from core.industry_source_store import normalize_lookup_key, validate_catalog_selection, dedupe_catalog_against_db, select_json_source_catalog
 from core.low_balance_variable_policy import validate_llm_official_selection, dedupe_against_db
 from config.runtime import JSON_SOURCE_LLM_CATALOG_LIMIT
@@ -251,20 +252,39 @@ class GeminiIntentAgent:
         }
         if json_grounded:
             catalog = catalog_for_request(industry_type, domain_query or "")
-            projected, projection_report = select_json_source_catalog(
-                [dict(row) for row in (catalog.get("models") or []) if isinstance(row, dict)],
-                business_context=request_context,
-                max_fields=JSON_SOURCE_LLM_CATALOG_LIMIT,
-            )
-            prompt_catalog = dict(catalog)
-            prompt_catalog["models"] = projected
-            prompt_catalog["llm_projection"] = projection_report
+            if low_balance:
+                # Low Balance receives the canonical, deduplicated business-variable catalog built
+                # directly from the active MongoDB standards documents. The LLM never sees the raw
+                # Swagger event/CRUD fan-out and cannot select DB_RECOMMENDED variables.
+                canonical_models = [dict(row) for row in material_low_balance_catalog()]
+                prompt_catalog = dict(catalog)
+                prompt_catalog["models"] = canonical_models[:JSON_SOURCE_LLM_CATALOG_LIMIT]
+                prompt_catalog["llm_projection"] = {
+                    "candidate_count": len(canonical_models),
+                    "selected_count": len(prompt_catalog["models"]),
+                    "selection_mode": "canonical_low_balance_business_variables",
+                    "selected_names": [str(row.get("name") or "") for row in prompt_catalog["models"]],
+                }
+            else:
+                projected, projection_report = select_json_source_catalog(
+                    [dict(row) for row in (catalog.get("models") or []) if isinstance(row, dict)],
+                    business_context=request_context,
+                    max_fields=JSON_SOURCE_LLM_CATALOG_LIMIT,
+                )
+                prompt_catalog = dict(catalog)
+                prompt_catalog["models"] = projected
+                prompt_catalog["llm_projection"] = projection_report
             catalog_text = json.dumps(prompt_catalog, separators=(",", ":"), sort_keys=True)
             grounding_header = (
                 "MONGODB INDUSTRY-SOURCE GROUNDING (authoritative):\n"
                 "Use only active JSON source documents stored in MongoDB for this exact industryType/domain pair. "
                 "Their scalar fields, descriptions, types, declared constraints, and enum values are the only standards vocabulary available to you. "
-                "Do not use external standards, URLs, static application registries, profiles, templates, examples, memory, or generic industry knowledge.\n\n"
+                "Do not use external standards, URLs, static application registries, profiles, templates, examples, memory, or generic industry knowledge.\n"
+                + (
+                    "For Low Balance & Top-up, the supplied source catalog is already canonicalized and deduplicated at the business-concept level. "
+                    "Do not create separate candidates for CRUD/event/payload copies represented in source_paths; source_paths are provenance only.\n\n"
+                    if low_balance else "\n"
+                )
             )
             mandatory_line = "Do not add variables outside the supplied MongoDB source catalog or separately persisted MongoDB scenario variables. "
         elif persisted_variables:

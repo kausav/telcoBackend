@@ -22,7 +22,6 @@ from core.low_balance_variable_policy import (
     dedupe_schema_fields_against_db,
     validate_db_definition,
     validate_low_balance_variable_sources,
-    validate_low_balance_required_identity_sources,
     reconcile_low_balance_variables,
     semantic_signature,
     official_catalog_by_name,
@@ -236,9 +235,10 @@ class AgenticSchemaWorkflow:
         industry_key = normalize_industry_key(req.industry_type)
         low_balance = is_low_balance_domain(req.domain, req.industry_type)
         json_grounded = is_json_grounded_domain(req.domain, industry_key)
-        # Mongo variables are authoritative inputs to the source-bound proposal. Fetch both
-        # scenario recommendations and the user's selected variables before the LLM/cache step.
-        recommended = get_recommended(requested_scenario_id, 1)
+        # Mongo user-selected variables are still supported, but Low Balance proposals must not
+        # pull DB_RECOMMENDED variables. Standards variables for that journey come only from the
+        # active MongoDB industry/domain JSON source catalog.
+        recommended = [] if low_balance else get_recommended(requested_scenario_id, 1)
         user_selected = (
             get_user_variables(req.user_id.strip(), requested_scenario_id, 1)
             if req.user_id and req.user_id.strip()
@@ -268,10 +268,6 @@ class AgenticSchemaWorkflow:
             "SCENARIO-VARIABLES REQUIREMENT: there is no registered JSON source for this exact industryType/domain pair. "
             "Use only the persisted MongoDB scenario variables supplied to you. Do not invent, rename, alias, or derive executable variable names. "
         )
-        if low_balance:
-            # Low Balance has domain-specific identity extensions. account_id and msisdn are absent from
-            # the active MongoDB source catalog, so exact DB extensions remain mandatory for that domain.
-            validate_low_balance_required_identity_sources(db_variables)
         protected_name_set = set(self._variable_name_keys(db_variables))
         if low_balance and db_variables:
             # Do semantic DB-vs-JSON deduplication BEFORE the deterministic breadth budget.

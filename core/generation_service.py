@@ -22,6 +22,7 @@ from core.dynamic_scenarios import (
 from agents.data_generation_agent import run_deterministic_agentic_generation
 from core.pipeline import run_pipeline
 from core.industry_source_store import catalog_for_request, has_sources
+from core.json_domain_policy import is_low_balance_domain
 from core.scenario_variable_store import get_recommended
 
 logger = logging.getLogger(__name__)
@@ -93,11 +94,18 @@ def _require_generation_source(
     # present in the active industry/domain standards. Persisted scenario_variables are the only
     # permitted exception.
     if source_available:
-        catalog_names = {
-            str(row.get("name") or "").strip().casefold()
-            for row in (catalog_for_request(industry, domain).get("models") or [])
-            if isinstance(row, dict) and str(row.get("name") or "").strip()
-        }
+        if is_low_balance_domain(domain, industry):
+            # Low Balance source fields are canonicalized from the MongoDB TMF654/TMF629 catalog.
+            # Accept both the new canonical names and legacy raw Swagger names so confirmed
+            # scenarios remain compatible after the de-duplication/naming upgrade.
+            from core.low_balance_variable_policy import official_catalog_aliases, official_catalog_by_name
+            catalog_names = set(official_catalog_by_name()) | set(official_catalog_aliases())
+        else:
+            catalog_names = {
+                str(row.get("name") or "").strip().casefold()
+                for row in (catalog_for_request(industry, domain).get("models") or [])
+                if isinstance(row, dict) and str(row.get("name") or "").strip()
+            }
         scenario_variable_names = {
             str(row.get("name") or "").strip().casefold()
             for row in scenario_variables

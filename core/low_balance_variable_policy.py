@@ -29,8 +29,11 @@ _ALLOWED_CONTEXT_PREFIXES = {
 # Low Balance rows should maximize analytical coverage without reproducing transport/display
 # metadata or customer PII. These exclusions operate only on the active MongoDB TMF654/TMF629
 # scalar catalog; they do not introduce any new business vocabulary.
-LOW_BALANCE_REQUIRED_FIELDS = ("customer_id", "account_id", "msisdn")
-LOW_BALANCE_DB_REQUIRED_FIELDS = ("account_id", "msisdn")
+LOW_BALANCE_REQUIRED_FIELDS = ("customer_id",)
+# The Low Balance journey must not require DB-recommended identity extensions. Every executable
+# industry/domain field comes from the active MongoDB JSON source catalog, while existing user-selected
+# scenario variables remain independently supported by the general DB-variable path.
+LOW_BALANCE_DB_REQUIRED_FIELDS: tuple[str, ...] = ()
 _LOW_BALANCE_TECHNICAL_SUFFIXES = ("_href", "_description", "_referred_type")
 _LOW_BALANCE_PII_NAMES = {
     "customer_name",
@@ -87,33 +90,305 @@ def is_material_low_balance_spec(spec: dict[str, Any]) -> bool:
     return dtype not in {"object", "array"}
 
 
+_LOW_BALANCE_CORE_RESOURCES = {"customer", "bucket", "topup"}
+_LOW_BALANCE_OPERATION_ROOTS = {
+    "adjust_balance",
+    "transfer_balance",
+    "reserve_balance",
+    "accumulated_balance",
+    "balance_action_history",
+}
+_LOW_BALANCE_EVENT_MARKERS = {
+    "event",
+    "payload",
+    "create_event",
+    "update_event",
+    "delete_event",
+    "cancel_event",
+    "failure_event",
+    "state_change_event",
+    "attribute_value_change_event",
+}
+_LOW_BALANCE_REF_FIELDS = {
+    "partyaccount": "party_account",
+    "party_account": "party_account",
+    "channel": "channel",
+    "paymentmethod": "payment_method",
+    "payment_method": "payment_method",
+    "requestor": "requestor",
+    "bucket": "bucket",
+    "product": "product",
+    "logicalresource": "logical_resource",
+    "logical_resource": "logical_resource",
+    "engagedparty": "engaged_party",
+    "engaged_party": "engaged_party",
+}
+_LOW_BALANCE_EXCLUDED_REFERENCE_LEAVES = {"href", "description", "name", "referred_type", "@referredtype"}
+
+
+def _lb_path_segments(path: object) -> list[str]:
+    return [_normalize_name(part) for part in str(path or "").split(".") if _normalize_name(part)]
+
+
+def _lb_root_family(segment: str) -> str | None:
+    """Map only genuine business-resource roots to a Low Balance resource family."""
+    token = _normalize_name(segment)
+    if not token:
+        return None
+    allowed_roots = {
+        "customer",
+        "customer_create", "customer_update", "customer_delete",
+        "customer_create_event", "customer_update_event", "customer_delete_event",
+        "customer_state_change_event", "customer_attribute_value_change_event",
+        "bucket",
+        "bucket_create", "bucket_update", "bucket_delete",
+        "bucket_create_event", "bucket_update_event", "bucket_delete_event",
+        "topup_balance", "topup_balance_create", "topup_balance_update", "topup_balance_delete",
+        "topup_balance_create_event", "topup_balance_update_event", "topup_balance_delete_event",
+        "topup_balance_cancel_event", "topup_balance_failure_event",
+    }
+    if token in allowed_roots:
+        if token.startswith("customer"):
+            return "customer"
+        if token.startswith("bucket"):
+            return "bucket"
+        return "topup"
+    return None
+
+
+def _lb_target_resource_and_tail(path: object) -> tuple[str | None, list[str], bool]:
+    """Resolve event/create/update wrappers to the underlying business resource.
+
+    The raw Mongo catalog is intentionally flat and contains the same business property many times
+    through CRUD/event payload schemas. We canonicalize those wrappers before variable selection.
+    Event-only payload fields remain excluded; the underlying business property is represented once.
+    """
+    segments = _lb_path_segments(path)
+    if not segments:
+        return None, [], False
+
+    first_family = _lb_root_family(segments[0])
+    first_has_event = "event" in segments[0] or segments[0].endswith("_event") or any(
+        marker in segments[0] for marker in ("create_event", "update_event", "delete_event", "cancel_event", "failure_event", "state_change_event")
+    )
+    operation_root = normalize_lookup_operation_root = segments[0]
+    if operation_root in _LOW_BALANCE_OPERATION_ROOTS or operation_root.startswith(tuple(f"{item}_" for item in _LOW_BALANCE_OPERATION_ROOTS)):
+        return None, [], False
+
+    # A direct base resource (Customer/Bucket/TopupBalance or their Create/Update variants).
+    if first_family:
+        if first_has_event:
+            # Event schemas are transport wrappers around the same business resource. Locate the
+            # embedded Customer/Bucket/TopupBalance object and reuse its canonical leaf so event,
+            # payload, create/update and base-resource copies collapse into one analytical field.
+            for idx, segment in enumerate(segments[1:], start=1):
+                family = _lb_root_family(segment)
+                if family == first_family:
+                    return family, segments[idx + 1:], True
+            return first_family, [], True
+        return first_family, segments[1:], False
+
+    # Other definitions such as Action.bucket, TransferBalance.bucket, etc. are deliberately not
+    # mined for embedded references. Low Balance & Top-up is scoped to the Customer/Bucket/TopupBalance
+    # business resources, otherwise unrelated operation schemas would leak duplicate reference leaves.
+    return None, [], False
+
+
+def _canonical_low_balance_name(row: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    """Convert a raw standards path into one canonical analytical variable name.
+
+    Canonical names intentionally describe the business concept, not the Swagger event/transport
+    path. The original source paths are retained in ``source_paths`` for traceability.
+    """
+    path = str(row.get("path") or "")
+    resource, tail, from_event = _lb_target_resource_and_tail(path)
+    if resource not in _LOW_BALANCE_CORE_RESOURCES:
+        return None, {}
+    if from_event:
+        # Event wrappers are represented by their underlying base resource fields. A path that has
+        # no business-resource tail is an event-only field, so it is not a scenario variable.
+        if not tail:
+            return None, {}
+
+    # Convert property segments to their normalized forms.
+    tail = [_normalize_name(part) for part in tail if _normalize_name(part)]
+    if not tail:
+        return None, {}
+
+    leaf = tail[-1]
+    ref_parent = _LOW_BALANCE_REF_FIELDS.get(tail[-2]) if len(tail) >= 2 else None
+
+    canonical: str | None = None
+    if resource == "customer":
+        if tail == ["id"]:
+            canonical = "customer_id"
+        elif tail == ["status"]:
+            canonical = "customer_status"
+        elif tail == ["status_reason"]:
+            canonical = "customer_status_reason"
+        elif tail == ["valid_for", "start_date_time"]:
+            canonical = "customer_valid_from"
+        elif tail == ["valid_for", "end_date_time"]:
+            canonical = "customer_valid_to"
+        else:
+            # engagedParty/account/agreement/contact/creditProfile nested metadata is either
+            # relationship transport or unrelated to this flat retention/recharge scenario.
+            return None, {}
+
+    elif resource == "bucket":
+        if tail == ["id"]:
+            canonical = "bucket_id"
+        elif tail == ["remaining_value", "amount"]:
+            canonical = "bucket_remaining_amount"
+        elif tail == ["remaining_value", "units"]:
+            canonical = "bucket_remaining_unit"
+        elif tail == ["reserved_value", "amount"]:
+            canonical = "bucket_reserved_amount"
+        elif tail == ["reserved_value", "units"]:
+            canonical = "bucket_reserved_unit"
+        elif tail == ["status"]:
+            canonical = "bucket_status"
+        elif tail == ["usage_type"]:
+            canonical = "usage_type"
+        elif tail == ["is_shared"]:
+            canonical = "bucket_is_shared"
+        elif tail == ["valid_for", "start_date_time"]:
+            canonical = "bucket_valid_from"
+        elif tail == ["valid_for", "end_date_time"]:
+            canonical = "bucket_valid_to"
+        elif len(tail) == 2 and ref_parent == "party_account" and leaf in {"id", "status"}:
+            canonical = f"party_account_{leaf}"
+        else:
+            return None, {}
+
+    elif resource == "topup":
+        if tail == ["id"]:
+            canonical = "topup_id"
+        elif tail == ["requested_date"]:
+            canonical = "topup_requested_at"
+        elif tail == ["confirmation_date"]:
+            canonical = "topup_confirmed_at"
+        elif tail == ["status"]:
+            canonical = "topup_status"
+        elif tail == ["is_auto_topup"]:
+            canonical = "topup_is_auto"
+        elif tail == ["number_of_periods"]:
+            canonical = "topup_number_of_periods"
+        elif tail == ["recurring_period"]:
+            canonical = "topup_recurring_period"
+        elif tail == ["reason"]:
+            canonical = "topup_reason"
+        elif tail == ["amount", "amount"]:
+            canonical = "topup_amount"
+        elif tail == ["amount", "units"]:
+            canonical = "topup_amount_unit"
+        elif tail == ["usage_type"]:
+            canonical = "usage_type"
+        elif len(tail) == 2 and ref_parent == "party_account" and leaf in {"id", "status"}:
+            canonical = f"party_account_{leaf}"
+        elif len(tail) == 2 and ref_parent == "bucket" and leaf == "id":
+            canonical = "bucket_id"
+        elif len(tail) == 2 and ref_parent == "channel" and leaf == "name":
+            canonical = "topup_channel_name"
+        elif len(tail) == 2 and ref_parent == "payment_method" and leaf == "name":
+            canonical = "topup_payment_method_name"
+        elif len(tail) == 2 and ref_parent == "requestor" and leaf == "role":
+            canonical = "topup_requestor_role"
+        elif tail == ["valid_for", "start_date_time"]:
+            canonical = "topup_valid_from"
+        elif tail == ["valid_for", "end_date_time"]:
+            canonical = "topup_valid_to"
+        else:
+            # Opaque voucher/reference IDs, names, hrefs and nested RelatedTopupBalance metadata are
+            # intentionally excluded from the analytical variable set.
+            return None, {}
+
+    if not canonical:
+        return None, {}
+    meta = dict(row)
+    meta["name"] = canonical
+    meta["canonical_name"] = canonical
+    meta["source_paths"] = [path] if path else []
+    meta["source_models"] = [str(row.get("model") or "")] if row.get("model") else []
+    raw_aliases = []
+    for alias in (row.get("name"), path):
+        normalized_alias = _normalize_name(alias)
+        if normalized_alias and normalized_alias not in raw_aliases:
+            raw_aliases.append(normalized_alias)
+    meta["source_aliases"] = raw_aliases
+    return canonical, meta
+
+
+def _merge_low_balance_source_rows(group: dict[str, Any], row: dict[str, Any]) -> None:
+    """Merge source provenance and constraints for one canonical field."""
+    for key, singular in (("source_paths", row.get("path")), ("source_models", row.get("model"))):
+        values = group.setdefault(key, [])
+        if singular and str(singular) not in values:
+            values.append(str(singular))
+    for sid in row.get("source_ids") or ([row.get("source_id")] if row.get("source_id") else []):
+        sid = str(sid or "")
+        if sid and sid not in group.setdefault("source_ids", []):
+            group["source_ids"].append(sid)
+    for alias in (row.get("name"), _normalize_name(row.get("path"))):
+        alias = _normalize_name(alias)
+        if alias and alias not in group.setdefault("source_aliases", []):
+            group["source_aliases"].append(alias)
+    if row.get("required"):
+        group["required"] = True
+    descriptions = [str(group.get("description") or "").strip(), str(row.get("description") or "").strip()]
+    descriptions = [value for value in descriptions if value]
+    if descriptions:
+        group["description"] = max(descriptions, key=len)
+    enum_values = list(group.get("enum_values") or [])
+    for value in row.get("enum_values") or []:
+        if value not in enum_values:
+            enum_values.append(value)
+    if enum_values:
+        group["enum_values"] = enum_values
+
+
 def material_low_balance_catalog() -> tuple[dict[str, Any], ...]:
-    """Return the broad, quality-safe official Low Balance variable catalog."""
-    rows = [dict(row) for row in expanded_scalar_catalog() if is_material_low_balance_spec(row)]
-    rows.sort(key=lambda item: (str(item.get("model") or ""), str(item.get("path") or ""), str(item.get("name") or "")))
+    """Return canonical, deduplicated, source-backed Low Balance business variables.
+
+    The raw MongoDB catalog deliberately contains Swagger path fan-out. This function is the semantic
+    boundary between the standards documents and the scenario selector: one business concept becomes
+    one variable, while all contributing source paths remain available as provenance.
+    """
+    groups: dict[str, dict[str, Any]] = {}
+    for raw in expanded_scalar_catalog():
+        if not isinstance(raw, dict) or not is_material_low_balance_spec(raw):
+            continue
+        canonical, item = _canonical_low_balance_name(raw)
+        if not canonical:
+            continue
+        existing = groups.get(canonical)
+        if existing is None:
+            groups[canonical] = item
+        else:
+            _merge_low_balance_source_rows(existing, raw)
+
+    rows = []
+    for name, row in groups.items():
+        item = dict(row)
+        item["name"] = name
+        item["canonical_name"] = name
+        item["source_paths"] = sorted(set(str(value) for value in item.get("source_paths") or []))
+        item["source_models"] = sorted(set(str(value) for value in item.get("source_models") or [] if value))
+        item["source_ids"] = sorted(set(str(value) for value in item.get("source_ids") or [] if value))
+        item["source_aliases"] = sorted(set(str(value) for value in item.get("source_aliases") or [] if value))
+        rows.append(item)
+    rows.sort(key=lambda item: str(item.get("name") or ""))
     return tuple(rows)
 
 
 def validate_low_balance_required_identity_sources(db_variables: list[dict[str, Any]]) -> None:
-    """Require the exact DB extension fields that are absent from the official Swagger catalog.
+    """Legacy compatibility hook; Low Balance identity fields are no longer DB-recommended.
 
-    This is a source-availability check only. MongoDB owns the persisted executable definition,
-    including scope, required/nullable flags, generator and parameters; the Low Balance journey
-    must never reinterpret those DB-owned attributes as a different schema contract.
+    The active TMF654/TMF629 source catalog supplies the official customer identity (Customer.id).
+    This function intentionally performs no DB-extension requirement so ``DB_RECOMMENDED`` variables
+    cannot be forced into new Low Balance proposals.
     """
-    names = {
-        _normalize_name(item.get("name"))
-        for item in (db_variables or [])
-        if isinstance(item, dict) and str(item.get("name") or "").strip()
-    }
-    missing = [name for name in LOW_BALANCE_DB_REQUIRED_FIELDS if _normalize_name(name) not in names]
-    if missing:
-        raise ValueError(
-            "Low Balance & Top-up requires the exact DB variables "
-            + ", ".join(missing)
-            + ". They are not present in the active MongoDB TMF654/TMF629 source scalar catalog and must not be invented by the LLM or another generator."
-        )
-
+    return
 
 def reconcile_low_balance_variables(
     variables: list[dict[str, Any]],
@@ -130,6 +405,7 @@ def reconcile_low_balance_variables(
     was incomplete, while preserving every DB-owned definition exactly as supplied.
     """
     catalog = official_catalog_by_name()
+    aliases = official_catalog_aliases()
     db_names = {
         _normalize_name(name)
         for name in (db_variable_names or set())
@@ -154,13 +430,14 @@ def reconcile_low_balance_variables(
             db_names.add(name)
 
     def source_for(name: str) -> str:
-        existing = sources.get(name, "")
+        canonical_name = aliases.get(name, name)
+        existing = sources.get(name, "") or sources.get(canonical_name, "")
         if name in db_names:
             return existing if existing in {"DB_RECOMMENDED", "USER_SELECTED"} else "DB_RECOMMENDED"
         if existing in {"DB_RECOMMENDED", "USER_SELECTED"}:
             return existing
-        if name in catalog:
-            return "OFFICIAL_JSON"
+        if canonical_name in catalog:
+            return "MONGODB_JSON"
         return existing
 
     # Deduplicate exact names deterministically. A DB definition always replaces any earlier
@@ -224,6 +501,7 @@ def validate_low_balance_variable_sources(
     owns the field and are intentionally not revalidated against a journey-local template.
     """
     catalog = official_catalog_by_name()
+    aliases = official_catalog_aliases()
     sources = {
         _normalize_name(name): str(source).strip().upper()
         for name, source in (source_by_name or {}).items()
@@ -246,25 +524,28 @@ def validate_low_balance_variable_sources(
         if not name:
             invalid.append("<missing-name>")
             continue
-        if name in seen_names:
+        canonical_name = aliases.get(name, name)
+        if canonical_name in seen_names:
             invalid.append(f"{name} (duplicate exact variable name)")
             continue
-        seen_names.add(name)
+        seen_names.add(canonical_name)
 
         source = sources.get(name, "")
+        if not source:
+            source = sources.get(canonical_name, "")
         # DB membership is the authoritative provenance signal. This also repairs legacy drafts
         # where the source map was missing or still labeled the DB field as official JSON.
         if name in db_names:
             source = source if source in allowed_db else "DB_RECOMMENDED"
-        elif not source and name in catalog:
-            source = "OFFICIAL_JSON"
+        elif not source and canonical_name in catalog:
+            source = "MONGODB_JSON"
 
         if source in allowed_db:
             if name not in db_names:
                 invalid.append(f"{name} (DB source is not present in the persisted DB variable set)")
                 continue
-        elif source == "OFFICIAL_JSON":
-            if name not in catalog:
+        elif source in {"MONGODB_JSON", "OFFICIAL_JSON"}:
+            if canonical_name not in catalog:
                 invalid.append(f"{name} (not present in the active MongoDB TMF654/TMF629 catalog)")
                 continue
         else:
@@ -277,13 +558,9 @@ def validate_low_balance_variable_sources(
             except Exception as exc:
                 invalid.append(f"{name} (invalid MongoDB definition: {exc})")
 
-    required = {_normalize_name(name) for name in LOW_BALANCE_REQUIRED_FIELDS}
+    required = {canonical_low_balance_name(name) for name in LOW_BALANCE_REQUIRED_FIELDS}
     missing = sorted(required - seen_names)
     invalid.extend(f"{name} (required Low Balance identity variable is missing)" for name in missing)
-
-    required_db = {_normalize_name(name) for name in LOW_BALANCE_DB_REQUIRED_FIELDS}
-    invalid_db = sorted(required_db - db_names)
-    invalid.extend(f"{name} (required DB identity variable is missing from MongoDB)" for name in invalid_db)
 
     if invalid:
         raise ValueError(
@@ -413,7 +690,7 @@ def semantic_signature(variable: dict[str, Any] | GeneratedSchemaField) -> tuple
     else:
         data = variable
 
-    name = str(data.get("name") or "")
+    name = canonical_low_balance_name(str(data.get("name") or ""))
     raw_tokens = _tokenize(name)
     tokens = _canonical_tokens(name)
     if not tokens:
@@ -459,7 +736,7 @@ def semantic_signature(variable: dict[str, Any] | GeneratedSchemaField) -> tuple
     return context, f"{concept}::{dtype_key}"
 
 
-LOW_BALANCE_OFFICIAL_MAX_FIELDS = 45
+LOW_BALANCE_OFFICIAL_MAX_FIELDS = 60
 
 
 def _lb_norm_text(value: object) -> str:
@@ -613,68 +890,34 @@ def _low_balance_relevance_profile(outcome_mode: str) -> dict[str, dict[str, flo
 
 
 def _low_balance_profile_exclusions(outcome_mode: str, business_scenario: str = "") -> set[str]:
-    """Exclude source fields that add little independent signal for the requested scenario.
-
-    These are quality filters over the approved TMF654/TMF629 catalog, not source restrictions.
-    MongoDB variables are handled separately and are never removed here.
-    """
+    """Exclude canonical source fields that add little independent value for this scenario."""
     mode = str(outcome_mode or "").strip().lower()
     scenario_text = _lb_norm_text(business_scenario)
-    exclusions = {
-        "customer_engaged_party_id",
-        "customer_engaged_party_role",
-        "topupbalance_balance_topup_id",
-        "topupbalance_balance_topup_name",
-        "topupbalance_balance_topup_role",
-        "topupbalance_party_account_name",
-        # The TopupBalance bucket reference is a transport-level pointer. The direct Bucket
-        # resource below provides the useful balance-state facts, so reference labels are not
-        # duplicated in the flat row.
-        "topupbalance_bucket_id",
-        "topupbalance_bucket_name",
-        # Low-value bucket metadata/display fields.
-        "bucket_name",
-        "bucket_requested_date",
-        "bucket_confirmation_date",
-        "bucket_party_account_id",
-        "bucket_party_account_name",
-        "bucket_party_account_status",
-        "bucket_remaining_value_name",
-    }
+    exclusions: set[str] = set()
 
-    has_reservation = _lb_has_scenario_terms(scenario_text, {
-        "reserved", "reservation", "reserve", "hold"
-    })
-    has_shared = _lb_has_scenario_terms(scenario_text, {
-        "shared", "family", "multi_device", "multidevice"
-    })
-    has_validity = _lb_has_scenario_terms(scenario_text, {
-        "expiry", "expire", "expiration", "validity", "valid_for", "validity_period"
-    })
-    has_usage = _lb_has_scenario_terms(scenario_text, {
-        "usage", "data", "voice", "sms", "monetary", "currency"
-    })
+    has_reservation = _lb_has_scenario_terms(scenario_text, {"reserved", "reservation", "reserve", "hold"})
+    has_shared = _lb_has_scenario_terms(scenario_text, {"shared", "family", "multi_device", "multidevice"})
+    has_validity = _lb_has_scenario_terms(
+        scenario_text, {"expiry", "expire", "expiration", "validity", "valid_for", "validity_period"}
+    )
+    has_automatic = _lb_has_scenario_terms(
+        scenario_text, {"automatic", "autotopup", "auto_topup", "recurring", "periodic"}
+    )
 
     if not has_reservation:
-        exclusions.update({"bucket_reserved_value_amount", "bucket_reserved_value_units"})
+        exclusions.update({"bucket_reserved_amount", "bucket_reserved_unit"})
     if not has_shared:
         exclusions.add("bucket_is_shared")
     if not has_validity:
-        exclusions.update({"bucket_valid_for_start_date_time", "bucket_valid_for_end_date_time"})
-    if mode in {"suppression", "negative", "decline_or_no_response", "concurrent"} and not has_usage:
-        exclusions.add("bucket_usage_type")
-
-    if mode == "suppression":
-        # Recurrence configuration is only useful when the suppression scenario explicitly
-        # discusses recurring/automatic top-up behavior.
-        scenario_tokens = _lb_scenario_tokens(scenario_text)
-        if not scenario_tokens.intersection({"recurring", "periodic", "automatic", "autotopup"}) and not "auto_topup" in scenario_text:
-            exclusions.update({"topupbalance_recurring_period", "topupbalance_number_of_periods"})
-        if not scenario_tokens.intersection({"usage", "data", "voice", "sms"}):
-            exclusions.add("topupbalance_usage_type")
+        exclusions.update({
+            "customer_valid_from", "customer_valid_to",
+            "bucket_valid_from", "bucket_valid_to",
+            "topup_valid_from", "topup_valid_to",
+        })
+    if mode == "suppression" and not has_automatic:
+        exclusions.update({"topup_number_of_periods", "topup_recurring_period"})
 
     return exclusions
-
 
 def low_balance_official_relevance_score(
     row: dict[str, Any],
@@ -683,48 +926,56 @@ def low_balance_official_relevance_score(
     business_scenario: str = "",
     scenario_type: str = "",
 ) -> float:
-    """Score an exact official scalar by scenario relevance without inventing any field."""
+    """Score a canonical source variable by scenario relevance without creating vocabulary."""
     name = _lb_norm_text(row.get("name"))
     description = _lb_norm_text(row.get("description"))
     text = f"{name} {description}"
-    profile = _low_balance_relevance_profile(outcome_mode)
-    score = 45.0
+    mode = str(outcome_mode or "").strip().lower()
+    score = 50.0
 
+    resource = name.split("_", 1)[0] if name else ""
     if name == "customer_id":
-        score += 18.0
-    if str(row.get("model") or "").lower() == "topupbalance":
+        score += 20.0
+    if name in {"topup_id", "bucket_id"}:
         score += 7.0
-    elif str(row.get("model") or "").lower() == "customer":
-        score += 4.0
+    if name in {"bucket_remaining_amount", "bucket_remaining_unit"}:
+        score += 15.0
+    if name in {"topup_requested_at", "topup_confirmed_at"}:
+        score += 10.0
+    if name in {"topup_status", "bucket_status", "customer_status"}:
+        score += 9.0
+    if name == "customer_status_reason":
+        score += 8.0
+    if name == "party_account_status":
+        score += 8.0
+    if name == "topup_is_auto":
+        score += 8.0
+    if name in {"topup_amount", "topup_amount_unit"}:
+        score += 6.0
+    if name in {"usage_type"}:
+        score += 6.0
+    if name in {"topup_channel_name", "topup_payment_method_name", "topup_requestor_role"}:
+        score += 5.0
 
-    for token, weight in profile.items():
-        if token in text:
-            score += weight
-
-    # Scenario language is an additional weak signal, never a source of new field names.
+    # Scenario text is a weak relevance signal layered over the source-defined concept.
     scenario_text = f"{_lb_norm_text(scenario_type)} {_lb_norm_text(business_scenario)}"
-    for token in ("retention", "intervention", "trigger", "recharge", "topup", "balance", "customer"):
+    concept_terms = {
+        "suppression": {"suppression", "cooldown", "contact", "intervention", "retention", "trigger"},
+        "positive": {"recharge", "topup", "balance", "successful", "completed", "retention"},
+        "negative": {"failure", "failed", "rejected", "error"},
+        "decline_or_no_response": {"decline", "declined", "no_response", "no_response", "suppression"},
+        "concurrent": {"concurrent", "simultaneous", "pending", "duplicate"},
+    }
+    for token in concept_terms.get(mode, set()):
         if token in scenario_text and token in text:
-            score += 1.5
-    if outcome_mode == "suppression":
-        if any(token in text for token in ("name", "role")):
-            score -= 3.0
-        if "balance_topup" in text:
-            score -= 5.0
-    elif outcome_mode == "positive":
-        if "balance_topup" in text:
-            score -= 3.0
-        if "customer_engaged_party" in text:
-            score -= 2.0
+            score += 2.0
 
-    # Names/roles are relation context rather than the primary behavioral signal. Keep them only
-    # when they clear the scenario-specific quality threshold or are required by dependencies.
-    if name.endswith("_name"):
-        score -= 4.0
+    # Independent analytical value: identifiers for related reference resources are lower value than
+    # behavioral/category fields, but a role/status still carries useful segmentation information.
     if name.endswith("_role"):
-        score -= 3.0
-    if name.endswith("_units"):
         score -= 1.0
+    if name.endswith("_unit"):
+        score -= 0.5
     return score
 
 
@@ -737,11 +988,7 @@ def select_low_balance_official_catalog(
     preferred_names: set[str] | None = None,
     max_fields: int = LOW_BALANCE_OFFICIAL_MAX_FIELDS,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Select the widest high-quality scenario-specific official field set.
-
-    Only exact fields from the active MongoDB TMF654/TMF629 material catalog are returned. The LLM can
-    influence priority through ``preferred_names`` but cannot force unrelated/low-quality fields.
-    """
+    """Select the widest *canonical* source-backed set that remains relevant to the scenario."""
     excluded = {_lb_norm_text(name) for name in (excluded_names or set()) if _lb_norm_text(name)}
     excluded.update(_low_balance_profile_exclusions(outcome_mode, business_scenario))
     preferred = {_lb_norm_text(name) for name in (preferred_names or set()) if _lb_norm_text(name)}
@@ -763,45 +1010,9 @@ def select_low_balance_official_catalog(
             score += 3.0
         scored.append((score, index, row))
 
-    # Core journey facts are always useful when present. Everything else must earn inclusion through
-    # the scenario-specific score, which is what creates meaningful differences between Normal,
-    # Suppression, Failure, etc. instead of returning the entire catalog for every scenario.
-    core_names = {
-        "topupbalance_id",
-        "topupbalance_requested_date",
-        "topupbalance_confirmation_date",
-        "topupbalance_status",
-        "topupbalance_amount_amount",
-        "customer_id",
-        # Current bucket state is central to a Low Balance journey. Optional bucket dimensions
-        # are added only when the scenario context supports them.
-        "bucket_id",
-        "bucket_remaining_value_amount",
-        "bucket_remaining_value_units",
-        "bucket_status",
-    }
-    scenario_text = _lb_norm_text(business_scenario)
-    if outcome_mode == "positive" or _lb_has_scenario_terms(
-        scenario_text, {"usage", "data", "voice", "sms", "monetary", "currency"}
-    ):
-        core_names.add("bucket_usage_type")
-    core: list[tuple[float, int, dict[str, Any]]] = [item for item in scored if _lb_norm_text(item[2].get("name")) in core_names]
-    core_keys = {_lb_norm_text(item[2].get("name")) for item in core}
     ranked = sorted(scored, key=lambda item: (-item[0], item[1], _lb_norm_text(item[2].get("name"))))
-
-    selected: list[dict[str, Any]] = []
-    selected_keys: set[str] = set()
-    for item in core + ranked:
-        score, _index, row = item
-        name = _lb_norm_text(row.get("name"))
-        if name in selected_keys:
-            continue
-        if name not in core_keys and score < 47.0:
-            continue
-        if len(selected) >= max(1, int(max_fields)):
-            break
-        selected.append(row)
-        selected_keys.add(name)
+    selected = [row for _score, _index, row in ranked[: max(1, int(max_fields))]]
+    selected_keys = {_lb_norm_text(row.get("name")) for row in selected}
 
     report = {
         "candidate_count": len(rows),
@@ -810,9 +1021,9 @@ def select_low_balance_official_catalog(
         "outcome_mode": outcome_mode,
         "preferred_names_used": sorted(preferred & selected_keys),
         "selected_names": [str(row.get("name") or "") for row in selected],
+        "excluded_names": sorted(excluded),
     }
     return selected, report
-
 
 def official_catalog() -> tuple[dict[str, Any], ...]:
     """Return the active MongoDB-backed Low Balance scalar catalog.
@@ -835,6 +1046,33 @@ def official_catalog() -> tuple[dict[str, Any], ...]:
 def official_catalog_by_name() -> dict[str, dict[str, Any]]:
     """Return the current MongoDB-backed Low Balance catalog without process-local staleness."""
     return {str(row["name"]): dict(row) for row in official_catalog()}
+
+
+def official_catalog_aliases() -> dict[str, str]:
+    """Map legacy raw Swagger field names to the new canonical analytical variable names."""
+    aliases: dict[str, str] = {}
+    for row in material_low_balance_catalog():
+        canonical = _normalize_name(row.get("name"))
+        if not canonical:
+            continue
+        aliases[canonical] = canonical
+        for alias in row.get("source_aliases") or []:
+            normalized = _normalize_name(alias)
+            if normalized:
+                aliases[normalized] = canonical
+        for path in row.get("source_paths") or []:
+            normalized = _normalize_name(path)
+            if normalized:
+                aliases[normalized] = canonical
+    return aliases
+
+
+def canonical_low_balance_name(value: Any) -> str:
+    """Resolve a canonical or legacy source field name to the canonical analytical name."""
+    name = _normalize_name(value)
+    if not name:
+        return ""
+    return official_catalog_aliases().get(name, name)
 
 
 def validate_llm_official_selection(variables: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:

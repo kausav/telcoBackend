@@ -285,8 +285,9 @@ class SchemaCompiler:
                 string_params["max_length"] = spec.get("maxLength")
             if spec.get("pattern") is not None:
                 string_params["pattern"] = spec.get("pattern")
-            if not low_balance:
-                string_params["source_contract"] = True
+            # Every MongoDB-backed JSON string is source-contract-bound. There is no
+            # filesystem/telecom fallback for an industry source field.
+            string_params["source_contract"] = True
             if fmt in {"uuid", "uuid4"}:
                 return "uuid_string", "string", string_params
             if fmt in {"email", "idn-email"}:
@@ -627,6 +628,8 @@ class SchemaCompiler:
                 "source_json_id": source_spec.get("source_id") if source_from_json else None,
                 "source_json_model": source_spec.get("model") if source_from_json else None,
                 "source_json_path": source_spec.get("path") if source_from_json else None,
+                "source_json_paths": list(source_spec.get("source_paths") or []) if source_from_json else [],
+                "source_json_aliases": list(source_spec.get("source_aliases") or []) if source_from_json else [],
                 "grain": grain,
                 "quality_score": quality_engine.score(idea, selection_context, entity_key).score,
                 "quality_reasons": list(quality_engine.score(idea, selection_context, entity_key).reasons),
