@@ -696,6 +696,43 @@ def _temporal_output_params(params: dict | None, generator: str) -> dict:
     return result
 
 
+def _generate_temporal_child_value_for_constraints(
+    var: dict,
+    constraints: list[tuple[str, datetime, int | None, int]],
+) -> str:
+    """Generate one temporal child satisfying all currently available parent constraints.
+
+    Lower bounds are hard causal ordering. Maximum-delay constraints are honored whenever the
+    feasible interval is non-empty; if a set of optional bounds is internally contradictory, the
+    safest executable behavior is to preserve causality and ignore only the conflicting maxima.
+    The rule is generic and therefore works for any industry/resource naming scheme.
+    """
+    if not constraints:
+        raise ValueError("temporal child generation requires at least one parent constraint")
+
+    lower = max(parent_dt + timedelta(seconds=max(0, int(min_gap or 0)))
+                for _parent, parent_dt, _max_gap, min_gap in constraints)
+    uppers = [parent_dt + timedelta(seconds=int(max_gap))
+              for _parent, parent_dt, max_gap, _min_gap in constraints
+              if max_gap is not None]
+    upper = min(uppers) if uppers else lower + timedelta(days=7)
+
+    if upper < lower:
+        # A model-generated rule set can contain overlapping maximum-delay hints that are
+        # impossible to satisfy simultaneously. Do not fabricate a pre-parent event. Preserve
+        # the non-negotiable ordering relation and use a conservative causal timestamp.
+        desired = lower
+    elif upper == lower:
+        desired = lower
+    else:
+        span = int((upper - lower).total_seconds())
+        desired = lower + timedelta(seconds=random.randint(0, max(0, span)))
+
+    if str(var.get("dtype") or "datetime").strip().lower() == "date":
+        return desired.date().isoformat()
+    return _format_datetime_for_variable(desired, var)
+
+
 def _generate_temporal_child_value(
     var: dict,
     parent_dt: datetime,
@@ -1115,6 +1152,24 @@ def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None
     return value
 
 
+def _temporal_field_is_absent_by_scenario(var: dict, rules: dict | None) -> bool:
+    """Return True when scenario semantics say the temporal event did not occur.
+
+    This is deliberately role-based.  It prevents a field such as
+    ``customer_response_timestamp`` from being generated for a ``No Response`` scenario
+    without maintaining a list of telecom/Low-Balance field names.
+    """
+    if not isinstance(rules, dict):
+        return False
+    semantics = rules.get("scenario_semantics")
+    if not isinstance(semantics, dict):
+        return False
+    absent_roles = {str(x).strip().lower() for x in semantics.get("absent_temporal_roles", []) or []}
+    if not absent_roles:
+        return False
+    return _temporal_role(var) in absent_roles
+
+
 def _apply_scenario_semantics(rec: dict, rules: dict | None) -> dict:
     """Apply schema-driven scenario-type guardrails after generic generation."""
     if not isinstance(rules, dict):
@@ -1131,6 +1186,17 @@ def _apply_scenario_semantics(rec: dict, rules: dict | None) -> dict:
     for field, preferred in (semantics.get("preferred_values") or {}).items():
         if field in rec and isinstance(preferred, list) and preferred:
             rec[field] = preferred[0]
+
+    # Non-occurring temporal events are represented by null rather than a fabricated timestamp.
+    # Field constraints retain the authoritative description/nullability without duplicating the
+    # entire confirmed variable list inside the rules document.
+    field_constraints = rules.get("field_constraints") if isinstance(rules.get("field_constraints"), dict) else {}
+    for name, constraint in field_constraints.items():
+        if not isinstance(constraint, dict):
+            continue
+        var = {"name": name, "description": constraint.get("description", "")}
+        if _temporal_field_is_absent_by_scenario(var, rules) and name in rec and bool(constraint.get("nullable", True)):
+            rec[name] = None
     return rec
 
 
@@ -1346,7 +1412,7 @@ def _generate_record(variables: list[dict], rules: dict | None = None, plan: _Ge
     ordered, cyclic, known_fields = plan.ordered, plan.cyclic, plan.known_fields
     temporal_child_rules = {}
     for parent, child, max_gap, min_gap in plan.temporal_relations:
-        temporal_child_rules.setdefault(child, (parent, max_gap, min_gap))
+        temporal_child_rules.setdefault(child, []).append((parent, max_gap, min_gap))
     for var in ordered:
         gen_type = var["gen"]
         effective_var = var
@@ -1365,16 +1431,25 @@ def _generate_record(variables: list[dict], rules: dict | None = None, plan: _Ge
             effective_var = dict(var)
             effective_var["gen"] = "formula"
             effective_var["formula"] = str(rule_formula)
-        temporal_rule = temporal_child_rules.get(var["name"])
+        # Generate only events that occur in this scenario.  In a No Response scenario,
+        # response timestamps are absent instead of being generated and later repaired away.
+        if _temporal_field_is_absent_by_scenario(var, rules):
+            rec[var["name"]] = None
+            continue
+
+        temporal_rules = temporal_child_rules.get(var["name"], [])
         original_generator = str(effective_var.get("gen") or "").strip().lower()
-        if temporal_rule and not rule_formula and original_generator in {
+        if temporal_rules and not rule_formula and original_generator in {
             "recent_datetime", "recent_date", "timestamp", "datetime"
         }:
-            parent_name, max_gap, min_gap = temporal_rule
-            parent_dt = _qa_parse_dt(rec.get(parent_name))
+            available_constraints = []
+            for parent_name, max_gap, min_gap in temporal_rules:
+                parent_dt = _qa_parse_dt(rec.get(parent_name))
+                if parent_dt is not None:
+                    available_constraints.append((parent_name, parent_dt, max_gap, min_gap))
             value = (
-                _generate_temporal_child_value(var, parent_dt, max_gap, min_gap)
-                if parent_dt is not None
+                _generate_temporal_child_value_for_constraints(var, available_constraints)
+                if available_constraints
                 else None
             )
         else:
@@ -1418,7 +1493,7 @@ def _generate_selected_record(
     ordered, cyclic, known_fields = plan.ordered, plan.cyclic, plan.known_fields
     temporal_child_rules = {}
     for parent, child, max_gap, min_gap in plan.temporal_relations:
-        temporal_child_rules.setdefault(child, (parent, max_gap, min_gap))
+        temporal_child_rules.setdefault(child, []).append((parent, max_gap, min_gap))
     for var in ordered:
         name = var["name"]
         if name in rec:
@@ -1436,16 +1511,24 @@ def _generate_selected_record(
             effective_var = dict(var)
             effective_var["gen"] = "formula"
             effective_var["formula"] = str(rule_formula)
-        temporal_rule = temporal_child_rules.get(name)
+        # Do not fabricate timestamps for events the scenario says did not occur.
+        if _temporal_field_is_absent_by_scenario(var, rules):
+            rec[name] = None
+            continue
+
+        temporal_rules = temporal_child_rules.get(name, [])
         original_generator = str(effective_var.get("gen") or "").strip().lower()
-        if temporal_rule and not rule_formula and original_generator in {
+        if temporal_rules and not rule_formula and original_generator in {
             "recent_datetime", "recent_date", "timestamp", "datetime"
         }:
-            parent_name, max_gap, min_gap = temporal_rule
-            parent_dt = _qa_parse_dt(rec.get(parent_name))
+            available_constraints = []
+            for parent_name, max_gap, min_gap in temporal_rules:
+                parent_dt = _qa_parse_dt(rec.get(parent_name))
+                if parent_dt is not None:
+                    available_constraints.append((parent_name, parent_dt, max_gap, min_gap))
             value = (
-                _generate_temporal_child_value(var, parent_dt, max_gap, min_gap)
-                if parent_dt is not None
+                _generate_temporal_child_value_for_constraints(var, available_constraints)
+                if available_constraints
                 else None
             )
         else:
@@ -1681,6 +1764,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
     variables=list(compiled.variables); entity_key=compiled.entity_key
     records_per_user=max(1,min(50,int(records_per_user or 10)))
     timestamp_field=_pick_timestamp_field(variables)
+    timestamp_var = next((v for v in variables if str(v.get("name") or "") == str(timestamp_field or "")), None)
     generated_records=[]
     used_entity_keys=set()
     used_identity_values={name:set() for name in ("subscriber_id", "account_id", "msisdn", "customer_id")}
@@ -1812,12 +1896,25 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     base=dict(user_context)
                     if timestamp_field:
                         # One authoritative transaction timestamp anchors the complete row.
-                        base[timestamp_field]=timestamps[record_index].isoformat()
+                        # Serialize it using the field's own confirmed contract before any dependent
+                        # timestamp is generated. This avoids mixing an ISO+timezone anchor with a
+                        # display-formatted child, which can shift comparisons by the local UTC offset.
+                        if timestamp_var and str(timestamp_var.get("dtype") or "").strip().lower() == "date":
+                            base[timestamp_field] = timestamps[record_index].date().isoformat()
+                        elif timestamp_var:
+                            base[timestamp_field] = _format_datetime_for_variable(timestamps[record_index], timestamp_var)
+                        else:
+                            base[timestamp_field] = timestamps[record_index].isoformat()
                     row=_generate_selected_record(variables,record_field_names,base=base,rules=rules,plan=record_plan,apply_repairs=False)
                     if not isinstance(row, dict):
                         raise TypeError("Transactional record generator returned a non-object")
                     if timestamp_field and timestamp_field not in row:
-                        row[timestamp_field]=timestamps[record_index].isoformat()
+                        if timestamp_var and str(timestamp_var.get("dtype") or "").strip().lower() == "date":
+                            row[timestamp_field] = timestamps[record_index].date().isoformat()
+                        elif timestamp_var:
+                            row[timestamp_field] = _format_datetime_for_variable(timestamps[record_index], timestamp_var)
+                        else:
+                            row[timestamp_field] = timestamps[record_index].isoformat()
 
                     # TopupBalance.id and topup_transaction_id identify concrete transaction
                     # resources. Guarantee uniqueness across the generated dataset instead of
@@ -2269,6 +2366,8 @@ def _enforce_authoritative_formulas(
         if field not in rec:
             continue
         field_def = variable_by_name.get(field) or {}
+        if _temporal_field_is_absent_by_scenario(field_def, rules) and rec.get(field) is None:
+            continue
         if str(field_def.get("gen", "")).strip().lower() in {"derived_timestamp", "ts_offset"}:
             if (field_def.get("params") or {}).get("delay_seconds") is not None:
                 continue
@@ -3825,6 +3924,8 @@ def _validate_record(
         # A derived timestamp formula can be descriptive in the confirmed contract. The executable
         # source of truth is its delay_seconds range plus the declared base dependency.
         field_def = variable_by_name.get(field) or {}
+        if _temporal_field_is_absent_by_scenario(field_def, rules) and rec.get(field) is None:
+            continue
         if str(field_def.get("gen", "")).strip().lower() in {"derived_timestamp", "ts_offset"}:
             if (field_def.get("params") or {}).get("delay_seconds") is not None:
                 continue
@@ -3860,6 +3961,8 @@ def _validate_record(
         if field not in active_fields:
             continue
         field_def = variable_by_name.get(field) or {}
+        if _temporal_field_is_absent_by_scenario(field_def, rules) and rec.get(field) is None:
+            continue
         if str(field_def.get("gen", "")).strip().lower() in {"derived_timestamp", "ts_offset"}:
             if (field_def.get("params") or {}).get("delay_seconds") is not None:
                 continue

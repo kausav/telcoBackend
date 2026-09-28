@@ -240,12 +240,24 @@ def derive_scenario_semantics(state, variables: list[dict]) -> dict:
                     preferred_values[name] = [normalized_choices[normalized]]
                     break
 
+    # Event occurrence is distinct from event ordering.  A scenario such as
+    # "No Response" can legitimately contain a response-capable source field, but that
+    # event did not occur; generating a timestamp for it would create a logically impossible
+    # record.  The policy is role-based, so it is not tied to any particular field name,
+    # domain, industry, or scenario ID.
+    absent_temporal_roles = []
+    if outcome_mode == "decline_or_no_response":
+        absent_temporal_roles.append("response")
+    elif outcome_mode == "suppression":
+        absent_temporal_roles.extend(["presentation", "dispatch", "response"])
+
     return {
         "mode": scenario_type or "unspecified",
         "outcome_mode": outcome_mode,
         "force_true_fields": force_true,
         "force_false_fields": force_false,
         "preferred_values": preferred_values,
+        "absent_temporal_roles": sorted(set(absent_temporal_roles)),
         "context_used": {k: v for k, v in pieces.items() if v},
     }
 

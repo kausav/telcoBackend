@@ -261,6 +261,24 @@ class SchemaAgent:
             generation_constraints[field] = gc
         rules["generation_constraints"] = generation_constraints
 
+        # The LLM may omit field metadata from its rules object. Keep a complete deterministic
+        # field-constraint projection so scenario occurrence semantics (for example a non-occurring
+        # response timestamp) can be applied without depending on an LLM-generated subset.
+        field_constraints = rules.get("field_constraints", {})
+        if not isinstance(field_constraints, dict):
+            field_constraints = {}
+        for var in VARS:
+            field = str(var.get("name") or "")
+            if not field:
+                continue
+            current = field_constraints.get(field)
+            if not isinstance(current, dict):
+                current = {}
+            current.setdefault("description", str(var.get("description") or ""))
+            current.setdefault("nullable", bool(var.get("nullable", False)))
+            field_constraints[field] = current
+        rules["field_constraints"] = field_constraints
+
         # Normalize and retain only executable conditional rules that reference fields
         # in the confirmed schema. These are consumed deterministically by data generation.
         var_names = {str(v.get("name")) for v in VARS if v.get("name")}
