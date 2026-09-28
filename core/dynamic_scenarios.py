@@ -7,6 +7,8 @@ from models.scenario_draft import ScenarioDraftModel
 from models.scenario_feedback import ScenarioFeedbackModel
 from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain
 from core.low_balance_variable_policy import validate_low_balance_variable_sources, reconcile_low_balance_variables
+from core.scenario_variable_store import get_recommended
+from core.industry_source_store import has_sources
 
 def next_scenario_id() -> str:
     return ScenarioModel.next_id()
@@ -202,24 +204,54 @@ def resolve_variables(requested_scenario_id: str) -> tuple[list[dict[str, Any]],
     raw_variables = [dict(v) for v in (dyn.get("variables") or []) if isinstance(v, dict)]
     meta = dyn.get("meta") or {}
     domain = meta.get("domain") or meta.get("journey") or ""
+    industry = meta.get("industry") or "generic"
+    source_available = bool(domain and has_sources(industry, domain))
+    scenario_version = int(meta.get("scenario_version", 1) or 1)
+    source_policy = str(meta.get("source_policy") or "").strip()
 
-    if is_low_balance_domain(domain, meta.get("industry")):
+    # When an exact industry/domain JSON source is not registered, scenario_variables is the
+    # only supported alternate variable source. A confirmed scenario may already contain the
+    # same definitions (the normal path), but if it does not, use the enabled recommendations
+    # persisted for this scenario/version rather than falling back to static files or legacy
+    # telecom vocabulary. The generation service performs the fail-closed source gate before
+    # execution, so reaching this branch with no DB variables is treated as empty.
+    recommended_fallback = []
+    if not source_available:
+        recommended_fallback = [dict(v) for v in get_recommended(requested_scenario_id, scenario_version) if isinstance(v, dict)]
+        if recommended_fallback:
+            raw_variables = recommended_fallback
+            source_policy = "scenario_variables"
+
+    if is_low_balance_domain(domain, industry):
         db_names = set(meta.get("db_variable_names") or [])
+        if recommended_fallback:
+            db_names.update(
+                str(v.get("name") or "").strip().casefold()
+                for v in recommended_fallback
+                if str(v.get("name") or "").strip()
+            )
         db_names.update((meta.get("db_variable_definitions") or {}).keys())
         variables, sources, db_names, normalized_order = reconcile_low_balance_variables(
             raw_variables,
             meta.get("variable_sources") or {},
             db_variable_names=db_names,
-            field_order=list(dyn.get("field_order") or []),
-            db_variable_definitions=meta.get("db_variable_definitions") or {},
+            field_order=(
+                list(dyn.get("field_order") or [])
+                if not recommended_fallback
+                else [str(v.get("name")) for v in recommended_fallback if str(v.get("name") or "").strip()]
+            ),
+            db_variable_definitions=(
+                dict(meta.get("db_variable_definitions") or {})
+                if not recommended_fallback
+                else {str(v.get("name")).strip(): dict(v) for v in recommended_fallback if str(v.get("name") or "").strip()}
+            ),
         )
         validate_low_balance_variable_sources(variables, sources, db_variable_names=db_names)
         field_order = normalized_order
     else:
         # Source-grounded scenarios are already compiled from their authoritative MongoDB
         # JSON catalog. Never apply legacy telecom repairs to another industry's fields.
-        source_policy = str(meta.get("source_policy") or "").strip()
-        if source_policy == "mongodb_industry_source_documents" or (
+        if source_policy in {"mongodb_industry_source_documents", "scenario_variables"} or (
             is_json_grounded_domain(domain, meta.get("industry"))
             and not is_low_balance_domain(domain, meta.get("industry"))
         ):
@@ -227,7 +259,12 @@ def resolve_variables(requested_scenario_id: str) -> tuple[list[dict[str, Any]],
         else:
             variables = _repair_legacy_variables(raw_variables)
         allowed = {str(v.get("name")) for v in variables if isinstance(v, dict) and v.get("name")}
-        field_order = [name for name in list(dyn.get("field_order") or []) if str(name) in allowed]
+        candidate_order = (
+            [str(v.get("name")) for v in recommended_fallback if str(v.get("name") or "").strip()]
+            if recommended_fallback
+            else list(dyn.get("field_order") or [])
+        )
+        field_order = [name for name in candidate_order if str(name) in allowed]
     return variables, field_order
 
 
@@ -251,8 +288,10 @@ def resolve_scenario_context(requested_scenario_id: str) -> dict[str, Any]:
         "country": meta.get("country"),
         "type_of_data": meta.get("type_of_data", "aggregational"),
         "entity_key": meta.get("entity_key"),
+        "variables": [dict(v) for v in (resolve_variables(requested_scenario_id) or ([], []))[0] if isinstance(v, dict)],
         "records_per_user": int(meta.get("records_per_user", 10) or 10),
         "agentic": bool(meta.get("agentic", False)),
+        "scenario_version": int(meta.get("scenario_version", 1) or 1),
         "variable_sources": dict(meta.get("variable_sources") or {}),
         "db_variable_names": sorted(set(meta.get("db_variable_names") or []) | set((meta.get("db_variable_definitions") or {}).keys())),
         "db_variable_definitions": dict(meta.get("db_variable_definitions") or {}),

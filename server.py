@@ -30,12 +30,11 @@ from core.compiled_schema import invalidate_scenario, infer_history_field_sets
 from core.runtime_cache import clear_scenario
 from core.agentic_models import ScenarioProposeRequest, ScenarioImportResponse
 from core.csv_scenario import infer_type_of_data, parse_definition_csv
-from config.industry_profiles import COUNTRY_BASE
-from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES, INDUSTRY_SOURCE_MAX_JSON_BYTES, INDUSTRY_SOURCE_UPLOAD_TOKEN
+from config.country_metadata import COUNTRY_BASE
+from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES, INDUSTRY_SOURCE_MAX_JSON_BYTES, INDUSTRY_SOURCE_ADMIN_TOKEN
 from core.agentic_workflow import AgenticSchemaWorkflow, get_agentic_workflow
 from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain
 from core.low_balance_variable_policy import validate_low_balance_variable_sources
-from core.telecom_registry import RegistryError, get_registry
 from core.scenario_variable_store import upsert_recommended, get_recommended, set_user_variables, get_user_variables, get_user_variable_records, delete_user_variable
 from models.database import ping as ping_mongodb
 from models.model_registry import ensure_indexes as ensure_model_indexes
@@ -45,8 +44,8 @@ from core.industry_source_store import (
     get_source_document,
     list_source_documents,
     save_source_document,
-    seed_bundled_industry_sources,
     set_source_active,
+    generate_internal_source_id,
 )
 
 
@@ -87,16 +86,7 @@ async def lifespan(_app: FastAPI):
     try:
         ping_mongodb()
         ensure_model_indexes()
-        seeded = seed_bundled_industry_sources()
-        logger.info("Industry source registry ready: sources=%s", len(seeded))
-        registry = get_registry()
-        health = registry.health()
-        if not health["healthy"]:
-            raise RegistryError("Telecom standards registry is empty")
-        logger.info(
-            "Standards registry ready: standards=%s entities=%s attributes=%s relationships=%s",
-            health["standards"], health["entities"], health["attributes"], health["relationships"],
-        )
+        logger.info("Industry source registry ready: source_of_truth=mongodb")
     except Exception:
         logger.exception("Application startup validation failed")
         raise
@@ -291,9 +281,9 @@ class IndustrySourceResponse(BaseModel):
 
 def _require_industry_source_admin_token(request: Request) -> None:
     """Protect destructive source-registry mutations with a deployment-provided admin token."""
-    expected = INDUSTRY_SOURCE_UPLOAD_TOKEN
+    expected = INDUSTRY_SOURCE_ADMIN_TOKEN
     if not expected:
-        raise HTTPException(503, detail={"error": "Industry source administration is disabled; set INDUSTRY_SOURCE_UPLOAD_TOKEN"})
+        raise HTTPException(503, detail={"error": "Industry source administration is disabled; set INDUSTRY_SOURCE_ADMIN_TOKEN"})
     supplied = str(request.headers.get("X-Industry-Source-Token") or "")
     if not secrets.compare_digest(supplied, expected):
         raise HTTPException(401, detail={"error": "Invalid industry source administration token"})
@@ -330,14 +320,12 @@ def health():
 @app.get("/ready")
 def ready():
     """Readiness check for deployment probes."""
-    registry_health = get_registry().health()
-    if not registry_health.get("healthy"):
-        raise HTTPException(status_code=503, detail={"error": "Telecom standards registry is not ready"})
-    source_count = len(list_source_documents(active_only=True))
-    return {"status": "ready", "registry": {
-        "standards": registry_health["standards"],
-        "entities": registry_health["entities"],
-    }, "industrySources": {"active": source_count}}
+    try:
+        ping_mongodb()
+        source_count = len(list_source_documents(active_only=True))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={"error": f"MongoDB/source registry is not ready: {exc}"}) from exc
+    return {"status": "ready", "sourceOfTruth": "mongodb", "industrySources": {"active": source_count}}
 
 
 def _read_json_source_upload(file: UploadFile) -> tuple[bytes, dict]:
@@ -575,17 +563,24 @@ def upload_industry_sources(
         file_name = upload.filename or f"source_{index + 1}.json"
         info = item["document"].get("info") if isinstance(item["document"].get("info"), dict) else {}
         try:
+            internal_source_id = generate_internal_source_id(
+                industry_type=industryType,
+                domain=domain,
+                file_name=file_name,
+                document=item["document"],
+                raw_bytes=item["raw"],
+            )
             source = save_source_document(
                 industry_type=industryType,
                 domain=domain,
                 document=item["document"],
                 file_name=file_name,
-                source_name=file_name,
+                source_name=str(info.get("title") or file_name).strip(),
                 standard=None,
                 version=str(info.get("version") or "").strip() or None,
                 description=str(info.get("description") or "").strip() or None,
                 active=True,
-                source_id=None,
+                source_id=internal_source_id,
                 raw_bytes=item["raw"],
             )
             uploaded_sources.append(source)
@@ -628,17 +623,6 @@ def remove_industry_source(source_id: str, request: Request):
     return {"success": True, "sourceId": source_id, "deleted": True}
 
 
-@app.post("/industry-sources/bootstrap")
-def bootstrap_industry_sources(request: Request):
-    """Explicitly run the bundled Low Balance compatibility migration."""
-    _require_industry_source_admin_token(request)
-    try:
-        sources = seed_bundled_industry_sources()
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-    return {"success": True, "sources": sources}
-
-
 @app.post("/scenario/import-csv", response_model=ScenarioImportResponse)
 def import_scenario_csv(
     file: UploadFile = File(..., description="CSV scenario definition containing variables"),
@@ -662,9 +646,9 @@ def import_scenario_csv(
     Low Balance & Top-up is intentionally source-locked to TMF654/TMF629 or MongoDB
     variables, so CSV cannot become a third variable source for that domain.
     """
-    if is_json_grounded_domain(domain, industryType):
+    if is_low_balance_domain(domain, industryType) or is_json_grounded_domain(domain, industryType):
         message = (
-            "Low Balance & Top-up variables cannot be defined through CSV. Use the active TMF654/TMF629 source documents or MongoDB variables."
+            "Low Balance & Top-up variables cannot be defined through CSV. Use the active MongoDB industry source documents or scenario variables."
             if is_low_balance_domain(domain, industryType)
             else "This JSON-source-backed industry/domain cannot be defined through CSV. Use the active MongoDB industry source documents."
         )
@@ -804,7 +788,7 @@ def confirm_scenario_route(req: ConfirmRequest):
             if str(name).strip() and str(source).strip()
         },
         "db_variable_names": sorted(str(name).strip().casefold() for name in (draft.get("db_variable_names") or []) if str(name).strip()),
-        "source_policy": draft.get("source_policy", "approved_telecom_standards_registry"),
+        "source_policy": draft.get("source_policy", "scenario_variables"),
         "source_documents": list(draft.get("source_documents") or []),
     }
     try:
@@ -843,7 +827,7 @@ def propose_scenario(req: ScenarioProposeRequest):
     can reuse the same HITL review screen and call /scenario/confirm unchanged.
     """
     try:
-        return get_agentic_workflow(registry=get_registry()).propose(req)
+        return get_agentic_workflow().propose(req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
     except (RuntimeError, EnvironmentError) as exc:

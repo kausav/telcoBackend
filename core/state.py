@@ -8,8 +8,8 @@ class WorkflowState(BaseModel):
     # ── Inputs ────────────────────────────────────────────────────────────
     scenario: str       # e.g. "LB-01"
     count: int          # number of users/entities requested for transactional scenarios
-    industry: str = "generic"  # e.g. "Telecom", "Banking", "Retail" — drives industry conventions (see config/industry_profiles.py)
-    country: str | None = None  # None means GLOBAL/non-country-specific conventions
+    industry: str = "generic"  # Request context only; standards come from MongoDB source documents.
+    country: str | None = None  # Request context only; not an LLM standards source.
     type_of_data: Literal["transactional", "aggregational"] = "aggregational"
     batch_size: int = 50
     records_per_user: int = 10

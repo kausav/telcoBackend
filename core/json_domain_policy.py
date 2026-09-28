@@ -4,8 +4,8 @@ The original implementation hard-coded two TM Forum files for Low Balance & Top-
 operational source of truth is now MongoDB: source documents are keyed by ``industryType`` and
 ``domain`` and may contain one or more Swagger/OpenAPI/JSON-Schema documents.
 
-The bundled Low Balance files remain only as a one-time bootstrap migration. No proposal or
-runtime generation path reads their filesystem paths directly.
+There is no bundled industry/domain source fallback. Active MongoDB source documents are the only
+source of truth for executable industry/domain JSON schemas.
 """
 from __future__ import annotations
 
@@ -36,16 +36,6 @@ LOW_BALANCE_MAIN_MODEL_IDS = (
     "tmf654_v4__bucket",
     "tmf629_v4__customer",
 )
-LOW_BALANCE_SOURCE_NAMES = {
-    "tmf654_v4": "TMF654 Prepay Balance Management API v4.0.0 Swagger",
-    "tmf629_v4": "TMF629 Customer Management API v4.0.0 Swagger",
-}
-LOW_BALANCE_SOURCE_FILES = {
-    "tmf654_v4": "TMF654_Prepay_Balance_Management_API_v4.0.0_swagger.json",
-    "tmf629_v4": "TMF629_Customer_Management_API_v4.0.0_swagger.json",
-}
-
-
 def normalize_domain(value: str | None) -> str:
     return " ".join(str(value or "").strip().lower().replace("_", " ").split())
 
@@ -60,17 +50,15 @@ def is_low_balance_domain(value: str | None, industry_type: str | None = None) -
 
 
 def is_json_grounded_domain(value: str | None, industry_type: str | None = None) -> bool:
-    """Return whether the exact request is backed by active MongoDB JSON source documents.
+    """Return True only when active MongoDB source documents exist for the exact pair.
 
-    Low Balance remains recognized by its historical aliases so legacy confirmed scenarios keep
-    their special business rules. Other industries/domains are JSON-grounded only when MongoDB
-    actually contains active documents for the supplied pair.
+    Historical domain aliases are used only to select business-policy code. They never bypass
+    the MongoDB source check. This deliberately fails closed when the source registry has no
+    active documents for the requested industry/domain pair.
     """
-    if is_low_balance_domain(value, industry_type):
-        return True
-    if industry_type and str(value or "").strip():
-        return has_sources(industry_type, value)
-    return False
+    if not industry_type or not str(value or "").strip():
+        return False
+    return has_sources(industry_type, value)
 
 
 def expanded_scalar_catalog(

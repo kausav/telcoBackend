@@ -1578,17 +1578,21 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
             # Repair application-level telecom identity anchors before grouping. This is
             # intentionally independent of the confirmed draft's stored generators so old
             # scenarios cannot collapse all requested users into a single subscriber.
-            low_balance_domain = "low balance" in str((rules or {}).get("domain") or "").lower() and "top" in str((rules or {}).get("domain") or "").lower()
-            user_context=_enforce_mandatory_telecom_identity(
-                user_context,
-                variables,
-                country=country,
-                used_values=used_identity_values,
-                low_balance=low_balance_domain,
-                rules=rules,
-            )
+            industry_key = re.sub(r"[^a-z0-9]+", "", str((rules or {}).get("industry_type") or "").lower())
+            telecom_industry = industry_key in {"telecom", "telecommunications", "telecommunication"}
+            low_balance_domain = telecom_industry and "low balance" in str((rules or {}).get("domain") or "").lower() and "top" in str((rules or {}).get("domain") or "").lower()
+            if telecom_industry:
+                user_context=_enforce_mandatory_telecom_identity(
+                    user_context,
+                    variables,
+                    country=country,
+                    used_values=used_identity_values,
+                    low_balance=low_balance_domain,
+                    rules=rules,
+                )
             # Establish stable entity-level domain context before transaction rows are created.
-            user_context, _ = _enforce_low_balance_topup_consistency(user_context, variables, rules=rules)
+            if low_balance_domain:
+                user_context, _ = _enforce_low_balance_topup_consistency(user_context, variables, rules=rules)
 
             if entity_key and entity_key in user_context:
                 attempts=0
@@ -1599,30 +1603,30 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     attempts+=1
                 used_entity_keys.add(str(user_context.get(entity_key)))
 
-            # Enforce unique stable telecom identity anchors at the user/entity level.
-            # This prevents response grouping from collapsing multiple requested users into
-            # one object when a legacy/edited draft contains constant placeholder generators.
+            # Enforce unique stable telecom identity anchors only for telecom scenarios.
+            # Other industries may legitimately use fields such as account_id/customer_id with different contracts.
             variable_names={str(v.get("name")) for v in variables if v.get("name")}
-            for identity_name in ("subscriber_id", "account_id", "msisdn", "customer_id"):
-                if identity_name not in variable_names:
-                    continue
-                identity_value=str(user_context.get(identity_name) or "")
-                attempts=0
-                while identity_value in used_identity_values[identity_name] and attempts < 100:
-                    if identity_name == "account_id" and low_balance_domain:
-                        regenerated = _regenerate_declared_field(variables, "account_id", user_context, rules=rules)
-                        user_context["account_id"] = regenerated
-                    elif identity_name == "account_id":
-                        user_context=_generate_selected_record(
-                            variables,{"subscriber_id","account_id"},base=user_context,rules=rules
-                        )
-                    else:
-                        regenerated = _regenerate_declared_field(variables, identity_name, user_context, rules=rules)
-                        user_context[identity_name] = regenerated
+            if telecom_industry:
+                for identity_name in ("subscriber_id", "account_id", "msisdn", "customer_id"):
+                    if identity_name not in variable_names:
+                        continue
                     identity_value=str(user_context.get(identity_name) or "")
-                    attempts+=1
-                if identity_value:
-                    used_identity_values[identity_name].add(identity_value)
+                    attempts=0
+                    while identity_value in used_identity_values[identity_name] and attempts < 100:
+                        if identity_name == "account_id" and low_balance_domain:
+                            regenerated = _regenerate_declared_field(variables, "account_id", user_context, rules=rules)
+                            user_context["account_id"] = regenerated
+                        elif identity_name == "account_id":
+                            user_context=_generate_selected_record(
+                                variables,{"subscriber_id","account_id"},base=user_context,rules=rules
+                            )
+                        else:
+                            regenerated = _regenerate_declared_field(variables, identity_name, user_context, rules=rules)
+                            user_context[identity_name] = regenerated
+                        identity_value=str(user_context.get(identity_name) or "")
+                        attempts+=1
+                    if identity_value:
+                        used_identity_values[identity_name].add(identity_value)
 
             # Resource identifiers are real identifiers, not descriptive dimensions. Keep
             # bucket ids unique across subscribers so cross-subscriber references cannot collide.

@@ -13,7 +13,6 @@ import logging
 from core.agentic_models import ScenarioImportResponse, ScenarioProposeRequest, ScenarioSchema, ScenarioIntent, GeneratedSchemaField
 from core.conversation_store import append_message, ensure_conversation
 from core.dynamic_scenarios import new_draft_id, save_draft
-from core.telecom_registry import TelecomRegistry, get_registry
 from core.errors import LLMUpstreamError
 from core.runtime_cache import get_proposal, set_proposal
 from core.scenario_variable_store import get_recommended, get_user_variables, save_proposal
@@ -38,27 +37,22 @@ from core.industry_source_store import normalize_industry_key
 class AgenticSchemaWorkflow:
     """Build a standards-backed draft and validate HITL edits without an extra API."""
 
-    def __init__(self, api_key: str | None = None, registry: TelecomRegistry | None = None):
-        self.registry = registry or get_registry()
+    def __init__(self, api_key: str | None = None):
         self._api_key = api_key
         self._intent_agent: GeminiIntentAgent | None = None
-        self.compiler = SchemaCompiler(self.registry)
+        self.compiler = SchemaCompiler()
 
     def _get_intent_agent(self) -> GeminiIntentAgent:
         if self._intent_agent is None:
-            self._intent_agent = GeminiIntentAgent(api_key=self._api_key, registry=self.registry)
+            self._intent_agent = GeminiIntentAgent(api_key=self._api_key)
         return self._intent_agent
 
     @staticmethod
     def _infer_type_of_data(requested: str | None, schema: ScenarioSchema) -> str:
         if requested in {"transactional", "aggregational"}:
             return requested
-        entity_ids = {entity.canonical_id for entity in schema.entities}
-        transactional_markers = {
-            "subscriber", "customer", "customer_account", "prepaid_account",
-            "recharge", "usage_event", "charging_event",
-        }
-        return "transactional" if entity_ids & transactional_markers else "aggregational"
+        # Prefer the source-backed field grain rather than an industry-specific marker list.
+        return "transactional" if any(str(field.grain or "").lower() == "entity" for field in schema.fields) else "aggregational"
 
     @staticmethod
     def _entity_key(requested: str | None, field_names: list[str], type_of_data: str) -> str | None:
@@ -208,7 +202,7 @@ class AgenticSchemaWorkflow:
                 ordered.append(field)
                 by_name[key] = field
                 generated_from = str(field.provenance.get("generated_from") or "").strip().lower()
-                source_by_name[key] = "OFFICIAL_JSON" if generated_from == "official_json_source" else "LLM_GENERATED"
+                source_by_name[key] = "MONGODB_JSON" if generated_from == "mongodb_json_source" else "LLM_GENERATED"
 
         def add_persisted(items: list[dict[str, Any]], source: str) -> None:
             for raw in items or []:
@@ -242,18 +236,7 @@ class AgenticSchemaWorkflow:
         industry_key = normalize_industry_key(req.industry_type)
         low_balance = is_low_balance_domain(req.domain, req.industry_type)
         json_grounded = is_json_grounded_domain(req.domain, industry_key)
-        if not json_grounded and industry_key != "telecom":
-            raise ValueError(
-                f"No active JSON source documents are registered for industryType='{req.industry_type}', domain='{req.domain}'. Upload at least one industry-standard JSON source first."
-            )
-        grounding_requirement = (
-            "JSON-SOURCE REQUIREMENT: use only active MongoDB source documents for this exact industryType/domain pair. "
-            "The source catalog is the only official executable vocabulary; do not use unrelated standards, PDFs, CSV examples, memory, generic knowledge, or invented fields. "
-            "Every non-DB executable variable must be an exact scalar leaf from that catalog. The LLM is a selector/reviewer only; it cannot invent, rename, alias, or derive executable variable names. "
-            if json_grounded
-            else "Use all relevant concepts from the complete approved telecom standards registry context, across all registered source URLs. "
-        )
-        # Mongo variables are authoritative inputs to the Low Balance variable set. Fetch both
+        # Mongo variables are authoritative inputs to the source-bound proposal. Fetch both
         # scenario recommendations and the user's selected variables before the LLM/cache step.
         recommended = get_recommended(requested_scenario_id, 1)
         user_selected = (
@@ -272,9 +255,22 @@ class AgenticSchemaWorkflow:
                 )
 
         db_variables = self._merge_db_variable_sources(recommended, user_selected)
+        if not json_grounded and not db_variables:
+            raise ValueError(
+                f"No active JSON source documents and no persisted MongoDB scenario variables exist for industryType='{req.industry_type}', domain='{req.domain}'. "
+                "Upload at least one industry-standard JSON or save scenario variables before proposing/generating this scenario."
+            )
+        grounding_requirement = (
+            "JSON-SOURCE REQUIREMENT: use only active MongoDB source documents for this exact industryType/domain pair. "
+            "The source catalog is the only executable standards vocabulary; do not use external standards, URLs, static registries, profiles, templates, examples, memory, or generic industry knowledge. "
+            "Every non-DB executable variable must be an exact scalar leaf from that catalog. "
+            if json_grounded else
+            "SCENARIO-VARIABLES REQUIREMENT: there is no registered JSON source for this exact industryType/domain pair. "
+            "Use only the persisted MongoDB scenario variables supplied to you. Do not invent, rename, alias, or derive executable variable names. "
+        )
         if low_balance:
-            # Low Balance has two source families only. account_id and msisdn are absent from
-            # the bundled TMF654/TMF629 catalog, so the exact DB variables are mandatory.
+            # Low Balance has domain-specific identity extensions. account_id and msisdn are absent from
+            # the active MongoDB source catalog, so exact DB extensions remain mandatory for that domain.
             validate_low_balance_required_identity_sources(db_variables)
         protected_name_set = set(self._variable_name_keys(db_variables))
         if low_balance and db_variables:
@@ -326,9 +322,7 @@ class AgenticSchemaWorkflow:
             )
             intent.industry_type = industry_key
             intent.domain = req.domain
-            intent.subdomain = req.use_case.strip().lower() if req.use_case.strip().lower() in {
-                "prepaid", "postpaid", "charging", "usage", "customer", "network"
-            } and industry_key == "telecom" else "unknown"
+            intent.subdomain = req.use_case.strip().lower() if req.use_case.strip() else "unknown"
             if req.country:
                 intent.country = req.country
             intent.scenario_type = req.scenario_type
@@ -347,22 +341,44 @@ class AgenticSchemaWorkflow:
                     if str(idea.name or "").strip().casefold() not in protected_name_set
                 ]
 
-            schema = self.compiler.compile(
-                intent,
-                max_variables=None,
-                domain_query=req.domain,
-                entity_key=req.entity_key,
-                industry_type=req.industry_type,
-                scenario_type=req.scenario_type,
-                type_of_data=req.type_of_data,
-                use_case=req.use_case,
-                business_scenario=req.business_scenario,
-                business_response="",
-                expected_outcome="",
-                country=req.country,
-                excluded_field_names=list(protected_names),
-                external_variable_names=set(protected_name_set),
-            )
+            if json_grounded:
+                schema = self.compiler.compile(
+                    intent,
+                    max_variables=None,
+                    domain_query=req.domain,
+                    entity_key=req.entity_key,
+                    industry_type=req.industry_type,
+                    scenario_type=req.scenario_type,
+                    type_of_data=req.type_of_data,
+                    use_case=req.use_case,
+                    business_scenario=req.business_scenario,
+                    business_response="",
+                    expected_outcome="",
+                    country=req.country,
+                    excluded_field_names=list(protected_names),
+                    external_variable_names=set(protected_name_set),
+                )
+            else:
+                # No JSON source exists for this pair. The only executable definitions allowed
+                # are the persisted MongoDB scenario variables; build the schema directly from
+                # their stored contracts and never ask a registry/static source for replacements.
+                db_fields = [GeneratedSchemaField.model_validate(dict(item)) for item in db_variables]
+                names = [field.name for field in db_fields]
+                resolved_entity_key = req.entity_key or (names[0] if req.type_of_data == "transactional" and names else None)
+                schema = ScenarioSchema(
+                    domain=req.domain,
+                    subdomain="unknown",
+                    applicable_standards=[],
+                    entities=[],
+                    relationships=[],
+                    fields=db_fields,
+                    hard_constraints=[
+                        "Executable variables are restricted to persisted MongoDB scenario_variables because no industry/domain JSON source is registered for this pair.",
+                        "The LLM is a reviewer only and cannot create, rename, alias, or change executable scenario variables.",
+                    ] + ([f"'{resolved_entity_key}' is the authoritative entity key for transactional grouping."] if resolved_entity_key else []),
+                    unresolved_items=[] if db_fields else ["No persisted MongoDB scenario variables are available."],
+                    warnings=["No industry-standard JSON source is registered for this industry/domain pair; MongoDB scenario variables are the complete executable source."],
+                )
             set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
 
         # For Low Balance, remove only official JSON fields that duplicate an authoritative DB
@@ -412,7 +428,7 @@ class AgenticSchemaWorkflow:
             if low_balance:
                 continue
             if json_grounded:
-                variable["source"] = "OFFICIAL_JSON"
+                variable["source"] = "MONGODB_JSON"
                 continue
             variable["source"] = "LLM_GENERATED"
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
@@ -444,11 +460,11 @@ class AgenticSchemaWorkflow:
             "intent": intent.model_dump(),
             "schema": schema.model_dump(),
             "approval_questions": unresolved_questions,
-            "source_policy": ("mongodb_low_balance_source_documents" if low_balance else "mongodb_industry_source_documents") if json_grounded else "approved_telecom_standards_registry",
+            "source_policy": ("mongodb_low_balance_source_documents" if low_balance else "mongodb_industry_source_documents") if json_grounded else "scenario_variables",
             "source_documents": source_manifest(req.industry_type, req.domain) if json_grounded else [],
             "variable_sources": variable_sources,
-            "db_variable_names": sorted(raw_persisted_by_name.keys()) if low_balance else [],
-            "db_variable_definitions": raw_persisted_by_name if low_balance else {},
+            "db_variable_names": sorted(raw_persisted_by_name.keys()),
+            "db_variable_definitions": raw_persisted_by_name,
         }
         save_draft(draft_id, draft)
         save_proposal(
@@ -599,7 +615,7 @@ class AgenticSchemaWorkflow:
             if not name:
                 raise ValueError("Agentic HITL additions require an existing field name")
             if name not in fields_by_name:
-                raise ValueError(f"Agentic HITL cannot add field '{name}' because it is not in the proposed registry-backed schema")
+                raise ValueError(f"Agentic HITL cannot add field '{name}' because it is not in the proposed MongoDB source-backed schema")
             raise ValueError(f"Agentic HITL cannot add duplicate field '{name}'; revise existing fields instead")
 
         allowed_override_keys = {"nullable", "description", "params"}
@@ -692,8 +708,8 @@ class AgenticSchemaWorkflow:
 _WORKFLOW_SINGLETONS: dict[str, AgenticSchemaWorkflow] = {}
 
 
-def get_agentic_workflow(api_key: str | None = None, registry: TelecomRegistry | None = None) -> AgenticSchemaWorkflow:
-    """Reuse the Gemini intent client/registry objects across proposal requests.
+def get_agentic_workflow(api_key: str | None = None) -> AgenticSchemaWorkflow:
+    """Reuse the Gemini intent client across proposal requests.
 
     The cache key is the explicit API key (or a process-local default), never requestedScenarioId.
     This removes repeated Gemini client/provider construction from /scenario/propose.
@@ -701,6 +717,6 @@ def get_agentic_workflow(api_key: str | None = None, registry: TelecomRegistry |
     key = api_key or "__default__"
     workflow = _WORKFLOW_SINGLETONS.get(key)
     if workflow is None:
-        workflow = AgenticSchemaWorkflow(api_key=api_key, registry=registry)
+        workflow = AgenticSchemaWorkflow(api_key=api_key)
         _WORKFLOW_SINGLETONS[key] = workflow
     return workflow

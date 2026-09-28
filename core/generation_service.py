@@ -21,6 +21,8 @@ from core.dynamic_scenarios import (
 )
 from agents.data_generation_agent import run_deterministic_agentic_generation
 from core.pipeline import run_pipeline
+from core.industry_source_store import catalog_for_request, has_sources
+from core.scenario_variable_store import get_recommended
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,72 @@ def _timestamp_sort_key(value: Any):
     return dt.astimezone(timezone.utc)
 
 
+
+def _require_generation_source(
+    requested_scenario_id: str,
+    scenario_context: dict[str, Any],
+) -> None:
+    """Fail closed unless the exact industry/domain has JSON sources or scenario_variables.
+
+    Industry/domain JSON documents are the preferred executable source. The only supported
+    fallback is enabled scenario-level recommendations stored in MongoDB. This check is kept in
+    the generation service itself so every caller, not just the HTTP route, observes the same
+    source-of-truth boundary.
+    """
+    industry = str(scenario_context.get("industry") or "").strip()
+    domain = str(scenario_context.get("domain") or "").strip()
+    if not industry or not domain:
+        raise ValueError(
+            f"Generation is blocked for scenario '{requested_scenario_id}': the confirmed scenario is missing industryType or domain."
+        )
+
+    source_available = has_sources(industry, domain)
+    scenario_version = int(scenario_context.get("scenario_version", 1) or 1)
+    scenario_variables = get_recommended(requested_scenario_id, scenario_version)
+    if not source_available and not scenario_variables:
+        raise ValueError(
+            "Generation is blocked because no active industry-standard JSON source documents exist "
+            f"in MongoDB for industryType='{industry}', domain='{domain}', and no enabled "
+            f"scenario_variables exist for scenario='{requested_scenario_id}', scenarioVersion={scenario_version}. "
+            "Upload at least one industry-standard JSON for this industry/domain or save scenario "
+            "variables before calling /scenario/generate."
+        )
+
+    # Source-backed confirmed variables are validated against the CURRENT MongoDB source catalog.
+    # This prevents a legacy/edited confirmed scenario from smuggling in a field that is no longer
+    # present in the active industry/domain standards. Persisted scenario_variables are the only
+    # permitted exception.
+    if source_available:
+        catalog_names = {
+            str(row.get("name") or "").strip().casefold()
+            for row in (catalog_for_request(industry, domain).get("models") or [])
+            if isinstance(row, dict) and str(row.get("name") or "").strip()
+        }
+        scenario_variable_names = {
+            str(row.get("name") or "").strip().casefold()
+            for row in scenario_variables
+            if isinstance(row, dict) and str(row.get("name") or "").strip()
+        }
+        confirmed_variables = scenario_context.get("variables") or []
+        # resolve_scenario_context includes the confirmed variable list. Keep this check exact-name
+        # and deliberately do not attempt fuzzy matching/renaming.
+        unknown = sorted(
+            {
+                str(row.get("name") or "").strip()
+                for row in confirmed_variables
+                if isinstance(row, dict)
+                and str(row.get("name") or "").strip()
+                and str(row.get("name") or "").strip().casefold() not in catalog_names
+                and str(row.get("name") or "").strip().casefold() not in scenario_variable_names
+            }
+        )
+        if unknown:
+            raise ValueError(
+                "Generation is blocked because the confirmed scenario contains variables outside the current MongoDB source boundary: "
+                + ", ".join(unknown[:25])
+            )
+    return
+
 def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
     """Run the full generation + QA pipeline and build the API response payload."""
     requested_scenario_id = req_payload.get("requested_scenario_id")
@@ -75,11 +143,12 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Unknown requested_scenario_id '{requested_scenario_id}'")
 
     scenario_context = resolve_scenario_context(requested_scenario_id)
+    _require_generation_source(requested_scenario_id, scenario_context)
     if scenario_context.get("agentic"):
         state = run_deterministic_agentic_generation(
             scenario=requested_scenario_id,
             count=count,
-            industry=scenario_context.get("industry", "telecom"),
+            industry=scenario_context.get("industry", "generic"),
             country=scenario_context.get("country"),
             type_of_data=scenario_context.get("type_of_data", resolve_data_type(requested_scenario_id)),
             scenario_context=scenario_context,

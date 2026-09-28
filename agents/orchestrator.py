@@ -11,7 +11,6 @@ import json
 
 from langgraph.graph import StateGraph, END
 
-from config.industry_profiles import get_profile
 from core.dynamic_scenarios import list_scenarios, resolve_scenario_meta, resolve_variables, scenario_exists
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
@@ -22,12 +21,12 @@ logger = logging.getLogger(__name__)
 _SYSTEM = """
 You are the Orchestrator Agent for a synthetic data generation pipeline covering
 any business industry (telecom, banking, retail, healthcare, etc.).
-You run AFTER the CSV scenario definition has been imported and confirmed. Gatekeep the
-confirmed scenario variable data against the target industry's and country's real-world conventions
-and the full CSV contract. The CSV fields, descriptions, params, dependencies, and formulas
-Include any declared timestamp_format/format exactly; timestamps are presentation constraints as well as semantic fields.
-are authoritative. Do not recommend or imply values outside explicit params choices/values,
-numeric ranges, buckets/weights, precision, currency, timezone, or formulas. Return a JSON object with:
+You run AFTER the scenario definition has been imported and confirmed. Gatekeep the
+confirmed scenario variable data against the complete confirmed scenario contract. The CSV/source
+fields, descriptions, params, dependencies, formulas, and timestamp_format/format are authoritative.
+Do not recommend or imply values outside explicit params choices/values, numeric ranges,
+buckets/weights, precision, currency, timezone, formulas, or the confirmed source definitions.
+Return a JSON object with:
   - "valid": bool
   - "reason": str  (empty string when valid)
   - "execution_notes": str
@@ -106,18 +105,17 @@ class OrchestratorAgent:
         return state
 
     def _validate(self, state: WorkflowState) -> WorkflowState:
-        # Agentic scenarios have already passed registry resolution + HITL approval.
+        # Agentic scenarios have already passed MongoDB source resolution + HITL approval.
         # Never re-ask an LLM to reinterpret an approved schema.
         if (state.scenario_context or {}).get("agentic"):
             set_orchestrator(self._cache_key_value, {
                 "valid": True,
-                "reason": "Approved agentic scenario; deterministic registry gate used.",
+                "reason": "Approved agentic scenario; deterministic MongoDB source gate used.",
                 "execution_notes": "LLM stages bypassed after HITL approval.",
             })
-            logger.info("[Orchestrator] Agentic scenario: deterministic registry gate passed; LLM skipped.")
+            logger.info("[Orchestrator] Agentic scenario: deterministic MongoDB source gate passed; LLM skipped.")
             return state
         sc = resolve_scenario_meta(state.scenario)
-        profile = get_profile(state.industry, state.country)
         variable_summary = [
             {
                 "name": v.get("name"),
@@ -144,8 +142,9 @@ class OrchestratorAgent:
             f"Records requested: {state.count}\n"
             f"confirmed scenario variable data ({len(variable_summary)} fields): {variable_summary}\n"
             f"Complete confirmed scenario context (source of truth): {json.dumps(state.scenario_context, default=str, sort_keys=True)}\n"
-            f"Target industry: {profile['industry']}; country: {profile['country_name']} ({state.country}) — "
-            f"regulator {profile['regulator']}, market character: {profile['market_character']}\n"
+            f"Industry request context: {state.industry}; country context: {state.country or '<none>'}\n"
+            "SOURCE BOUNDARY: use only the confirmed scenario variables, confirmed scenario context, and MongoDB-backed source definitions represented by them. "
+            "Do not use external standards, static registries, bundled files, country/industry profiles, URLs, templates, examples, memory, or generic industry knowledge.\n"
             "Validate and produce execution notes."
         )
         plan = self._llm.generate_json(_SYSTEM, prompt, temperature=0.1)

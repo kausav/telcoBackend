@@ -7,9 +7,6 @@ from models.scenario_user_variable import ScenarioUserVariableModel
 from models.scenario_proposal import ScenarioProposalModel
 from models.conversation import ConversationModel
 from models.chat_message import ChatMessageModel
-from models.registry_entity import RegistryEntityModel
-from models.registry_standard import RegistryStandardModel
-from models.registry_meta import RegistryMetaModel
 from models.industry_source import IndustrySourceModel
 
 ALL_MODELS = (
@@ -21,9 +18,6 @@ ALL_MODELS = (
     ScenarioProposalModel,
     ConversationModel,
     ChatMessageModel,
-    RegistryEntityModel,
-    RegistryStandardModel,
-    RegistryMetaModel,
     IndustrySourceModel,
 )
 

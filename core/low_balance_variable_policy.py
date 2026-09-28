@@ -2,8 +2,8 @@
 
 The Low Balance journey has exactly two allowed variable sources:
 
-1. the bundled TMF654 + TMF629 Swagger/OpenAPI scalar catalog; or
-2. variables explicitly persisted in MongoDB as scenario/user variables.
+1. active TMF654/TMF629 Swagger/OpenAPI source documents stored in the MongoDB industry/domain registry; or
+2. variables explicitly persisted in MongoDB as scenario variables.
 
 Gemini is a selector/reviewer only. It can select official JSON variables for the
 current scenario and identify semantic duplicates, but it can never introduce a
@@ -27,7 +27,7 @@ _ALLOWED_CONTEXT_PREFIXES = {
 }
 
 # Low Balance rows should maximize analytical coverage without reproducing transport/display
-# metadata or customer PII. These exclusions are based only on the supplied TMF654/TMF629
+# metadata or customer PII. These exclusions operate only on the active MongoDB TMF654/TMF629
 # scalar catalog; they do not introduce any new business vocabulary.
 LOW_BALANCE_REQUIRED_FIELDS = ("customer_id", "account_id", "msisdn")
 LOW_BALANCE_DB_REQUIRED_FIELDS = ("account_id", "msisdn")
@@ -62,7 +62,7 @@ def is_material_low_balance_spec(spec: dict[str, Any]) -> bool:
     The function only filters low-value metadata/PII from the supplied official JSON catalog.
     Material Bucket state is deliberately allowed through so scenario policy can decide whether it
     adds independent value.
-    Every retained field remains traceable to TMF654/TMF629.
+    Every retained field remains traceable to an active MongoDB TMF654/TMF629 source document.
     """
     name = _normalize_name(spec.get("name"))
     if not name:
@@ -111,7 +111,7 @@ def validate_low_balance_required_identity_sources(db_variables: list[dict[str, 
         raise ValueError(
             "Low Balance & Top-up requires the exact DB variables "
             + ", ".join(missing)
-            + ". They are not present in the supplied TMF654/TMF629 Swagger scalar catalog and must not be invented by the LLM or another generator."
+            + ". They are not present in the active MongoDB TMF654/TMF629 source scalar catalog and must not be invented by the LLM or another generator."
         )
 
 
@@ -124,8 +124,8 @@ def reconcile_low_balance_variables(
 ) -> tuple[list[dict[str, Any]], dict[str, str], set[str], list[str]]:
     """Reconcile Low Balance source metadata once, without rewriting any variable definition.
 
-    The lifecycle has two authoritative source families only: the bundled Swagger catalog and
-    explicitly persisted MongoDB variables. DB provenance wins over stale official/LLM metadata
+    The lifecycle has two authoritative source families only: active MongoDB industry/domain source
+    documents and explicitly persisted MongoDB variables. DB provenance wins over stale official/LLM metadata
     for the same exact field name. The function also repairs legacy drafts whose source metadata
     was incomplete, while preserving every DB-owned definition exactly as supplied.
     """
@@ -265,7 +265,7 @@ def validate_low_balance_variable_sources(
                 continue
         elif source == "OFFICIAL_JSON":
             if name not in catalog:
-                invalid.append(f"{name} (not present in the supplied TMF654/TMF629 catalog)")
+                invalid.append(f"{name} (not present in the active MongoDB TMF654/TMF629 catalog)")
                 continue
         else:
             invalid.append(f"{name} (unsupported or missing source provenance)")
@@ -287,7 +287,7 @@ def validate_low_balance_variable_sources(
 
     if invalid:
         raise ValueError(
-            "Low Balance & Top-up executable variables must come only from the supplied TMF654/TMF629 Swagger scalar catalog or MongoDB variables. "
+            "Low Balance & Top-up executable variables must come only from the active MongoDB TMF654/TMF629 source scalar catalog or MongoDB variables. "
             "Invalid variables: " + ", ".join(sorted(set(invalid)))
         )
 
@@ -481,7 +481,7 @@ def _low_balance_relevance_profile(outcome_mode: str) -> dict[str, dict[str, flo
     """Return scenario-specific concept weights for official Low Balance fields.
 
     The selector never creates a field name. It only ranks exact leaves already present in the
-    supplied TMF654/TMF629 catalog. Scenario type changes the ranking so distinct scenarios do not
+    active MongoDB TMF654/TMF629 catalog. Scenario type changes the ranking so distinct scenarios do not
     collapse to the same variable set merely because they share the same business description.
     """
     common = {
@@ -739,7 +739,7 @@ def select_low_balance_official_catalog(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Select the widest high-quality scenario-specific official field set.
 
-    Only exact fields from the supplied TMF654/TMF629 material catalog are returned. The LLM can
+    Only exact fields from the active MongoDB TMF654/TMF629 material catalog are returned. The LLM can
     influence priority through ``preferred_names`` but cannot force unrelated/low-quality fields.
     """
     excluded = {_lb_norm_text(name) for name in (excluded_names or set()) if _lb_norm_text(name)}
@@ -815,9 +815,9 @@ def select_low_balance_official_catalog(
 
 
 def official_catalog() -> tuple[dict[str, Any], ...]:
-    """Return the immutable official Low Balance scalar catalog from the two bundled Swagger files.
+    """Return the active MongoDB-backed Low Balance scalar catalog.
 
-    The catalog contains material journey fields from TMF654 TopupBalance, TMF654 Bucket, and
+    The catalog contains material journey fields from the active MongoDB TMF654 TopupBalance, TMF654 Bucket, and
     TMF629 Customer. Bucket transport/display/reference noise is filtered, while materially useful
     balance-state fields remain available for scenario-aware selection.
     """
@@ -840,7 +840,7 @@ def official_catalog_by_name() -> dict[str, dict[str, Any]]:
 def validate_llm_official_selection(variables: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
     """Keep only exact official catalog variables returned by Gemini.
 
-    Any LLM-created name that is not an exact normalized official source leaf is
+    Any LLM-created name that is not an exact normalized source leaf from the active MongoDB catalog is
     rejected from the executable path. We return the rejected names for logging/
     diagnostics, never as schema fields.
     """

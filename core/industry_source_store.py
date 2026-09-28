@@ -1,8 +1,9 @@
 """Data-driven industry/domain standard JSON source registry.
 
-Operational generation must never depend on a filesystem path for domain-standard JSONs.
+Operational generation must never depend on a filesystem path for industry/domain source JSONs.
 This module stores uploaded machine-readable source documents in MongoDB and exposes a
-normalized scalar catalog used by the intent agent and schema compiler.
+normalized scalar catalog used by the intent agent and schema compiler. MongoDB is the sole
+source of truth for executable industry/domain JSON documents.
 
 Supported source shapes:
 - OpenAPI/Swagger 2: ``definitions``
@@ -34,23 +35,6 @@ def _collection():
 
     return IndustrySourceModel.collection
 
-_LOW_BALANCE_BUNDLED_SOURCES = (
-    {
-        "source_id": "tmf654_v4",
-        "filename": "TMF654_Prepay_Balance_Management_API_v4.0.0_swagger.json",
-        "source_name": "TMF654 Prepay Balance Management API v4.0.0 Swagger",
-        "standard": "TM Forum TMF654",
-        "version": "4.0.0",
-    },
-    {
-        "source_id": "tmf629_v4",
-        "filename": "TMF629_Customer_Management_API_v4.0.0_swagger.json",
-        "source_name": "TMF629 Customer Management API v4.0.0 Swagger",
-        "standard": "TM Forum TMF629",
-        "version": "4.0.0",
-    },
-)
-
 
 def normalize_lookup_key(value: str | None) -> str:
     """Normalize human labels to deterministic Mongo lookup keys."""
@@ -61,18 +45,13 @@ def normalize_lookup_key(value: str | None) -> str:
 
 
 def normalize_industry_key(value: str | None) -> str:
-    """Normalize industry aliases while preserving unknown industries as stable keys."""
-    from config.industry_profiles import match_industry_key
-
+    """Normalize industry labels without consulting any static industry/standards registry."""
     raw = str(value or "").strip()
     if not raw:
         return "generic"
     compact = normalize_lookup_key(raw)
     if compact in {"telecom", "telecommunication", "telecommunications"}:
         return "telecom"
-    known = match_industry_key(raw)
-    if known != "generic":
-        return normalize_lookup_key(known)
     return compact or "generic"
 
 
@@ -103,6 +82,40 @@ def _safe_file_name(value: str | None) -> str:
     raw = Path(str(value or "source.json")).name
     raw = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
     return raw or "source.json"
+
+
+def generate_internal_source_id(
+    *,
+    industry_type: str,
+    domain: str,
+    file_name: str | None,
+    document: dict[str, Any],
+    raw_bytes: bytes,
+) -> str:
+    """Create a stable server-owned source ID without exposing per-file ID fields in the API.
+
+    Known Low Balance TM Forum artifacts retain their historical IDs so the existing telecom
+    policy can continue to recognize TMF654/TMF629. Other uploads get a deterministic ID derived
+    from the exact industry/domain, filename, and content fingerprint.
+    """
+    safe_name = _safe_file_name(file_name)
+    compact_name = normalize_lookup_key(Path(safe_name).stem)
+    lower_name = safe_name.casefold()
+    if "tmf654" in lower_name and "prepay" in lower_name and "balance" in lower_name:
+        return "tmf654_v4"
+    if "tmf629" in lower_name and "customer" in lower_name and "management" in lower_name:
+        return "tmf629_v4"
+
+    industry_key = normalize_industry_key(industry_type)
+    domain_key = normalize_domain_key(domain)
+    info = document.get("info") if isinstance(document.get("info"), dict) else {}
+    source_hint = compact_name or normalize_lookup_key(str(info.get("title") or "source"))
+    source_hint = re.sub(r"_+", "_", source_hint).strip("_") or "source"
+    digest = _sha256_bytes(raw_bytes)[:12]
+    prefix = f"src_{industry_key}_{domain_key}_"
+    max_hint = max(8, 128 - len(prefix) - len(digest) - 1)
+    source_hint = source_hint[:max_hint].rstrip("._:-") or "source"
+    return f"{prefix}{source_hint}_{digest}"
 
 
 def _deepcopy_mapping(value: Any) -> dict[str, Any]:
@@ -627,43 +640,6 @@ def set_source_active(source_id: str, active: bool) -> bool:
         {"$set": {"active": bool(active), "updated_at": _utc_now()}},
     )
     return result.matched_count > 0
-
-
-def seed_bundled_industry_sources() -> list[dict[str, Any]]:
-    """One-time compatibility migration for the existing Low Balance TMF files.
-
-    After this bootstrap, all proposal/generation paths read the source documents from MongoDB.
-    Files are only read here to migrate an existing deployment into the new source registry.
-    """
-    root = Path(__file__).resolve().parents[1]
-    source_dir = root / "resources" / "telecom" / "domain_sources" / "low_balance_topup"
-    imported: list[dict[str, Any]] = []
-    for item in _LOW_BALANCE_BUNDLED_SOURCES:
-        existing = get_source_document(item["source_id"])
-        if existing:
-            imported.append(existing)
-            continue
-        path = source_dir / item["filename"]
-        if not path.exists():
-            raise FileNotFoundError(f"Bundled source required for migration is missing: {path}")
-        raw = path.read_bytes()
-        if len(raw) > _env_max_bytes():
-            raise ValueError(f"Bundled source exceeds INDUSTRY_SOURCE_MAX_JSON_BYTES: {path.name}")
-        document = json.loads(raw.decode("utf-8"))
-        saved = save_source_document(
-            industry_type="Telecommunications",
-            domain="Low Balance & Top-up",
-            document=document,
-            file_name=item["filename"],
-            source_name=item["source_name"],
-            standard=item["standard"],
-            version=item["version"],
-            active=True,
-            source_id=item["source_id"],
-            raw_bytes=raw,
-        )
-        imported.append(saved)
-    return imported
 
 
 def validate_catalog_selection(variables: Iterable[dict[str, Any]], catalog: dict[str, dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:

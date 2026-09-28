@@ -15,7 +15,6 @@ import json
 
 from langgraph.graph import StateGraph, END
 
-from config.industry_profiles import get_profile
 from core.dynamic_scenarios import resolve_scenario_meta, resolve_variables
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
@@ -31,10 +30,8 @@ logger = logging.getLogger(__name__)
 _SYSTEM = """
 You are the Schema Agent for a synthetic data generation pipeline covering any
 business industry (telecom, banking, retail, healthcare, etc.).
-Given a scenario, its variable definitions, and the target industry's and
-country's real-world conventions (currency, product/plan types, regulator,
-market character), produce a precise JSON rules document consistent with that
-industry and country's actual standards.
+Given a scenario, its confirmed variable definitions, confirmed source metadata, and request context,
+produce a precise JSON rules document. Do not add external industry or country knowledge.
 
 Return a JSON object with:
   - "scenario_summary": str
@@ -49,12 +46,16 @@ Return a JSON object with:
   - "temporal_rules": [{"before": str, "after": str, "min_delay_seconds": number, "max_delay_seconds": number, "reason": str}]
     — causal timestamp ordering and bounded-delay relationships supported by the confirmed schema
 
+SOURCE BOUNDARY IS MANDATORY:
+- The only authoritative external/domain inputs are the confirmed scenario variables and, when present, the active MongoDB industry/domain source catalog represented by those variables.
+- Do not use static telecom registries, bundled standards files, country/industry profiles, external URLs, templates, examples, memory, or generic industry knowledge as a source of field names or categorical values.
+
 SEMANTIC ACCURACY IS MANDATORY:
 - Every field and every categorical value must be relevant to the target industry,
   country, domain, and scenario.
 - Reject placeholder values such as Provider_A, Company_A, Product_A, Gateway_A,
   Synthetic_Provider, or similar when the field represents a real-world entity.
-- Use real-world industry/country vocabulary supplied in the profile whenever available.
+- Use only vocabulary and literal values present in the confirmed variables or their MongoDB source definitions.
 - Do not treat syntactic validity as semantic validity. A value that fits a datatype is
   still invalid if it does not make business sense for the target industry.
 - Preserve the scenario variable definitions as the source of truth, and make
@@ -75,9 +76,9 @@ SEMANTIC ACCURACY IS MANDATORY:
   must be a bank/payment institution when such a field is appropriate; a retail
   provider/merchant must be retail-appropriate. Never use Provider_A, Company_A,
   telecom brands in banking/retail/etc., or any other cross-industry placeholder.
-- If the supplied profile has no authoritative entity list for a field, do NOT borrow
-  an entity list from another industry. Use scenario-supported domain vocabulary or
-  leave the field unconstrained rather than introducing unrelated entities.
+- If the confirmed MongoDB source contract has no authoritative entity list for a field, do NOT borrow
+  an entity list from another industry. Use only supplied scenario vocabulary or leave the field
+  unconstrained rather than introducing unrelated entities.
 - Treat semantic relevance as a HARD validation rule. If a variable/value fails the
   industry + country + scenario audit, reject or replace it before generation.
 - Encode important state dependencies explicitly. Example: if a scenario states that
@@ -147,7 +148,7 @@ class SchemaAgent:
         VARS, _ = dyn
         self._variables = VARS
 
-        # Approved agentic schemas are registry-compiled and HITL-approved.
+        # Approved agentic schemas are MongoDB-source-compiled and HITL-approved.
         # Do not let a downstream LLM rewrite or augment their semantic rules.
         if (state.scenario_context or {}).get("agentic"):
             cache_key = self._cache_key(state)
@@ -158,7 +159,7 @@ class SchemaAgent:
                 return state
             state.rules = build_deterministic_rules(state, VARS)
             set_schema(cache_key, state.rules)
-            logger.info("[SchemaAgent] Agentic scenario: registry rules compiled deterministically; LLM skipped.")
+            logger.info("[SchemaAgent] Agentic scenario: MongoDB source rules compiled deterministically; LLM skipped.")
             return state
 
         cache_key = self._cache_key(state)
@@ -183,7 +184,6 @@ class SchemaAgent:
             for v in VARS
         ]
 
-        profile = get_profile(state.industry, state.country)
         prompt = (
             f"Scenario: {sc['label']}\n"
             f"Journey: {sc['journey']}\n"
@@ -194,37 +194,15 @@ class SchemaAgent:
             f"Expected outcome: {state.expected_outcome or sc.get('expected_outcome', '')}\n"
             f"Use case: {state.use_case or sc.get('use_case', '')}\n"
             f"Scenario type: {state.scenario_type or sc.get('scenario_type', '')}\n"
-            f"Target industry: {profile['industry']}; country: {profile['country_name']} ({state.country})\n"
-            f"Currency: {profile['currency']}; Regulator: {profile['regulator']}\n"
-            f"Country-appropriate payment methods: {profile.get('payment_methods', [])}\n"
-            f"Industry-appropriate service providers/operators (when applicable): {profile.get('service_providers', [])}\n"
-            f"Market character: {profile['market_character']}\n"
             f"Output data type: {state.type_of_data}\n"
-            f"Typical product/plan types: {profile['product_types']}\n"
-            f"Variables: {field_summary}\n"
+            f"Variables (authoritative): {field_summary}\n"
             f"Complete confirmed scenario context (source of truth): {json.dumps(state.scenario_context, default=str, sort_keys=True)}\n\n"
-            "IMPORTANT: generation_constraints, cross_field_rules, and formula_rules are machine-readable and must be "
-            "derived from the supplied scenario/use case, not generic filler. Do not invent a constraint "
-            "unless it is supported by the scenario, industry, country, or explicit variable definition. "
-            "Before returning, audit every field AND every categorical value for industry/country relevance. "
-            "A syntactically valid value from another industry is still invalid and must be replaced. "
-            "Do not use telecom entities as generic providers for non-telecom industries. "
-            "Timestamp rules are also part of the confirmed scenario contract. If a datetime field declares "
-            "params.timestamp_format (or params.format), treat that exact format as presentation authority. "
-            "Do not invent or change timestamp formats. Timestamp arithmetic/formulas must be evaluated using real "
-            "datetime values, then serialized back using the field's declared timestamp format. "
-            "A common requested format is DD/MM/YYYY hh:mm A, e.g. 18/08/2026 12:30 AM. "
-            "For every meaningful relationship between business-state fields, add an explicit conditional rule "
-            "that the data generator can enforce. For datetime dependencies, explicitly reason about "
-            "causal ordering and realistic delay windows; a child timestamp must not precede its parent, "
-            "and response/decision events should not be separated by absurd multi-week or multi-month gaps "
-            "unless the scenario explicitly calls for that.\n"
-            f"Produce a complete rules document covering all {len(VARS)} variables, "
-            f"consistent with this industry and country's real-world standards. "
-            "For transactional output, validate that stable user-context fields stay consistent across each user history, "
-            "record identifiers are unique when defined, and record timestamps are non-decreasing within each user history."
+            "SOURCE BOUNDARY: use only the confirmed scenario variables and the MongoDB-backed source definitions represented by them. "
+            "Do not use static telecom registries, bundled standards files, external standards URLs, country/industry profiles, templates, examples, memory, or generic industry knowledge. "
+            "generation_constraints, cross_field_rules, and formula_rules are machine-readable and must be derived from the supplied scenario contract. "
+            "Confirmed literal choices, numeric bounds, buckets, weights, precision, currency, timestamp format, dependencies, and formulas are authoritative and must not be changed. "
+            "Validate and produce execution notes. Time relationships must preserve causal order and use realistic delays supported by the confirmed contract. "
         )
-
         rules = self._llm.generate_json(_SYSTEM, prompt, temperature=0.1)
         if not isinstance(rules, dict):
             rules = {}

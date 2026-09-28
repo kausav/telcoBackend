@@ -126,6 +126,7 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
     return {
         "scenario_summary": "Confirmed scenario schema with deterministic scenario-context semantics; no scenario-ID lookup.",
         "domain": domain,
+        "industry_type": str(getattr(state, "industry", "") or "").strip(),
         "scenario_type": str(getattr(state, "scenario_type", "") or "").strip(),
         "use_case": str(getattr(state, "use_case", "") or "").strip(),
         "type_of_data": str(getattr(state, "type_of_data", "") or "").strip().lower(),
