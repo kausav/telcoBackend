@@ -721,75 +721,358 @@ def _catalog_role(spec: dict[str, Any]) -> str:
     return "other"
 
 
+def _catalog_text_tokens(value: Any) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", str(value or "").casefold()) if len(token) > 1}
+
+
+_CATALOG_GENERIC_OVERLAP_TOKENS = {
+    "id", "key", "name", "type", "status", "state", "date", "time",
+    "timestamp", "value", "code", "role", "description", "lifecycle",
+}
+
+
+def _catalog_business_metadata_penalty(row: dict[str, Any]) -> float:
+    """Return a domain-neutral penalty for source fields that are primarily transport/display metadata."""
+    name = normalize_lookup_key(row.get("name"))
+    description = str(row.get("description") or "").casefold()
+    tokens = _catalog_text_tokens(f"{name} {description}")
+    penalty = 0.0
+    if name.endswith(("_href", "_uri", "_url", "_reference", "_referred_type", "_schema_location", "_base_type")):
+        penalty += 30.0
+    if tokens & {"href", "uri", "url", "transport", "schema", "referred", "reference", "discriminator", "disambiguation"}:
+        penalty += 18.0
+    if name.endswith(("_description", "_display_name", "_display_label", "_formatted", "_friendly_name")):
+        penalty += 16.0
+    return penalty
+
+
+def _catalog_relevance_score(
+    row: dict[str, Any],
+    *,
+    context_tokens: set[str],
+    preferred: set[str],
+) -> tuple[float, dict[str, Any]]:
+    """Score a source-backed field using only source metadata + request context.
+
+    The score is intentionally domain-neutral. It is used to maximize recall inside the
+    authoritative MongoDB catalog without inventing a field or relying on a hard-coded industry.
+    """
+    name = normalize_lookup_key(row.get("name"))
+    name_tokens = _catalog_text_tokens(name)
+    path_tokens = _catalog_text_tokens(row.get("path"))
+    model_tokens = _catalog_text_tokens(row.get("model"))
+    description_tokens = _catalog_text_tokens(row.get("description"))
+    all_tokens = name_tokens | path_tokens | model_tokens | description_tokens
+
+    name_overlap = name_tokens & context_tokens
+    path_overlap = path_tokens & context_tokens
+    model_overlap = model_tokens & context_tokens
+    description_overlap = description_tokens & context_tokens
+    informative_overlap = (name_overlap | path_overlap | description_overlap | model_overlap) - _CATALOG_GENERIC_OVERLAP_TOKENS
+
+    score = 0.0
+    reasons: list[str] = []
+    if name in preferred:
+        score += 100.0
+        reasons.append("llm_preferred")
+    if row.get("required"):
+        score += 30.0
+        reasons.append("source_required")
+
+    role = _catalog_role(row)
+    role_bonus = {
+        "identity": 14.0,
+        "timing": 10.0,
+        "measurement": 10.0,
+        "status": 11.0,
+        "categorical": 8.0,
+        "event": 10.0,
+        "transaction": 10.0,
+        "decision": 11.0,
+        "configuration": 7.0,
+        "profile": 8.0,
+        "other": 2.0,
+    }.get(role, 2.0)
+    score += role_bonus
+    reasons.append(f"role_{role}")
+
+    if informative_overlap:
+        score += min(36.0, 9.0 * len(informative_overlap))
+        reasons.append("informative_context_overlap")
+    if model_overlap:
+        score += min(12.0, 6.0 * len(model_overlap))
+        reasons.append("model_context_overlap")
+    if description_overlap - _CATALOG_GENERIC_OVERLAP_TOKENS:
+        score += min(12.0, 3.0 * len(description_overlap - _CATALOG_GENERIC_OVERLAP_TOKENS))
+        reasons.append("description_context_overlap")
+    if (name_overlap | path_overlap) & _CATALOG_GENERIC_OVERLAP_TOKENS and (informative_overlap or model_overlap):
+        score += 2.0
+        reasons.append("structural_context_overlap")
+
+    if row.get("enum_values"):
+        score += 2.0
+        reasons.append("declared_vocabulary")
+    depth = int(row.get("depth", 0) or 0)
+    if depth >= 3:
+        score -= min(8.0, 2.0 * (depth - 2))
+        reasons.append("deep_source_path")
+
+    metadata_penalty = _catalog_business_metadata_penalty(row)
+    if metadata_penalty:
+        score -= metadata_penalty
+        reasons.append("technical_or_display_metadata")
+
+    return score, {
+        "name_overlap": sorted(name_overlap),
+        "path_overlap": sorted(path_overlap),
+        "model_overlap": sorted(model_overlap),
+        "description_overlap": sorted(description_overlap),
+        "informative_overlap": sorted(informative_overlap),
+        "tokens": sorted(all_tokens),
+        "role": role,
+        "metadata_penalty": metadata_penalty,
+        "reasons": reasons,
+    }
+
+
 def select_json_source_catalog(
     catalog_rows: list[dict[str, Any]],
     *,
     business_context: str = "",
     preferred_names: set[str] | None = None,
     excluded_names: set[str] | None = None,
-    max_fields: int = 100,
+    max_fields: int = 500,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Deterministically rank source-backed variables using request semantics.
+    """Select a broad, scenario-relevant source catalog without inventing vocabulary.
 
-    This is deliberately domain-neutral: the source JSON defines the vocabulary, while the
-    request context determines relevance. No new field names are ever created here.
+    Selection is recall-first inside the authoritative source boundary:
+      1. exact LLM-preferred, source-required and identity fields are retained;
+      2. directly context-relevant fields are retained;
+      3. once a source model is relevant, additional business fields from that model are
+         included when they are not transport/display metadata;
+      4. strongly related scalar fields from other models are also retained;
+      5. only the configured hard variable budget can truncate the result.
+
+    This function deliberately contains no industry-specific names. It therefore applies equally
+    to telecom, banking, healthcare, retail, insurance, logistics, manufacturing, public sector,
+    or any other domain represented by the active MongoDB JSON source catalog.
     """
-    excluded = {normalize_lookup_key(value) for value in (excluded_names or set()) if normalize_lookup_key(value)}
-    preferred = {normalize_lookup_key(value) for value in (preferred_names or set()) if normalize_lookup_key(value)}
-    context_tokens = set(re.findall(r"[a-z0-9]+", str(business_context or "").casefold()))
-
-    ranked: list[tuple[float, int, dict[str, Any]]] = []
-    for index, raw in enumerate(catalog_rows or []):
+    excluded = {
+        normalize_lookup_key(value)
+        for value in (excluded_names or set())
+        if normalize_lookup_key(value)
+    }
+    preferred = {
+        normalize_lookup_key(value)
+        for value in (preferred_names or set())
+        if normalize_lookup_key(value)
+    }
+    context_tokens = _catalog_text_tokens(business_context)
+    rows: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for raw in catalog_rows or []:
+        if not isinstance(raw, dict):
+            continue
         row = dict(raw)
         name = normalize_lookup_key(row.get("name"))
-        if not name or name in excluded:
+        if not name or name in excluded or name in seen_names:
             continue
-        text_tokens = set(re.findall(r"[a-z0-9]+", " ".join(str(row.get(key) or "") for key in ("name", "path", "description", "model")).casefold()))
-        overlap = len(context_tokens & text_tokens)
-        score = float(overlap * 5)
-        if name in preferred:
-            score += 7.0
-        if row.get("required"):
-            score += 4.0
-        role = _catalog_role(row)
-        if role == "identity":
-            score += 3.0
-        elif role == "timing":
-            score += 2.5
-        elif role == "measurement":
-            score += 2.0
-        elif role in {"status", "categorical"}:
-            score += 2.0
-        if row.get("enum_values"):
-            score += 1.0
-        ranked.append((score, index, row))
+        seen_names.add(name)
+        rows.append(row)
 
-    ranked.sort(key=lambda item: (-item[0], item[1], normalize_lookup_key(item[2].get("name"))))
-    limit = max(1, int(max_fields))
-    selected: list[dict[str, Any]] = []
-    selected_names: set[str] = set()
+    scored: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        score, meta = _catalog_relevance_score(
+            row,
+            context_tokens=context_tokens,
+            preferred=preferred,
+        )
+        scored.append({
+            "row": row,
+            "index": index,
+            "score": score,
+            "meta": meta,
+        })
 
-    # Explicit model-selected exact names are the strongest semantic signal. Required and
-    # identity fields follow, then the remaining relevance-ranked source variables. This
-    # guarantees a tight schema budget cannot silently discard a requested source field.
-    preferred_items = [item for item in ranked if normalize_lookup_key(item[2].get("name")) in preferred]
-    priority = [
-        item for item in ranked
-        if item in preferred_items or item[2].get("required") or _catalog_role(item[2]) == "identity"
-    ]
-    priority.sort(key=lambda item: (0 if normalize_lookup_key(item[2].get("name")) in preferred else 1, -item[0], item[1]))
-    remainder = [item for item in ranked if item not in priority]
-    for item in priority + remainder:
-        name = normalize_lookup_key(item[2].get("name"))
-        if name in selected_names or len(selected) >= limit:
+    # Seeds are deliberately easy to qualify: the goal is broad recall, not a tiny shortlist.
+    # A field is a seed when it is explicitly preferred/required, identifies an entity, has direct
+    # name/path context overlap, or is a strong behavioral field inside a model with contextual evidence.
+    seed_items = []
+    for item in scored:
+        row = item["row"]
+        meta = item["meta"]
+        role = meta["role"]
+        is_identity = role == "identity"
+        is_preferred = normalize_lookup_key(row.get("name")) in preferred
+        is_required = bool(row.get("required"))
+        direct_overlap = bool(
+            meta["informative_overlap"]
+            or meta["model_overlap"]
+            or len(set(meta["name_overlap"]) | set(meta["path_overlap"])) >= 2
+        )
+        model_context_overlap = bool(meta["model_overlap"])
+        score = float(item["score"])
+        # Identity/required fields are strong anchors only when the resource itself is relevant.
+        # This prevents unrelated models' IDs from flooding an otherwise focused scenario.
+        contract_anchor = is_required or is_identity
+        metadata_blocked = meta["metadata_penalty"] >= 30.0
+        if is_preferred or (direct_overlap and not metadata_blocked) or (contract_anchor and model_context_overlap) or score >= 24.0:
+            seed_items.append(item)
+
+    selected: dict[str, dict[str, Any]] = {}
+    selected_reasons: dict[str, set[str]] = {}
+
+    def add(item: dict[str, Any], reason: str) -> None:
+        name = normalize_lookup_key(item["row"].get("name"))
+        if not name or name in selected:
+            if name in selected:
+                selected_reasons.setdefault(name, set()).add(reason)
+            return
+        selected[name] = item
+        selected_reasons[name] = {reason}
+
+    # Highest-certainty fields first.
+    for item in sorted(seed_items, key=lambda x: (-x["score"], x["index"], normalize_lookup_key(x["row"].get("name")))):
+        row = item["row"]
+        meta = item["meta"]
+        if normalize_lookup_key(row.get("name")) in preferred:
+            add(item, "llm_preferred")
+        elif row.get("required"):
+            add(item, "source_required")
+        elif meta["role"] == "identity":
+            add(item, "identity_seed")
+        elif meta["name_overlap"] or meta["path_overlap"] or meta["model_overlap"] or meta["description_overlap"]:
+            add(item, "direct_context_match")
+        else:
+            add(item, "high_information_seed")
+
+    # A relevant model/resource should expose its full meaningful scalar contract, rather than
+    # only a few fields that happen to contain words from the request. This is the core breadth
+    # mechanism and is intentionally domain-neutral.
+    selected_models: set[str] = set()
+    selected_top_paths: set[str] = set()
+    for item in seed_items:
+        row = item["row"]
+        name = normalize_lookup_key(row.get("name"))
+        if name not in selected:
             continue
-        selected.append(dict(item[2]))
-        selected_names.add(name)
+        model = normalize_lookup_key(row.get("model"))
+        if model:
+            selected_models.add(model)
+        path = str(row.get("path") or "")
+        first = path.split(".", 1)[0].strip()
+        if first:
+            selected_top_paths.add(normalize_lookup_key(first))
 
-    return selected, {
-        "candidate_count": len(ranked),
-        "selected_count": len(selected),
-        "max_fields": limit,
-        "preferred_names_used": sorted(preferred & selected_names),
-        "selected_names": [str(item.get("name") or "") for item in selected],
+    model_expanded = 0
+    for item in sorted(scored, key=lambda x: (x["index"], normalize_lookup_key(x["row"].get("name")))):
+        row = item["row"]
+        name = normalize_lookup_key(row.get("name"))
+        model = normalize_lookup_key(row.get("model"))
+        if not model or model not in selected_models or name in selected:
+            continue
+        meta = item["meta"]
+        if meta["metadata_penalty"] >= 30.0:
+            continue
+        # Meaningful source fields from a relevant model are included even when their own wording
+        # has no direct context overlap. This is what increases breadth without opening unrelated models.
+        add(item, "relevant_model_expansion")
+        model_expanded += 1
+
+    # Also include highly relevant fields from related models that are strongly grounded in the
+    # request itself. This catches linked resources such as customer/order/payment or patient/claim
+    # relationships without assuming any particular industry vocabulary.
+    related_model_expanded = 0
+    for item in sorted(scored, key=lambda x: (-x["score"], x["index"], normalize_lookup_key(x["row"].get("name")))):
+        name = normalize_lookup_key(item["row"].get("name"))
+        if name in selected:
+            continue
+        meta = item["meta"]
+        row = item["row"]
+        role = meta["role"]
+        direct_overlap_count = len(meta["informative_overlap"]) + len(meta["model_overlap"])
+        if meta["metadata_penalty"] >= 30.0:
+            continue
+        if direct_overlap_count >= 1 and float(item["score"]) >= 16.0:
+            add(item, "related_model_context_match")
+            related_model_expanded += 1
+        elif role in {"identity", "timing", "measurement", "status", "event", "transaction", "decision"} and float(item["score"]) >= 28.0:
+            add(item, "strong_behavioral_match")
+            related_model_expanded += 1
+
+    # Retain required fields within already relevant models. This preserves the selected source
+    # model's contract without pulling unrelated models into the scenario just because their own
+    # schemas mark an attribute as required.
+    required_added = 0
+    for item in scored:
+        if not item["row"].get("required"):
+            continue
+        model = normalize_lookup_key(item["row"].get("model"))
+        if not model or model not in selected_models:
+            continue
+        before = len(selected)
+        add(item, "source_required")
+        required_added += int(len(selected) > before)
+
+    # Stable ranking: certainty first, then relevance score, then source order. The original source
+    # row is never rewritten, so exact field names, dtype, enum values and constraints stay intact.
+    ordered_items = sorted(
+        selected.values(),
+        key=lambda item: (
+            0 if normalize_lookup_key(item["row"].get("name")) in preferred else 1,
+            0 if item["row"].get("required") else 1,
+            0 if item["meta"]["role"] == "identity" else 1,
+            -float(item["score"]),
+            item["index"],
+            normalize_lookup_key(item["row"].get("name")),
+        ),
+    )
+
+    configured_limit = max(1, int(max_fields))
+    truncated = max(0, len(ordered_items) - configured_limit)
+    selected_items = ordered_items[:configured_limit]
+    selected_rows = [dict(item["row"]) for item in selected_items]
+    selected_names = {
+        normalize_lookup_key(row.get("name")) for row in selected_rows
     }
+
+    technical_candidates = sum(
+        1 for item in scored
+        if item["meta"]["metadata_penalty"] >= 30.0 and normalize_lookup_key(item["row"].get("name")) not in selected_names
+    )
+    direct_relevance_count = sum(
+        1 for item in selected_items
+        if item["meta"]["name_overlap"] or item["meta"]["path_overlap"] or item["meta"]["model_overlap"] or item["meta"]["description_overlap"]
+    )
+    model_expansion_count = sum(
+        1 for item in selected_items if "relevant_model_expansion" in selected_reasons.get(normalize_lookup_key(item["row"].get("name")), set())
+    )
+
+    report = {
+        "candidate_count": len(scored),
+        "eligible_count_before_cap": len(ordered_items),
+        "selected_count": len(selected_rows),
+        "max_fields": configured_limit,
+        "capped": bool(truncated),
+        "truncated_count": truncated,
+        "selection_mode": "recall_first_domain_neutral_source_expansion",
+        "direct_relevance_count": direct_relevance_count,
+        "relevant_models": sorted(selected_models),
+        "model_expansion_count": model_expanded,
+        "model_expansion_selected_count": model_expansion_count,
+        "related_model_expansion_count": related_model_expanded,
+        "required_added": required_added,
+        "technical_or_display_fields_excluded": technical_candidates,
+        "preferred_names_used": sorted(preferred & selected_names),
+        "selected_names": [str(row.get("name") or "") for row in selected_rows],
+        "excluded_names": sorted(excluded),
+        "breadth_policy": {
+            "prioritize_recall": True,
+            "source_vocabulary_only": True,
+            "expand_relevant_models": True,
+            "exclude_transport_display_metadata": True,
+            "preserve_source_contract": True,
+            "llm_is_not_final_breadth_gate": True,
+        },
+    }
+    return selected_rows, report

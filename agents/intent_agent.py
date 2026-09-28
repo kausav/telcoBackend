@@ -17,7 +17,6 @@ from core.agentic_models import ScenarioIntent
 from core.errors import LLMUpstreamError
 from core.llm_client import GeminiClient
 from core.json_domain_policy import catalog_for_request, is_json_grounded_domain, is_low_balance_domain
-from core.low_balance_variable_policy import material_low_balance_catalog
 from core.industry_source_store import normalize_lookup_key, validate_catalog_selection, dedupe_catalog_against_db, select_json_source_catalog
 from core.low_balance_variable_policy import validate_llm_official_selection, dedupe_against_db
 from config.runtime import JSON_SOURCE_LLM_CATALOG_LIMIT
@@ -35,23 +34,39 @@ IMPORTANT BOUNDARIES:
 - Candidate variables are semantic ideas only. The deterministic compiler assigns executable generator contracts.
 - scenarioId is an identifier only and MUST NOT influence what variables are proposed.
 - Use scenarioType, industryType, domain, businessScenario, useCase, country, and typeOfData together. Entity key is backend schema metadata; do not use it to ideate variables.
-- There is NO variable-count target and NO variable-count maximum. Be COMPREHENSIVE in semantic coverage,
-  but include ONLY variables that materially represent this business scenario. Never add a variable merely
-  because an attribute exists outside the supplied MongoDB source catalog or persisted MongoDB variables.
+- VARIABLE BREADTH IS A FIRST-CLASS REQUIREMENT. Do NOT return a short representative list. Review the
+  supplied source catalog and maximize recall of materially relevant variables while staying strictly
+  inside the authoritative source boundary. When two source-backed fields both add legitimate business,
+  causal, temporal, relational, lifecycle, measurement, segmentation, configuration, or analytical value,
+  include BOTH. Do not omit a relevant field merely to keep the list concise. The deterministic compiler
+  performs an additional recall-first expansion over the complete MongoDB catalog, so this LLM list is a
+  relevance/preference signal and is never the final breadth gate.
+- There is NO small variable-count target. The only hard upper bound is the backend safety budget. Aim for
+  the largest high-integrity related set the supplied catalog can support; do not optimize for brevity.
+- Use a domain-neutral coverage pass: identify relevant entity/profile fields, identifiers and relationships,
+  lifecycle/event/transaction fields, states/outcomes/reasons, timestamps/dates/durations, monetary/quantity/usage
+  measures, channels/methods, configuration/eligibility, geography/segment attributes, and other fields that
+  materially explain the scenario. Skip only fields that are truly redundant or are transport/display metadata.
   The deterministic compiler assigns executable contracts and rejects anything without a safe source-backed contract.
 - Do not add application-specific identity anchors unless the supplied MongoDB source catalog or persisted
-  MongoDB variables explicitly contain them.
-  For Low Balance & Top-up, do not add application-generated telecom anchors; the strict Low Balance source policy below governs every executable variable.
+  MongoDB variables explicitly contain them. All executable variables must remain inside those authoritative
+  sources regardless of industry or domain.
 - When MongoDB source grounding is active, candidate variable names MUST exactly match a supplied MongoDB source field.
   When scenario_variables grounding is active, names MUST exactly match persisted MongoDB variable names.
-- Avoid redundant identity/contact fields. In telecom transactional scenarios, msisdn is the canonical
-  subscriber mobile identifier; do NOT also propose phoneNumber, mobileNumber, telephoneNumber, or equivalent
-  duplicates unless the business scenario explicitly requires a separate contact-medium concept. For other industries,
-  apply the same principle using the supplied source vocabulary and persisted DB variables.
+- Avoid true semantic duplicates. Keep distinct fields when they represent different business concepts,
+  entities, lifecycle steps, measures, relationships, or time points—even when their names look similar.
+  Suppress only genuine aliases/duplicates (for example, multiple transport/display representations of the
+  same business attribute). Use the supplied source paths/models to distinguish same-name concepts on different
+  resources. Do not collapse legitimate source-backed breadth merely because two fields share a suffix such as id,
+  status, type, amount, date, or timestamp.
 - For transactional data, distinguish stable entity/profile fields from repeated transaction/event/decision fields using grain.
 - Prefer variables that explain triggers, states, transitions, outcomes, timing, monetary/usage measures,
   decisions, contention, suppression, recovery, or retention when those concepts fit the scenario.
-- Treat scenarioType as a behavioral mode and make the variable set materially reflect it. For telecom top-up workflows, a Normal scenario should prioritize completed/successful operational states and coherent lifecycle timing; do not introduce pending/failed operation outcomes unless the business scenario explicitly asks for adverse outcomes. For other industries, use the business scenario and supplied source semantics to identify the relevant lifecycle/state behavior.
+- Treat scenarioType as a behavioral mode and make the variable set materially reflect it. For positive/normal
+  journeys, prioritize the source-backed fields that describe the intended successful lifecycle; for negative,
+  exception, suppression, decline, failure, recovery, or mixed journeys, prioritize the corresponding state,
+  reason, decision, timing, retry, recovery, and outcome fields. Never invent an outcome value; use only source-defined
+  values. Scenario type changes relevance, not the authoritative vocabulary.
 - Cover only concepts justified by the current business scenario and domain.
 - The MongoDB source catalog is authoritative grounding, not a variable template. Select only source-backed fields that materially fit the request.
 - For any JSON-grounded domain, the active MongoDB source catalog is the ONLY source from which the LLM may select variables. Review the complete catalog and return materially useful variables for the scenario. Every returned candidate variable name MUST exactly match one variable name from that catalog. Never invent, rename, alias, paraphrase, or synthesize a variable name.
@@ -252,28 +267,17 @@ class GeminiIntentAgent:
         }
         if json_grounded:
             catalog = catalog_for_request(industry_type, domain_query or "")
-            if low_balance:
-                # Low Balance receives the canonical, deduplicated business-variable catalog built
-                # directly from the active MongoDB standards documents. The LLM never sees the raw
-                # Swagger event/CRUD fan-out and cannot select DB_RECOMMENDED variables.
-                canonical_models = [dict(row) for row in material_low_balance_catalog()]
-                prompt_catalog = dict(catalog)
-                prompt_catalog["models"] = canonical_models[:JSON_SOURCE_LLM_CATALOG_LIMIT]
-                prompt_catalog["llm_projection"] = {
-                    "candidate_count": len(canonical_models),
-                    "selected_count": len(prompt_catalog["models"]),
-                    "selection_mode": "canonical_low_balance_business_variables",
-                    "selected_names": [str(row.get("name") or "") for row in prompt_catalog["models"]],
-                }
-            else:
-                projected, projection_report = select_json_source_catalog(
-                    [dict(row) for row in (catalog.get("models") or []) if isinstance(row, dict)],
-                    business_context=request_context,
-                    max_fields=JSON_SOURCE_LLM_CATALOG_LIMIT,
-                )
-                prompt_catalog = dict(catalog)
-                prompt_catalog["models"] = projected
-                prompt_catalog["llm_projection"] = projection_report
+            # The LLM receives a broad, deterministic projection for practical prompt size, while the
+            # final compiler always re-evaluates the COMPLETE MongoDB catalog. There is deliberately no
+            # Low Balance-only selection branch: breadth policy is shared across every industry/domain.
+            projected, projection_report = select_json_source_catalog(
+                [dict(row) for row in (catalog.get("models") or []) if isinstance(row, dict)],
+                business_context=request_context,
+                max_fields=JSON_SOURCE_LLM_CATALOG_LIMIT,
+            )
+            prompt_catalog = dict(catalog)
+            prompt_catalog["models"] = projected
+            prompt_catalog["llm_projection"] = projection_report
             catalog_text = json.dumps(prompt_catalog, separators=(",", ":"), sort_keys=True)
             grounding_header = (
                 "MONGODB INDUSTRY-SOURCE GROUNDING (authoritative):\n"
@@ -281,9 +285,8 @@ class GeminiIntentAgent:
                 "Their scalar fields, descriptions, types, declared constraints, and enum values are the only standards vocabulary available to you. "
                 "Do not use external standards, URLs, static application registries, profiles, templates, examples, memory, or generic industry knowledge.\n"
                 + (
-                    "For Low Balance & Top-up, the supplied source catalog is already canonicalized and deduplicated at the business-concept level. "
-                    "Do not create separate candidates for CRUD/event/payload copies represented in source_paths; source_paths are provenance only.\n\n"
-                    if low_balance else "\n"
+                    "The source projection is a breadth aid, not a contract limit. Omitted source fields are not evidence of irrelevance; "
+                    "the deterministic backend will re-evaluate the complete active catalog before compilation.\n\n"
                 )
             )
             mandatory_line = "Do not add variables outside the supplied MongoDB source catalog or separately persisted MongoDB scenario variables. "
@@ -327,10 +330,16 @@ class GeminiIntentAgent:
             f"Selected industry: {industry_type}\n"
             f"Business domain: {domain_query or '<none>'}\n"
             f"Country: {country or '<none>'}\n\n"
-            "Create the final official-variable selection for this scenario. There is NO artificial variable-count target. "
-            "First review the complete supplied catalog. Then select only DISTINCT, analytically useful official variables supported by the scenario. "
-            "Do not pad the candidate list with API href/referredType/reference metadata, display-only name/description fields, or semantic aliases. "
-            "Prefer one canonical field per business concept and include additional fields only when they add independent analytical, causal, temporal, relational, or segmentation value. " + mandatory_line + "\n"
+            "Create a RECALL-FIRST official-variable selection for this scenario. Do not return a small representative list. "
+            "Review the supplied catalog and include the largest set of DISTINCT source-backed fields that materially explain the scenario. "
+            "Use a coverage pass across relevant entities/models: identity and relationship anchors, profile/context, events/transactions, "
+            "states/statuses/reasons, timing/timestamps/dates, monetary/quantity/usage measures, decisions/outcomes, configuration/eligibility, "
+            "channels/methods, geography/segments, and other source-backed analytical signals. When a model/resource is clearly relevant, "
+            "include its other meaningful scalar business fields unless they are true semantic duplicates or technical/display metadata. "
+            "Do NOT intentionally keep the candidate list short, do NOT choose an arbitrary handful, and do NOT omit a field merely because "
+            "its name does not repeat the exact business-scenario wording. Never pad with API href/referredType/reference metadata, display-only "
+            "fields, or aliases. The final deterministic compiler uses the complete MongoDB catalog to expand this selection further, so the "
+            "LLM candidate list is a relevance signal, never the final variable-count gate. " + mandatory_line + "\n"
             + (
                 "PERSISTED MONGODB VARIABLES (IMMUTABLE; NEVER RENAME OR MODIFY):\n"
                 + json.dumps([

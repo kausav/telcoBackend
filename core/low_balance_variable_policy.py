@@ -16,6 +16,7 @@ from typing import Any, Iterable
 
 from core.agentic_models import GeneratedSchemaField
 from core.json_domain_policy import expanded_scalar_catalog
+from config.runtime import SCHEMA_MAX_VARIABLES
 
 
 _ALLOWED_CONTEXT_PREFIXES = {
@@ -736,7 +737,7 @@ def semantic_signature(variable: dict[str, Any] | GeneratedSchemaField) -> tuple
     return context, f"{concept}::{dtype_key}"
 
 
-LOW_BALANCE_OFFICIAL_MAX_FIELDS = 60
+LOW_BALANCE_OFFICIAL_MAX_FIELDS = SCHEMA_MAX_VARIABLES
 
 
 def _lb_norm_text(value: object) -> str:

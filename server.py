@@ -526,10 +526,12 @@ def get_industry_source(source_id: str, includeDocument: bool = False):
 
 @app.post("/industry-sources/upload", response_model=IndustrySourceResponse)
 def upload_industry_sources(
+    request: Request,
     industryType: str = Form(..., description="Industry type for all uploaded JSON sources"),
     domain: str = Form(..., description="Domain for all uploaded JSON sources"),
     file: list[UploadFile] = File(..., description="One or more Swagger/OpenAPI/JSON Schema JSON files for this industryType/domain"),
 ):
+    _require_industry_source_admin_token(request)
     """Upload multiple standards JSON files for one exact industryType/domain pair.
 
     The multipart request intentionally exposes only three inputs:

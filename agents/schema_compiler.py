@@ -664,6 +664,7 @@ class SchemaCompiler:
         scenario_type: str | None = None,
         excluded_field_names: list[str] | None = None,
         external_variable_names: set[str] | None = None,
+        max_variables: int | None = None,
     ) -> ScenarioSchema:
         """Compile any MongoDB-backed standards domain without assuming telecom semantics."""
         catalog_payload = catalog_for_request(industry_type, domain)
@@ -692,12 +693,13 @@ class SchemaCompiler:
             for name in (excluded_field_names or [])
             if normalize_lookup_key(name)
         }
+        variable_budget = max(1, int(max_variables if max_variables is not None else SCHEMA_MAX_VARIABLES))
         selected_rows, selection_report = select_json_source_catalog(
             catalog_rows,
             business_context=business_context,
             preferred_names=preferred_names,
             excluded_names=excluded,
-            max_fields=SCHEMA_MAX_VARIABLES,
+            max_fields=variable_budget,
         )
         selected_names = {normalize_lookup_key(row.get("name")) for row in selected_rows}
         external_keys = {
@@ -773,7 +775,7 @@ class SchemaCompiler:
             country=country or "GLOBAL",
             type_of_data=normalized_type,
             scenario_mode=str(scenario_type or intent.scenario_type or "mixed"),
-            max_variables=max(len(selected_source_ideas), SCHEMA_MAX_VARIABLES),
+            max_variables=max(len(selected_source_ideas), variable_budget),
             include_all_registry_scalars=False,
             include_all_json_source_scalars=False,
             include_application_telecom_anchors=False,
@@ -848,6 +850,7 @@ class SchemaCompiler:
         scenario_type: str | None = None,
         excluded_field_names: list[str] | None = None,
         external_variable_names: set[str] | None = None,
+        max_variables: int | None = None,
     ) -> ScenarioSchema:
         """Compile Low Balance & Top-up from the active MongoDB JSON source catalog."""
         normalized_country = str(country or "IN").strip().upper()
@@ -859,6 +862,7 @@ class SchemaCompiler:
             business_response="",
             business_scenario=business_scenario,
         )
+        variable_budget = max(1, int(max_variables if max_variables is not None else SCHEMA_MAX_VARIABLES))
 
         # Gemini selects/reviews exact official names, but it must not determine breadth by itself.
         # The deterministic selector ranks the complete supplied MongoDB source catalog according to
@@ -882,6 +886,7 @@ class SchemaCompiler:
             scenario_type=normalized_scenario,
             excluded_names=excluded_names,
             preferred_names=llm_selected_names,
+            max_fields=variable_budget,
         )
         ordered_names = [
             self._normalize_variable_name(row.get("name"))
@@ -955,7 +960,7 @@ class SchemaCompiler:
             # The deterministic Low Balance selector defines breadth. The quality engine may
             # deduplicate true semantic duplicates, but it must not reduce this source-grounded
             # selection merely because Gemini returned a narrower candidate list.
-            max_variables=max(len(selected_source_ideas), SCHEMA_MAX_VARIABLES),
+            max_variables=max(len(selected_source_ideas), variable_budget),
             include_all_registry_scalars=False,
             include_all_json_source_scalars=False,
             include_application_telecom_anchors=False,
@@ -1088,6 +1093,7 @@ class SchemaCompiler:
                 scenario_type=scenario_type,
                 excluded_field_names=excluded_field_names,
                 external_variable_names=external_variable_names,
+                max_variables=max_variables,
             )
         return self._compile_json_source_grounded(
             intent,
@@ -1101,6 +1107,7 @@ class SchemaCompiler:
             scenario_type=scenario_type,
             excluded_field_names=excluded_field_names,
             external_variable_names=external_variable_names,
+            max_variables=max_variables,
         )
 
     def approval_questions(self, intent: ScenarioIntent, schema: ScenarioSchema) -> list[str]:
