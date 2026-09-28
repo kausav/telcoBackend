@@ -17,14 +17,16 @@ from core.agentic_models import ScenarioIntent
 from core.errors import LLMUpstreamError
 from core.llm_client import GeminiClient
 from core.telecom_registry import TelecomRegistry
-from core.json_domain_policy import catalog_for_request, is_json_grounded_domain
+from core.json_domain_policy import catalog_for_request, is_json_grounded_domain, is_low_balance_domain
+from core.industry_source_store import normalize_lookup_key, validate_catalog_selection, dedupe_catalog_against_db, select_json_source_catalog
 from core.low_balance_variable_policy import validate_llm_official_selection, dedupe_against_db
+from config.runtime import JSON_SOURCE_LLM_CATALOG_LIMIT
 
 logger = logging.getLogger(__name__)
 
 
 INSTRUCTIONS = """
-You are the intent-understanding and variable-ideation agent for a telecom synthetic-data platform.
+You are the intent-understanding and variable-ideation agent for a multi-industry synthetic-data platform.
 Interpret the COMPLETE business request and propose a FRESH semantic variable set.
 
 IMPORTANT BOUNDARIES:
@@ -39,24 +41,26 @@ IMPORTANT BOUNDARIES:
   ground relevant ideas to the approved registry and will reject any idea that lacks a safe executable
   generation contract.
 - For normal registry-grounded telecom transactional data, subscriber_id, account_id and msisdn are mandatory stable entity-level fields.
+  For source-grounded non-telecom requests, do not add application-specific anchors unless the supplied source catalog or persisted DB variables explicitly contain them.
   For Low Balance & Top-up, do not add application-generated telecom anchors; the strict Low Balance source policy below governs every executable variable.
 - For normal registry-grounded requests, candidate variable names should be fresh and should not simply copy a template or reference list. For Low Balance & Top-up, names MUST instead exactly match the supplied official catalog or remain unchanged DB names.
-- Avoid redundant identity/contact fields. In a telecom transactional scenario, msisdn is the canonical
+- Avoid redundant identity/contact fields. In telecom transactional scenarios, msisdn is the canonical
   subscriber mobile identifier; do NOT also propose phoneNumber, mobileNumber, telephoneNumber, or equivalent
-  duplicates unless the business scenario explicitly requires a separate contact-medium concept.
+  duplicates unless the business scenario explicitly requires a separate contact-medium concept. For other industries,
+  apply the same principle using the supplied source vocabulary and persisted DB variables.
 - For transactional data, distinguish stable entity/profile fields from repeated transaction/event/decision fields using grain.
 - Prefer variables that explain triggers, states, transitions, outcomes, timing, monetary/usage measures,
   decisions, contention, suppression, recovery, or retention when those concepts fit the scenario.
-- Treat scenarioType as a behavioral mode and make the variable set materially reflect it. For a Normal scenario in a transactional top-up workflow, prioritize completed/successful operational states and coherent lifecycle timing; do not introduce pending/failed operation outcomes unless the business scenario explicitly asks for adverse outcomes.
+- Treat scenarioType as a behavioral mode and make the variable set materially reflect it. For telecom top-up workflows, a Normal scenario should prioritize completed/successful operational states and coherent lifecycle timing; do not introduce pending/failed operation outcomes unless the business scenario explicitly asks for adverse outcomes. For other industries, use the business scenario and supplied source semantics to identify the relevant lifecycle/state behavior.
 - Cover only concepts justified by the current business scenario and domain.
-- The telecom registry is grounding information for normal registry-grounded requests, not a variable template. Do not dump catalog attributes.
+- The industry registry/source catalog is grounding information, not a variable template. Do not dump catalog attributes.
 - For Low Balance & Top-up, the supplied machine-readable TMF654/TMF629 Swagger catalog is the ONLY source from which the LLM may select variables. Review the COMPLETE catalog and return a COMPREHENSIVE set of materially useful variables for the scenario, not a small shortlist. Every returned candidate variable name MUST exactly match one variable name from that catalog. Never invent, rename, alias, paraphrase, or synthesize a variable name. The backend applies a deterministic breadth gate over the same catalog so breadth does not depend on model verbosity.
 - For Low Balance & Top-up, MongoDB scenario/user variables may contain additional business variables that are not present in the Swagger files. Those DB variables are immutable inputs: never rename, rewrite, replace, or generate them. Review the full DB variable list and omit an official JSON variable when it represents the same business use as a DB variable. DB variables always win semantic duplicates.
 - Scenario-specific variables are NOT allowed to be invented by the LLM. If a concept is absent from the two supplied Swagger catalogs and is not already present as a DB variable, do not create it. For Low Balance, account_id and msisdn are mandatory exact DB variables because those names are not present in the two supplied Swagger catalogs.
 - Do not propose unsupported nested/object fields when a flat synthetic dataset cannot deterministically
   populate their nested structure.
 
-Return this JSON shape:
+Return this JSON shape. For non-telecom industries, set subdomain to "unknown":
 {
   "industry_type": "telecom",
   "domain": "...",
@@ -240,27 +244,46 @@ class GeminiIntentAgent:
         excluded_variable_names: list[str] | None = None,
         persisted_variables: list[dict[str, Any]] | None = None,
     ) -> ScenarioIntent:
-        json_grounded = is_json_grounded_domain(domain_query)
+        low_balance = is_low_balance_domain(domain_query, industry_type)
+        json_grounded = is_json_grounded_domain(domain_query, industry_type)
         excluded_names = {
             str(name).strip().casefold()
             for name in (excluded_variable_names or [])
             if str(name).strip()
         }
         if json_grounded:
-            catalog = catalog_for_request()
-            # Keep the complete official catalog visible to Gemini. Exact-name DB overlaps
-            # are still shown as persisted variables and are filtered deterministically after
-            # the provider response; hiding them before review would prevent true full-catalog
-            # duplicate analysis.
-            catalog_text = json.dumps(catalog, separators=(",", ":"), sort_keys=True)
+            catalog = catalog_for_request(industry_type, domain_query or "")
+            if low_balance:
+                prompt_catalog = catalog
+            else:
+                # Do not send multi-megabyte OpenAPI catalogs directly into the LLM context.
+                # The deterministic compiler still reads the complete MongoDB catalog; the LLM
+                # receives a bounded relevance-ranked projection solely for semantic review.
+                projected, projection_report = select_json_source_catalog(
+                    [dict(row) for row in (catalog.get("models") or []) if isinstance(row, dict)],
+                    business_context=request_context,
+                    max_fields=JSON_SOURCE_LLM_CATALOG_LIMIT,
+                )
+                prompt_catalog = dict(catalog)
+                prompt_catalog["models"] = projected
+                prompt_catalog["llm_projection"] = projection_report
+            catalog_text = json.dumps(prompt_catalog, separators=(",", ":"), sort_keys=True)
             grounding_header = (
-                "SUPPLIED MACHINE-READABLE GROUNDING (authoritative for this domain):\n"
-                "The ONLY official semantic sources for Low Balance & Top-up are the supplied TMF654 and TMF629 v4.0.0 Swagger/OpenAPI documents. "
-                "Use their scalar fields, descriptions, types, and enum values as the standards boundary, including scalar leaves inside referenced objects. "
-                "Do not use PDFs, unrelated telecom standards, templates, CSV examples, memory, general telecom knowledge, or invented fields as the variable source. "
-                "Return only exact variable names present in this machine-readable catalog.\n\n"
+                (
+                    "SUPPLIED MACHINE-READABLE GROUNDING (authoritative for this Low Balance & Top-up domain):\n"
+                    "Use only active MongoDB source documents associated with this exact industry/domain pair. For the existing Low Balance & Top-up domain, these are the migrated TMF654/TMF629 v4.0.0 artifacts. "
+                    "Their scalar fields, descriptions, types, constraints, and enum values are the standards boundary, including scalar leaves inside referenced objects. "
+                    "Do not use unrelated standards, PDFs, CSV examples, memory, generic telecom knowledge, or invented fields.\n\n"
+                ) if low_balance else (
+                    "SUPPLIED MACHINE-READABLE GROUNDING (authoritative for this industry/domain):\n"
+                    "Use only the active MongoDB source documents stored for this exact industryType/domain pair. Their scalar fields, descriptions, types, constraints, and enum values are the executable vocabulary. "
+                    "Do not invent, alias, rename, or import fields from another industry, domain, standards family, templates, examples, memory, or generic knowledge.\n\n"
+                )
             )
-            mandatory_line = "Do not add application-generated telecom anchors or any other non-JSON variable names. "
+            mandatory_line = (
+                "Do not add application-generated telecom anchors or any other non-source variable names. "
+                if low_balance else "Do not add variables outside the supplied source catalog. "
+            )
         else:
             catalog = self.registry.llm_catalog_context(
                 query=" ".join(part for part in (domain_query, request_context) if part)
@@ -275,10 +298,10 @@ class GeminiIntentAgent:
             )
             mandatory_line = "For transactional telecom scenarios, ALWAYS include subscriber_id, account_id, and msisdn. "
         scenario_focus = ""
-        # The request context already contains scenario type. Provide a concise deterministic
-        # focus hint so Gemini's review priorities align with the backend's scenario-aware selector.
+        # Telecom-specific scenario hints must not leak into source-grounded non-telecom domains.
         normalized_scenario_type = re.sub(r"[^a-z0-9]+", " ", str(request_context or "").lower())
-        if "suppression" in normalized_scenario_type:
+        telecom_context = normalize_lookup_key(industry_type) in {"telecom", "telecommunications", "telecommunication"}
+        if telecom_context and "suppression" in normalized_scenario_type:
             scenario_focus = (
                 "Scenario focus: Suppression. Prefer official fields that make suppression observable "
                 "(status/state, reason, customer/account status, channel, payment/requestor context, "
@@ -287,13 +310,13 @@ class GeminiIntentAgent:
                 "configuration unless the request explicitly makes it relevant. Bucket fields are optional: select "
                 "only those that add independent suppression signal.\n\n"
             )
-        elif any(token in normalized_scenario_type for token in ("failure", "failed", "error", "decline", "no response")):
+        elif telecom_context and any(token in normalized_scenario_type for token in ("failure", "failed", "error", "decline", "no response")):
             scenario_focus = (
                 "Scenario focus: adverse/decline outcome. Prefer official fields that make failure or "
                 "non-completion observable (status, reason, timestamps, amount, channel/payment/requestor, "
                 "and customer/account state).\n\n"
             )
-        elif "normal" in normalized_scenario_type or "success" in normalized_scenario_type:
+        elif telecom_context and ("normal" in normalized_scenario_type or "success" in normalized_scenario_type):
             scenario_focus = (
                 "Scenario focus: normal/positive top-up lifecycle. Prefer official fields that describe "
                 "execution and outcome (amount, usage, request/confirmation timing, status, channel, "
@@ -339,7 +362,7 @@ class GeminiIntentAgent:
                 if excluded_names
                 else ""
             )
-            + "Do not invent unsupported telecom entities or fields. Every candidate_variables.name must exactly match a name in the supplied official catalog. "
+            + "Every candidate_variables.name must exactly match a name in the supplied machine-readable source catalog when JSON grounding is active. "
             "Return JSON only."
         )
 
@@ -372,20 +395,39 @@ class GeminiIntentAgent:
 
             payload = _normalize_payload(payload)
             if json_grounded:
-                filtered, rejected = validate_llm_official_selection(payload.get("candidate_variables") or [])
-                filtered, duplicates = dedupe_against_db(filtered, persisted_variables or [])
-                payload["candidate_variables"] = filtered
                 notes = list(payload.get("notes") or [])
-                if rejected:
-                    notes.append(
-                        "LLM-proposed variable names outside the supplied TMF654/TMF629 scalar catalog were rejected: "
-                        + ", ".join(rejected)
-                    )
-                if duplicates:
-                    notes.append(
-                        "Official JSON variables semantically duplicated by MongoDB variables were suppressed; DB definitions remain authoritative: "
-                        + ", ".join(duplicates)
-                    )
+                if low_balance:
+                    filtered, rejected = validate_llm_official_selection(payload.get("candidate_variables") or [])
+                    filtered, duplicates = dedupe_against_db(filtered, persisted_variables or [])
+                    if rejected:
+                        notes.append(
+                            "LLM-proposed Low Balance variable names outside the active MongoDB TMF654/TMF629 scalar catalog were rejected: "
+                            + ", ".join(rejected)
+                        )
+                    if duplicates:
+                        notes.append(
+                            "Official JSON variables semantically duplicated by MongoDB variables were suppressed; DB definitions remain authoritative: "
+                            + ", ".join(duplicates)
+                        )
+                else:
+                    catalog_by_name = {
+                        normalize_lookup_key(row.get("name")): dict(row)
+                        for row in (catalog.get("models") or [])
+                        if normalize_lookup_key(row.get("name"))
+                    }
+                    filtered, rejected = validate_catalog_selection(payload.get("candidate_variables") or [], catalog_by_name)
+                    filtered, duplicates = dedupe_catalog_against_db(filtered, persisted_variables or [])
+                    if rejected:
+                        notes.append(
+                            "LLM-proposed variable names outside the active MongoDB source catalog were rejected: "
+                            + ", ".join(rejected)
+                        )
+                    if duplicates:
+                        notes.append(
+                            "Source-backed variables with exact-name MongoDB duplicates were suppressed; DB definitions remain authoritative: "
+                            + ", ".join(duplicates)
+                        )
+                payload["candidate_variables"] = filtered
                 payload["notes"] = notes[:50]
             intent = ScenarioIntent.model_validate(payload)
         except LLMUpstreamError:

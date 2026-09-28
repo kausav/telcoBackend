@@ -10,6 +10,7 @@ from models.chat_message import ChatMessageModel
 from models.registry_entity import RegistryEntityModel
 from models.registry_standard import RegistryStandardModel
 from models.registry_meta import RegistryMetaModel
+from models.industry_source import IndustrySourceModel
 
 ALL_MODELS = (
     ScenarioModel,
@@ -23,6 +24,7 @@ ALL_MODELS = (
     RegistryEntityModel,
     RegistryStandardModel,
     RegistryMetaModel,
+    IndustrySourceModel,
 )
 
 

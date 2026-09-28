@@ -11,7 +11,6 @@ new variable into the executable schema.
 """
 from __future__ import annotations
 
-from functools import lru_cache
 import re
 from typing import Any, Iterable
 
@@ -833,8 +832,8 @@ def official_catalog() -> tuple[dict[str, Any], ...]:
     return tuple(rows)
 
 
-@lru_cache(maxsize=1)
 def official_catalog_by_name() -> dict[str, dict[str, Any]]:
+    """Return the current MongoDB-backed Low Balance catalog without process-local staleness."""
     return {str(row["name"]): dict(row) for row in official_catalog()}
 
 

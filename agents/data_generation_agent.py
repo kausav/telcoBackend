@@ -43,11 +43,11 @@ _QA_SYSTEM = """You are the final QA validator for generated synthetic data.
 Validate every supplied record against the FULL confirmed scenario contract, official source
 semantics, business/cross-field rules, and subscriber-history rules. The goal is not merely
 to produce syntactically valid rows: every record must represent a logically possible business
-event sequence. Treat the generated dataset as if it were emitted by a real telecom charging
-and customer-management system.
+event sequence. Treat the generated dataset as if it were emitted by the real business system
+defined by the confirmed scenario and its approved industry/domain source documents.
 
-The confirmed schema and supplied official TMF Swagger JSON are authoritative for structure,
-field meaning, required/optional fields, datatype, enum vocabulary, nested-reference meaning,
+The confirmed schema and supplied official source JSON are authoritative for structure, field
+meaning, required/optional fields, datatype, enum vocabulary, nested-reference meaning,
 amount/unit meaning, lifecycle timestamps, and relationship semantics. Never invent official
 enum values or substitute synonyms. Never use a free-form value from one field as though it
 were the semantic value of a different field.
@@ -142,6 +142,26 @@ def _semantic_placeholder(name: str, params: dict, rec: dict) -> str:
     return f"EVENT_{token[:32]}_{random.randint(1000, 9999)}" if token else f"EVENT_{random.randint(1000, 9999)}"
 
 
+def _fit_string_length(value: str, params: dict) -> str:
+    text = str(value)
+    minimum = params.get("min_length")
+    maximum = params.get("max_length")
+    try:
+        minimum_i = max(0, int(minimum)) if minimum is not None else None
+    except (TypeError, ValueError):
+        minimum_i = None
+    try:
+        maximum_i = max(0, int(maximum)) if maximum is not None else None
+    except (TypeError, ValueError):
+        maximum_i = None
+    if maximum_i is not None and len(text) > maximum_i:
+        text = text[:maximum_i]
+    if minimum_i is not None and len(text) < minimum_i:
+        padding = "X" if any(ch.isupper() for ch in text) else "x"
+        text = text + (padding * (minimum_i - len(text)))
+    return text
+
+
 def _semantic_string(var: dict, rec: dict) -> str | None:
     """Generate a useful synthetic string from field name/description semantics.
 
@@ -154,6 +174,20 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
     desc = str(var.get("description") or "").strip()
     n = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
     d = desc.lower()
+    fmt = str(p.get("format") or "").strip().lower()
+
+    # Standard formats are authoritative and must win over field-name heuristics.
+    if fmt in {"uuid", "uuid4"}:
+        return str(uuid.uuid4())
+    if fmt in {"email", "idn-email"}:
+        return f"user{random.randint(100000, 999999)}@example.test"
+    if fmt in {"uri", "uri-reference", "url"}:
+        return f"https://example.test/resource/{uuid.uuid4().hex[:12]}"
+    if fmt == "ipv4":
+        return ".".join(str(random.randint(1, 254) if i == 0 else random.randint(0, 255)) for i in range(4))
+    if fmt == "ipv6":
+        groups = [f"{random.randint(0, 65535):x}" for _ in range(8)]
+        return ":".join(groups)
 
     if "choices" in p or "values" in p:
         vals = p.get("choices", p.get("values"))
@@ -205,10 +239,16 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
     if "email" in n:
         return f"user{random.randint(100000, 999999)}@example.test"
     if "uri" in d or "url" in d or any(token in n for token in ("href", "url", "schemalocation", "resourcepath", "path")):
-        return f"https://example.test/telecom/{uuid.uuid4().hex[:12]}"
+        return f"https://example.test/resource/{uuid.uuid4().hex[:12]}"
     if "reference" in d and not any(token in d for token in ("uri", "url", "documentation")):
         prefix = re.sub(r"[^A-Z0-9]+", "_", n.upper()).strip("_") or "REF"
         return _prefixed_int({"prefix": f"{prefix}-", "digits": 10}, rec)
+
+    # Generic JSON-source contracts intentionally stop here before legacy telecom/domain
+    # vocabularies (channels, payment instruments, low-balance reasons, etc.) are considered.
+    # If the standard did not declare a vocabulary, emit a neutral deterministic synthetic value.
+    if p.get("source_contract"):
+        return _fit_string_length(f"SYN_{(n.upper() or 'VALUE')[:32]}_{random.randint(1000, 9999)}", p)
 
     if "operating circle" in d or "regulatory service area" in d:
         return random.choice([
@@ -293,7 +333,7 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         return str(p.get("country") or "IN").upper()
 
     label = re.sub(r"_+", "_", n.upper()).strip("_") or "VALUE"
-    return f"SYN_{label[:24]}_{random.randint(1000, 9999)}"
+    return _fit_string_length(f"SYN_{label[:24]}_{random.randint(1000, 9999)}", p)
 
 
 def _generic_value(var: dict, rec: dict):
@@ -464,6 +504,28 @@ def _weighted_bucket(params: dict, _rec: dict):
     return random.randint(int(math.ceil(lo)), int(math.floor(hi))) if lo.is_integer() and hi.is_integer() else random.uniform(lo, hi)
 
 
+def _multiple_of_tick_bounds(lo: float, hi: float, multiple_of: float, scale: int) -> tuple[int, int, int] | None:
+    """Return integer tick bounds for a positive multipleOf constraint.
+
+    The returned tuple is ``(lo_index, hi_index, step)`` where the generated value is
+    ``index * multiple_of`` after conversion to the requested decimal precision.
+    """
+    try:
+        multiple = float(multiple_of)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(multiple) or multiple <= 0:
+        return None
+    step = max(1, int(round(multiple * scale)))
+    if abs((step / scale) - multiple) > (1 / scale) * 0.51:
+        return None
+    lo_tick = int(math.ceil((lo * scale) / step))
+    hi_tick = int(math.floor((hi * scale) / step))
+    if hi_tick < lo_tick:
+        return None
+    return lo_tick, hi_tick, step
+
+
 def _uniform(params: dict, _rec: dict) -> float:
     precision = int(params.get("precision", 2) or 2)
     lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
@@ -475,6 +537,11 @@ def _uniform(params: dict, _rec: dict) -> float:
     hi = max(lo, hi)
     if precision > 0:
         scale = 10 ** precision
+        multiple = params.get("multiple_of")
+        bounds = _multiple_of_tick_bounds(lo, hi, multiple, scale) if multiple is not None else None
+        if bounds:
+            lo_index, hi_index, step = bounds
+            return (random.randint(lo_index, hi_index) * step) / scale
         lo_tick = int(math.ceil(lo * scale))
         hi_tick = int(math.floor(hi * scale))
         if hi_tick >= lo_tick:
@@ -492,9 +559,21 @@ def _uniform(params: dict, _rec: dict) -> float:
 def _uniform_int(params: dict, _rec: dict) -> int:
     lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
     hi = _to_finite_float(params.get("max", params.get("hi")), lo)
-    lo_int = int(round(lo if lo is not None else 0.0))
-    hi_int = int(round(hi if hi is not None else lo_int))
-    return random.randint(min(lo_int, hi_int), max(lo_int, hi_int))
+    lo_int = int(math.ceil(lo if lo is not None else 0.0))
+    hi_int = int(math.floor(hi if hi is not None else lo_int))
+    if hi_int < lo_int:
+        hi_int = lo_int
+    multiple = params.get("multiple_of")
+    try:
+        multiple_int = int(multiple) if multiple is not None else 0
+    except (TypeError, ValueError):
+        multiple_int = 0
+    if multiple_int > 0:
+        first = int(math.ceil(lo_int / multiple_int) * multiple_int)
+        last = int(math.floor(hi_int / multiple_int) * multiple_int)
+        if first <= last:
+            return random.randrange(first, last + multiple_int, multiple_int)
+    return random.randint(lo_int, hi_int)
 
 
 def _lognormal(params: dict, _rec: dict) -> float:
@@ -831,6 +910,11 @@ _GENERATORS = {
     "generic":        lambda v, rec: _generic_value(v, rec),
     "semantic_event": lambda v, rec: _semantic_placeholder(v.get("name"), v.get("params") or {}, rec),
     "semantic_string": lambda v, rec: _semantic_string(v, rec),
+    "uuid_string":    lambda v, rec: str(uuid.uuid4()),
+    "email_string":   lambda v, rec: f"user{random.randint(100000, 999999)}@example.test",
+    "uri_string":     lambda v, rec: f"https://example.test/resource/{uuid.uuid4().hex[:12]}",
+    "ipv4_string":    lambda v, rec: ".".join(str(random.randint(1, 254) if i == 0 else random.randint(0, 255)) for i in range(4)),
+    "ipv6_string":    lambda v, rec: ":".join(f"{random.randint(0, 65535):x}" for _ in range(8)),
 }
 
 
@@ -3097,6 +3181,39 @@ def _strict_validate_record(rec: dict, variables: list[dict], rules: dict | None
                 raise ValueError(f"{name} has invalid date value")
 
         params = var.get("params") or {}
+
+        # Declared string constraints are part of the confirmed executable contract.
+        # Enforce them regardless of provenance so they survive confirmation and reloads.
+        if isinstance(value, str):
+            try:
+                min_length = int(params["min_length"]) if params.get("min_length") is not None else None
+                max_length = int(params["max_length"]) if params.get("max_length") is not None else None
+            except (TypeError, ValueError):
+                min_length = max_length = None
+            if min_length is not None and len(value) < min_length:
+                raise ValueError(f"{name} is shorter than source minLength")
+            if max_length is not None and len(value) > max_length:
+                raise ValueError(f"{name} exceeds source maxLength")
+            pattern = params.get("pattern")
+            if pattern:
+                try:
+                    if re.fullmatch(str(pattern), value) is None:
+                        raise ValueError(f"{name} does not match source pattern")
+                except re.error:
+                    # OpenAPI/JSON Schema regex dialects can differ from Python's. Keep the
+                    # source contract intact rather than rejecting an otherwise valid document.
+                    logger.warning("[QA] Skipping unsupported Python regex dialect for source-backed field %s", name)
+
+        declared_multiple = params.get("multiple_of")
+        if dtype in _NUMERIC_DTYPES and declared_multiple is not None and isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                multiple = float(declared_multiple)
+            except (TypeError, ValueError):
+                multiple = 0.0
+            if multiple > 0:
+                quotient = float(value) / multiple
+                if not math.isclose(quotient, round(quotient), rel_tol=1e-9, abs_tol=1e-9):
+                    raise ValueError(f"{name} violates source multipleOf={declared_multiple}")
         declared = _declared_param_options(params)
         if declared and not any(_matches_declared_option(value, choice) for choice in declared):
             raise ValueError(f"{name} is outside its declared value set")

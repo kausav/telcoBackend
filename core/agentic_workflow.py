@@ -17,7 +17,7 @@ from core.telecom_registry import TelecomRegistry, get_registry
 from core.errors import LLMUpstreamError
 from core.runtime_cache import get_proposal, set_proposal
 from core.scenario_variable_store import get_recommended, get_user_variables, save_proposal
-from core.json_domain_policy import is_json_grounded_domain, source_manifest
+from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain, source_manifest
 from core.low_balance_variable_policy import (
     dedupe_db_variable_sources,
     dedupe_schema_fields_against_db,
@@ -32,7 +32,7 @@ from core.low_balance_variable_policy import (
 logger = logging.getLogger(__name__)
 from agents.intent_agent import GeminiIntentAgent
 from agents.schema_compiler import SchemaCompiler
-from config.industry_profiles import match_industry_key
+from core.industry_source_store import normalize_industry_key
 
 
 class AgenticSchemaWorkflow:
@@ -170,7 +170,7 @@ class AgenticSchemaWorkflow:
         canonical_db = json.dumps(db_variables or [], sort_keys=True, separators=(",", ":"), default=str)
         db_fingerprint = hashlib.sha256(canonical_db.encode("utf-8")).hexdigest()
         source_fingerprint = hashlib.sha256(
-            json.dumps(source_manifest(), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            json.dumps(source_manifest(req.industry_type, req.domain), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
         return (
             "agentic_proposal_v30_low_balance_source_boundary",
@@ -239,18 +239,17 @@ class AgenticSchemaWorkflow:
     def propose(self, req: ScenarioProposeRequest) -> ScenarioImportResponse:
         prompt = req.business_scenario.strip()
         requested_scenario_id = req.requested_scenario_id.strip()
-        industry_key = match_industry_key(req.industry_type)
-        if industry_key != "telecom":
+        industry_key = normalize_industry_key(req.industry_type)
+        low_balance = is_low_balance_domain(req.domain, req.industry_type)
+        json_grounded = is_json_grounded_domain(req.domain, industry_key)
+        if not json_grounded and industry_key != "telecom":
             raise ValueError(
-                "scenario/propose currently supports telecom industry aliases: "
-                "Telecom, Telecommunication, or Telecommunications (case-insensitive)"
+                f"No active JSON source documents are registered for industryType='{req.industry_type}', domain='{req.domain}'. Upload at least one industry-standard JSON source first."
             )
-
-        json_grounded = is_json_grounded_domain(req.domain)
         grounding_requirement = (
-            "JSON-SOURCE REQUIREMENT: because this domain is Low Balance & Top-up, use ONLY the supplied TMF654 and TMF629 v4.0.0 Swagger/OpenAPI artifacts for official variable selection. "
-            "Do not use PDFs, unrelated telecom standards, templates, CSV examples, memory, generic telecom knowledge, or application-specific hardcoded variables as a variable source. "
-            "Every non-DB executable variable must be an exact scalar leaf from the supplied machine-readable catalog. The LLM is a selector/reviewer only; it cannot invent, rename, alias, or derive new executable variable names. "
+            "JSON-SOURCE REQUIREMENT: use only active MongoDB source documents for this exact industryType/domain pair. "
+            "The source catalog is the only official executable vocabulary; do not use unrelated standards, PDFs, CSV examples, memory, generic knowledge, or invented fields. "
+            "Every non-DB executable variable must be an exact scalar leaf from that catalog. The LLM is a selector/reviewer only; it cannot invent, rename, alias, or derive executable variable names. "
             if json_grounded
             else "Use all relevant concepts from the complete approved telecom standards registry context, across all registered source URLs. "
         )
@@ -262,7 +261,7 @@ class AgenticSchemaWorkflow:
             if req.user_id and req.user_id.strip()
             else []
         )
-        if json_grounded:
+        if low_balance:
             recommended, user_selected, suppressed_db_names = dedupe_db_variable_sources(
                 recommended, user_selected
             )
@@ -273,12 +272,12 @@ class AgenticSchemaWorkflow:
                 )
 
         db_variables = self._merge_db_variable_sources(recommended, user_selected)
-        if json_grounded:
+        if low_balance:
             # Low Balance has two source families only. account_id and msisdn are absent from
             # the bundled TMF654/TMF629 catalog, so the exact DB variables are mandatory.
             validate_low_balance_required_identity_sources(db_variables)
         protected_name_set = set(self._variable_name_keys(db_variables))
-        if json_grounded and db_variables:
+        if low_balance and db_variables:
             # Do semantic DB-vs-JSON deduplication BEFORE the deterministic breadth budget.
             # Otherwise a JSON alias such as topupbalance_is_auto_topup can consume one of the
             # maximum official slots, only to be removed later when is_automatic_topup wins.
@@ -329,7 +328,7 @@ class AgenticSchemaWorkflow:
             intent.domain = req.domain
             intent.subdomain = req.use_case.strip().lower() if req.use_case.strip().lower() in {
                 "prepaid", "postpaid", "charging", "usage", "customer", "network"
-            } else "unknown"
+            } and industry_key == "telecom" else "unknown"
             if req.country:
                 intent.country = req.country
             intent.scenario_type = req.scenario_type
@@ -368,7 +367,7 @@ class AgenticSchemaWorkflow:
 
         # For Low Balance, remove only official JSON fields that duplicate an authoritative DB
         # variable by business use. DB fields are never modified or removed.
-        if json_grounded:
+        if low_balance:
             filtered_fields, duplicate_names = dedupe_schema_fields_against_db(
                 list(schema.fields), db_variables
             )
@@ -387,7 +386,7 @@ class AgenticSchemaWorkflow:
 
         unresolved_questions = self.compiler.approval_questions(intent, schema)
         variables, field_order = self._schema_to_variables(schema, raw_persisted_by_name)
-        if json_grounded:
+        if low_balance:
             variables, variable_sources, db_variable_names, field_order = reconcile_low_balance_variables(
                 variables,
                 variable_sources,
@@ -407,12 +406,13 @@ class AgenticSchemaWorkflow:
             if persisted_source:
                 # Low Balance keeps DB definitions unchanged and records provenance separately
                 # in the draft; other domains retain the legacy per-variable source annotation.
-                if not json_grounded:
+                if not low_balance:
                     variable["source"] = persisted_source
                 continue
-            if is_json_grounded_domain(req.domain):
-                # Do not add an application/LLM/derived variable source to Low Balance fields.
-                # Every such field has already been proven to exist in the supplied JSON catalog.
+            if low_balance:
+                continue
+            if json_grounded:
+                variable["source"] = "OFFICIAL_JSON"
                 continue
             variable["source"] = "LLM_GENERATED"
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
@@ -444,11 +444,11 @@ class AgenticSchemaWorkflow:
             "intent": intent.model_dump(),
             "schema": schema.model_dump(),
             "approval_questions": unresolved_questions,
-            "source_policy": "bundled_official_swagger_only" if json_grounded else "approved_telecom_standards_registry",
-            "source_documents": source_manifest() if json_grounded else [],
+            "source_policy": ("mongodb_low_balance_source_documents" if low_balance else "mongodb_industry_source_documents") if json_grounded else "approved_telecom_standards_registry",
+            "source_documents": source_manifest(req.industry_type, req.domain) if json_grounded else [],
             "variable_sources": variable_sources,
-            "db_variable_names": sorted(raw_persisted_by_name.keys()) if json_grounded else [],
-            "db_variable_definitions": raw_persisted_by_name if json_grounded else {},
+            "db_variable_names": sorted(raw_persisted_by_name.keys()) if low_balance else [],
+            "db_variable_definitions": raw_persisted_by_name if low_balance else {},
         }
         save_draft(draft_id, draft)
         save_proposal(
@@ -510,7 +510,7 @@ class AgenticSchemaWorkflow:
             if str(name).strip()
         )
 
-        if is_json_grounded_domain(draft.get("domain")):
+        if is_low_balance_domain(draft.get("domain"), draft.get("industry_type")):
             draft_variables, draft_source_by_name, draft_db_names, draft_order = reconcile_low_balance_variables(
                 draft_variables,
                 draft_source_by_name,
@@ -551,7 +551,7 @@ class AgenticSchemaWorkflow:
         # Concept labels are soft hints. Only genuinely executable unresolved requirements block confirmation.
         # Reconcile compiler-stage diagnostics against the already merged executable variable set
         # before evaluating anything as a blocking confirmation requirement.
-        if is_json_grounded_domain(draft.get("domain")):
+        if is_low_balance_domain(draft.get("domain"), draft.get("industry_type")):
             schema = AgenticSchemaWorkflow._finalize_low_balance_schema(schema, draft_variables)
         external_db_names = set(draft_db_names)
         proposed_names = {
@@ -579,7 +579,12 @@ class AgenticSchemaWorkflow:
             )
 
         fields_by_name = {field.name: field for field in schema.fields}
-        mandatory_telecom = {"customer_id", "account_id", "msisdn"} if is_json_grounded_domain(draft.get("domain")) else {"subscriber_id", "account_id", "msisdn"}
+        telecom_context = normalize_industry_key(draft.get("industry_type")) == "telecom"
+        mandatory_telecom = (
+            {"customer_id", "account_id", "msisdn"}
+            if is_low_balance_domain(draft.get("domain"), draft.get("industry_type"))
+            else ({"subscriber_id", "account_id", "msisdn"} if telecom_context else set())
+        )
         delete_set = {str(name).strip() for name in delete if str(name).strip()}
         for name in delete_set:
             if name not in fields_by_name:
@@ -666,7 +671,7 @@ class AgenticSchemaWorkflow:
             variables.append(data)
             field_order.append(field.name)
 
-        if is_json_grounded_domain(draft.get("domain")):
+        if is_low_balance_domain(draft.get("domain"), draft.get("industry_type")):
             variables, draft_source_by_name, draft_db_names, field_order = reconcile_low_balance_variables(
                 variables,
                 draft_source_by_name,

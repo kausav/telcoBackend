@@ -4,10 +4,12 @@ from __future__ import annotations
 from core.agentic_models import GeneratedSchemaField, ResolvedConcept, ScenarioIntent, ScenarioSchema, SchemaRelationship, VariableIdea
 from core.telecom_registry import EntityDef, TelecomRegistry
 from config.industry_profiles import get_profile
+import math
 import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
-from core.json_domain_policy import LOW_BALANCE_MAIN_MODEL_IDS, LOW_BALANCE_SOURCE_IDS, expanded_scalar_catalog, is_json_grounded_domain
+from core.json_domain_policy import LOW_BALANCE_MAIN_MODEL_IDS, LOW_BALANCE_SOURCE_IDS, expanded_scalar_catalog, is_json_grounded_domain, is_low_balance_domain, source_manifest
+from core.industry_source_store import catalog_for_request, normalize_lookup_key, select_json_source_catalog
 from core.low_balance_variable_policy import official_catalog_by_name, select_low_balance_official_catalog
 from core.variable_quality import VariableQualityEngine
 from config.runtime import SCHEMA_MAX_VARIABLES, SCHEMA_MIN_VARIABLE_SCORE
@@ -17,8 +19,15 @@ def _tokens(value: str) -> list[str]:
     return [token for token in re.findall(r"[a-z0-9]+", str(value or "").lower()) if len(token) > 1]
 
 
+def _is_entity_catalog_row(spec: dict[str, Any]) -> bool:
+    text = f"{spec.get('model','')} {spec.get('path','')}".lower()
+    return any(token in text for token in ("customer", "account", "party", "subscriber", "member", "patient", "policyholder", "user", "profile")) and not any(
+        token in text for token in ("transaction", "event", "order", "payment", "claim", "encounter", "visit")
+    )
+
+
 class SchemaCompiler:
-    """Compiles scenario schemas from the approved telecom standards registry."""
+    """Compile telecom-registry schemas and MongoDB source-backed multi-industry schemas."""
 
     @staticmethod
     def _source_id(entity: EntityDef) -> str:
@@ -556,7 +565,12 @@ class SchemaCompiler:
         return None
 
     @staticmethod
-    def _json_source_contract(spec: dict[str, object], country: str | None) -> tuple[str, str, dict]:
+    def _json_source_contract(
+        spec: dict[str, object],
+        country: str | None,
+        *,
+        low_balance: bool = False,
+    ) -> tuple[str, str, dict]:
         """Create an executable generator contract from a flattened Swagger scalar leaf."""
         dtype = str(spec.get("dtype") or "string").strip().lower()
         fmt = str(spec.get("format") or "").strip().lower()
@@ -568,8 +582,36 @@ class SchemaCompiler:
 
         # Low Balance has an explicit public customer identity contract. The source field is
         # still TMF629 Customer.id; only the deterministic synthetic representation is fixed here.
-        if SchemaCompiler._normalize_variable_name(str(spec.get("name") or "")) == "customer_id":
+        if low_balance and SchemaCompiler._normalize_variable_name(str(spec.get("name") or "")) == "customer_id":
             return "prefixed_int", "string", {"prefix": "cust-", "digits": 8}
+
+        # Honor standard-defined string formats before generic semantic name heuristics. This is
+        # important for non-telecom sources where a field named ``id`` may legally be a UUID/URI.
+        if dtype in {"string", "str", "text"}:
+            string_params: dict[str, object] = {}
+            if fmt:
+                string_params["format"] = fmt
+            if country:
+                string_params["country"] = country
+            if spec.get("minLength") is not None:
+                string_params["min_length"] = spec.get("minLength")
+            if spec.get("maxLength") is not None:
+                string_params["max_length"] = spec.get("maxLength")
+            if spec.get("pattern") is not None:
+                string_params["pattern"] = spec.get("pattern")
+            if not low_balance:
+                string_params["source_contract"] = True
+            if fmt in {"uuid", "uuid4"}:
+                return "uuid_string", "string", string_params
+            if fmt in {"email", "idn-email"}:
+                return "email_string", "string", string_params
+            if fmt in {"uri", "uri-reference", "url"}:
+                return "uri_string", "string", string_params
+            if fmt == "ipv4":
+                return "ipv4_string", "string", string_params
+            if fmt == "ipv6":
+                return "ipv6_string", "string", string_params
+            return "semantic_string", "string", string_params
 
         # Some official Swagger string definitions encode a constrained vocabulary only
         # in their descriptions (for example RelatedTopupBalance.role = parent/child).
@@ -593,11 +635,80 @@ class SchemaCompiler:
                 "days_back": 365,
             }
         if dtype in {"integer", "int", "bigint", "smallint"}:
-            return "uniform_int", "integer", {"min": 0, "max": 100, "precision": 0}
+            minimum_raw = spec.get("minimum", 0)
+            maximum_raw = spec.get("maximum", 100)
+            exclusive_min = spec.get("exclusiveMinimum")
+            exclusive_max = spec.get("exclusiveMaximum")
+            try:
+                minimum = float(minimum_raw)
+            except (TypeError, ValueError):
+                minimum = 0.0
+            try:
+                maximum = float(maximum_raw)
+            except (TypeError, ValueError):
+                maximum = max(minimum + 1.0, 100.0)
+            if isinstance(exclusive_min, bool):
+                if exclusive_min:
+                    minimum = math.floor(minimum) + 1
+            elif exclusive_min is not None:
+                try:
+                    minimum = math.floor(float(exclusive_min)) + 1
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(exclusive_max, bool):
+                if exclusive_max:
+                    maximum = math.ceil(maximum) - 1
+            elif exclusive_max is not None:
+                try:
+                    maximum = math.ceil(float(exclusive_max)) - 1
+                except (TypeError, ValueError):
+                    pass
+            minimum = int(math.ceil(minimum))
+            maximum = int(math.floor(maximum))
+            if maximum < minimum:
+                maximum = minimum
+            params = {"min": minimum, "max": maximum, "precision": 0}
+            if spec.get("multipleOf") is not None:
+                params["multiple_of"] = spec["multipleOf"]
+            return "uniform_int", "integer", params
         if dtype in {"number", "float", "double", "decimal", "numeric"}:
-            return "uniform", "float", {"min": 0.0, "max": 1000.0, "precision": 2}
-        # Identifier/reference/URI semantics are handled by semantic_string, which already
-        # creates deterministic synthetic identifiers and example.test URIs safely.
+            minimum_raw = spec.get("minimum", 0.0)
+            maximum_raw = spec.get("maximum", 1000.0)
+            exclusive_min = spec.get("exclusiveMinimum")
+            exclusive_max = spec.get("exclusiveMaximum")
+            try:
+                minimum = float(minimum_raw)
+            except (TypeError, ValueError):
+                minimum = 0.0
+            try:
+                maximum = float(maximum_raw)
+            except (TypeError, ValueError):
+                maximum = max(minimum + 1.0, 1000.0)
+            if isinstance(exclusive_min, bool):
+                if exclusive_min:
+                    minimum = math.nextafter(minimum, math.inf)
+            elif exclusive_min is not None:
+                try:
+                    minimum = math.nextafter(float(exclusive_min), math.inf)
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(exclusive_max, bool):
+                if exclusive_max:
+                    maximum = math.nextafter(maximum, -math.inf)
+            elif exclusive_max is not None:
+                try:
+                    maximum = math.nextafter(float(exclusive_max), -math.inf)
+                except (TypeError, ValueError):
+                    pass
+            if maximum < minimum:
+                maximum = minimum
+            precision = int(spec.get("precision") or 2) if str(spec.get("precision") or "").isdigit() else 2
+            params = {"min": minimum, "max": maximum, "precision": max(0, min(8, precision))}
+            if spec.get("multipleOf") is not None:
+                params["multiple_of"] = spec["multipleOf"]
+            return "uniform", "float", params
+        # Identifier/reference semantics are handled by the semantic generator after all
+        # primitive/standard formats above have been accounted for.
         return "semantic_string", "string", {}
 
     @staticmethod
@@ -636,6 +747,9 @@ class SchemaCompiler:
         candidate_variables_override: list[dict[str, object]] | None = None,
     ) -> list[GeneratedSchemaField]:
         normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
+        normalized_industry = str(intent.industry_type or "telecom").strip().lower()
+        telecom_context = normalized_industry in {"telecom", "telecommunications", "telecommunication"}
+        low_balance_context = is_low_balance_domain(intent.domain, intent.industry_type)
         excluded_keys = {
             self._normalize_variable_name(name)
             for name in (excluded_field_names or [])
@@ -765,7 +879,7 @@ class SchemaCompiler:
             for item in ideas
         )
         explicit_customer_entity_key = self._normalize_variable_name(entity_key or "") == "customer_id"
-        if has_subscriber_anchor and not explicit_customer_entity_key:
+        if telecom_context and has_subscriber_anchor and not explicit_customer_entity_key:
             ideas = [
                 item for item in ideas
                 if self._normalize_variable_name(str(item.get("name") or "")) != "customer_id"
@@ -832,7 +946,7 @@ class SchemaCompiler:
                     }, preserve_name=True)
 
         # Explicit telecom de-duplication before field construction.
-        if any(self._normalize_variable_name(str(item.get("name") or "")) == "msisdn" for item in ideas):
+        if telecom_context and any(self._normalize_variable_name(str(item.get("name") or "")) == "msisdn" for item in ideas):
             ideas = [
                 item for item in ideas
                 if self._normalize_variable_name(str(item.get("name") or "")) not in self.REDUNDANT_MSISDN_FIELDS
@@ -881,7 +995,7 @@ class SchemaCompiler:
         # Defensive post-selection guard for the same redundancy rule. This prevents any
         # future quality-engine dependency closure change from reintroducing customer_id into
         # a subscriber-anchored telecom proposal.
-        if has_subscriber_anchor and not explicit_customer_entity_key:
+        if telecom_context and has_subscriber_anchor and not explicit_customer_entity_key:
             ideas = [
                 item for item in ideas
                 if self._normalize_variable_name(str(item.get("name") or "")) != "customer_id"
@@ -937,7 +1051,9 @@ class SchemaCompiler:
             if source_spec is not None:
                 source_model = str(source_spec.get("model") or "")
                 entity = next((e for e in entities if e.name == source_model), None)
-                runtime_generator, dtype, params = self._json_source_contract(source_spec, country)
+                runtime_generator, dtype, params = self._json_source_contract(
+                    source_spec, country, low_balance=low_balance_context
+                )
             # Mandatory public telecom anchors use authoritative subscriber attributes
             # directly, rather than allowing a generic account_id match to resolve to a
             # different entity.
@@ -956,7 +1072,7 @@ class SchemaCompiler:
             if source_spec is not None:
                 # Contract was already compiled from the authoritative Swagger leaf above.
                 pass
-            elif original_name in self.REQUIRED_TELECOM_FIELDS:
+            elif source_spec is None and telecom_context and original_name in self.REQUIRED_TELECOM_FIELDS:
                 entity = next((e for e in entities if e.canonical_id == "subscriber"), None)
                 if original_name == "subscriber_id":
                     runtime_generator, dtype, params = (
@@ -1043,7 +1159,7 @@ class SchemaCompiler:
                 deps = []
             registry_required = bool(idea.get("_registry_required")) if idea.get("_registry_required") is not None else False
             registry_nullable = bool(idea.get("_registry_nullable")) if idea.get("_registry_nullable") is not None else True
-            low_balance_customer = is_json_grounded_domain(intent.domain) and self._normalize_variable_name(original_name) == "customer_id"
+            low_balance_customer = is_low_balance_domain(intent.domain, intent.industry_type) and self._normalize_variable_name(original_name) == "customer_id"
             required = original_name == entity_key or original_name in self.REQUIRED_TELECOM_FIELDS or low_balance_customer or registry_required
             nullable = False if required else registry_nullable
             if low_balance_customer:
@@ -1080,6 +1196,191 @@ class SchemaCompiler:
                 scope=grain,
             ))
         return fields
+
+    def _compile_json_source_grounded(
+        self,
+        intent: ScenarioIntent,
+        *,
+        industry_type: str,
+        domain: str,
+        business_scenario: str,
+        use_case: str,
+        country: str | None,
+        type_of_data: str | None,
+        entity_key: str | None,
+        scenario_type: str | None = None,
+        excluded_field_names: list[str] | None = None,
+        external_variable_names: set[str] | None = None,
+    ) -> ScenarioSchema:
+        """Compile any MongoDB-backed standards domain without assuming telecom semantics."""
+        catalog_payload = catalog_for_request(industry_type, domain)
+        catalog_rows = [dict(row) for row in (catalog_payload.get("models") or []) if isinstance(row, dict)]
+        if not catalog_rows:
+            raise ValueError(
+                f"No usable active JSON source variables exist for industryType='{industry_type}' and domain='{domain}'."
+            )
+
+        normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
+        business_context = " ".join(
+            str(value or "") for value in (
+                industry_type, domain, scenario_type or intent.scenario_type, normalized_type,
+                use_case, business_scenario, country or "", intent.entity_key or "",
+            )
+        )
+        preferred_names = {
+            normalize_lookup_key(idea.name)
+            for idea in intent.candidate_variables
+            if normalize_lookup_key(idea.name)
+        }
+        excluded = {
+            normalize_lookup_key(name)
+            for name in (excluded_field_names or [])
+            if normalize_lookup_key(name)
+        }
+        selected_rows, selection_report = select_json_source_catalog(
+            catalog_rows,
+            business_context=business_context,
+            preferred_names=preferred_names,
+            excluded_names=excluded,
+            max_fields=SCHEMA_MAX_VARIABLES,
+        )
+        selected_names = {normalize_lookup_key(row.get("name")) for row in selected_rows}
+        external_keys = {
+            normalize_lookup_key(name)
+            for name in (external_variable_names or set())
+            if normalize_lookup_key(name)
+        }
+
+        all_identity_names = [
+            normalize_lookup_key(row.get("name"))
+            for row in catalog_rows
+            if normalize_lookup_key(row.get("name")) and self._normalize_variable_name(row.get("name"))
+            and str(row.get("name") or "").lower().endswith(("_id", "_key"))
+        ]
+        resolved_entity_key = None
+        if normalized_type == "transactional":
+            requested_key = normalize_lookup_key(entity_key or "")
+            if requested_key:
+                if requested_key not in {normalize_lookup_key(row.get("name")) for row in catalog_rows} and requested_key not in external_keys:
+                    raise ValueError(
+                        f"Requested entity key '{entity_key}' is not present in the active JSON source catalog or MongoDB variables."
+                    )
+                resolved_entity_key = entity_key.strip()
+            else:
+                chosen_key = next((name for name in all_identity_names if name in selected_names), None) or (all_identity_names[0] if all_identity_names else None)
+                if chosen_key:
+                    resolved_entity_key = next(
+                        (str(row.get("name")) for row in catalog_rows if normalize_lookup_key(row.get("name")) == chosen_key),
+                        chosen_key,
+                    )
+
+        selected_source_ideas: list[dict[str, object]] = []
+        for spec in selected_rows:
+            dtype = str(spec.get("dtype") or "string").strip().lower()
+            normalized_dtype = (
+                "integer" if dtype in {"integer", "int", "bigint", "smallint"}
+                else "float" if dtype in {"number", "float", "double", "decimal", "numeric"}
+                else "datetime" if dtype in {"date-time", "datetime", "timestamp"} or str(spec.get("format") or "").lower() == "date-time"
+                else "date" if dtype == "date"
+                else "categorical" if spec.get("enum_values")
+                else "boolean" if dtype in {"boolean", "bool"}
+                else "string"
+            )
+            role = (
+                "timing" if normalized_dtype in {"datetime", "date"}
+                else "measurement" if normalized_dtype in {"integer", "float"}
+                else "identity" if normalize_lookup_key(spec.get("name")).endswith(("_id", "_key"))
+                else "status" if spec.get("enum_values") and any(token in f"{spec.get('name','')} {spec.get('path','')}".lower() for token in ("status", "state", "reason"))
+                else "categorical" if spec.get("enum_values")
+                else "other"
+            )
+            grain = "entity" if _is_entity_catalog_row(spec) else "transaction"
+            selected_source_ideas.append({
+                "name": str(spec["name"]),
+                "description": str(spec.get("description") or "")[:500],
+                "role": role if role in {"identity", "profile", "event", "transaction", "status", "measurement", "metric", "timing", "decision", "configuration", "derived", "other"} else "other",
+                "grain": grain,
+                "dtype": normalized_dtype,
+                "depends_on": [],
+                "_json_source_spec": dict(spec),
+                "_json_source": True,
+                "_preserve_name": True,
+                "_registry_entity": f"{spec.get('source_id','')}__{spec.get('model','')}",
+                "_registry_entity_name": str(spec.get("model") or ""),
+                "_registry_required": bool(spec.get("required")),
+                "_registry_nullable": not bool(spec.get("required")),
+            })
+
+        working_intent = intent
+        fields = self._build_fresh_fields(
+            working_intent,
+            [],
+            entity_key=resolved_entity_key,
+            country=country or "GLOBAL",
+            type_of_data=normalized_type,
+            scenario_mode=str(scenario_type or intent.scenario_type or "mixed"),
+            max_variables=max(len(selected_source_ideas), SCHEMA_MAX_VARIABLES),
+            include_all_registry_scalars=False,
+            include_all_json_source_scalars=False,
+            include_application_telecom_anchors=False,
+            excluded_field_names=excluded_field_names,
+            business_scenario=business_scenario,
+            context_text=business_context,
+            candidate_variables_override=selected_source_ideas,
+        )
+
+        actual_names = {normalize_lookup_key(field.name) for field in fields}
+        missing_source_fields = sorted(selected_names - actual_names)
+        if missing_source_fields:
+            raise ValueError(
+                "JSON-source variables were lost during deterministic compilation: " + ", ".join(missing_source_fields[:25])
+            )
+        if normalized_type == "transactional" and resolved_entity_key and normalize_lookup_key(resolved_entity_key) not in actual_names and normalize_lookup_key(resolved_entity_key) not in external_keys:
+            raise ValueError(f"Transactional entity key '{resolved_entity_key}' could not be represented by the active JSON source fields.")
+
+        model_groups: dict[tuple[str, str], dict[str, Any]] = {}
+        for spec in selected_rows:
+            key = (str(spec.get("source_id") or ""), str(spec.get("model") or ""))
+            model_groups.setdefault(key, spec)
+        entities = [
+            ResolvedConcept(
+                canonical_id=f"{source_id}__{model}".strip("_"),
+                name=model or source_id,
+                source_model=str(spec.get("standard") or source_id),
+                source_references=[str(source_id)],
+                selected_attributes=sorted(
+                    normalize_lookup_key(row.get("name"))
+                    for row in selected_rows
+                    if str(row.get("source_id") or "") == source_id and str(row.get("model") or "") == model
+                ),
+            )
+            for (source_id, model), spec in sorted(model_groups.items())
+        ]
+        hard_constraints = [
+            "Executable source variables are restricted to scalar leaves extracted from active MongoDB JSON documents for the exact industryType/domain pair.",
+            "The LLM is a selector only; it cannot invent, rename, alias, or derive executable source variable names.",
+            "Exact scalar names from the active catalog are preserved through deterministic compilation.",
+            "Standard enum values and declared numeric constraints from the source documents are authoritative.",
+            "Arrays and complex objects are not emitted as fake flat scalar variables.",
+        ]
+        if resolved_entity_key:
+            hard_constraints.append(f"'{resolved_entity_key}' is the authoritative entity key for transactional grouping.")
+        warnings = [
+            f"Source catalog selection: {selection_report['selected_count']} of {selection_report['candidate_count']} scalar variables were selected deterministically for this request.",
+            "Adding or replacing industry/domain standard JSONs changes the available source catalog without requiring code changes.",
+        ]
+        source_docs = source_manifest(industry_type, domain)
+        return ScenarioSchema(
+            domain=intent.domain,
+            subdomain="unknown",
+            applicable_standards=source_docs,
+            entities=entities,
+            relationships=[],
+            fields=fields,
+            hard_constraints=hard_constraints,
+            unresolved_items=[],
+            warnings=warnings,
+        )
 
     def _compile_low_balance_json_grounded(
         self,
@@ -1334,14 +1635,26 @@ class SchemaCompiler:
         external_variable_names: set[str] | None = None,
     ) -> ScenarioSchema:
         requested = intent
-        normalized_industry = (industry_type or intent.industry_type or "telecom").strip().lower()
-        if normalized_industry not in {"telecom", "telecommunications"}:
-            raise ValueError(
-                f"Unsupported industryType '{industry_type or intent.industry_type}'. The telecom registry only supports Telecommunications/Telecom."
-            )
-        if is_json_grounded_domain(domain_query or intent.domain):
-            return self._compile_low_balance_json_grounded(
+        normalized_industry = (industry_type or intent.industry_type or "telecom").strip()
+        domain = domain_query or intent.domain
+        json_grounded = is_json_grounded_domain(domain, normalized_industry)
+        if json_grounded:
+            if is_low_balance_domain(domain, normalized_industry):
+                return self._compile_low_balance_json_grounded(
+                    requested,
+                    business_scenario=business_scenario or "",
+                    use_case=use_case or requested.use_case or "",
+                    country=country,
+                    type_of_data=type_of_data or requested.type_of_data,
+                    entity_key=entity_key,
+                    scenario_type=scenario_type,
+                    excluded_field_names=excluded_field_names,
+                    external_variable_names=external_variable_names,
+                )
+            return self._compile_json_source_grounded(
                 requested,
+                industry_type=normalized_industry,
+                domain=domain,
                 business_scenario=business_scenario or "",
                 use_case=use_case or requested.use_case or "",
                 country=country,
@@ -1350,6 +1663,10 @@ class SchemaCompiler:
                 scenario_type=scenario_type,
                 excluded_field_names=excluded_field_names,
                 external_variable_names=external_variable_names,
+            )
+        if normalized_industry.casefold() not in {"telecom", "telecommunication", "telecommunications"}:
+            raise ValueError(
+                f"No active JSON source documents are registered for industryType='{normalized_industry}', domain='{domain}'. Upload at least one source JSON before proposing a scenario for this industry."
             )
         if selected_entities is not None:
             normalized: list[str] = []

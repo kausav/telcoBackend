@@ -50,6 +50,9 @@ CORS_ALLOW_ORIGINS = [
 ]
 
 MAX_CSV_BYTES = int(os.getenv("MAX_CSV_BYTES", str(10 * 1024 * 1024)))
+INDUSTRY_SOURCE_MAX_JSON_BYTES = int(os.getenv("INDUSTRY_SOURCE_MAX_JSON_BYTES", str(8 * 1024 * 1024)))
+INDUSTRY_SOURCE_UPLOAD_TOKEN = os.getenv("INDUSTRY_SOURCE_UPLOAD_TOKEN", "").strip()
+JSON_SOURCE_LLM_CATALOG_LIMIT = int(os.getenv("JSON_SOURCE_LLM_CATALOG_LIMIT", "500"))
 
 # Schema breadth is quality-gated rather than "include everything". The maximum is a
 # preference: mandatory application/identity contracts are never dropped for size.

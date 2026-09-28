@@ -1,6 +1,7 @@
 from __future__ import annotations
 import logging
 import re
+import secrets
 import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -30,15 +31,23 @@ from core.runtime_cache import clear_scenario
 from core.agentic_models import ScenarioProposeRequest, ScenarioImportResponse
 from core.csv_scenario import infer_type_of_data, parse_definition_csv
 from config.industry_profiles import COUNTRY_BASE
-from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES
+from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES, INDUSTRY_SOURCE_MAX_JSON_BYTES, INDUSTRY_SOURCE_UPLOAD_TOKEN
 from core.agentic_workflow import AgenticSchemaWorkflow, get_agentic_workflow
-from core.json_domain_policy import is_json_grounded_domain
+from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain
 from core.low_balance_variable_policy import validate_low_balance_variable_sources
 from core.telecom_registry import RegistryError, get_registry
 from core.scenario_variable_store import upsert_recommended, get_recommended, set_user_variables, get_user_variables, get_user_variable_records, delete_user_variable
 from models.database import ping as ping_mongodb
 from models.model_registry import ensure_indexes as ensure_model_indexes
 from core.generation_service import build_generation_response
+from core.industry_source_store import (
+    delete_source_document,
+    get_source_document,
+    list_source_documents,
+    save_source_document,
+    seed_bundled_industry_sources,
+    set_source_active,
+)
 
 
 
@@ -78,6 +87,8 @@ async def lifespan(_app: FastAPI):
     try:
         ping_mongodb()
         ensure_model_indexes()
+        seeded = seed_bundled_industry_sources()
+        logger.info("Industry source registry ready: sources=%s", len(seeded))
         registry = get_registry()
         health = registry.health()
         if not health["healthy"]:
@@ -127,7 +138,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
+    allow_headers=["Content-Type", "Authorization", "X-Request-ID", "X-Industry-Source-Token"],
 )
 
 
@@ -212,6 +223,25 @@ class ConfirmResponse(BaseModel):
     variableSources: dict[str, str] = Field(default_factory=dict, description="Internal provenance for Low Balance variables")
 
 
+class IndustrySourceStatusRequest(BaseModel):
+    active: bool
+
+
+class IndustrySourceResponse(BaseModel):
+    success: bool = True
+    source: dict
+
+
+def _require_industry_source_admin_token(request: Request) -> None:
+    """Protect source-registry mutations with a deployment-provided admin token."""
+    expected = INDUSTRY_SOURCE_UPLOAD_TOKEN
+    if not expected:
+        raise HTTPException(503, detail={"error": "Industry source mutations are disabled; set INDUSTRY_SOURCE_UPLOAD_TOKEN"})
+    supplied = str(request.headers.get("X-Industry-Source-Token") or "")
+    if not secrets.compare_digest(supplied, expected):
+        raise HTTPException(401, detail={"error": "Invalid industry source administration token"})
+
+
 @app.get("/")
 def root():
     """Liveness check."""
@@ -230,10 +260,32 @@ def ready():
     registry_health = get_registry().health()
     if not registry_health.get("healthy"):
         raise HTTPException(status_code=503, detail={"error": "Telecom standards registry is not ready"})
+    source_count = len(list_source_documents(active_only=True))
     return {"status": "ready", "registry": {
         "standards": registry_health["standards"],
         "entities": registry_health["entities"],
-    }}
+    }, "industrySources": {"active": source_count}}
+
+
+def _read_json_source_upload(file: UploadFile) -> tuple[bytes, dict]:
+    """Read and parse one standards JSON with a bounded upload size."""
+    filename = (file.filename or "").strip().lower()
+    if filename and not filename.endswith(".json"):
+        raise HTTPException(status_code=400, detail={"error": "Only .json files are accepted"})
+    raw = file.file.read(INDUSTRY_SOURCE_MAX_JSON_BYTES + 1)
+    if len(raw) > INDUSTRY_SOURCE_MAX_JSON_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": f"JSON source exceeds the configured size limit of {INDUSTRY_SOURCE_MAX_JSON_BYTES} bytes"},
+        )
+    try:
+        import json
+        document = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail={"error": f"Source file must contain valid UTF-8 JSON: {exc}"}) from exc
+    if not isinstance(document, dict):
+        raise HTTPException(status_code=400, detail={"error": "Source JSON root must be an object"})
+    return raw, document
 
 
 def _read_csv_upload(file: UploadFile) -> str:
@@ -384,6 +436,96 @@ def remove_user_scenario_variable(requested_scenario_id: str, user_id: str, vari
         raise HTTPException(404, detail={"error": "User scenario variable not found"})
     return {"success": True, "userId": user_id, "requestedScenarioId": requested_scenario_id, "scenarioId": requested_scenario_id, "variableKey": variable_key, "deleted": True}
 
+@app.get("/industry-sources")
+def get_industry_sources(
+    industryType: str | None = None,
+    domain: str | None = None,
+    activeOnly: bool = True,
+):
+    """List source documents registered for an optional industry/domain filter."""
+    return {
+        "success": True,
+        "industryType": industryType,
+        "domain": domain,
+        "sources": list_source_documents(
+            industry_type=industryType,
+            domain=domain,
+            active_only=activeOnly,
+        ),
+    }
+
+
+@app.get("/industry-sources/{source_id}")
+def get_industry_source(source_id: str, includeDocument: bool = False):
+    source = get_source_document(source_id, include_document=includeDocument)
+    if source is None:
+        raise HTTPException(404, detail={"error": f"Unknown industry source '{source_id}'"})
+    return {"success": True, "source": source}
+
+
+@app.post("/industry-sources/upload", response_model=IndustrySourceResponse)
+def upload_industry_source(
+    request: Request,
+    file: UploadFile = File(..., description="Swagger/OpenAPI/JSON Schema source document"),
+    industryType: str = Form(...),
+    domain: str = Form(...),
+    sourceId: str | None = Form(None),
+    sourceName: str | None = Form(None),
+    standard: str | None = Form(None),
+    version: str | None = Form(None),
+    description: str | None = Form(None),
+    active: bool = Form(True),
+):
+    """Upload or replace one standards JSON for an exact industryType/domain pair."""
+    _require_industry_source_admin_token(request)
+    raw, document = _read_json_source_upload(file)
+    try:
+        source = save_source_document(
+            industry_type=industryType,
+            domain=domain,
+            document=document,
+            file_name=file.filename or "source.json",
+            source_name=sourceName,
+            standard=standard,
+            version=version,
+            description=description,
+            active=active,
+            source_id=sourceId,
+            raw_bytes=raw,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    return {"success": True, "source": source}
+
+
+@app.patch("/industry-sources/{source_id}", response_model=IndustrySourceResponse)
+def update_industry_source(source_id: str, req: IndustrySourceStatusRequest, request: Request):
+    _require_industry_source_admin_token(request)
+    if not set_source_active(source_id, req.active):
+        raise HTTPException(404, detail={"error": f"Unknown industry source '{source_id}'"})
+    source = get_source_document(source_id)
+    return {"success": True, "source": source}
+
+
+@app.delete("/industry-sources/{source_id}")
+def remove_industry_source(source_id: str, request: Request):
+    _require_industry_source_admin_token(request)
+    if not delete_source_document(source_id):
+        raise HTTPException(404, detail={"error": f"Unknown industry source '{source_id}'"})
+    return {"success": True, "sourceId": source_id, "deleted": True}
+
+
+@app.post("/industry-sources/bootstrap")
+def bootstrap_industry_sources(request: Request):
+    """Explicitly run the bundled Low Balance compatibility migration."""
+    _require_industry_source_admin_token(request)
+    try:
+        sources = seed_bundled_industry_sources()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    return {"success": True, "sources": sources}
+
+
 @app.post("/scenario/import-csv", response_model=ScenarioImportResponse)
 def import_scenario_csv(
     file: UploadFile = File(..., description="CSV scenario definition containing variables"),
@@ -407,16 +549,13 @@ def import_scenario_csv(
     Low Balance & Top-up is intentionally source-locked to TMF654/TMF629 or MongoDB
     variables, so CSV cannot become a third variable source for that domain.
     """
-    if is_json_grounded_domain(domain):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": (
-                    "Low Balance & Top-up variables cannot be defined through CSV. "
-                    "Use the supplied TMF654/TMF629 Swagger variables or MongoDB variables."
-                )
-            },
+    if is_json_grounded_domain(domain, industryType):
+        message = (
+            "Low Balance & Top-up variables cannot be defined through CSV. Use the active TMF654/TMF629 source documents or MongoDB variables."
+            if is_low_balance_domain(domain, industryType)
+            else "This JSON-source-backed industry/domain cannot be defined through CSV. Use the active MongoDB industry source documents."
         )
+        raise HTTPException(status_code=400, detail={"error": message})
     csv_text = _read_csv_upload(file)
 
     try:
@@ -518,7 +657,7 @@ def confirm_scenario_route(req: ConfirmRequest):
             cleaned=_clean_dict(new_var); name=cleaned.get("name")
             if not _is_placeholder(name): by_name[str(name)]=cleaned
         variables=list(by_name.values()); field_order=[str(v["name"]) for v in variables if v.get("name")]
-    if is_json_grounded_domain(draft.get("domain")):
+    if is_low_balance_domain(draft.get("domain"), draft.get("industry_type")):
         try:
             validate_low_balance_variable_sources(
                 variables,
@@ -552,6 +691,8 @@ def confirm_scenario_route(req: ConfirmRequest):
             if str(name).strip() and str(source).strip()
         },
         "db_variable_names": sorted(str(name).strip().casefold() for name in (draft.get("db_variable_names") or []) if str(name).strip()),
+        "source_policy": draft.get("source_policy", "approved_telecom_standards_registry"),
+        "source_documents": list(draft.get("source_documents") or []),
     }
     try:
         scenario_id, scenario_id_reassigned = confirm_scenario(

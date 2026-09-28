@@ -6,4 +6,5 @@ SUPPORTED_GENERATORS = frozenset({
     "lognormal_int", "beta", "segment_range", "uniform_bounded", "recent_datetime",
     "ts_offset", "ts_add_field", "date_offset", "date_offset_range", "prefixed_uuid",
     "tx_id", "formula", "generic", "semantic_event", "semantic_string",
+    "uuid_string", "email_string", "uri_string", "ipv4_string", "ipv6_string",
 })

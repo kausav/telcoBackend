@@ -5,7 +5,7 @@ from typing import Any
 from models.scenario import ScenarioModel
 from models.scenario_draft import ScenarioDraftModel
 from models.scenario_feedback import ScenarioFeedbackModel
-from core.json_domain_policy import is_json_grounded_domain
+from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain
 from core.low_balance_variable_policy import validate_low_balance_variable_sources, reconcile_low_balance_variables
 
 def next_scenario_id() -> str:
@@ -203,7 +203,7 @@ def resolve_variables(requested_scenario_id: str) -> tuple[list[dict[str, Any]],
     meta = dyn.get("meta") or {}
     domain = meta.get("domain") or meta.get("journey") or ""
 
-    if is_json_grounded_domain(domain):
+    if is_low_balance_domain(domain, meta.get("industry")):
         db_names = set(meta.get("db_variable_names") or [])
         db_names.update((meta.get("db_variable_definitions") or {}).keys())
         variables, sources, db_names, normalized_order = reconcile_low_balance_variables(
@@ -216,7 +216,16 @@ def resolve_variables(requested_scenario_id: str) -> tuple[list[dict[str, Any]],
         validate_low_balance_variable_sources(variables, sources, db_variable_names=db_names)
         field_order = normalized_order
     else:
-        variables = _repair_legacy_variables(raw_variables)
+        # Source-grounded scenarios are already compiled from their authoritative MongoDB
+        # JSON catalog. Never apply legacy telecom repairs to another industry's fields.
+        source_policy = str(meta.get("source_policy") or "").strip()
+        if source_policy == "mongodb_industry_source_documents" or (
+            is_json_grounded_domain(domain, meta.get("industry"))
+            and not is_low_balance_domain(domain, meta.get("industry"))
+        ):
+            variables = raw_variables
+        else:
+            variables = _repair_legacy_variables(raw_variables)
         allowed = {str(v.get("name")) for v in variables if isinstance(v, dict) and v.get("name")}
         field_order = [name for name in list(dyn.get("field_order") or []) if str(name) in allowed]
     return variables, field_order
