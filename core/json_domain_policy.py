@@ -30,12 +30,6 @@ LOW_BALANCE_DOMAIN_ALIASES = {
     "recharge balance",
 }
 
-LOW_BALANCE_SOURCE_IDS = ("tmf654_v4", "tmf629_v4")
-LOW_BALANCE_MAIN_MODEL_IDS = (
-    "tmf654_v4__topup_balance",
-    "tmf654_v4__bucket",
-    "tmf629_v4__customer",
-)
 def normalize_domain(value: str | None) -> str:
     return " ".join(str(value or "").strip().lower().replace("_", " ").split())
 

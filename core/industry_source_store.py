@@ -92,20 +92,14 @@ def generate_internal_source_id(
     document: dict[str, Any],
     raw_bytes: bytes,
 ) -> str:
-    """Create a stable server-owned source ID without exposing per-file ID fields in the API.
+    """Create a deterministic server-owned source ID scoped to an industry/domain pair.
 
-    Known Low Balance TM Forum artifacts retain their historical IDs so the existing telecom
-    policy can continue to recognize TMF654/TMF629. Other uploads get a deterministic ID derived
-    from the exact industry/domain, filename, and content fingerprint.
+    The same JSON document may be uploaded for multiple domains or industries. Its internal ID
+    therefore includes the normalized industry/domain pair plus filename/content fingerprint,
+    so a source can be reused without global-ID reassignment conflicts.
     """
     safe_name = _safe_file_name(file_name)
     compact_name = normalize_lookup_key(Path(safe_name).stem)
-    lower_name = safe_name.casefold()
-    if "tmf654" in lower_name and "prepay" in lower_name and "balance" in lower_name:
-        return "tmf654_v4"
-    if "tmf629" in lower_name and "customer" in lower_name and "management" in lower_name:
-        return "tmf629_v4"
-
     industry_key = normalize_industry_key(industry_type)
     domain_key = normalize_domain_key(domain)
     info = document.get("info") if isinstance(document.get("info"), dict) else {}

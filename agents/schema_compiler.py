@@ -8,7 +8,7 @@ import math
 import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
-from core.json_domain_policy import LOW_BALANCE_MAIN_MODEL_IDS, LOW_BALANCE_SOURCE_IDS, expanded_scalar_catalog, is_json_grounded_domain, is_low_balance_domain, source_manifest
+from core.json_domain_policy import expanded_scalar_catalog, is_json_grounded_domain, is_low_balance_domain, source_manifest
 from core.industry_source_store import catalog_for_request, normalize_lookup_key, select_json_source_catalog
 from core.low_balance_variable_policy import official_catalog_by_name, select_low_balance_official_catalog
 from core.variable_quality import VariableQualityEngine
