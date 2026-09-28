@@ -70,6 +70,36 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
                 )
 
     datetime_vars = [v for v in variables if str(v.get("dtype", "")).lower() == "datetime"]
+    # Do not infer chronology merely from generic role words (start/end/request/etc.).
+    # That creates false edges across unrelated resources, e.g.
+    # ``bucket_valid_for_start`` -> ``topup_valid_for_end``. Only add lifecycle edges when
+    # the fields belong to the same semantic family/resource. Explicit depends_on edges and
+    # the suffix-based pairs below remain authoritative.
+    def _temporal_family(name: str) -> str:
+        text = re.sub(r"[^a-z0-9]+", "_", str(name or "").casefold()).strip("_")
+        suffixes = (
+            "_confirmation_date_time", "_confirmation_datetime", "_confirmation_timestamp", "_confirmation_date",
+            "_requested_date_time", "_requested_datetime", "_requested_timestamp", "_requested_date",
+            "_created_date_time", "_created_datetime", "_created_timestamp", "_created_at", "_created_date",
+            "_creation_date_time", "_creation_datetime", "_creation_timestamp", "_creation_at", "_creation_date",
+            "_start_date_time", "_start_datetime", "_start_date", "_start_at",
+            "_end_date_time", "_end_datetime", "_end_date", "_end_at",
+            "_completion_date_time", "_completion_datetime", "_completion_timestamp", "_completion_at", "_completion_date",
+            "_completed_date_time", "_completed_datetime", "_completed_timestamp", "_completed_at", "_completed_date",
+            "_processed_date_time", "_processed_datetime", "_processed_timestamp", "_processed_at",
+            "_settled_date_time", "_settled_datetime", "_settled_timestamp", "_settled_at",
+            "_finished_date_time", "_finished_datetime", "_finished_timestamp", "_finished_at",
+            "_decision_timestamp", "_decision_date", "_decision_at",
+            "_presentation_timestamp", "_presentation_date", "_presentation_at",
+            "_presented_timestamp", "_presented_date", "_presented_at",
+            "_response_timestamp", "_response_date", "_response_at",
+            "_dispatch_timestamp", "_dispatch_date", "_dispatch_at",
+        )
+        for suffix in suffixes:
+            if text.endswith(suffix):
+                return text[:-len(suffix)]
+        return text
+
     lifecycle_pairs = {
         ("presentation", "response"),
         ("dispatch", "response"),
@@ -83,12 +113,13 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
                 continue
             parent_role = temporal_role(parent)
             child_role = temporal_role(child)
-            if (parent_role, child_role) in lifecycle_pairs and str(parent.get("scope", "transaction")) == str(child.get("scope", "transaction")):
+            same_family = _temporal_family(parent.get("name")) == _temporal_family(child.get("name"))
+            if same_family and (parent_role, child_role) in lifecycle_pairs and str(parent.get("scope", "transaction")) == str(child.get("scope", "transaction")):
                 add_edge(
                     str(parent.get("name")),
                     str(child.get("name")),
                     temporal_delay_limit_seconds(child, parent),
-                    "Scenario lifecycle semantics imply chronological order.",
+                    "Same-resource lifecycle semantics imply chronological order.",
                 )
 
     # Low Balance & Top-up uses short operational lifecycles. The supplied TMF654
@@ -143,6 +174,16 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
             "Every paired start/end period must satisfy start <= end.",
             "Every request/confirmation lifecycle must satisfy request <= confirmation when confirmation exists.",
             "Values describing the same transaction, entity, or balance snapshot must be mutually consistent.",
+        ],
+        "generation_policy": [
+            "Generate root/independent fields first and all dependent fields from their actual dependencies.",
+            "Never independently sample two fields when the confirmed schema or universal semantics imply a relationship.",
+            "Generate temporal pairs and event lifecycles causally; validation is a safety net, not the generation mechanism.",
+            "Apply scenarioType, businessScenario, expectedOutcome, businessResponse, useCase, domain, industry, country, and typeOfData before a record reaches validation.",
+            "Use exact confirmed enum/value vocabularies and numeric constraints; never invent source values.",
+            "Keep entity-level attributes stable across that entity's transactions and keep transaction/event attributes at transaction grain.",
+            "Preserve reference/identifier consistency across related source-backed fields.",
+            "A correctly generated record should normally require zero validation repairs; repeated repair/retry is treated as a generator defect.",
         ],
         "domain_invariants": [
             "Low Balance & Top-up records must keep customer_id/account_id/msisdn stable across a customer history.",

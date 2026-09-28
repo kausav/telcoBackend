@@ -284,11 +284,31 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
         for entity_value, rows in grouped.items():
             timestamp_field = next(
                 (f for f in (
-                    "topup_requested_date_time", "topupbalance_requested_date", "topupbalance_requesteddate",
-                    "recharge_timestamp", "transaction_timestamp", "record_timestamp", "timestamp", "created_at", "updated_at",
+                    "event_timestamp", "event_datetime", "event_date_time",
+                    "transaction_timestamp", "transaction_datetime", "transaction_date_time",
+                    "record_timestamp", "record_datetime", "record_date_time",
+                    "topup_balance_requested_date", "topup_balance_requested_date_time",
+                    "topupbalance_requested_date", "topupbalance_requested_datetime", "topupbalance_requested_date_time",
+                    "recharge_timestamp", "recharge_datetime", "recharge_date_time",
+                    "requested_timestamp", "requested_datetime", "requested_date_time",
+                    "occurred_at", "occurred_timestamp", "created_at", "creation_date_time",
+                    "start_date_time", "start_datetime", "start_date",
                 ) if f in rows[0]),
                 None,
             )
+            if timestamp_field is None:
+                candidates = [
+                    f for f in rows[0]
+                    if any(token in f.casefold() for token in (
+                        "event", "transaction", "record", "occurred", "requested", "request",
+                        "start", "created", "timestamp",
+                    ))
+                    and not any(token in f.casefold() for token in (
+                        "confirmation", "confirmed", "decision", "end", "expiry", "expiration", "updated",
+                        "valid_for_end", "validity_end",
+                    ))
+                ]
+                timestamp_field = next((f for f in candidates if f in rows[0]), None)
             if timestamp_field:
                 rows = sorted(rows, key=lambda r: _timestamp_sort_key(r.get(timestamp_field)), reverse=True)
             latest = rows[0] if rows else {}

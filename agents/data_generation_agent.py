@@ -87,6 +87,11 @@ its JSON, datatype, or range checks pass. If deterministic validation can prove 
 that deterministic result overrides an LLM judgement. Never invent missing business facts to make
 a record look valid.
 
+The generator is expected to produce records that already satisfy the complete contract. Treat a non-zero
+repair count as evidence that the generation policy missed a dependency or scenario invariant. Do not perform
+creative repair merely to increase the number of accepted rows; any repair must be deterministic, contract-backed,
+and limited to the affected downstream values.
+
 Return JSON with keys: valid_records, dropped_records, fixes_applied, issues_found.
 Each input record contains an internal `__qa_id`. Preserve that exact ID on every returned valid
 record. Never create, modify, duplicate, or reuse a `__qa_id`. If a record must be dropped, put its
@@ -691,6 +696,26 @@ def _temporal_output_params(params: dict | None, generator: str) -> dict:
     return result
 
 
+def _generate_temporal_child_value(
+    var: dict,
+    parent_dt: datetime,
+    max_gap: int | None,
+    min_gap: int = 0,
+) -> str:
+    """Generate a lifecycle child from an already-generated temporal parent."""
+    lower = max(0, int(min_gap or 0))
+    try:
+        upper = int(max_gap) if max_gap is not None else lower + 7 * 86400
+    except (TypeError, ValueError):
+        upper = lower + 7 * 86400
+    upper = max(lower, upper)
+    gap = random.randint(lower, upper) if upper > lower else lower
+    desired = parent_dt + timedelta(seconds=gap)
+    if str(var.get("dtype") or "datetime").strip().lower() == "date":
+        return desired.date().isoformat()
+    return _format_datetime_for_variable(desired, var)
+
+
 def _ts_offset(params: dict, rec: dict) -> str:
     base_field = str(params.get("base_field") or params.get("source_field") or "").strip()
     if not base_field:
@@ -1217,6 +1242,7 @@ class _GenerationPlan:
     cyclic: frozenset[str]
     known_fields: frozenset[str]
     formula_by_name: dict[str, str]
+    temporal_relations: tuple[tuple[str, str, int | None, int], ...] = ()
 
 
 def _variable_dependency_order(
@@ -1228,6 +1254,15 @@ def _variable_dependency_order(
     by_name = {str(v.get("name")): v for v in variables if v.get("name")}
     position = {name: idx for idx, name in enumerate(by_name)}
     selected = set(selected_names or by_name) & set(by_name)
+
+    # Temporal relationships are execution dependencies even when they are not persisted in
+    # the source-backed ``depends_on`` list. This prevents lifecycle timestamps from being
+    # independently sampled. The relationship remains runtime metadata only.
+    temporal_relations = _infer_temporal_relationships(variables, rules=rules)
+    temporal_parent_by_child: dict[str, list[str]] = {}
+    for parent, child, _max_gap, _min_gap in temporal_relations:
+        temporal_parent_by_child.setdefault(child, []).append(parent)
+
     changed = True
     while changed:
         changed = False
@@ -1239,6 +1274,9 @@ def _variable_dependency_order(
                 for dep in _formula_dependencies(str(expr)):
                     if dep not in dep_names:
                         dep_names.append(dep)
+            for temporal_parent in temporal_parent_by_child.get(name, []):
+                if temporal_parent not in dep_names:
+                    dep_names.append(temporal_parent)
             for dep in dep_names:
                 if dep in by_name and dep not in selected:
                     selected.add(dep)
@@ -1254,6 +1292,9 @@ def _variable_dependency_order(
             for dep in _formula_dependencies(str(expr)):
                 if dep not in dep_names:
                     dep_names.append(dep)
+        for temporal_parent in temporal_parent_by_child.get(name, []):
+            if temporal_parent not in dep_names:
+                dep_names.append(temporal_parent)
         for dep in dep_names:
             if dep in selected:
                 indegree[name] += 1
@@ -1289,11 +1330,13 @@ def _build_generation_plan(
         expr = var.get("formula") or _formula_from_rules(name, rules)
         if name and expr:
             formula_by_name[name] = str(expr)
+    temporal_relations = tuple(_infer_temporal_relationships(variables, rules=rules))
     return _GenerationPlan(
         ordered=tuple(ordered),
         cyclic=frozenset(cyclic),
         known_fields=frozenset(str(v.get("name")) for v in variables if v.get("name")),
         formula_by_name=formula_by_name,
+        temporal_relations=temporal_relations,
     )
 
 def _generate_record(variables: list[dict], rules: dict | None = None, plan: _GenerationPlan | None = None, apply_repairs: bool = True) -> dict:
@@ -1301,6 +1344,9 @@ def _generate_record(variables: list[dict], rules: dict | None = None, plan: _Ge
     rec: dict = {}
     plan = plan or _build_generation_plan(variables, rules=rules)
     ordered, cyclic, known_fields = plan.ordered, plan.cyclic, plan.known_fields
+    temporal_child_rules = {}
+    for parent, child, max_gap, min_gap in plan.temporal_relations:
+        temporal_child_rules.setdefault(child, (parent, max_gap, min_gap))
     for var in ordered:
         gen_type = var["gen"]
         effective_var = var
@@ -1319,24 +1365,37 @@ def _generate_record(variables: list[dict], rules: dict | None = None, plan: _Ge
             effective_var = dict(var)
             effective_var["gen"] = "formula"
             effective_var["formula"] = str(rule_formula)
-        generator = _GENERATORS.get(effective_var.get("gen"))
-        if generator:
-            rec["__current_field__"] = var["name"]
-            try:
-                value = generator(effective_var, rec)
-            finally:
-                rec.pop("__current_field__", None)
+        temporal_rule = temporal_child_rules.get(var["name"])
+        original_generator = str(effective_var.get("gen") or "").strip().lower()
+        if temporal_rule and not rule_formula and original_generator in {
+            "recent_datetime", "recent_date", "timestamp", "datetime"
+        }:
+            parent_name, max_gap, min_gap = temporal_rule
+            parent_dt = _qa_parse_dt(rec.get(parent_name))
+            value = (
+                _generate_temporal_child_value(var, parent_dt, max_gap, min_gap)
+                if parent_dt is not None
+                else None
+            )
         else:
-            value = None
+            generator = _GENERATORS.get(effective_var.get("gen"))
+            if generator:
+                rec["__current_field__"] = var["name"]
+                try:
+                    value = generator(effective_var, rec)
+                finally:
+                    rec.pop("__current_field__", None)
+            else:
+                value = None
         rec[var["name"]] = _apply_generation_constraint(var, value, rec, rules)
     if apply_repairs:
         rec = _apply_conditional_rules(rec, rules)
         rec = _apply_scenario_semantics(rec, rules)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules, relations=plan.temporal_relations)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
         rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
-        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules, relations=plan.temporal_relations)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
         rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
@@ -1357,6 +1416,9 @@ def _generate_selected_record(
     rec = dict(base or {})
     plan = plan or _build_generation_plan(variables, selected_names, rules)
     ordered, cyclic, known_fields = plan.ordered, plan.cyclic, plan.known_fields
+    temporal_child_rules = {}
+    for parent, child, max_gap, min_gap in plan.temporal_relations:
+        temporal_child_rules.setdefault(child, (parent, max_gap, min_gap))
     for var in ordered:
         name = var["name"]
         if name in rec:
@@ -1374,15 +1436,28 @@ def _generate_selected_record(
             effective_var = dict(var)
             effective_var["gen"] = "formula"
             effective_var["formula"] = str(rule_formula)
-        generator = _GENERATORS.get(effective_var.get("gen"))
-        if generator:
-            rec["__current_field__"] = name
-            try:
-                value = generator(effective_var, rec)
-            finally:
-                rec.pop("__current_field__", None)
+        temporal_rule = temporal_child_rules.get(name)
+        original_generator = str(effective_var.get("gen") or "").strip().lower()
+        if temporal_rule and not rule_formula and original_generator in {
+            "recent_datetime", "recent_date", "timestamp", "datetime"
+        }:
+            parent_name, max_gap, min_gap = temporal_rule
+            parent_dt = _qa_parse_dt(rec.get(parent_name))
+            value = (
+                _generate_temporal_child_value(var, parent_dt, max_gap, min_gap)
+                if parent_dt is not None
+                else None
+            )
         else:
-            value = None
+            generator = _GENERATORS.get(effective_var.get("gen"))
+            if generator:
+                rec["__current_field__"] = name
+                try:
+                    value = generator(effective_var, rec)
+                finally:
+                    rec.pop("__current_field__", None)
+            else:
+                value = None
 
         declared_dtype = str(var.get("dtype", "")).strip().lower()
         try:
@@ -1398,10 +1473,10 @@ def _generate_selected_record(
         rec = _apply_conditional_rules(rec, rules)
         rec = _apply_scenario_semantics(rec, rules)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules, relations=plan.temporal_relations)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
         rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
-        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules)
+        rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules, relations=plan.temporal_relations)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
         rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
@@ -1413,17 +1488,50 @@ def _generate_selected_record(
 # -- Transactional/user-history generation helpers -----------------------------
 
 def _pick_timestamp_field(variables: list[dict]) -> str | None:
-    preferred=(
-        "topup_requested_date_time", "topupbalance_requested_date", "topupbalance_requesteddate",
-        "recharge_timestamp", "transaction_timestamp", "record_timestamp", "timestamp", "created_at", "updated_at",
+    """Choose the transaction-history anchor without accidentally anchoring on a completion/end date.
+
+    A transactional history needs an event/request/start timestamp as its chronological anchor.
+    Completion/confirmation/end/expiry timestamps are generated from their causal parent and
+    must not become the user-history clock merely because they appear first in the source schema.
+    """
+    candidates=[]
+    exact_preferred=(
+        "event_timestamp", "event_datetime", "event_date_time",
+        "transaction_timestamp", "transaction_datetime", "transaction_date_time",
+        "record_timestamp", "record_datetime", "record_date_time",
+        "topup_balance_requested_date", "topup_balance_requested_date_time",
+        "topupbalance_requested_date", "topupbalance_requested_datetime", "topupbalance_requested_date_time",
+        "recharge_timestamp", "recharge_datetime", "recharge_date_time",
+        "requested_timestamp", "requested_datetime", "requested_date_time",
+        "occurred_at", "occurred_timestamp", "created_at", "creation_date_time",
+        "start_date_time", "start_datetime", "start_date",
     )
     names={str(v.get("name")):v for v in variables if v.get("name")}
-    for name in preferred:
-        if name in names and str(names[name].get("dtype","")).lower() in {"datetime","date"}:
+    valid_dtypes={"datetime","date"}
+    for name in exact_preferred:
+        var=names.get(name)
+        if var and str(var.get("dtype","")).strip().lower() in valid_dtypes:
             return name
-    for v in variables:
-        if str(v.get("dtype","")).lower()=="datetime" and v.get("name"):
-            return str(v["name"])
+
+    positive=("event", "transaction", "record", "occurred", "requested", "request", "start", "created", "creation", "timestamp")
+    negative=("confirmation", "confirmed", "decision", "end", "expiry", "expiration", "expired", "updated", "update", "valid_for_end", "validity_end")
+    for index,var in enumerate(variables):
+        name=str(var.get("name") or "").strip()
+        dtype=str(var.get("dtype") or "").strip().lower()
+        if not name or dtype not in valid_dtypes:
+            continue
+        low=name.casefold()
+        score=0
+        score += sum(4 for token in positive if token in low)
+        score -= sum(6 for token in negative if token in low)
+        if low.endswith(("_timestamp", "_datetime", "_date_time")):
+            score += 2
+        if "valid_for" in low or "validity" in low:
+            score -= 8
+        candidates.append((score, -index, name))
+    if candidates:
+        candidates.sort(reverse=True)
+        return candidates[0][2]
     return None
 
 
@@ -1745,6 +1853,16 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     # If the schema exposes a RelatedTopupBalance reference, point it to a
                     # real earlier transaction in this subscriber's history. The first event has
                     # no earlier top-up and therefore leaves the optional reference null.
+                    # Apply scenario semantics before strict validation. Validation stays fail-closed,
+                    # but ordinary generation should already satisfy scenarioType/outcome/conditional rules.
+                    row = _apply_conditional_rules(row, rules)
+                    row = _apply_scenario_semantics(row, rules)
+                    row, _ = _enforce_authoritative_formulas(row, variables, rules=rules)
+                    if _lb_domain(rules):
+                        row, _ = _enforce_low_balance_topup_consistency(row, variables, rules=rules)
+                        row, _ = _enforce_authoritative_formulas(row, variables, rules=rules)
+                    row, _ = _enforce_csv_contract(row, variables, rules=rules)
+
                     if "topupbalance_balance_topup_id" in row and "topupbalance_id" in row:
                         previous_topup_id = (
                             generated_records[-1].get("topupbalance_id")
@@ -1773,7 +1891,12 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     # Run the full validator once per successful attempt. This replaces the
                     # previous strict-validation pass plus a second batch validation pass.
                     repaired, issues = _validate_record(
-                        row, variables, list(compiled.field_order), True, rules=rules
+                        row,
+                        variables,
+                        list(compiled.field_order),
+                        True,
+                        rules=rules,
+                        temporal_relations=record_plan.temporal_relations,
                     )
                     if not isinstance(repaired, dict):
                         raise TypeError("Transactional validator returned a non-object record")
@@ -1966,13 +2089,65 @@ def _infer_temporal_relationships(
                     add_relation(start_name, end_name, max_gap, 0)
                     break
 
-    # 3) Universal validity windows. A one-year ceiling prevents absurd month/year spans while
-    # remaining broad enough for contractual/customer validity periods.
-    add_suffix_pair(("_start_date_time", "_start_datetime", "_start_date"), ("_end_date_time", "_end_datetime", "_end_date"), 365 * 86400)
+    # 3) Same-resource lifecycle pairs. Normalize common lifecycle suffixes before matching so
+    # ``order_created_at`` and ``order_completed_at`` can be linked while unrelated resources
+    # such as ``bucket_*`` and ``topup_*`` remain independent.
+    def temporal_family(name: str) -> str:
+        text = re.sub(r"[^a-z0-9]+", "_", str(name or "").casefold()).strip("_")
+        suffixes = (
+            "_confirmation_date_time", "_confirmation_datetime", "_confirmation_timestamp", "_confirmation_date",
+            "_requested_date_time", "_requested_datetime", "_requested_timestamp", "_requested_date",
+            "_created_date_time", "_created_datetime", "_created_timestamp", "_created_at", "_created_date",
+            "_creation_date_time", "_creation_datetime", "_creation_timestamp", "_creation_at", "_creation_date",
+            "_start_date_time", "_start_datetime", "_start_date", "_start_at",
+            "_end_date_time", "_end_datetime", "_end_date", "_end_at",
+            "_completion_date_time", "_completion_datetime", "_completion_timestamp", "_completion_at", "_completion_date",
+            "_completed_date_time", "_completed_datetime", "_completed_timestamp", "_completed_at", "_completed_date",
+            "_processed_date_time", "_processed_datetime", "_processed_timestamp", "_processed_at",
+            "_settled_date_time", "_settled_datetime", "_settled_timestamp", "_settled_at",
+            "_finished_date_time", "_finished_datetime", "_finished_timestamp", "_finished_at",
+            "_decision_timestamp", "_decision_date", "_decision_at",
+            "_presentation_timestamp", "_presentation_date", "_presentation_at",
+            "_presented_timestamp", "_presented_date", "_presented_at",
+            "_response_timestamp", "_response_date", "_response_at",
+            "_dispatch_timestamp", "_dispatch_date", "_dispatch_at",
+        )
+        for suffix in suffixes:
+            if text.endswith(suffix):
+                return text[:-len(suffix)]
+        return text
 
-    # 4) Request/confirmation lifecycle. A confirmation later than the request is required; a
-    # 30-day cap avoids accidentally creating an unrelated month-long gap while remaining generic.
-    add_suffix_pair(("_requested_date_time", "_requested_datetime", "_requested_timestamp", "_requested_date"), ("_confirmation_date_time", "_confirmation_datetime", "_confirmation_timestamp", "_confirmation_date"), 30 * 86400)
+    lifecycle_pairs = {
+        ("presentation", "response"),
+        ("dispatch", "response"),
+        ("start", "completion"),
+        ("start", "end"),
+        ("presentation", "completion"),
+    }
+    datetime_vars = [v for v in variables if str(v.get("dtype", "")).strip().lower() == "datetime"]
+    for parent in datetime_vars:
+        for child in datetime_vars:
+            if parent is child:
+                continue
+            if temporal_family(parent.get("name")) != temporal_family(child.get("name")):
+                continue
+            if _temporal_role(parent) == _temporal_role(child):
+                continue
+            if (_temporal_role(parent), _temporal_role(child)) in lifecycle_pairs:
+                add_relation(
+                    str(parent.get("name")),
+                    str(child.get("name")),
+                    _temporal_delay_limit_seconds(child, parent),
+                    0,
+                )
+
+    # 4) Universal validity windows. Enforce ordering without imposing an arbitrary duration
+    # when the source contract does not define one.
+    add_suffix_pair(("_start_date_time", "_start_datetime", "_start_date", "_start_at"), ("_end_date_time", "_end_datetime", "_end_date", "_end_at"), None)
+
+    # 5) Request/confirmation lifecycle. Only ordering is universal; use an explicit source/rule
+    # maximum when available instead of fabricating a domain-specific upper bound.
+    add_suffix_pair(("_requested_date_time", "_requested_datetime", "_requested_timestamp", "_requested_date"), ("_confirmation_date_time", "_confirmation_datetime", "_confirmation_timestamp", "_confirmation_date"), None)
 
     # 5) Common presentation/decision pair. Only apply when the schema has an unambiguous offer-like
     # presentation field and an unambiguous decision field; this protects recommendation/offer
@@ -1994,7 +2169,10 @@ def _infer_temporal_relationships(
 
 
 def _enforce_temporal_consistency(
-    rec: dict, variables: list[dict], rules: dict | None = None
+    rec: dict,
+    variables: list[dict],
+    rules: dict | None = None,
+    relations: list[tuple[str, str, int | None, int]] | tuple[tuple[str, str, int | None, int], ...] | None = None,
 ) -> tuple[dict, list[str]]:
     """Repair causal timestamp contradictions deterministically.
 
@@ -2007,7 +2185,7 @@ def _enforce_temporal_consistency(
     rec = dict(rec)
     issues: list[str] = []
     by_name = {str(v.get("name")): v for v in variables if v.get("name")}
-    relations = _infer_temporal_relationships(variables, rules=rules)
+    relations = list(relations) if relations is not None else _infer_temporal_relationships(variables, rules=rules)
     if not relations:
         return rec, issues
 
@@ -3505,12 +3683,37 @@ def _enforce_obvious_semantic_consistency(rec: dict, variables: list[dict]) -> t
     return rec, issues
 
 
+def _assert_temporal_consistency(
+    rec: dict,
+    variables: list[dict],
+    *,
+    relations: list[tuple[str, str, int | None, int]] | tuple[tuple[str, str, int | None, int], ...] | None = None,
+) -> None:
+    """Fail closed when any declared/inferred temporal relation remains contradictory."""
+    rels = list(relations) if relations is not None else _infer_temporal_relationships(variables)
+    for parent_name, child_name, max_gap, min_gap in rels:
+        parent_dt = _qa_parse_dt(rec.get(parent_name))
+        child_dt = _qa_parse_dt(rec.get(child_name))
+        if parent_dt is None or child_dt is None:
+            continue
+        delta = (child_dt - parent_dt).total_seconds()
+        if delta < min_gap:
+            raise ValueError(
+                f"temporal relationship violation: {child_name} occurs before {parent_name}"
+            )
+        if max_gap is not None and delta > max_gap:
+            raise ValueError(
+                f"temporal relationship violation: {child_name} exceeds allowed gap from {parent_name}"
+            )
+
+
 def _validate_record(
     rec: dict,
     variables: list[dict],
     field_order: list[str],
     transactional: bool,
     rules: dict | None = None,
+    temporal_relations: list[tuple[str, str, int | None, int]] | tuple[tuple[str, str, int | None, int], ...] | None = None,
 ) -> tuple[dict, list[str]]:
     """Validate and repair one record using only the confirmed CSV schema."""
     rec = dict(rec)
@@ -3678,7 +3881,11 @@ def _validate_record(
     rec, final_contract_issues = _enforce_csv_contract(rec, variables, rules=rules)
     issues.extend(final_contract_issues)
 
-    rec, temporal_issues = _enforce_temporal_consistency(rec, variables, rules=rules)
+    # Temporal relationships are enforced once after all scenario/domain semantic mutations.
+    # This avoids repeatedly parsing the same timestamp pairs on the hot path.
+    rec, temporal_issues = _enforce_temporal_consistency(
+        rec, variables, rules=rules, relations=temporal_relations
+    )
     issues.extend(temporal_issues)
     # Recalculate explicit formulas after temporal repair because a moved parent timestamp
     # can legitimately change a dependent duration/formula field.
@@ -3711,8 +3918,16 @@ def _validate_record(
     rec, final_contract_issues = _enforce_csv_contract(rec, variables, rules=rules)
     issues.extend(final_contract_issues)
 
+    # A formula or scenario-semantic repair above may change a timestamp after the earlier
+    # temporal pass. Enforce the temporal graph once more as the final pre-validation invariant.
+    rec, terminal_temporal_issues = _enforce_temporal_consistency(
+        rec, variables, rules=rules, relations=temporal_relations
+    )
+    issues.extend(terminal_temporal_issues)
+
     # Fail closed after every repair/constraint pass. This prevents a future change to
     # one repair stage from silently reintroducing a contradiction into final_records.
+    _assert_temporal_consistency(rec, variables, relations=temporal_relations)
     _assert_low_balance_topup_consistency(rec, variables, rules=rules)
 
     bad_placeholders = []
@@ -3724,8 +3939,8 @@ def _validate_record(
         raise ValueError(f"Unresolved placeholder values remain: {bad_placeholders}")
 
     # Presentation format is a deterministic CSV concern, not an LLM concern.
-    # Internally timestamps are parsed as real datetimes for formulas/comparisons;
-    # the record returned to callers uses each field's declared timestamp_format.
+    # Formatting preserves the parsed instant and therefore does not require another
+    # temporal-consistency scan after serialization.
     rec = _format_datetime_fields(rec, variables)
 
     # Recalculate displayed-duration fields after timestamp serialization. The public format is
@@ -3911,6 +4126,7 @@ class DataGenerationAgent:
             raise ValueError(f"Unknown scenario '{state.scenario}'")
         variables, _ = dyn
         transactional = state.type_of_data == "transactional"
+        qa_temporal_relations = _build_generation_plan(variables, rules=state.rules).temporal_relations
 
         checked: list[dict] = []
         algo_fixed = 0
@@ -3918,7 +4134,7 @@ class DataGenerationAgent:
             try:
                 repaired, issues = _validate_record(
                     record, variables, state.field_order, transactional,
-                    rules=state.rules,
+                    rules=state.rules, temporal_relations=qa_temporal_relations,
                 )
                 algo_fixed += len(issues)
                 checked.append(repaired)
@@ -3944,6 +4160,9 @@ class DataGenerationAgent:
             system_prompt = _QA_SYSTEM.format(
                 rules="\n".join(f"- {r}" for r in state.rules.get("business_rules", [])) or "Apply the supplied CSV schema and deterministic checks.",
                 cross_field_rules="\n".join(f"- {r}" for r in state.rules.get("cross_field_rules", [])) or "Validate declared mathematical, temporal, and business relationships.",
+            ) + (
+                "\n\nGENERATION POLICY (records should arrive pre-correct):\n"
+                + "\n".join(f"- {r}" for r in state.rules.get("generation_policy", []))
             ) + f"\n\nFULL SCENARIO SCHEMA CONTRACT (authoritative):\n{schema_contract}\n"
             for i in range(0, len(checked), _CHUNK):
                 chunk = checked[i:i + _CHUNK]
@@ -4014,7 +4233,8 @@ class DataGenerationAgent:
             for record_index, record in enumerate(checked):
                 try:
                     repaired, final_issues = _validate_record(
-                        record, variables, state.field_order, transactional, rules=state.rules
+                        record, variables, state.field_order, transactional,
+                        rules=state.rules, temporal_relations=qa_temporal_relations,
                     )
                     algo_fixed += len(final_issues)
                     deterministic_final.append(repaired)
