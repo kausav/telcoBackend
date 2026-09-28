@@ -229,17 +229,36 @@ class IndustrySourceStatusRequest(BaseModel):
 
 class IndustrySourceResponse(BaseModel):
     success: bool = True
-    source: dict
+    source: dict | None = None
+    sources: list[dict] = Field(default_factory=list)
+    uploaded: int = 0
+    errors: list[dict] = Field(default_factory=list)
 
 
 def _require_industry_source_admin_token(request: Request) -> None:
-    """Protect source-registry mutations with a deployment-provided admin token."""
+    """Protect destructive source-registry mutations with a deployment-provided admin token."""
     expected = INDUSTRY_SOURCE_UPLOAD_TOKEN
     if not expected:
-        raise HTTPException(503, detail={"error": "Industry source mutations are disabled; set INDUSTRY_SOURCE_UPLOAD_TOKEN"})
+        raise HTTPException(503, detail={"error": "Industry source administration is disabled; set INDUSTRY_SOURCE_UPLOAD_TOKEN"})
     supplied = str(request.headers.get("X-Industry-Source-Token") or "")
     if not secrets.compare_digest(supplied, expected):
         raise HTTPException(401, detail={"error": "Invalid industry source administration token"})
+
+
+def _normalize_upload_metadata(values: list[str] | None, file_count: int, field_name: str) -> list[str | None]:
+    """Normalize repeated multipart metadata so per-file source IDs/names are unambiguous."""
+    if not values:
+        return [None] * file_count
+    cleaned = [str(value).strip() for value in values]
+    if len(cleaned) == 1 and file_count == 1:
+        return cleaned
+    if len(cleaned) != file_count:
+        raise HTTPException(400, detail={
+            "error": f"{field_name} must be omitted or supplied once per uploaded file",
+            "expected": file_count,
+            "received": len(cleaned),
+        })
+    return cleaned
 
 
 @app.get("/")
@@ -464,38 +483,87 @@ def get_industry_source(source_id: str, includeDocument: bool = False):
 
 
 @app.post("/industry-sources/upload", response_model=IndustrySourceResponse)
-def upload_industry_source(
-    request: Request,
-    file: UploadFile = File(..., description="Swagger/OpenAPI/JSON Schema source document"),
+def upload_industry_sources(
+    files: list[UploadFile] | None = File(None, description="One or more Swagger/OpenAPI/JSON Schema source documents"),
+    file: UploadFile | None = File(None, description="Backward-compatible single-file upload field"),
     industryType: str = Form(...),
     domain: str = Form(...),
-    sourceId: str | None = Form(None),
-    sourceName: str | None = Form(None),
+    sourceId: list[str] | None = Form(None, description="Optional source ID per file; omit to generate a unique ID"),
+    sourceName: list[str] | None = Form(None, description="Optional source name per file; defaults to the uploaded filename"),
     standard: str | None = Form(None),
     version: str | None = Form(None),
     description: str | None = Form(None),
     active: bool = Form(True),
 ):
-    """Upload or replace one standards JSON for an exact industryType/domain pair."""
-    _require_industry_source_admin_token(request)
-    raw, document = _read_json_source_upload(file)
-    try:
-        source = save_source_document(
-            industry_type=industryType,
-            domain=domain,
-            document=document,
-            file_name=file.filename or "source.json",
-            source_name=sourceName,
-            standard=standard,
-            version=version,
-            description=description,
-            active=active,
-            source_id=sourceId,
-            raw_bytes=raw,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-    return {"success": True, "source": source}
+    """Upload one or more standards JSON files for one exact industryType/domain pair.
+
+    The upload endpoint is intentionally unauthenticated at this application layer so it can
+    be used directly from local Swagger/UI workflows. Destructive PATCH/DELETE/bootstrap
+    operations remain protected by the configured admin token.
+    """
+    upload_files = list(files or [])
+    if file is not None:
+        upload_files.append(file)
+    if not upload_files:
+        raise HTTPException(status_code=400, detail={"error": "At least one JSON file is required"})
+    if len(upload_files) > 25:
+        raise HTTPException(status_code=400, detail={"error": "A maximum of 25 files can be uploaded in one request"})
+
+    source_ids = _normalize_upload_metadata(sourceId, len(upload_files), "sourceId")
+    source_names = _normalize_upload_metadata(sourceName, len(upload_files), "sourceName")
+
+    normalized_ids = [item for item in source_ids if item]
+    if len(normalized_ids) != len(set(normalized_ids)):
+        raise HTTPException(status_code=400, detail={"error": "Each sourceId in a multi-file upload must be unique"})
+
+    prepared: list[dict] = []
+    for upload in upload_files:
+        raw, document = _read_json_source_upload(upload)
+        prepared.append({
+            "file": upload,
+            "raw": raw,
+            "document": document,
+        })
+
+    uploaded_sources: list[dict] = []
+    errors: list[dict] = []
+    for index, item in enumerate(prepared):
+        upload = item["file"]
+        try:
+            source = save_source_document(
+                industry_type=industryType,
+                domain=domain,
+                document=item["document"],
+                file_name=upload.filename or "source.json",
+                source_name=source_names[index],
+                standard=standard,
+                version=version,
+                description=description,
+                active=active,
+                source_id=source_ids[index],
+                raw_bytes=item["raw"],
+            )
+            uploaded_sources.append(source)
+        except ValueError as exc:
+            errors.append({
+                "file": upload.filename or "source.json",
+                "index": index,
+                "error": str(exc),
+            })
+
+    if not uploaded_sources and errors:
+        raise HTTPException(status_code=400, detail={
+            "error": "No source files were uploaded successfully",
+            "files": errors,
+        })
+
+    return {
+        "success": not errors,
+        "source": uploaded_sources[0] if len(uploaded_sources) == 1 else None,
+        "sources": uploaded_sources,
+        "uploaded": len(uploaded_sources),
+        "errors": errors,
+    }
 
 
 @app.patch("/industry-sources/{source_id}", response_model=IndustrySourceResponse)

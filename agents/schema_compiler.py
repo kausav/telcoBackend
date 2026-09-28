@@ -1,6 +1,8 @@
 """Deterministic schema compiler and HITL proposal builder."""
 from __future__ import annotations
 
+from typing import Any
+
 from core.agentic_models import GeneratedSchemaField, ResolvedConcept, ScenarioIntent, ScenarioSchema, SchemaRelationship, VariableIdea
 from core.telecom_registry import EntityDef, TelecomRegistry
 from config.industry_profiles import get_profile
