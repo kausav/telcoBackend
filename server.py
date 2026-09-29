@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import ORJSONResponse
 from starlette.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ConfigDict
@@ -101,7 +100,6 @@ app = FastAPI(
     title="Telco Agentic SDG",
     version="2.9.0",
     lifespan=lifespan,
-    default_response_class=ORJSONResponse,
     responses={
         400: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
@@ -879,7 +877,7 @@ def _timestamp_sort_key(value):
 
 
 @app.post("/scenario/generate", response_model=GenerateResponse)
-async def generate_scenario(req: GenerateRequest):
+async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
     """Generate and return the complete validated dataset synchronously.
 
     The request remains open until deterministic generation and final QA are complete. This
@@ -910,9 +908,10 @@ async def generate_scenario(req: GenerateRequest):
             "count": req.count,
             "recordsPerUser": req.recordsPerUser,
         })
-        # build_generation_response performs the full contract/type/semantic validation. Avoid a
-        # second recursive Pydantic traversal of potentially millions of generated values. The
-        # response_model remains the OpenAPI contract; returning a Response bypasses duplicate work.
+        # build_generation_response performs the domain-level generation and QA checks.
+        # Returning the plain payload lets FastAPI apply the declared GenerateResponse contract
+        # for response validation, filtering, and JSON serialization. This is the supported
+        # FastAPI path for response_model endpoints and avoids a deprecated custom JSON response class.
         logger.info(
             "[Latency] /scenario/generate scenario=%s records=%d fields=%d elapsed_ms=%.1f",
             requested_scenario_id,
@@ -920,7 +919,7 @@ async def generate_scenario(req: GenerateRequest):
             len(payload.get("fields") or []),
             (perf_counter() - started) * 1000.0,
         )
-        return ORJSONResponse(content=payload)
+        return payload
     except ValueError as exc:
         raise HTTPException(400, detail={"error": str(exc)}) from exc
 
