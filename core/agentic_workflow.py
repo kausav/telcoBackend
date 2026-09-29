@@ -9,6 +9,7 @@ from typing import Any
 import hashlib
 import json
 import logging
+import re
 
 from core.agentic_models import ScenarioImportResponse, ScenarioProposeRequest, ScenarioSchema, ScenarioIntent, GeneratedSchemaField
 from core.conversation_store import append_message, ensure_conversation
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 from agents.intent_agent import GeminiIntentAgent
 from agents.schema_compiler import SchemaCompiler
 from core.industry_source_store import normalize_industry_key, semantic_exclusion_aliases, catalog_for_request
+from core.output_equivalence import output_equivalence_signature
 
 
 class AgenticSchemaWorkflow:
@@ -180,6 +182,7 @@ class AgenticSchemaWorkflow:
         schema: ScenarioSchema,
         recommended: list[dict[str, Any]],
         user_selected: list[dict[str, Any]],
+        entity_key: str | None = None,
     ) -> tuple[ScenarioSchema, dict[str, str], dict[str, dict[str, Any]]]:
         """Merge DB-controlled variables with semantic precedence over source aliases.
 
@@ -257,8 +260,179 @@ class AgenticSchemaWorkflow:
         add_schema_fields(list(schema.fields))
         add_persisted(recommended, "DB_RECOMMENDED")
         add_persisted(user_selected, "USER_SELECTED")
+
+        # Final generic executable-output guard. A field is removed only when its confirmed
+        # generator contract guarantees the same value as another field for the same record
+        # context. Equal random distributions are intentionally NOT considered duplicates.
+        ordered, source_by_name, raw_persisted_by_name, output_removed = AgenticSchemaWorkflow._dedupe_output_equivalent_fields(
+            ordered,
+            source_by_name,
+            raw_persisted_by_name,
+            entity_key=entity_key,
+        )
+        if output_removed:
+            logger.info(
+                "[AgenticSchemaWorkflow] Suppressed %d executable-output duplicates: %s",
+                len(output_removed),
+                ", ".join(sorted(output_removed)),
+            )
+
         merged = schema.model_copy(update={"fields": ordered})
         return merged, source_by_name, raw_persisted_by_name
+
+    @staticmethod
+    def _dedupe_output_equivalent_fields(
+        fields: list[GeneratedSchemaField],
+        source_by_name: dict[str, str],
+        raw_persisted_by_name: dict[str, dict[str, Any]],
+        entity_key: str | None = None,
+    ) -> tuple[list[GeneratedSchemaField], dict[str, str], dict[str, dict[str, Any]], list[str]]:
+        """Collapse only variables with guaranteed identical executable output.
+
+        Persistence precedence is deterministic: a persisted MongoDB variable wins over a source
+        JSON/LLM variable; within persisted definitions, USER_SELECTED retains the existing workflow
+        precedence over DB_RECOMMENDED. When no persisted definition exists, the first field already
+        present in the schema order wins.
+
+        The rewrite is intentionally generic: removed field names are redirected in all executable
+        dependency representations used by the generator, including ``depends_on``, formula
+        references, and field-reference generator parameters. A second pass is allowed because
+        redirecting one dependency can make two previously-distinct executable signatures equivalent.
+        """
+        current_fields = [field.model_copy(deep=True) for field in (fields or [])]
+        current_source_map = {
+            str(key).strip().casefold(): str(value or "").strip().upper()
+            for key, value in (source_by_name or {}).items()
+        }
+        current_persisted_map = {
+            str(key).strip().casefold(): dict(value)
+            for key, value in (raw_persisted_by_name or {}).items()
+        }
+        removed_names: list[str] = []
+
+        def _redirect_name(value: Any, replacements: dict[str, str]) -> Any:
+            if not isinstance(value, str):
+                return value
+            key = value.strip().casefold()
+            return replacements.get(key, value)
+
+        def _redirect_formula(formula: Any, replacements: dict[str, str]) -> Any:
+            if not isinstance(formula, str) or not formula.strip() or not replacements:
+                return formula
+            result = formula
+            # Field names produced by the compiler are identifier-safe. Replace longest names first
+            # and require identifier boundaries so string literals and substrings are not rewritten.
+            for loser, winner in sorted(replacements.items(), key=lambda item: (-len(item[0]), item[0])):
+                result = re.sub(
+                    rf"(?<![A-Za-z0-9_]){re.escape(loser)}(?![A-Za-z0-9_])",
+                    winner,
+                    result,
+                )
+            return result
+
+        def _rewrite_field_references(field: GeneratedSchemaField, replacements: dict[str, str]) -> GeneratedSchemaField:
+            if not replacements:
+                return field
+            rewritten = field.model_copy(deep=True)
+            rewritten.depends_on = [_redirect_name(dep, replacements) for dep in (rewritten.depends_on or [])]
+            rewritten.formula = _redirect_formula(rewritten.formula, replacements)
+            params = dict(rewritten.params or {})
+            reference_keys = {
+                "depends_on_field",
+                "field",
+                "segment_field",
+                "hi_field",
+                "lo_field",
+                "base_field",
+                "source_field",
+                "add_seconds_field",
+            }
+            for key in reference_keys:
+                if key in params:
+                    params[key] = _redirect_name(params.get(key), replacements)
+            rewritten.params = params
+            return rewritten
+
+        # A schema usually stabilizes in one pass. Re-run only when a removal actually changed the
+        # executable dependency graph, and cap passes so a malformed schema cannot loop forever.
+        max_passes = max(1, len(current_fields))
+        for _ in range(max_passes):
+            groups: dict[tuple[Any, ...], list[int]] = {}
+            for index, field in enumerate(current_fields):
+                signature = output_equivalence_signature(field)
+                if signature is None:
+                    continue
+                groups.setdefault(signature, []).append(index)
+
+            if not groups:
+                break
+
+            entity_key_norm = str(entity_key or "").strip().casefold()
+            replacements: dict[str, str] = {}
+            remove_indices: set[int] = set()
+
+            def source_priority(index: int) -> tuple[int, int, int]:
+                field = current_fields[index]
+                key = field.name.strip().casefold()
+                source = current_source_map.get(key, "")
+                if key == entity_key_norm and entity_key_norm:
+                    return (-1, 0, index)
+                if source == "USER_SELECTED":
+                    return (0, 0, index)
+                if source == "DB_RECOMMENDED" or key in current_persisted_map:
+                    return (1, 0, index)
+                return (2, 0, index)
+
+            for indices in groups.values():
+                if len(indices) < 2:
+                    continue
+                winner = min(indices, key=source_priority)
+                winner_name = current_fields[winner].name
+                winner_key = winner_name.strip().casefold()
+                winner_deps = {
+                    str(dep).strip().casefold()
+                    for dep in (current_fields[winner].depends_on or [])
+                    if str(dep).strip()
+                }
+
+                for index in sorted(indices):
+                    if index == winner:
+                        continue
+                    loser_name = current_fields[index].name
+                    loser_key = loser_name.strip().casefold()
+                    # Keep the duplicate when the chosen winner directly depends on it; removing
+                    # such a prerequisite would invalidate the winner's own executable contract.
+                    if loser_key in winner_deps:
+                        continue
+                    replacements[loser_key] = winner_name
+                    remove_indices.add(index)
+
+            if not remove_indices:
+                break
+
+            next_fields: list[GeneratedSchemaField] = []
+            result_keys: set[str] = set()
+            for index, field in enumerate(current_fields):
+                if index in remove_indices:
+                    removed_names.append(field.name)
+                    continue
+                rewritten = _rewrite_field_references(field, replacements)
+                next_fields.append(rewritten)
+                result_keys.add(rewritten.name.strip().casefold())
+
+            current_fields = next_fields
+            current_source_map = {
+                key: value
+                for key, value in current_source_map.items()
+                if key in result_keys
+            }
+            current_persisted_map = {
+                key: value
+                for key, value in current_persisted_map.items()
+                if key in result_keys
+            }
+
+        return current_fields, current_source_map, current_persisted_map, sorted(set(removed_names))
 
     def propose(self, req: ScenarioProposeRequest) -> ScenarioImportResponse:
         prompt = req.business_scenario.strip()
@@ -400,6 +574,7 @@ class AgenticSchemaWorkflow:
             schema,
             recommended,
             user_selected,
+            entity_key=req.entity_key,
         )
 
         unresolved_questions = self.compiler.approval_questions(intent, schema)
@@ -617,6 +792,30 @@ class AgenticSchemaWorkflow:
             str(item.get("name") or "").strip().casefold(): dict(item)
             for item in draft_variables
         }
+        draft_persisted_by_name = {
+            key: dict(value)
+            for key, value in draft_raw_by_name.items()
+            if key in draft_db_names
+        }
+        remaining, draft_source_by_name, draft_persisted_by_name, output_removed = AgenticSchemaWorkflow._dedupe_output_equivalent_fields(
+            remaining,
+            draft_source_by_name,
+            draft_persisted_by_name,
+            entity_key=str(draft.get("entity_key") or "").strip() or None,
+        )
+        if output_removed:
+            removed_keys = {name.strip().casefold() for name in output_removed}
+            draft_db_names = {
+                key for key in draft_db_names
+                if key not in removed_keys
+            }
+            logger.info(
+                "[AgenticSchemaWorkflow] Confirmation suppressed %d executable-output duplicates: %s",
+                len(output_removed),
+                ", ".join(sorted(output_removed)),
+            )
+        remaining_names = {field.name for field in remaining}
+
         variables: list[dict[str, Any]] = []
         field_order: list[str] = []
         for field in remaining:

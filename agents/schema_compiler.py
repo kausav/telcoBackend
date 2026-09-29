@@ -1,6 +1,7 @@
 """Deterministic schema compiler and HITL proposal builder."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from core.agentic_models import GeneratedSchemaField, ResolvedConcept, ScenarioIntent, ScenarioSchema, SchemaRelationship, VariableIdea
@@ -11,7 +12,11 @@ from core.scenario_semantics import classify_outcome_mode
 from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain, source_manifest
 from core.industry_source_store import catalog_for_request, normalize_lookup_key, select_json_source_catalog, canonical_variable_semantic_key, semantic_exclusion_aliases
 from core.variable_quality import VariableQualityEngine
+from core.temporal_contract import is_supported_temporal_rule
 from config.runtime import SCHEMA_MAX_VARIABLES, SCHEMA_MIN_VARIABLE_SCORE
+
+
+logger = logging.getLogger(__name__)
 
 
 def _tokens(value: str) -> list[str]:
@@ -34,7 +39,14 @@ class SchemaCompiler:
         """Create a compiler whose only industry-standard input is MongoDB."""
 
     @staticmethod
-    def _normalize_variable_name(name: str) -> str:
+    def _normalize_variable_key(name: str) -> str:
+        """Return a stable full-length identity key for an executable variable name.
+
+        The source catalog can contain deeply nested standards fields whose flattened names are
+        longer than the 120-character LLM-facing ``VariableIdea.name`` contract. Identity keys must
+        never truncate those names because truncation can merge distinct source fields and silently
+        drop variables during deterministic compilation.
+        """
         text = str(name or "").strip().lower()
         text = re.sub(r"[^a-z0-9]+", "_", text)
         text = re.sub(r"_+", "_", text).strip("_")
@@ -42,7 +54,17 @@ class SchemaCompiler:
             text = "scenario_attribute"
         if text[0].isdigit():
             text = f"feature_{text}"
-        return text[:120]
+        return text
+
+    @classmethod
+    def _normalize_variable_name(cls, name: str) -> str:
+        """Return the legacy 120-character-safe name used for LLM-facing semantic variables.
+
+        Source-backed variables retain their original full names and use ``_normalize_variable_key``
+        for identity/deduplication. This 120-character view remains only for semantic/non-source
+        naming paths so existing provider and API contracts are not widened unnecessarily.
+        """
+        return cls._normalize_variable_key(name)[:120]
 
     @staticmethod
     def _idea_tokens(idea: dict[str, object]) -> set[str]:
@@ -420,9 +442,9 @@ class SchemaCompiler:
         normalized_industry = str(intent.industry_type or "generic").strip().lower()
         telecom_context = normalized_industry in {"telecom", "telecommunications", "telecommunication"}
         excluded_keys = {
-            self._normalize_variable_name(name)
+            self._normalize_variable_key(name)
             for name in (excluded_field_names or [])
-            if self._normalize_variable_name(name)
+            if self._normalize_variable_key(name)
         }
         raw_ideas = (
             [dict(idea) for idea in candidate_variables_override]
@@ -443,7 +465,11 @@ class SchemaCompiler:
                 item["name"] = force_name
             if preserve_name:
                 item["_preserve_name"] = True
-            key = self._normalize_variable_name(str(item.get("name") or ""))
+            key = (
+                self._normalize_variable_key(str(item.get("name") or ""))
+                if bool(item.get("_json_source_spec"))
+                else self._normalize_variable_name(str(item.get("name") or ""))
+            )
             if not key or key in seen_idea_keys:
                 return
             seen_idea_keys.add(key)
@@ -473,14 +499,14 @@ class SchemaCompiler:
         # quality scoring so it cannot consume the variable budget or be reintroduced by
         # standards expansion.
         has_subscriber_anchor = any(
-            self._normalize_variable_name(str(item.get("name") or "")) == "subscriber_id"
+            self._normalize_variable_key(str(item.get("name") or "")) == "subscriber_id"
             for item in ideas
         )
         explicit_customer_entity_key = self._normalize_variable_name(entity_key or "") == "customer_id"
         if telecom_context and has_subscriber_anchor and not explicit_customer_entity_key:
             ideas = [
                 item for item in ideas
-                if self._normalize_variable_name(str(item.get("name") or "")) != "customer_id"
+                if self._normalize_variable_key(str(item.get("name") or "")) != "customer_id"
             ]
 
         # For JSON-source compilation, candidate_variables_override has already passed through the
@@ -527,7 +553,7 @@ class SchemaCompiler:
         if telecom_context and has_subscriber_anchor and not explicit_customer_entity_key:
             ideas = [
                 item for item in ideas
-                if self._normalize_variable_name(str(item.get("name") or "")) != "customer_id"
+                if self._normalize_variable_key(str(item.get("name") or "")) != "customer_id"
             ]
         dependency_aliases = quality_report.get("dependency_aliases", {})
         if dependency_aliases:
@@ -542,6 +568,8 @@ class SchemaCompiler:
         name_map: dict[str, str] = {}
 
         # First assign names so later dependency references can be resolved to the fresh names.
+        # Source-backed names are kept at full length because deeply nested standards fields may
+        # legitimately exceed the 120-character LLM-facing semantic-name limit.
         for idea in ideas:
             current_requested = str(idea.get("name") or "scenario_attribute")
             if bool(idea.get("_json_source_spec")):
@@ -554,12 +582,12 @@ class SchemaCompiler:
                     entity_key,
                 )
             used_names.add(fresh)
-            name_map[self._normalize_variable_name(str(idea.get("name") or ""))] = fresh
+            name_map[self._normalize_variable_key(str(idea.get("name") or ""))] = fresh
 
         # No static industry/country profile is used here. Source JSON constraints are authoritative.
         datetime_by_name: dict[str, dict] = {}
         for candidate in ideas:
-            candidate_name = self._normalize_variable_name(str(candidate.get("name") or ""))
+            candidate_name = self._normalize_variable_key(str(candidate.get("name") or ""))
             candidate_spec = candidate.get("_json_source_spec") if isinstance(candidate.get("_json_source_spec"), dict) else None
             if candidate_spec is None:
                 continue
@@ -573,7 +601,7 @@ class SchemaCompiler:
 
         for idea in ideas:
             original_name = str(idea.get("name") or "scenario_attribute")
-            fresh = name_map[self._normalize_variable_name(original_name)]
+            fresh = name_map[self._normalize_variable_key(original_name)]
             source_spec = idea.get("_json_source_spec") if isinstance(idea.get("_json_source_spec"), dict) else None
             if source_spec is None:
                 raise ValueError(
@@ -595,8 +623,8 @@ class SchemaCompiler:
             raw_dependencies = [str(dep) for dep in (idea.get("depends_on") or []) if str(dep).strip()]
             unresolved_dependencies = [
                 dep for dep in raw_dependencies
-                if self._normalize_variable_name(dep) not in name_map
-                and self._normalize_variable_name(dependency_aliases.get(self._normalize_variable_name(dep), dep)) not in name_map
+                if self._normalize_variable_key(dep) not in name_map
+                and self._normalize_variable_key(dependency_aliases.get(self._normalize_variable_key(dep), dep)) not in name_map
             ]
             if unresolved_dependencies:
                 # A selected field with an unrepresentable prerequisite cannot produce a faithful
@@ -613,7 +641,7 @@ class SchemaCompiler:
                     "provenance": {"source_json_model": source_spec.get("model")},
                 }
                 for dep in deps:
-                    parent_meta = datetime_by_name.get(self._normalize_variable_name(str(dep)))
+                    parent_meta = datetime_by_name.get(self._normalize_variable_key(str(dep)))
                     if parent_meta and not is_supported_temporal_rule(parent_meta, child_meta):
                         logger.warning(
                             "[SchemaCompiler] Removed unsafe cross-resource datetime dependency %s -> %s",
@@ -727,14 +755,14 @@ class SchemaCompiler:
         all_identity_names = [
             normalize_lookup_key(row.get("name"))
             for row in catalog_rows
-            if normalize_lookup_key(row.get("name")) and self._normalize_variable_name(row.get("name"))
+            if normalize_lookup_key(row.get("name")) and self._normalize_variable_key(row.get("name"))
             and str(row.get("name") or "").lower().endswith(("_id", "_key"))
         ]
         resolved_entity_key = None
         if normalized_type == "transactional":
-            requested_key = normalize_lookup_key(entity_key or "")
+            requested_key = self._normalize_variable_key(entity_key or "")
             if requested_key:
-                if requested_key not in {normalize_lookup_key(row.get("name")) for row in catalog_rows} and requested_key not in external_keys:
+                if requested_key not in {self._normalize_variable_key(row.get("name")) for row in catalog_rows} and requested_key not in external_keys:
                     raise ValueError(
                         f"Requested entity key '{entity_key}' is not present in the active JSON source catalog or MongoDB variables."
                     )
@@ -786,7 +814,7 @@ class SchemaCompiler:
         working_intent = intent
         build_entity_key = (
             resolved_entity_key
-            if resolved_entity_key and normalize_lookup_key(resolved_entity_key) in selected_names
+            if resolved_entity_key and self._normalize_variable_key(resolved_entity_key) in selected_names
             else None
         )
         fields = self._build_fresh_fields(
@@ -806,7 +834,7 @@ class SchemaCompiler:
             candidate_variables_override=selected_source_ideas,
         )
 
-        actual_names = {normalize_lookup_key(field.name) for field in fields}
+        actual_names = {self._normalize_variable_key(field.name) for field in fields}
         missing_source_fields = sorted(selected_names - actual_names)
         if missing_source_fields:
             raise ValueError(
