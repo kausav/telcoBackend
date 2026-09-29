@@ -61,10 +61,11 @@ IMPORTANT BOUNDARIES:
   When scenario_variables grounding is active, names MUST exactly match persisted MongoDB variable names.
 - Avoid true semantic duplicates. Keep distinct fields when they represent different business concepts,
   entities, lifecycle steps, measures, relationships, or time points—even when their names look similar.
-  Suppress only genuine aliases/duplicates (for example, multiple transport/display representations of the
-  same business attribute). Use the supplied source paths/models to distinguish same-name concepts on different
-  resources. Do not collapse legitimate source-backed breadth merely because two fields share a suffix such as id,
-  status, type, amount, date, or timestamp.
+  When the same source leaf concept appears on multiple resources with the same business meaning and
+  executable shape (for example repeated ``status``/``usage_type``/same-valued flags), select only one
+  representative unless the source path demonstrates a materially different lifecycle or relationship.
+  Never add sibling-resource copies merely to increase variable count. Use the supplied source paths/models
+  to distinguish genuinely different concepts, and keep identifiers and relationship-specific fields distinct.
 - For transactional data, distinguish stable entity/profile fields from repeated transaction/event/decision fields using grain.
 - Prefer variables that explain triggers, states, transitions, outcomes, timing, monetary/usage measures,
   decisions, contention, suppression, recovery, or retention when those concepts fit the scenario.

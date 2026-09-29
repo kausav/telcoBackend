@@ -165,7 +165,7 @@ class AgenticSchemaWorkflow:
             json.dumps(source_sources or source_manifest(req.industry_type, req.domain), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
         return (
-            "agentic_proposal_v31_generic_source_semantic_boundary",
+            "agentic_proposal_v32_generic_source_semantic_boundary",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),

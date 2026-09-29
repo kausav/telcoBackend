@@ -990,6 +990,70 @@ def _semantic_aliases_for_row(row: dict[str, Any]) -> set[str]:
     return semantic_exclusion_aliases(dict(row))
 
 
+def _source_redundancy_signature(row: dict[str, Any]) -> tuple[Any, ...] | None:
+    """Return a conservative signature for source fields that are analytically redundant.
+
+    This is intentionally narrower than ``canonical_variable_semantic_key``. The canonical key
+    preserves source identity (resource + path), while this signature answers a different question:
+    whether two source leaves describe the same business attribute with the same executable shape.
+    Resource identifiers are never collapsed because their owner context is part of their meaning.
+    ``datetime`` leaves are only collapsed when their relative source leaf and description are the
+    same, preserving distinct lifecycle timestamps such as requested vs confirmation times.
+    """
+    if not isinstance(row, dict):
+        return None
+    semantic = canonical_variable_semantic_key(row)
+    if not semantic:
+        return None
+    model = normalize_lookup_key(row.get("business_model") or row.get("model"))
+    leaf = semantic
+    prefix = f"{model}_" if model else ""
+    if prefix and leaf.startswith(prefix):
+        leaf = leaf[len(prefix):]
+    leaf = normalize_lookup_key(leaf)
+    leaf = re.sub(r"_amount_amount$", "_amount", leaf)
+    if not leaf or leaf.endswith(("_id", "_key")) or leaf in {"id", "key"}:
+        return None
+
+    dtype = _canonical_catalog_dtype(row.get("dtype"), bool(row.get("enum_values")))
+    description = re.sub(r"\s+", " ", str(row.get("description") or "").strip().casefold())
+    fmt = normalize_lookup_key(row.get("format"))
+    enum_values = row.get("enum_values") or []
+    enum_signature = tuple(sorted(
+        normalize_lookup_key(str(value)) if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
+        for value in enum_values
+    ))
+
+    # Keep identity-like strings, names and relationship roles distinct unless the source leaf
+    # itself is identical. These fields often identify different entities/relationships despite
+    # sharing an execution contract.
+    generic_distinct_leafs = {
+        "name", "description", "role", "reason", "href", "url", "reference",
+    }
+    if leaf in generic_distinct_leafs and not enum_signature:
+        return None
+
+    constraints = tuple(sorted(
+        (key, json.dumps(row.get(key), sort_keys=True, default=str))
+        for key in (
+            "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+            "minLength", "maxLength", "pattern", "format", "default",
+        )
+        if key in row
+    ))
+    contract = (dtype, fmt, enum_signature, constraints)
+    return (leaf, description, contract)
+
+
+def _compact_name_alias(value: Any) -> str:
+    """Normalize a name for separator-insensitive DB/source matching.
+
+    This handles harmless naming differences such as ``topupbalance_status`` vs
+    ``topup_balance_status`` without changing the canonical executable/source identity.
+    """
+    return re.sub(r"[^a-z0-9]", "", normalize_lookup_key(value))
+
+
 def invalidate_catalog_cache(industry_type: str | None = None, domain: str | None = None) -> None:
     """Invalidate process-local source catalog cache after an admin source mutation."""
     industry_key = normalize_industry_key(industry_type) if industry_type else None
@@ -1091,6 +1155,7 @@ def validate_catalog_selection(variables: Iterable[dict[str, Any]], catalog: dic
     selected: list[dict[str, Any]] = []
     rejected: list[str] = []
     seen_semantics: set[str] = set()
+    seen_redundancy: set[tuple[Any, ...]] = set()
     for raw in variables or []:
         if not isinstance(raw, dict):
             continue
@@ -1107,8 +1172,13 @@ def validate_catalog_selection(variables: Iterable[dict[str, Any]], catalog: dic
         semantic = canonical_variable_semantic_key(spec)
         if semantic and semantic in seen_semantics:
             continue
+        redundancy = _source_redundancy_signature(spec)
+        if redundancy is not None and redundancy in seen_redundancy:
+            continue
         if semantic:
             seen_semantics.add(semantic)
+        if redundancy is not None:
+            seen_redundancy.add(redundancy)
         canonical = dict(raw)
         canonical["name"] = str(spec.get("name") or name)
         canonical["description"] = str(spec.get("description") or canonical.get("description") or "")[:500]
@@ -1483,7 +1553,11 @@ def semantic_exclusion_aliases(variable: dict[str, Any]) -> set[str]:
     # Known, domain-neutral lexical aliases for a few ubiquitous business operations.
     aliases.update(alias.replace("recharge", "topup") for alias in list(aliases))
     aliases.update(alias.replace("top_up", "topup") for alias in list(aliases))
-    return {normalize_lookup_key(alias) for alias in aliases if normalize_lookup_key(alias)}
+    normalized = {normalize_lookup_key(alias) for alias in aliases if normalize_lookup_key(alias)}
+    compact = _compact_name_alias(raw)
+    if compact:
+        normalized.add(compact)
+    return normalized
 
 
 def select_json_source_catalog(
@@ -1522,6 +1596,9 @@ def select_json_source_catalog(
     excluded_semantics = {
         normalize_lookup_key(value) for value in (excluded_semantic_keys or set()) if normalize_lookup_key(value)
     }
+    excluded_semantics_compact = {
+        _compact_name_alias(value) for value in excluded_semantics if _compact_name_alias(value)
+    }
     preferred = {
         normalize_lookup_key(value) for value in (preferred_names or set()) if normalize_lookup_key(value)
     }
@@ -1536,7 +1613,11 @@ def select_json_source_catalog(
         row = dict(raw)
         name = normalize_lookup_key(row.get("name"))
         semantic = canonical_variable_semantic_key(row)
-        if not name or name in excluded or (semantic and (semantic in seen_semantics or semantic in excluded_semantics)):
+        compact_semantic = _compact_name_alias(semantic) if semantic else ""
+        if not name or name in excluded or (
+            semantic
+            and (semantic in seen_semantics or semantic in excluded_semantics or compact_semantic in excluded_semantics_compact)
+        ):
             continue
         if str(row.get("model_kind") or "resource") in {"support", "support_reference", "abstract", "auxiliary"}:
             continue
@@ -1690,15 +1771,26 @@ def select_json_source_catalog(
 
     selected: dict[str, dict[str, Any]] = {}
     selected_reasons: dict[str, set[str]] = {}
+    selected_redundancy: dict[tuple[Any, ...], str] = {}
+    redundancy_collapsed = 0
 
     def add(item: dict[str, Any], reason: str) -> None:
+        nonlocal redundancy_collapsed
         semantic = canonical_variable_semantic_key(item["row"]) or normalize_lookup_key(item["row"].get("name"))
         if not semantic or semantic in selected:
             if semantic in selected:
                 selected_reasons.setdefault(semantic, set()).add(reason)
             return
+        redundancy = _source_redundancy_signature(item["row"])
+        if redundancy is not None and redundancy in selected_redundancy:
+            redundancy_collapsed += 1
+            existing_semantic = selected_redundancy[redundancy]
+            selected_reasons.setdefault(existing_semantic, set()).add("source_redundancy_collapsed")
+            return
         selected[semantic] = item
         selected_reasons[semantic] = {reason}
+        if redundancy is not None:
+            selected_redundancy[redundancy] = semantic
 
     # Preserve explicit preferred/entity-key/required fields first, unless privacy rules mark them
     # as sensitive. The requested entity key is validated separately against the source boundary.
@@ -1855,6 +1947,7 @@ def select_json_source_catalog(
         "candidate_count": len(scored),
         "canonical_candidate_count": len(rows),
         "semantic_duplicate_rows_collapsed": max(0, len(catalog_rows or []) - len(rows)),
+        "source_redundancy_rows_collapsed": redundancy_collapsed,
         "eligible_count_before_cap": len(ordered_items),
         "selected_count": len(selected_rows),
         "max_fields": limit,
@@ -1881,6 +1974,7 @@ def select_json_source_catalog(
         "selected_names": [str(row.get("name") or "") for row in selected_rows],
         "excluded_names": sorted(excluded),
         "excluded_semantic_keys": sorted(excluded_semantics),
+        "excluded_semantic_keys_compact": sorted(excluded_semantics_compact),
         "breadth_policy": {
             "prioritize_recall": True,
             "source_vocabulary_only": True,
