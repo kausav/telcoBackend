@@ -60,11 +60,202 @@ class SchemaCompiler:
     def _normalize_variable_name(cls, name: str) -> str:
         """Return the legacy 120-character-safe name used for LLM-facing semantic variables.
 
-        Source-backed variables retain their original full names and use ``_normalize_variable_key``
-        for identity/deduplication. This 120-character view remains only for semantic/non-source
-        naming paths so existing provider and API contracts are not widened unnecessarily.
+        JSON-source variables use their full source identity during compilation and are assigned a
+        separate human-readable path name in the final source-field naming pass. This method remains
+        limited to semantic/non-source naming paths so existing provider/API contracts are unchanged.
         """
         return cls._normalize_variable_key(name)[:120]
+
+    @staticmethod
+    def _source_semantic_segments(field: GeneratedSchemaField) -> list[str]:
+        """Return the exact human-readable path segments recorded by the JSON source."""
+        provenance = field.provenance or {}
+        semantic_key = str(provenance.get("source_json_semantic_key") or "").strip()
+        if semantic_key:
+            segments = [
+                SchemaCompiler._normalize_variable_key(segment)
+                for segment in semantic_key.split(".")
+                if SchemaCompiler._normalize_variable_key(segment)
+            ]
+            if segments:
+                return segments
+
+        # Legacy/source records may not have a semantic key yet. In that case the existing
+        # source field name is already the only trustworthy traceable representation.
+        fallback = SchemaCompiler._normalize_variable_key(field.name)
+        return [fallback] if fallback else ["scenario_attribute"]
+
+    @staticmethod
+    def _compact_source_segments(segments: list[str]) -> str:
+        """Join JSON path segments while removing only repeated boundary words."""
+        output: list[str] = []
+        for segment in segments:
+            tokens = [token for token in str(segment or "").split("_") if token]
+            if not tokens:
+                continue
+            max_overlap = min(len(output), len(tokens) - 1)
+            overlap = 0
+            for size in range(max_overlap, 0, -1):
+                if output[-size:] == tokens[:size]:
+                    overlap = size
+                    break
+            output.extend(tokens[overlap:])
+        return "_".join(output)
+
+    @classmethod
+    def _source_name_candidates(cls, segments: list[str]) -> list[tuple[str, int, str]]:
+        """Return readable suffix candidates ordered by length and path depth.
+
+        Every candidate consists only of complete source-path words. The compact form removes a
+        repeated word only when it occurs at the boundary between adjacent JSON path segments; no
+        abbreviations and no character-level truncation are performed.
+        """
+        minimum_count = 2 if len(segments) >= 2 else 1
+        candidates: list[tuple[str, int, str]] = []
+        seen: set[str] = set()
+        for count in range(minimum_count, len(segments) + 1):
+            suffix = segments[-count:]
+            exact = "_".join(suffix)
+            compact = cls._compact_source_segments(suffix)
+            for candidate, kind in ((compact, "compact"), (exact, "exact")):
+                if candidate and candidate not in seen:
+                    candidates.append((candidate, count, kind))
+                    seen.add(candidate)
+        return sorted(candidates, key=lambda item: (len(item[0]), 0 if item[2] == "compact" else 1, item[1], item[0]))
+
+    @classmethod
+    def _source_readable_names(
+        cls,
+        fields: list[GeneratedSchemaField],
+    ) -> dict[str, str]:
+        """Assign concise, traceable names using unique suffixes of JSON semantic paths."""
+        source_fields = [
+            field for field in fields
+            if str((field.provenance or {}).get("generated_from") or "").strip().lower() == "mongodb_json_source"
+        ]
+        if not source_fields:
+            return {}
+
+        paths: dict[str, list[str]] = {}
+        fields_by_key: dict[str, GeneratedSchemaField] = {}
+        options_by_key: dict[str, list[tuple[str, int, str]]] = {}
+        for field in source_fields:
+            key = cls._normalize_variable_key(field.name)
+            paths[key] = cls._source_semantic_segments(field)
+            fields_by_key[key] = field
+            options_by_key[key] = cls._source_name_candidates(paths[key])
+
+        occupied = {
+            cls._normalize_variable_key(field.name)
+            for field in fields
+            if str((field.provenance or {}).get("generated_from") or "").strip().lower() != "mongodb_json_source"
+        }
+
+        # Assign names deterministically using the shortest available JSON-path candidate. Fields
+        # with fewer possible path depths are processed first, so a short two-segment identity such as
+        # ``customer_id`` is not unnecessarily consumed by a much deeper field that has alternatives.
+        candidates: dict[str, str] = {}
+        unresolved: list[str] = []
+        pending = sorted(
+            options_by_key.items(),
+            key=lambda item: (len(item[1]), len(item[1][0][0]) if item[1] else 10**9, item[0]),
+        )
+        for original_key, options in pending:
+            chosen = next(
+                (candidate for candidate, _count, _kind in options if candidate not in occupied and candidate not in candidates.values()),
+                None,
+            )
+            if chosen:
+                candidates[original_key] = chosen
+            else:
+                unresolved.append(original_key)
+
+        # A collision can still happen when two source definitions expose the same semantic path or
+        # when no available suffix remains because of a non-source/DB-owned name. Prefer a
+        # human-readable source-path discriminator before the deterministic numeric variant.
+        for original_key in unresolved:
+            field = fields_by_key[original_key]
+            segments = paths[original_key]
+            base = "_".join(segments)
+            provenance = field.provenance or {}
+            source_path = str(provenance.get("source_json_path") or "").strip()
+            path_root = cls._normalize_variable_key(source_path.split(".", 1)[0]) if source_path else ""
+            model = cls._normalize_variable_key(str(provenance.get("source_json_model") or ""))
+
+            assigned = None
+            for discriminator in (path_root, model):
+                if not discriminator:
+                    continue
+                candidate = f"{base}_from_{discriminator}"
+                if candidate not in occupied and candidate not in candidates.values():
+                    assigned = candidate
+                    break
+            if assigned:
+                candidates[original_key] = assigned
+                continue
+
+            variant = 2
+            candidate = base
+            while candidate in occupied or candidate in candidates.values():
+                candidate = f"{base}_{variant}"
+                variant += 1
+            candidates[original_key] = candidate
+
+        return candidates
+
+    @classmethod
+    def _compact_source_field_names(cls, fields: list[GeneratedSchemaField]) -> list[GeneratedSchemaField]:
+        """Give JSON-source fields concise, traceable names without abbreviating or truncating them."""
+        if not fields:
+            return fields
+
+        replacements = cls._source_readable_names(fields)
+        if not replacements:
+            return fields
+
+        def redirect(value: Any) -> Any:
+            if not isinstance(value, str):
+                return value
+            return replacements.get(cls._normalize_variable_key(value), value)
+
+        def redirect_formula(formula: Any) -> Any:
+            if not isinstance(formula, str) or not formula.strip():
+                return formula
+            result = formula
+            for loser_key, winner in sorted(replacements.items(), key=lambda item: (-len(item[0]), item[0])):
+                result = re.sub(
+                    rf"(?<![A-Za-z0-9_]){re.escape(loser_key)}(?![A-Za-z0-9_])",
+                    winner,
+                    result,
+                )
+            return result
+
+        reference_keys = {
+            "depends_on_field", "field", "segment_field", "hi_field", "lo_field",
+            "base_field", "source_field", "add_seconds_field",
+        }
+        result: list[GeneratedSchemaField] = []
+        for field in fields:
+            rewritten = field.model_copy(deep=True)
+            old_name = rewritten.name.strip()
+            original_key = cls._normalize_variable_key(old_name)
+            is_source = str((rewritten.provenance or {}).get("generated_from") or "").strip().lower() == "mongodb_json_source"
+            rewritten.name = replacements.get(original_key, old_name)
+            rewritten.depends_on = [redirect(dep) for dep in (rewritten.depends_on or [])]
+            rewritten.formula = redirect_formula(rewritten.formula)
+            params = dict(rewritten.params or {})
+            for key in reference_keys:
+                if key in params:
+                    params[key] = redirect(params[key])
+            rewritten.params = params
+            if is_source:
+                provenance = dict(rewritten.provenance or {})
+                # Keep both the canonical source field name and source path immutable for traceback.
+                provenance.setdefault("source_json_name", old_name)
+                provenance.setdefault("source_json_original_name", old_name)
+                rewritten.provenance = provenance
+            result.append(rewritten)
+        return result
 
     @staticmethod
     def _idea_tokens(idea: dict[str, object]) -> set[str]:
@@ -82,8 +273,8 @@ class SchemaCompiler:
         if base and base not in used:
             return base
 
-        # Source-backed field names are preserved by the caller; this helper only resolves
-        # collisions for non-source semantic names retained for compatibility.
+        # Source-backed fields are assigned their traceable JSON-path names in the final naming pass;
+        # this helper resolves collisions for non-source semantic names retained for compatibility.
         desc_tokens = [token for token in _tokens(description) if len(token) > 2]
         candidate_bases = []
         if desc_tokens:
@@ -568,8 +759,8 @@ class SchemaCompiler:
         name_map: dict[str, str] = {}
 
         # First assign names so later dependency references can be resolved to the fresh names.
-        # Source-backed names are kept at full length because deeply nested standards fields may
-        # legitimately exceed the 120-character LLM-facing semantic-name limit.
+        # Source-backed names remain at their canonical source identity while fields are assembled;
+        # the final pass below assigns concise, traceable JSON-path names without altering provenance.
         for idea in ideas:
             current_requested = str(idea.get("name") or "scenario_attribute")
             if bool(idea.get("_json_source_spec")):
@@ -661,6 +852,8 @@ class SchemaCompiler:
                 "generated_from": "mongodb_json_source",
                 "canonical_entity": f"{source_spec.get('source_id','')}__{source_spec.get('model','')}".strip("_"),
                 "source_json_id": source_spec.get("source_id") if source_from_json else None,
+                "source_json_name": original_name if source_from_json else None,
+                "source_json_original_name": original_name if source_from_json else None,
                 "source_json_model": source_spec.get("model") if source_from_json else None,
                 "source_json_path": source_spec.get("path") if source_from_json else None,
                 "source_json_semantic_key": source_spec.get("semantic_key") if source_from_json else None,
@@ -684,7 +877,7 @@ class SchemaCompiler:
                 provenance=provenance,
                 scope=grain,
             ))
-        return fields
+        return self._compact_source_field_names(fields)
 
     def _compile_json_source_grounded(
         self,
@@ -835,13 +1028,20 @@ class SchemaCompiler:
         )
 
         actual_names = {self._normalize_variable_key(field.name) for field in fields}
-        missing_source_fields = sorted(selected_names - actual_names)
+        actual_source_names = {
+            self._normalize_variable_key(str((field.provenance or {}).get("source_json_name") or field.name))
+            for field in fields
+            if str((field.provenance or {}).get("generated_from") or "").strip().lower() == "mongodb_json_source"
+        }
+        missing_source_fields = sorted(selected_names - actual_source_names)
         if missing_source_fields:
             raise ValueError(
                 "JSON-source variables were lost during deterministic compilation: " + ", ".join(missing_source_fields[:25])
             )
-        if normalized_type == "transactional" and resolved_entity_key and normalize_lookup_key(resolved_entity_key) not in actual_names and normalize_lookup_key(resolved_entity_key) not in external_keys:
-            raise ValueError(f"Transactional entity key '{resolved_entity_key}' could not be represented by the active JSON source fields.")
+        if normalized_type == "transactional" and resolved_entity_key:
+            resolved_key = normalize_lookup_key(resolved_entity_key)
+            if resolved_key not in actual_names and resolved_key not in actual_source_names and resolved_key not in external_keys:
+                raise ValueError(f"Transactional entity key '{resolved_entity_key}' could not be represented by the active JSON source fields.")
 
         model_groups: dict[tuple[str, str], dict[str, Any]] = {}
         for spec in selected_rows:
@@ -864,7 +1064,7 @@ class SchemaCompiler:
         hard_constraints = [
             "Executable source variables are restricted to scalar leaves extracted from active MongoDB JSON documents for the exact industryType/domain pair.",
             "The LLM is a selector only; it cannot invent, rename, alias, or derive executable source variable names.",
-            "Exact scalar names from the active catalog are preserved through deterministic compilation.",
+            "Full scalar source names and JSON paths remain in provenance; runtime names use concise unique JSON-path expressions without changing source identity.",
             "Standard enum values and declared numeric constraints from the source documents are authoritative.",
             "Arrays and complex objects are not emitted as fake flat scalar variables.",
         ]
