@@ -1,7 +1,6 @@
 from __future__ import annotations
 import logging
 import re
-import secrets
 import uuid
 from time import perf_counter
 from datetime import datetime, timezone
@@ -35,7 +34,7 @@ from core.runtime_cache import clear_scenario
 from core.agentic_models import ScenarioProposeRequest, ScenarioImportResponse
 from core.csv_scenario import infer_type_of_data, parse_definition_csv
 from config.country_metadata import COUNTRY_BASE
-from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES, INDUSTRY_SOURCE_MAX_JSON_BYTES, INDUSTRY_SOURCE_ADMIN_TOKEN
+from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES, INDUSTRY_SOURCE_MAX_JSON_BYTES
 from core.agentic_workflow import AgenticSchemaWorkflow, get_agentic_workflow
 from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain
 from core.low_balance_variable_policy import validate_low_balance_variable_sources
@@ -188,7 +187,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Request-ID", "X-Industry-Source-Token"],
+    allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
 )
 
 # Compress large JSON generation/proposal responses to reduce transfer time without changing payload semantics.
@@ -287,15 +286,6 @@ class IndustrySourceResponse(BaseModel):
     uploaded: int = 0
     errors: list[dict] = Field(default_factory=list)
 
-
-def _require_industry_source_admin_token(request: Request) -> None:
-    """Protect destructive source-registry mutations with a deployment-provided admin token."""
-    expected = INDUSTRY_SOURCE_ADMIN_TOKEN
-    if not expected:
-        raise HTTPException(503, detail={"error": "Industry source administration is disabled; set INDUSTRY_SOURCE_ADMIN_TOKEN"})
-    supplied = str(request.headers.get("X-Industry-Source-Token") or "")
-    if not secrets.compare_digest(supplied, expected):
-        raise HTTPException(401, detail={"error": "Invalid industry source administration token"})
 
 
 def _normalize_upload_metadata(values: list[str] | None, file_count: int, field_name: str) -> list[str | None]:
@@ -535,12 +525,10 @@ def get_industry_source(source_id: str, includeDocument: bool = False):
 
 @app.post("/industry-sources/upload", response_model=IndustrySourceResponse)
 def upload_industry_sources(
-    request: Request,
     industryType: str = Form(..., description="Industry type for all uploaded JSON sources"),
     domain: str = Form(..., description="Domain for all uploaded JSON sources"),
     file: list[UploadFile] = File(..., description="One or more Swagger/OpenAPI/JSON Schema JSON files for this industryType/domain"),
 ):
-    _require_industry_source_admin_token(request)
     """Upload multiple standards JSON files for one exact industryType/domain pair.
 
     The multipart request intentionally exposes only three inputs:
@@ -620,8 +608,7 @@ def upload_industry_sources(
 
 
 @app.patch("/industry-sources/{source_id}", response_model=IndustrySourceResponse)
-def update_industry_source(source_id: str, req: IndustrySourceStatusRequest, request: Request):
-    _require_industry_source_admin_token(request)
+def update_industry_source(source_id: str, req: IndustrySourceStatusRequest):
     if not set_source_active(source_id, req.active):
         raise HTTPException(404, detail={"error": f"Unknown industry source '{source_id}'"})
     invalidate_catalog_cache()
@@ -630,8 +617,7 @@ def update_industry_source(source_id: str, req: IndustrySourceStatusRequest, req
 
 
 @app.delete("/industry-sources/{source_id}")
-def remove_industry_source(source_id: str, request: Request):
-    _require_industry_source_admin_token(request)
+def remove_industry_source(source_id: str):
     if not delete_source_document(source_id):
         raise HTTPException(404, detail={"error": f"Unknown industry source '{source_id}'"})
     invalidate_catalog_cache()

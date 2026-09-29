@@ -41,7 +41,6 @@ CORS_ALLOW_ORIGINS = [
 
 MAX_CSV_BYTES = int(os.getenv("MAX_CSV_BYTES", str(10 * 1024 * 1024)))
 INDUSTRY_SOURCE_MAX_JSON_BYTES = int(os.getenv("INDUSTRY_SOURCE_MAX_JSON_BYTES", str(8 * 1024 * 1024)))
-INDUSTRY_SOURCE_ADMIN_TOKEN = os.getenv("INDUSTRY_SOURCE_ADMIN_TOKEN", "").strip()
 JSON_SOURCE_LLM_CATALOG_LIMIT = int(os.getenv("JSON_SOURCE_LLM_CATALOG_LIMIT", "1200"))
 # Number of representative fields shown per source business model to Gemini. The complete
 # MongoDB catalog is still used by deterministic compilation; this only keeps propose latency low.
