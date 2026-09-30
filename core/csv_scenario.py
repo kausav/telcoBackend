@@ -16,6 +16,7 @@ import ast
 import csv
 import io
 import json
+import math
 import re
 from typing import Any
 
@@ -1010,13 +1011,15 @@ def _align_id_mirror_sources(variables: list[dict[str, Any]], all_names: set[str
 
 
 def _merge_duplicate_variable(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
-    """Merge repeated variable definitions when they are compatible.
+    """Merge repeated variable definitions only when their executable contracts agree.
 
-    Returns True when the incoming row can be absorbed into existing, otherwise False.
+    Repeated CSV rows are common in exports, but silently concatenating lists or ignoring conflicting
+    scalar parameters can produce a schema that is neither row's contract. This function therefore
+    rejects conflicts in generator semantics, distribution parameters and numeric constraints.
     """
     if existing.get("dtype") != incoming.get("dtype"):
         return False
-    if existing.get("formula", "") != incoming.get("formula", ""):
+    if str(existing.get("formula") or "").strip() != str(incoming.get("formula") or "").strip():
         return False
 
     ex_dep = list(existing.get("depends_on") or [])
@@ -1028,35 +1031,61 @@ def _merge_duplicate_variable(existing: dict[str, Any], incoming: dict[str, Any]
 
     ex_params = existing.get("params") if isinstance(existing.get("params"), dict) else {}
     in_params = incoming.get("params") if isinstance(incoming.get("params"), dict) else {}
-    ex_gen = str(existing.get("gen", ""))
-    in_gen = str(incoming.get("gen", ""))
+    ex_gen = str(existing.get("gen", "")).strip().lower()
+    in_gen = str(incoming.get("gen", "")).strip().lower()
 
-    # Same generator: merge deps and merge params conservatively.
+    def _canonical(value: Any) -> Any:
+        if isinstance(value, tuple):
+            return tuple(_canonical(x) for x in value)
+        if isinstance(value, list):
+            return tuple(_canonical(x) for x in value)
+        if isinstance(value, dict):
+            return tuple(sorted((str(k), _canonical(v)) for k, v in value.items()))
+        if isinstance(value, float):
+            return round(value, 12)
+        return value
+
+    # Same executable generator: only non-semantic metadata can differ. Parameters that change the
+    # probability model or numeric domain must be identical. Choices/values may be merged only when
+    # no explicit weights exist; with weights, alignment is part of the contract and is immutable.
     if ex_gen == in_gen:
+        critical = {
+            "weights", "buckets", "min", "max", "lo", "hi", "min_sec", "max_sec",
+            "precision", "multiple_of", "multipleOf", "pattern", "format", "timestamp_format",
+            "value", "prefix", "suffix", "length", "digits", "source_field", "source_prefix",
+            "country_codes", "days_back", "window_minutes", "mean", "stddev", "std_dev",
+        }
+        has_weights = "weights" in ex_params or "weights" in in_params
         merged_params = dict(ex_params)
-        for key, value in in_params.items():
-            if key not in merged_params:
-                merged_params[key] = value
+        all_keys = set(ex_params) | set(in_params)
+        for key in sorted(all_keys):
+            if key not in ex_params:
+                merged_params[key] = in_params[key]
                 continue
-            cur = merged_params[key]
-            if isinstance(cur, list) and isinstance(value, list):
-                for item in value:
-                    if item not in cur:
-                        cur.append(item)
-                merged_params[key] = cur
-            elif cur == value:
+            if key not in in_params or _canonical(ex_params[key]) == _canonical(in_params[key]):
                 continue
-            elif key in {"choices", "values"}:
-                left = cur if isinstance(cur, list) else _split_list(str(cur))
-                right = value if isinstance(value, list) else _split_list(str(value))
+            if key in {"choices", "values"} and not has_weights:
+                left = ex_params[key] if isinstance(ex_params[key], list) else _split_list(str(ex_params[key]))
+                right = in_params[key] if isinstance(in_params[key], list) else _split_list(str(in_params[key]))
                 merged = list(left)
                 for item in right:
                     if item not in merged:
                         merged.append(item)
-                merged_params[key] = merged
-            else:
-                # Prefer an explicit existing value; keep import deterministic.
-                pass
+                merged_params["choices" if "choices" in ex_params or "choices" in in_params else key] = merged
+                if key == "values":
+                    merged_params.pop("values", None)
+                continue
+            if key in critical or has_weights:
+                return False
+            # Unknown parameters are treated conservatively too. If they change, the executable
+            # semantics may have changed even when this module does not know the parameter yet.
+            return False
+
+        if has_weights:
+            choices = merged_params.get("choices", merged_params.get("values"))
+            weights = merged_params.get("weights")
+            if isinstance(choices, list) and isinstance(weights, list) and len(choices) != len(weights):
+                return False
 
         existing["depends_on"] = merged_dep
         existing["params"] = merged_params
@@ -1212,14 +1241,19 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
         # Weight specifications are occasionally emitted in the formula column
         # even though they describe a distribution rather than a formula.
         if gen_raw in {"weighted_choice", "choice"} and "weights" not in params and params.get("values") is not None:
-            pairs = re.findall(r"([^,;]+?)\\s*=\\s*(\\d+(?:\\.\\d+)?)\\s*%", formula)
+            pairs = re.findall(r"([^,;]+?)\s*=\s*(\d+(?:\.\d+)?)\s*%", formula)
             if pairs:
                 labels = params.get("values") if isinstance(params.get("values"), list) else _split_list(str(params.get("values")))
                 weight_map = {label.strip(): float(w) / 100.0 for label, w in pairs}
                 weights = [weight_map.get(str(label).strip(), 0.0) for label in labels]
-                if any(weights) and len(weights) == len(labels):
+                total = sum(weights)
+                if len(weights) == len(labels) and weights and all(w >= 0 for w in weights) and math.isfinite(total) and 0.999 <= total <= 1.001:
                     params["weights"] = weights
                     formula = ""
+                elif pairs:
+                    raise ValueError(
+                        f"Row {row_number} ('{name}'): percentage weights must cover all choices and sum to 100% (±0.1%)"
+                    )
         # ``gen`` is optional for generic CSV producers. Infer a safe default
         # from dtype/params instead of forcing every producer to know our internal
         # generator vocabulary.

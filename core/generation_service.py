@@ -19,7 +19,7 @@ from core.dynamic_scenarios import (
     resolve_variables,
     scenario_exists,
 )
-from agents.data_generation_agent import run_deterministic_agentic_generation
+from agents.data_generation_agent import generation_seed, run_deterministic_agentic_generation
 from core.pipeline import run_pipeline
 from core.industry_source_store import list_source_documents
 from core.scenario_variable_store import get_recommended
@@ -190,6 +190,8 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
     draft_id = req_payload.get("draftId")
     count = int(req_payload.get("count", 35) or 35)
     records_per_user = int(req_payload.get("recordsPerUser", 10) or 10)
+    seed_raw = req_payload.get("seed")
+    seed = int(seed_raw) if seed_raw is not None else None
 
     if draft_id:
         resolved = resolve_requested_scenario_id_from_draft(draft_id)
@@ -205,26 +207,27 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
 
     scenario_context = resolve_scenario_context(requested_scenario_id)
     _require_generation_source(requested_scenario_id, scenario_context)
-    if scenario_context.get("agentic"):
-        state = run_deterministic_agentic_generation(
-            scenario=requested_scenario_id,
-            count=count,
-            industry=scenario_context.get("industry", "generic"),
-            country=scenario_context.get("country"),
-            type_of_data=scenario_context.get("type_of_data", resolve_data_type(requested_scenario_id)),
-            scenario_context=scenario_context,
-            records_per_user=records_per_user,
-        )
-    else:
-        state = run_pipeline(
-            scenario=requested_scenario_id,
-            count=count,
-            industry=scenario_context.get("industry", "generic"),
-            country=scenario_context.get("country"),
-            type_of_data=scenario_context.get("type_of_data", resolve_data_type(requested_scenario_id)),
-            scenario_context=scenario_context,
-            records_per_user=records_per_user,
-        )
+    with generation_seed(seed):
+        if scenario_context.get("agentic"):
+            state = run_deterministic_agentic_generation(
+                scenario=requested_scenario_id,
+                count=count,
+                industry=scenario_context.get("industry", "generic"),
+                country=scenario_context.get("country"),
+                type_of_data=scenario_context.get("type_of_data", resolve_data_type(requested_scenario_id)),
+                scenario_context=scenario_context,
+                records_per_user=records_per_user,
+            )
+        else:
+            state = run_pipeline(
+                scenario=requested_scenario_id,
+                count=count,
+                industry=scenario_context.get("industry", "generic"),
+                country=scenario_context.get("country"),
+                type_of_data=scenario_context.get("type_of_data", resolve_data_type(requested_scenario_id)),
+                scenario_context=scenario_context,
+                records_per_user=records_per_user,
+            )
 
     if state.errors and not state.final_records and not state.record_errors:
         raise RuntimeError("; ".join(state.errors))
@@ -257,12 +260,13 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("Generation produced no valid record objects")
 
     entity_key = meta.get("entity_key")
-    if state.type_of_data == "transactional":
-        expected_records = max(1, count) * max(1, records_per_user)
-        if len(final_records) != expected_records:
-            raise RuntimeError(
-                f"Generation produced {len(final_records)} of {expected_records} requested transactional records"
-            )
+    expected_records = (max(1, count) * max(1, records_per_user)) if state.type_of_data == "transactional" else max(1, count)
+    if len(final_records) != expected_records:
+        validation = getattr(state, "validation_report", {}) or {}
+        raise RuntimeError(
+            f"Generation produced {len(final_records)} of {expected_records} requested {state.type_of_data} records; "
+            f"valid_record_rate={validation.get('valid_record_rate', 0)}%"
+        )
     response_records = final_records
     total_count = len(final_records)
     total_records = len(final_records)

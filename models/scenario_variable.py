@@ -21,6 +21,7 @@ class ScenarioVariableModel:
     def upsert_many(cls, requested_scenario_id: str, scenario_version: int,
                     variables: list[dict[str, Any]], actor_user_id: str | None = None) -> int:
         from core.agentic_models import GeneratedSchemaField
+        from core.variable_semantics import variable_semantic_identities
         import time
         requested = str(requested_scenario_id or "").strip()
         if not requested:
@@ -28,11 +29,41 @@ class ScenarioVariableModel:
         now = time.time()
         count = 0
         actor = actor_user_id or "system"
+        incoming_by_alias: dict[str, str] = {}
+        normalized_variables: list[dict[str, Any]] = []
         for variable in variables:
             normalized = GeneratedSchemaField.model_validate(variable).model_dump()
             key = str(normalized.get("name") or "").strip()
             if not key:
                 continue
+            aliases = variable_semantic_identities(normalized)
+            conflict = sorted({incoming_by_alias[alias] for alias in aliases if alias in incoming_by_alias and incoming_by_alias[alias].casefold() != key.casefold()})
+            if conflict:
+                raise ValueError(
+                    f"Scenario variables '{key}' semantically duplicate existing request variable(s): "
+                    + ", ".join(conflict)
+                )
+            for alias in aliases:
+                incoming_by_alias[alias] = key
+            normalized_variables.append(normalized)
+
+        # Recommendation means a selected subset. When a non-empty subset is supplied, deactivate
+        # older enabled rows that are no longer selected so stale variables cannot reappear on the
+        # next proposal/generation. Empty requests remain a no-op to avoid accidental clear-all calls.
+        selected_keys = {str(item.get("name") or "").strip() for item in normalized_variables if str(item.get("name") or "").strip()}
+        if selected_keys:
+            cls.collection.update_many(
+                {
+                    "requested_scenario_id": requested,
+                    "scenario_version": int(scenario_version),
+                    "enabled": True,
+                    "variable_key": {"$nin": sorted(selected_keys)},
+                },
+                {"$set": {"enabled": False, "updated_at": now, "updated_by": actor}},
+            )
+
+        for normalized in normalized_variables:
+            key = str(normalized.get("name") or "").strip()
             cls.collection.update_one(
                 {"requested_scenario_id": requested, "scenario_version": int(scenario_version), "variable_key": key},
                 {"$set": {

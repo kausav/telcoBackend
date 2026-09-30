@@ -10,10 +10,12 @@ import logging
 import math
 import os
 import ast
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 import re
-import random
+import random as _random_module
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -23,9 +25,9 @@ from langgraph.graph import StateGraph, END
 from core.dynamic_scenarios import resolve_variables
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
-from core.generator_contracts import SUPPORTED_GENERATORS
 from core.scenario_semantics import temporal_role as _temporal_role
 from core.deterministic_rules import build_deterministic_rules
+from core.pattern_generator import PatternGenerationError, generate_regex_sample
 from core.temporal_contract import (
     normalize_temporal_family,
     is_supported_temporal_rule,
@@ -34,6 +36,39 @@ from core.temporal_contract import (
 )
 
 logger = logging.getLogger(__name__)
+
+_GENERATION_RNG: ContextVar[_random_module.Random | None] = ContextVar("generation_rng", default=None)
+
+
+def _rng():
+    """Return the request-scoped RNG when one is configured, otherwise the module RNG."""
+    return _GENERATION_RNG.get() or _random_module
+
+
+def _uuid4() -> uuid.UUID:
+    """Generate UUIDv4 using the request RNG when seeded, preserving reproducibility."""
+    rng = _GENERATION_RNG.get()
+    if rng is None:
+        return uuid.uuid4()
+    value = rng.getrandbits(128)
+    value &= ~(0xF << 76)
+    value |= (4 << 76)
+    value &= ~(0x3 << 62)
+    value |= (2 << 62)
+    return uuid.UUID(int=value)
+
+
+@contextmanager
+def generation_seed(seed: int | None):
+    """Temporarily make stochastic generation reproducible for one request/test."""
+    if seed is None:
+        yield
+        return
+    token = _GENERATION_RNG.set(_random_module.Random(int(seed)))
+    try:
+        yield
+    finally:
+        _GENERATION_RNG.reset(token)
 
 # Canonical numeric dtypes used by the scenario contract and generation QA layer.
 # Scenario-definition normalization canonicalizes integer/decimal/uuid types before they
@@ -150,7 +185,7 @@ def _semantic_placeholder(name: str, params: dict, rec: dict) -> str:
     token = re.sub(r"[^A-Za-z0-9]+", "_", field).strip("_").upper()
     if token.lower().endswith("_id"):
         return _prefixed_int({"prefix": f"{token[:-3]}-", "digits": 10}, rec)
-    return f"EVENT_{token[:32]}_{random.randint(1000, 9999)}" if token else f"EVENT_{random.randint(1000, 9999)}"
+    return f"EVENT_{token[:32]}_{_rng().randint(1000, 9999)}" if token else f"EVENT_{_rng().randint(1000, 9999)}"
 
 
 def _fit_string_length(value: str, params: dict) -> str:
@@ -173,6 +208,19 @@ def _fit_string_length(value: str, params: dict) -> str:
     return text
 
 
+def _pattern_string(var: dict, _rec: dict) -> str:
+    params = dict(var.get("params") or {})
+    pattern = str(params.get("pattern") or "")
+    if not pattern:
+        raise ValueError("pattern_string requires params.pattern")
+    try:
+        minimum = max(0, int(params.get("min_length", 0) or 0))
+        maximum = max(minimum, int(params.get("max_length", 256) or 256))
+        return generate_regex_sample(pattern, _rng(), min_length=minimum, max_length=maximum)
+    except PatternGenerationError as exc:
+        raise ValueError(f"Unable to generate value for source pattern: {pattern!r}: {exc}") from exc
+
+
 def _semantic_string(var: dict, rec: dict) -> str | None:
     """Generate a useful synthetic string from field name/description semantics.
 
@@ -187,17 +235,20 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
     d = desc.lower()
     fmt = str(p.get("format") or "").strip().lower()
 
+    if p.get("pattern"):
+        return _pattern_string(var, rec)
+
     # Standard formats are authoritative and must win over field-name heuristics.
     if fmt in {"uuid", "uuid4"}:
-        return str(uuid.uuid4())
+        return str(_uuid4())
     if fmt in {"email", "idn-email"}:
-        return f"user{random.randint(100000, 999999)}@example.test"
+        return f"user{_rng().randint(100000, 999999)}@example.test"
     if fmt in {"uri", "uri-reference", "url"}:
-        return f"https://example.test/resource/{uuid.uuid4().hex[:12]}"
+        return f"https://example.test/resource/{_uuid4().hex[:12]}"
     if fmt == "ipv4":
-        return ".".join(str(random.randint(1, 254) if i == 0 else random.randint(0, 255)) for i in range(4))
+        return ".".join(str(_rng().randint(1, 254) if i == 0 else _rng().randint(0, 255)) for i in range(4))
     if fmt == "ipv6":
-        groups = [f"{random.randint(0, 65535):x}" for _ in range(8)]
+        groups = [f"{_rng().randint(0, 65535):x}" for _ in range(8)]
         return ":".join(groups)
 
     if "choices" in p or "values" in p:
@@ -205,7 +256,7 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         if isinstance(vals, str):
             vals = [x.strip() for x in re.split(r"[;,|]", vals) if x.strip()]
         if vals:
-            return str(random.choice(list(vals)))
+            return str(_rng().choice(list(vals)))
     if p.get("value") is not None:
         return str(p["value"])
 
@@ -227,7 +278,13 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         ]
         parts = [x for x in parts if x and len(x) <= 80 and x.strip().lower() not in {"and so forth", "etc", "etc."}]
         if len(parts) >= 2:
-            return str(random.choice(parts))
+            return str(_rng().choice(parts))
+
+    # Source-grounded free-form strings must not fall through into legacy telecom/domain
+    # vocabularies. The authoritative source contract owns the value semantics. Pattern-backed
+    # fields are handled by the dedicated pattern generator before this neutral fallback.
+    if p.get("source_contract"):
+        return _fit_string_length(f"SYN_{(n.upper() or 'VALUE')[:32]}_{_rng().randint(1000, 9999)}", p)
 
     # Identifier/reference semantics must be checked before broad words such as "offer",
     # "type", or "status", because many TMF fields are references to another entity.
@@ -248,103 +305,97 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         dial = dial_codes.get(country, "+91")
         return _e164_phone({"country_codes": [dial], "country": country}, rec)
     if "email" in n:
-        return f"user{random.randint(100000, 999999)}@example.test"
+        return f"user{_rng().randint(100000, 999999)}@example.test"
     if "uri" in d or "url" in d or any(token in n for token in ("href", "url", "schemalocation", "resourcepath", "path")):
-        return f"https://example.test/resource/{uuid.uuid4().hex[:12]}"
+        return f"https://example.test/resource/{_uuid4().hex[:12]}"
     if "reference" in d and not any(token in d for token in ("uri", "url", "documentation")):
         prefix = re.sub(r"[^A-Z0-9]+", "_", n.upper()).strip("_") or "REF"
         return _prefixed_int({"prefix": f"{prefix}-", "digits": 10}, rec)
 
-    # Generic JSON-source contracts intentionally stop here before legacy telecom/domain
-    # vocabularies (channels, payment instruments, low-balance reasons, etc.) are considered.
-    # If the standard did not declare a vocabulary, emit a neutral deterministic synthetic value.
-    if p.get("source_contract"):
-        return _fit_string_length(f"SYN_{(n.upper() or 'VALUE')[:32]}_{random.randint(1000, 9999)}", p)
-
     if "operating circle" in d or "regulatory service area" in d:
-        return random.choice([
+        return _rng().choice([
             "Delhi", "Haryana", "Punjab", "Rajasthan", "Uttar Pradesh East", "Uttar Pradesh West",
             "Maharashtra", "Mumbai", "Gujarat", "Karnataka", "Tamil Nadu", "Kerala",
             "Andhra Pradesh", "Telangana", "West Bengal", "Bihar", "Odisha", "Assam",
             "North East", "Himachal Pradesh", "Jammu Kashmir", "Madhya Pradesh", "Kolkata",
         ])
     if "medium" in n and "contact" in d:
-        return random.choice(["email", "telephone", "postal_address"])
+        return _rng().choice(["email", "telephone", "postal_address"])
     if "contact medium" in d:
-        return random.choice(["email", "telephone", "postal_address"])
+        return _rng().choice(["email", "telephone", "postal_address"])
     if "type of contact" in d:
-        return random.choice(["mobile", "fixed_home", "fixed_office", "shipping_address"])
+        return _rng().choice(["mobile", "fixed_home", "fixed_office", "shipping_address"])
     if "payment plan" in d or n == "plantype":
-        return random.choice(["prepaid", "postpaid", "hybrid"])
+        return _rng().choice(["prepaid", "postpaid", "hybrid"])
     if "consumption counter" in d:
-        return random.choice(["used", "outOfBucket"])
+        return _rng().choice(["used", "outOfBucket"])
     if "currency" in d or "iso4217" in d:
         return str(p.get("currency") or "INR").upper()
     if "currency" in n:
         return str(p.get("currency") or "INR").upper()
     if "billing time period" in d or "repeat the application of the price" in d:
-        return random.choice(["week", "month", "quarter", "year"])
+        return _rng().choice(["week", "month", "quarter", "year"])
     if "frequency of" in d or "frequency" == n:
-        return random.choice(["daily", "weekly", "monthly", "quarterly"])
+        return _rng().choice(["daily", "weekly", "monthly", "quarterly"])
     if "price" in n and ("recurring" in d or "discount" in d or "allowance" in d or "penalty" in d):
-        return random.choice(["recurring", "discount", "allowance", "penalty"])
+        return _rng().choice(["recurring", "discount", "allowance", "penalty"])
     if "catalog" in n and "catalog" in d:
-        return random.choice(["product", "service", "resource"])
+        return _rng().choice(["product", "service", "resource"])
     if "relationship" in n and ("relationship" in d or "migration" in d or "substitution" in d):
-        return random.choice(["override", "discount", "replace", "migrate"])
+        return _rng().choice(["override", "discount", "replace", "migrate"])
     if n == "value_type" or ("kind of value" in d and "numeric" in d and "text" in d):
-        return random.choice(["numeric", "text"])
+        return _rng().choice(["numeric", "text"])
     if n == "range_interval" or "inclusion or exclusion" in d:
-        return random.choice(["open", "closed", "closedBottom", "closedTop"])
+        return _rng().choice(["open", "closed", "closedBottom", "closedTop"])
     if n == "adjust_type" or "recurringcharge" in d or "onetimecharge" in d:
-        return random.choice(["RecurringCharge", "OneTimeCharge"])
+        return _rng().choice(["RecurringCharge", "OneTimeCharge"])
     if "format of the exported data" in d or n == "content_type":
-        return random.choice(["application/json", "text/csv", "application/xml"])
+        return _rng().choice(["application/json", "text/csv", "application/xml"])
     if "attachment mime type" in d:
-        return random.choice(["application/pdf", "image/png", "video/mp4"])
+        return _rng().choice(["application/pdf", "image/png", "video/mp4"])
     if n == "attachment_type" or "attachment type" in d:
-        return random.choice(["document", "image", "video"])
+        return _rng().choice(["document", "image", "video"])
     if "type of notification" in d or "type of the notification" in d:
-        return random.choice(["LOW_BALANCE_ALERT", "RECHARGE_UPDATE", "PAYMENT_UPDATE", "SYSTEM_NOTIFICATION"])
+        return _rng().choice(["LOW_BALANCE_ALERT", "RECHARGE_UPDATE", "PAYMENT_UPDATE", "SYSTEM_NOTIFICATION"])
     if "network" in n and "capability" in n:
-        return random.choice(["2G", "3G", "4G", "5G"])
+        return _rng().choice(["2G", "3G", "4G", "5G"])
     if "channel" in n:
-        return random.choice(["APP", "SMS", "WEB", "USSD", "WHATSAPP", "IVR", "RETAIL"])
+        return _rng().choice(["APP", "SMS", "WEB", "USSD", "WHATSAPP", "IVR", "RETAIL"])
     if "payment" in n and ("method" in n or "instrument" in n):
-        return random.choice(["UPI", "CREDIT_CARD", "DEBIT_CARD", "WALLET", "CASH", "AUTO_DEBIT"])
+        return _rng().choice(["UPI", "CREDIT_CARD", "DEBIT_CARD", "WALLET", "CASH", "AUTO_DEBIT"])
     if "reason" in n:
-        return random.choice(["LOW_BALANCE", "DATA_EXHAUSTED", "VALIDITY_EXPIRY", "CUSTOMER_REQUEST"])
+        return _rng().choice(["LOW_BALANCE", "DATA_EXHAUSTED", "VALIDITY_EXPIRY", "CUSTOMER_REQUEST"])
     if n in {"stateorprovince", "province", "state"} or n.endswith("_state_or_province"):
-        return random.choice(["Haryana", "Punjab", "Delhi", "Maharashtra", "Karnataka", "Tamil Nadu", "Gujarat"])
+        return _rng().choice(["Haryana", "Punjab", "Delhi", "Maharashtra", "Karnataka", "Tamil Nadu", "Gujarat"])
     if n == "city" or n.endswith("_city"):
-        return random.choice(["Delhi", "Gurugram", "Ludhiana", "Chandigarh", "Mumbai", "Bengaluru", "Pune"])
+        return _rng().choice(["Delhi", "Gurugram", "Ludhiana", "Chandigarh", "Mumbai", "Bengaluru", "Pune"])
     if n in {"postcode", "postalcode", "postal_code", "postcode"}:
-        return str(random.randint(110001, 999999))
+        return str(_rng().randint(110001, 999999))
     if "status reason" in d or n == "status_reason":
-        return random.choice(["CUSTOMER_REQUEST", "PAYMENT_FAILURE", "SYSTEM_ERROR", "POLICY_VIOLATION"])
+        return _rng().choice(["CUSTOMER_REQUEST", "PAYMENT_FAILURE", "SYSTEM_ERROR", "POLICY_VIOLATION"])
     if "status" in n or n.endswith("_state") or n in {"state"}:
-        return random.choice(["PENDING", "COMPLETED", "FAILED"])
+        return _rng().choice(["PENDING", "COMPLETED", "FAILED"])
     if "offer" in n and any(token in d for token in ("incentive", "recommendation", "cash back", "validity booster")):
-        return random.choice(["EXTRA_DATA", "CASH_BACK", "VALIDITY_BOOSTER", "DISCOUNT_VOUCHER"])
+        return _rng().choice(["EXTRA_DATA", "CASH_BACK", "VALIDITY_BOOSTER", "DISCOUNT_VOUCHER"])
     if "segment" in n or "market segment" in d:
-        return random.choice(["ULTRA_LOW", "MASS", "MID_TIER", "HIGH_VALUE"])
+        return _rng().choice(["ULTRA_LOW", "MASS", "MID_TIER", "HIGH_VALUE"])
     if n in {"role", "partyroletype"} or n.endswith("_role"):
-        return random.choice(["subscriber", "customer", "agent", "system"])
+        return _rng().choice(["subscriber", "customer", "agent", "system"])
     if n == "name" or n.endswith("_name"):
-        return random.choice(["Recharge Plan", "Data Booster", "Talktime Pack", "Retention Offer"])
+        return _rng().choice(["Recharge Plan", "Data Booster", "Talktime Pack", "Retention Offer"])
     if n == "title" or n.endswith("_title"):
-        return random.choice(["Low Balance Alert", "Recharge Event", "Top-up Request"])
+        return _rng().choice(["Low Balance Alert", "Recharge Event", "Top-up Request"])
     if n == "description" or n.endswith("_description"):
-        return random.choice(["Recharge operation", "Balance adjustment", "Retention intervention"])
+        return _rng().choice(["Recharge operation", "Balance adjustment", "Retention intervention"])
     if n in {"type", "basetype", "referredtype"} or n.endswith("_type"):
-        return random.choice(["PrepayBalance", "BalanceTopup", "ProductOffering", "Subscriber"])
+        return _rng().choice(["PrepayBalance", "BalanceTopup", "ProductOffering", "Subscriber"])
     if "code" in n:
-        return f"CODE-{random.randint(100000, 999999)}"
+        return f"CODE-{_rng().randint(100000, 999999)}"
     if "country" in n:
         return str(p.get("country") or "IN").upper()
 
     label = re.sub(r"_+", "_", n.upper()).strip("_") or "VALUE"
-    return _fit_string_length(f"SYN_{label[:24]}_{random.randint(1000, 9999)}", p)
+    return _fit_string_length(f"SYN_{label[:24]}_{_rng().randint(1000, 9999)}", p)
 
 
 def _generic_value(var: dict, rec: dict):
@@ -359,17 +410,17 @@ def _generic_value(var: dict, rec: dict):
         if isinstance(vals, str):
             vals = [x.strip() for x in re.split(r"[;,|]", vals) if x.strip()]
         if vals:
-            return random.choice(list(vals))
+            return _rng().choice(list(vals))
     if "value" in p and p.get("value") is not None:
         return p.get("value")
     if dtype in _NUMERIC_DTYPES:
         lo = _safe_number(p.get("min", p.get("lo")), 0.0)
         hi = _safe_number(p.get("max", p.get("hi")), 100.0)
         if dtype in {"int", "integer"}:
-            return random.randint(int(round(min(lo, hi))), int(round(max(lo, hi))))
-        return round(random.uniform(min(lo, hi), max(lo, hi)), int(p.get("precision", 2) or 2))
+            return _rng().randint(int(round(min(lo, hi))), int(round(max(lo, hi))))
+        return round(_rng().uniform(min(lo, hi), max(lo, hi)), int(p.get("precision", 2) or 2))
     if dtype == "boolean":
-        return random.choice([True, False])
+        return _rng().choice([True, False])
     if dtype == "datetime":
         return _recent_datetime(p, rec)
     if dtype == "date":
@@ -377,8 +428,8 @@ def _generic_value(var: dict, rec: dict):
     if dtype == "array":
         choices = p.get("choices", p.get("values"))
         if isinstance(choices, (list, tuple)) and choices:
-            size = random.randint(0, min(3, len(choices)))
-            return random.sample(list(choices), size) if size else []
+            size = _rng().randint(0, min(3, len(choices)))
+            return _rng().sample(list(choices), size) if size else []
         return None
     if dtype == "object":
         # Empty objects are not valid synthetic data. A flat dataset cannot invent nested
@@ -424,30 +475,30 @@ def _prefixed_int(params: dict, _rec: dict) -> str:
         number_max = (10 ** digits) - 1
 
     lo, hi = sorted((number_min, number_max))
-    number = random.randint(lo, hi)
+    number = _rng().randint(lo, hi)
     return f"{prefix}{str(number).zfill(digits)}"
 
 
 def _e164_phone(params: dict, _rec: dict) -> str:
-    cc = random.choice(params["country_codes"])
+    cc = _rng().choice(params["country_codes"])
     if cc == "+91":
         # India: 10-digit mobile number, first digit must be 6-9 (TRAI numbering plan)
-        first = random.choice("6789")
-        rest = "".join(random.choice("0123456789") for _ in range(9))
+        first = _rng().choice("6789")
+        rest = "".join(_rng().choice("0123456789") for _ in range(9))
         return f"{cc}{first}{rest}"
     if cc == "+44":
         # UK: mobile numbers start 7, followed by 9 digits
-        rest = "".join(random.choice("0123456789") for _ in range(9))
+        rest = "".join(_rng().choice("0123456789") for _ in range(9))
         return f"{cc}7{rest}"
     if cc == "+971":
         # UAE: mobile prefixes 50/52/54/55/56/58 + 7 digits
-        prefix = random.choice(["50", "52", "54", "55", "56", "58"])
-        rest = "".join(random.choice("0123456789") for _ in range(7))
+        prefix = _rng().choice(["50", "52", "54", "55", "56", "58"])
+        rest = "".join(_rng().choice("0123456789") for _ in range(7))
         return f"{cc}{prefix}{rest}"
     # Default / US (NANP): NPA (200-999) + NXX (200-999) + 4-digit line number
-    npa = random.randint(200, 999)
-    nxx = random.randint(200, 999)
-    xxxx = random.randint(1000, 9999)
+    npa = _rng().randint(200, 999)
+    nxx = _rng().randint(200, 999)
+    xxxx = _rng().randint(1000, 9999)
     return f"{cc}{npa}{nxx}{xxxx}"
 
 
@@ -470,16 +521,22 @@ def _dependent_choice(params: dict, rec: dict):
 
 def _weighted_choice(params: dict, _rec: dict):
     choices = list(params.get("choices", []))
-    raw_weights = params.get("weights", [])
     if not choices:
-        return None
+        raise ValueError("weighted_choice requires at least one choice")
+    if "weights" not in params:
+        return _rng().choice(choices)
+    raw_weights = params.get("weights")
     try:
         weights = [float(x) for x in (list(raw_weights) if isinstance(raw_weights, (list, tuple)) else [])]
-    except (TypeError, ValueError):
-        weights = []
-    if len(weights) != len(choices) or any((not math.isfinite(w) or w < 0) for w in weights) or sum(weights) <= 0:
-        weights = [1.0] * len(choices)
-    return random.choices(choices, weights=weights, k=1)[0]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("weighted_choice contains non-numeric weights") from exc
+    if (
+        len(weights) != len(choices)
+        or any((not math.isfinite(w) or w < 0) for w in weights)
+        or sum(weights) <= 0
+    ):
+        raise ValueError("weighted_choice weights must be finite, non-negative, non-zero, and match choices")
+    return _rng().choices(choices, weights=weights, k=1)[0]
 
 
 def _weighted_bucket(params: dict, _rec: dict):
@@ -496,14 +553,20 @@ def _weighted_bucket(params: dict, _rec: dict):
             continue
     if not normalized:
         return None
-    weights = params.get("weights") or []
-    try:
-        weights = [float(w) for w in weights]
-    except (TypeError, ValueError):
-        weights = []
-    if len(weights) != len(normalized) or any((not math.isfinite(w) or w < 0) for w in weights) or sum(weights) <= 0:
-        weights = [1.0] * len(normalized)
-    lo, hi = random.choices(normalized, weights=weights, k=1)[0]
+    if "weights" not in params:
+        weights = None
+    else:
+        try:
+            weights = [float(w) for w in params.get("weights") or []]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("weighted_bucket contains non-numeric weights") from exc
+        if (
+            len(weights) != len(normalized)
+            or any((not math.isfinite(w) or w < 0) for w in weights)
+            or sum(weights) <= 0
+        ):
+            raise ValueError("weighted_bucket weights must be finite, non-negative, non-zero, and match buckets")
+    lo, hi = _rng().choices(normalized, weights=weights, k=1)[0] if weights is not None else _rng().choice(normalized)
     precision = int(params.get("precision", 2) or 0)
     if precision > 0:
         scale = 10 ** precision
@@ -511,8 +574,8 @@ def _weighted_bucket(params: dict, _rec: dict):
         hi_tick = int(math.floor(hi * scale))
         if hi_tick < lo_tick:
             return round(lo, precision)
-        return random.randint(lo_tick, hi_tick) / scale
-    return random.randint(int(math.ceil(lo)), int(math.floor(hi))) if lo.is_integer() and hi.is_integer() else random.uniform(lo, hi)
+        return _rng().randint(lo_tick, hi_tick) / scale
+    return _rng().randint(int(math.ceil(lo)), int(math.floor(hi))) if lo.is_integer() and hi.is_integer() else _rng().uniform(lo, hi)
 
 
 def _multiple_of_tick_bounds(lo: float, hi: float, multiple_of: float, scale: int) -> tuple[int, int, int] | None:
@@ -552,11 +615,11 @@ def _uniform(params: dict, _rec: dict) -> float:
         bounds = _multiple_of_tick_bounds(lo, hi, multiple, scale) if multiple is not None else None
         if bounds:
             lo_index, hi_index, step = bounds
-            return (random.randint(lo_index, hi_index) * step) / scale
+            return (_rng().randint(lo_index, hi_index) * step) / scale
         lo_tick = int(math.ceil(lo * scale))
         hi_tick = int(math.floor(hi * scale))
         if hi_tick >= lo_tick:
-            tick = random.randint(lo_tick, hi_tick)
+            tick = _rng().randint(lo_tick, hi_tick)
             # Prefer non-integer decimal values when representable at this precision.
             if hi_tick > lo_tick and tick % scale == 0:
                 if tick + 1 <= hi_tick:
@@ -564,7 +627,7 @@ def _uniform(params: dict, _rec: dict) -> float:
                 elif tick - 1 >= lo_tick:
                     tick -= 1
             return tick / scale
-    return round(float(random.uniform(lo, hi)), precision)
+    return round(float(_rng().uniform(lo, hi)), precision)
 
 
 def _uniform_int(params: dict, _rec: dict) -> int:
@@ -583,8 +646,8 @@ def _uniform_int(params: dict, _rec: dict) -> int:
         first = int(math.ceil(lo_int / multiple_int) * multiple_int)
         last = int(math.floor(hi_int / multiple_int) * multiple_int)
         if first <= last:
-            return random.randrange(first, last + multiple_int, multiple_int)
-    return random.randint(lo_int, hi_int)
+            return _rng().randrange(first, last + multiple_int, multiple_int)
+    return _rng().randint(lo_int, hi_int)
 
 
 def _lognormal(params: dict, _rec: dict) -> float:
@@ -593,7 +656,7 @@ def _lognormal(params: dict, _rec: dict) -> float:
     sigma = _to_finite_float(params.get("sigma"), 1.0)
     lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
     hi = _to_finite_float(params.get("max", params.get("hi")), lo)
-    raw = math.exp(random.gauss(mu if mu is not None else 0.0, sigma if sigma is not None else 1.0))
+    raw = math.exp(_rng().gauss(mu if mu is not None else 0.0, sigma if sigma is not None else 1.0))
     clipped = max(lo if lo is not None else 0.0, min(hi if hi is not None else raw, raw))
     return round(float(clipped), precision)
 
@@ -603,12 +666,12 @@ def _lognormal_int(params: dict, _rec: dict) -> int:
     sigma = _to_finite_float(params.get("sigma"), 1.0)
     lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
     hi = _to_finite_float(params.get("max", params.get("hi")), lo)
-    raw = int(math.exp(random.gauss(mu if mu is not None else 0.0, sigma if sigma is not None else 1.0)))
+    raw = int(math.exp(_rng().gauss(mu if mu is not None else 0.0, sigma if sigma is not None else 1.0)))
     return int(max(lo if lo is not None else 0.0, min(hi if hi is not None else raw, raw)))
 
 
 def _beta(params: dict, _rec: dict) -> float:
-    return round(random.betavariate(params["alpha"], params["beta"]), 4)
+    return round(_rng().betavariate(params["alpha"], params["beta"]), 4)
 
 
 def _segment_range(params: dict, rec: dict) -> float:
@@ -619,7 +682,7 @@ def _segment_range(params: dict, rec: dict) -> float:
     if not isinstance(rng, dict):
         numeric_ranges = [v for v in params.values() if isinstance(v, dict) and "min" in v and "max" in v]
         rng = numeric_ranges[0] if numeric_ranges else {"min": 0, "max": 1}
-    return round(float(random.uniform(float(rng.get("min", 0)), float(rng.get("max", 1)))), precision)
+    return round(float(_rng().uniform(float(rng.get("min", 0)), float(rng.get("max", 1)))), precision)
 
 
 def _to_finite_float(value, default: float | None = None) -> float | None:
@@ -627,7 +690,7 @@ def _to_finite_float(value, default: float | None = None) -> float | None:
 
     Scenario definitions are persisted as confirmed contracts, so numeric params may be
     strings. Dependent fields can also be represented as strings (for example
-    ``"20.0"``). Never pass a raw string into random.uniform/max.
+    ``"20.0"``). Never pass a raw string into _rng().uniform/max.
     """
     if isinstance(value, bool):
         return default
@@ -641,8 +704,8 @@ def _to_finite_float(value, default: float | None = None) -> float | None:
 
 
 def _uniform_bounded(params: dict, rec: dict):
-    """Generate a value with one or both bounds optionally coming from fields."""
-    precision = int(params.get("precision", 2) or 2)
+    """Generate a bounded value while honoring integer and multipleOf constraints."""
+    precision = max(0, int(params.get("precision", 2) or 2))
     hi = _to_finite_float(rec.get(params.get("hi_field")), None) if params.get("hi_field") else None
     lo = _to_finite_float(rec.get(params.get("lo_field")), None) if params.get("lo_field") else None
     if hi is None:
@@ -654,18 +717,39 @@ def _uniform_bounded(params: dict, rec: dict):
     if hi is None:
         hi = lo
     lo, hi = min(lo, hi), max(lo, hi)
+
     if params.get("integer"):
-        return random.randint(int(math.ceil(lo)), int(math.floor(hi)))
-    return round(float(random.uniform(lo, hi)), precision)
+        lo_int = int(math.ceil(lo))
+        hi_int = int(math.floor(hi))
+        try:
+            multiple_int = int(params.get("multiple_of") or params.get("multipleOf") or 0)
+        except (TypeError, ValueError):
+            multiple_int = 0
+        if multiple_int > 1:
+            first = int(math.ceil(lo_int / multiple_int)) * multiple_int
+            last = int(math.floor(hi_int / multiple_int)) * multiple_int
+            if last >= first:
+                return _rng().randint(first // multiple_int, last // multiple_int) * multiple_int
+        if hi_int < lo_int:
+            return lo_int
+        return _rng().randint(lo_int, hi_int)
+
+    multiple = params.get("multiple_of", params.get("multipleOf"))
+    if multiple is not None:
+        bounds = _multiple_of_tick_bounds(lo, hi, float(multiple), 10 ** precision)
+        if bounds:
+            lo_index, hi_index, step = bounds
+            return (_rng().randint(lo_index, hi_index) * step) / (10 ** precision)
+    return round(float(_rng().uniform(lo, hi)), precision)
 
 
 def _recent_datetime(params: dict, _rec: dict) -> str:
     days_back = int(params.get("days_back", 0) or 0)
     base = datetime.now(timezone.utc) - timedelta(
-        days=random.randint(0, max(0, days_back)),
-        hours=random.randint(0, 23),
-        minutes=random.randint(0, 59),
-        seconds=random.randint(0, 59),
+        days=_rng().randint(0, max(0, days_back)),
+        hours=_rng().randint(0, 23),
+        minutes=_rng().randint(0, 59),
+        seconds=_rng().randint(0, 59),
     )
     return _format_datetime(base, params)
 
@@ -674,7 +758,7 @@ def _recent_date(params: dict, _rec: dict) -> str:
     """Generate an ISO-8601 calendar date for fields declared as JSON Schema ``format=date``."""
     days_back = int(params.get("days_back", 0) or 0)
     base = datetime.now(timezone.utc).date() - timedelta(
-        days=random.randint(0, max(0, days_back))
+        days=_rng().randint(0, max(0, days_back))
     )
     return base.isoformat()
 
@@ -737,7 +821,7 @@ def _generate_temporal_child_value_for_constraints(
         desired = lower
     else:
         span = int((upper - lower).total_seconds())
-        desired = lower + timedelta(seconds=random.randint(0, max(0, span)))
+        desired = lower + timedelta(seconds=_rng().randint(0, max(0, span)))
 
     if str(var.get("dtype") or "datetime").strip().lower() == "date":
         return desired.date().isoformat()
@@ -757,7 +841,7 @@ def _generate_temporal_child_value(
     except (TypeError, ValueError):
         upper = lower
     upper = max(lower, upper)
-    gap = random.randint(lower, upper) if upper > lower else lower
+    gap = _rng().randint(lower, upper) if upper > lower else lower
     desired = parent_dt + timedelta(seconds=gap)
     if str(var.get("dtype") or "datetime").strip().lower() == "date":
         return desired.date().isoformat()
@@ -774,7 +858,7 @@ def _ts_offset(params: dict, rec: dict) -> str:
     min_sec = int(params.get("min_sec", params.get("min_seconds", 0)))
     max_sec = int(params.get("max_sec", params.get("max_seconds", min_sec)))
     min_sec, max_sec = min(min_sec, max_sec), max(min_sec, max_sec)
-    offset = timedelta(seconds=random.randint(min_sec, max_sec))
+    offset = timedelta(seconds=_rng().randint(min_sec, max_sec))
     return _format_datetime(base + offset, _temporal_output_params(params, "ts_offset"))
 
 
@@ -784,7 +868,7 @@ def _ts_add_field(params: dict, rec: dict) -> str:
         raise ValueError("ts_add_field requires a valid base_field dependency")
     base = _parse_dt(rec[base_field])
     seconds = int(rec.get(params["add_seconds_field"], 60))
-    return _format_datetime(base + timedelta(seconds=seconds), params)
+    return _format_datetime(base + timedelta(seconds=seconds), _temporal_output_params(params, "ts_add_field"))
 
 
 def _date_offset(params: dict, rec: dict) -> str:
@@ -802,7 +886,7 @@ def _date_offset_range(params: dict, rec: dict) -> str:
     base = _parse_dt(rec[base_field])
     min_days = int(params.get("min_days", 0))
     max_days = int(params.get("max_days", min_days))
-    offset_days = random.randint(min(min_days, max_days), max(min_days, max_days))
+    offset_days = _rng().randint(min(min_days, max_days), max(min_days, max_days))
     return (base + timedelta(days=offset_days)).date().isoformat()
 
 
@@ -823,20 +907,20 @@ def _id_mirror(params: dict, rec: dict) -> str:
 
     if not number:
         digits = int(params.get("digits", 8) or 8)
-        number = str(random.randint(0, max(0, 10**digits - 1))).zfill(digits)
+        number = str(_rng().randint(0, max(0, 10**digits - 1))).zfill(digits)
     return f"{prefix}{number}"
 
 
 def _prefixed_uuid(params: dict, _rec: dict) -> str:
     """Return the configured prefix followed by the complete UUID value."""
     prefix = str(params.get("prefix", ""))
-    return prefix + str(uuid.uuid4())
+    return prefix + str(_uuid4())
 
 
 def _tx_id(params: dict, rec: dict) -> str:
     ts = rec.get("record_timestamp", datetime.now(timezone.utc).isoformat())
     date_part = ts[:10].replace("-", "")
-    rand_part = random.randint(1_000_000, 9_999_999)
+    rand_part = _rng().randint(1_000_000, 9_999_999)
     return f"{params['prefix']}{date_part}-{rand_part}"
 
 
@@ -1000,11 +1084,12 @@ _GENERATORS = {
     "generic":        lambda v, rec: _generic_value(v, rec),
     "semantic_event": lambda v, rec: _semantic_placeholder(v.get("name"), v.get("params") or {}, rec),
     "semantic_string": lambda v, rec: _semantic_string(v, rec),
-    "uuid_string":    lambda v, rec: str(uuid.uuid4()),
-    "email_string":   lambda v, rec: f"user{random.randint(100000, 999999)}@example.test",
-    "uri_string":     lambda v, rec: f"https://example.test/resource/{uuid.uuid4().hex[:12]}",
-    "ipv4_string":    lambda v, rec: ".".join(str(random.randint(1, 254) if i == 0 else random.randint(0, 255)) for i in range(4)),
-    "ipv6_string":    lambda v, rec: ":".join(f"{random.randint(0, 65535):x}" for _ in range(8)),
+    "uuid_string":    lambda v, rec: str(_uuid4()),
+    "pattern_string": lambda v, rec: _pattern_string(v, rec),
+    "email_string":   lambda v, rec: f"user{_rng().randint(100000, 999999)}@example.test",
+    "uri_string":     lambda v, rec: f"https://example.test/resource/{_uuid4().hex[:12]}",
+    "ipv4_string":    lambda v, rec: ".".join(str(_rng().randint(1, 254) if i == 0 else _rng().randint(0, 255)) for i in range(4)),
+    "ipv6_string":    lambda v, rec: ":".join(f"{_rng().randint(0, 65535):x}" for _ in range(8)),
 }
 
 
@@ -1118,7 +1203,7 @@ def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None
             ]
             if preferred_allowed:
                 return preferred_allowed[0]
-        return random.choice(declared_options)
+        return _rng().choice(declared_options)
 
     if dtype in {"float", "decimal", "number", "numeric"} and isinstance(value, (int, float)) and not isinstance(value, bool):
         value = round(float(value), precision)
@@ -1146,7 +1231,7 @@ def _apply_generation_constraint(var: dict, value, rec: dict, rules: dict | None
             return matches[0]
         # If the generator produced a value outside an authoritative categorical
         # constraint, choose from the constrained set instead of leaking invalid data.
-        return random.choice(allowed)
+        return _rng().choice(allowed)
 
     try:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -1263,7 +1348,7 @@ def _apply_conditional_rules(rec: dict, rules: dict | None) -> dict:
             if not desired:
                 return False
             if not any(matches(rec.get(field), x) for x in desired):
-                rec[field] = random.choice(desired)
+                rec[field] = _rng().choice(desired)
                 return True
             return False
         if not matches(rec.get(field), desired):
@@ -1805,6 +1890,8 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
     user_plan = _build_generation_plan(variables, user_field_names, rules)
     record_plan = _build_generation_plan(variables, record_field_names, rules)
 
+    from config.runtime import GENERATION_MAX_ATTEMPTS_PER_RECORD
+
     for user_index in range(user_count):
         try:
             user_context=_generate_selected_record(variables,user_field_names,rules=rules,plan=user_plan)
@@ -1820,8 +1907,10 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
             # scenarios cannot collapse all requested users into a single subscriber.
             industry_key = re.sub(r"[^a-z0-9]+", "", str((rules or {}).get("industry_type") or "").lower())
             telecom_industry = industry_key in {"telecom", "telecommunications", "telecommunication"}
-            low_balance_domain = telecom_industry and "low balance" in str((rules or {}).get("domain") or "").lower() and "top" in str((rules or {}).get("domain") or "").lower()
-            if telecom_industry:
+            source_grounded_agentic = bool((rules or {}).get("agentic")) and str((rules or {}).get("source_policy") or "").strip() == "mongodb_industry_source_documents"
+            legacy_telecom_policy = telecom_industry and not source_grounded_agentic
+            low_balance_domain = legacy_telecom_policy and "low balance" in str((rules or {}).get("domain") or "").lower() and "top" in str((rules or {}).get("domain") or "").lower()
+            if legacy_telecom_policy:
                 user_context=_enforce_mandatory_telecom_identity(
                     user_context,
                     variables,
@@ -1846,7 +1935,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
             # Enforce unique stable telecom identity anchors only for telecom scenarios.
             # Other industries may legitimately use fields such as account_id/customer_id with different contracts.
             variable_names={str(v.get("name")) for v in variables if v.get("name")}
-            if telecom_industry:
+            if legacy_telecom_policy:
                 for identity_name in ("subscriber_id", "account_id", "msisdn", "customer_id"):
                     if identity_name not in variable_names:
                         continue
@@ -1868,9 +1957,9 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     if identity_value:
                         used_identity_values[identity_name].add(identity_value)
 
-            # Resource identifiers are real identifiers, not descriptive dimensions. Keep
-            # bucket ids unique across subscribers so cross-subscriber references cannot collide.
-            if "bucket_id" in variable_names:
+            # Resource-specific bucket linking is a legacy telecom rule. Modern source-grounded
+            # scenarios must keep the identifier contract supplied by their confirmed source.
+            if legacy_telecom_policy and "bucket_id" in variable_names:
                 bucket_id_value = str(user_context.get("bucket_id") or "")
                 if (not bucket_id_value) or bucket_id_value in used_resource_ids["bucket_id"]:
                     db_names = _declared_db_variable_names(rules)
@@ -1907,14 +1996,14 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
         end_ts=datetime.now(timezone.utc)
         span=max(records_per_user,1)-1
         if span:
-            step_seconds=random.randint(6*3600, 72*3600)
+            step_seconds=_rng().randint(6*3600, 72*3600)
             start_ts=end_ts-timedelta(seconds=step_seconds*span)
         else:
             start_ts=end_ts
         timestamps=[]
         if timestamp_field:
             for i in range(records_per_user):
-                jitter=random.randint(0,max(60,min(6*3600,step_seconds if span else 60)))
+                jitter=_rng().randint(0,max(60,min(6*3600,step_seconds if span else 60)))
                 ts=start_ts+timedelta(seconds=(step_seconds*i if span else 0)+jitter)
                 ts=min(ts,end_ts)
                 timestamps.append(ts)
@@ -1922,7 +2011,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
 
         for record_index in range(records_per_user):
             last_exc: Exception | None = None
-            for attempt in range(5):
+            for attempt in range(GENERATION_MAX_ATTEMPTS_PER_RECORD):
                 try:
                     base=dict(user_context)
                     if timestamp_field:
@@ -1947,77 +2036,64 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                         else:
                             row[timestamp_field] = timestamps[record_index].isoformat()
 
-                    # TopupBalance.id and topup_transaction_id identify concrete transaction
-                    # resources. Guarantee uniqueness across the generated dataset instead of
-                    # relying on the stochastic semantic_string generator.
-                    db_names = _declared_db_variable_names(rules)
-                    for id_name,prefix in (("topupbalance_id","TOPUPBALANCE-"),("topup_transaction_id","TOPUP_TRANSACTION-")):
-                        if id_name in row:
-                            candidate=str(row.get(id_name) or "")
-                            if (not candidate) or candidate in used_resource_ids[id_name]:
-                                if id_name in db_names:
-                                    for _ in range(100):
-                                        generated_id = _regenerate_declared_field(variables, id_name, row, rules=rules)
-                                        candidate = str(generated_id or "")
-                                        if candidate and candidate not in used_resource_ids[id_name]:
-                                            break
+                    # Resource-specific identifiers and RelatedTopupBalance synchronization are
+                    # legacy telecom semantics. Source-grounded agentic scenarios must derive these
+                    # relationships from their confirmed source contract instead of hardcoded names.
+                    if legacy_telecom_policy:
+                        db_names = _declared_db_variable_names(rules)
+                        for id_name, prefix in (("topupbalance_id", "TOPUPBALANCE-"), ("topup_transaction_id", "TOPUP_TRANSACTION-")):
+                            if id_name in row:
+                                candidate = str(row.get(id_name) or "")
+                                if (not candidate) or candidate in used_resource_ids[id_name]:
+                                    if id_name in db_names:
+                                        for _ in range(100):
+                                            generated_id = _regenerate_declared_field(variables, id_name, row, rules=rules)
+                                            candidate = str(generated_id or "")
+                                            if candidate and candidate not in used_resource_ids[id_name]:
+                                                break
+                                        else:
+                                            raise RuntimeError(f"MongoDB/declared generator could not produce a unique {id_name}")
                                     else:
-                                        raise RuntimeError(f"MongoDB/declared generator could not produce a unique {id_name}")
-                                else:
-                                    for _ in range(1000):
-                                        generated_id=_prefixed_int({"prefix":prefix,"digits":10},row)
-                                        if generated_id not in used_resource_ids[id_name]:
-                                            candidate=generated_id
-                                            break
-                                    else:
-                                        raise RuntimeError(f"Unable to generate a unique {id_name}")
-                                row[id_name]=candidate
-                            # Keep the resource href synchronized when the stochastic id had to
-                            # be replaced for uniqueness.
-                            if id_name == "topupbalance_id" and "topupbalance_href" in row:
-                                row["topupbalance_href"] = f"https://example.test/telecom/topupBalance/{candidate}"
-                            used_resource_ids[id_name].add(candidate)
+                                        for _ in range(1000):
+                                            generated_id = _prefixed_int({"prefix": prefix, "digits": 10}, row)
+                                            if generated_id not in used_resource_ids[id_name]:
+                                                candidate = generated_id
+                                                break
+                                        else:
+                                            raise RuntimeError(f"Unable to generate a unique {id_name}")
+                                    row[id_name] = candidate
+                                if id_name == "topupbalance_id" and "topupbalance_href" in row:
+                                    row["topupbalance_href"] = f"https://example.test/telecom/topupBalance/{candidate}"
+                                used_resource_ids[id_name].add(candidate)
 
-                    # If the schema exposes a RelatedTopupBalance reference, point it to a
-                    # real earlier transaction in this subscriber's history. The first event has
-                    # no earlier top-up and therefore leaves the optional reference null.
-                    # Apply scenario semantics before strict validation. Validation stays fail-closed,
-                    # but ordinary generation should already satisfy scenarioType/outcome/conditional rules.
-                    row = _apply_conditional_rules(row, rules)
-                    row = _apply_scenario_semantics(row, rules)
-                    row, _ = _enforce_authoritative_formulas(row, variables, rules=rules)
-                    if _lb_domain(rules):
-                        row, _ = _enforce_low_balance_topup_consistency(row, variables, rules=rules)
-                        row, _ = _enforce_authoritative_formulas(row, variables, rules=rules)
-                    row, _ = _enforce_csv_contract(row, variables, rules=rules)
+                        if "topupbalance_balance_topup_id" in row and "topupbalance_id" in row:
+                            previous_topup_id = (
+                                generated_records[-1].get("topupbalance_id")
+                                if generated_records and generated_records[-1].get(entity_key) == row.get(entity_key)
+                                else None
+                            )
+                            if previous_topup_id and str(previous_topup_id) != str(row.get("topupbalance_id")):
+                                row["topupbalance_balance_topup_id"] = previous_topup_id
+                                if "topupbalance_balance_topup_href" in row:
+                                    row["topupbalance_balance_topup_href"] = f"https://example.test/telecom/topupBalance/{previous_topup_id}"
+                                if "topupbalance_balance_topup_name" in row:
+                                    row["topupbalance_balance_topup_name"] = "Related Top-up"
+                                if "topupbalance_balance_topup_role" in row:
+                                    row["topupbalance_balance_topup_role"] = "child"
+                                if "topupbalance_balance_topup_referred_type" in row:
+                                    row["topupbalance_balance_topup_referred_type"] = "TopupBalance"
+                            elif previous_topup_id is None:
+                                for ref_name in (
+                                    "topupbalance_balance_topup_id",
+                                    "topupbalance_balance_topup_href",
+                                    "topupbalance_balance_topup_name",
+                                    "topupbalance_balance_topup_role",
+                                    "topupbalance_balance_topup_referred_type",
+                                ):
+                                    if ref_name in row:
+                                        row[ref_name] = None
 
-                    if "topupbalance_balance_topup_id" in row and "topupbalance_id" in row:
-                        previous_topup_id = (
-                            generated_records[-1].get("topupbalance_id")
-                            if generated_records and generated_records[-1].get(entity_key) == row.get(entity_key)
-                            else None
-                        )
-                        if previous_topup_id and str(previous_topup_id) != str(row.get("topupbalance_id")):
-                            row["topupbalance_balance_topup_id"] = previous_topup_id
-                            row["topupbalance_balance_topup_href"] = f"https://example.test/telecom/topupBalance/{previous_topup_id}" if "topupbalance_balance_topup_href" in row else row.get("topupbalance_balance_topup_href")
-                            row["topupbalance_balance_topup_name"] = "Related Top-up" if "topupbalance_balance_topup_name" in row else row.get("topupbalance_balance_topup_name")
-                            row["topupbalance_balance_topup_role"] = "child" if "topupbalance_balance_topup_role" in row else row.get("topupbalance_balance_topup_role")
-                            row["topupbalance_balance_topup_referred_type"] = "TopupBalance" if "topupbalance_balance_topup_referred_type" in row else row.get("topupbalance_balance_topup_referred_type")
-                        elif previous_topup_id is None:
-                            # The first transaction has no real parent/related top-up. Clear all
-                            # flattened RelatedTopupBalance leaves so no orphaned metadata remains.
-                            for ref_name in (
-                                "topupbalance_balance_topup_id",
-                                "topupbalance_balance_topup_href",
-                                "topupbalance_balance_topup_name",
-                                "topupbalance_balance_topup_role",
-                                "topupbalance_balance_topup_referred_type",
-                            ):
-                                if ref_name in row:
-                                    row[ref_name] = None
-
-                    # Run the full validator once per successful attempt. This replaces the
-                    # previous strict-validation pass plus a second batch validation pass.
+                    # Apply scenario semantics before strict validation. Validation remains fail-closed.
                     repaired, issues = _validate_record(
                         row,
                         variables,
@@ -2036,9 +2112,9 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                 except Exception as exc:
                     last_exc = exc
             if last_exc is not None:
-                err={"user_index":user_index,"record_index":record_index,"error":str(last_exc),"record":dict(user_context),"attempts":5}
+                err={"user_index":user_index,"record_index":record_index,"error":str(last_exc),"record":dict(user_context),"attempts":GENERATION_MAX_ATTEMPTS_PER_RECORD}
                 if record_errors_out is not None: record_errors_out.append(err)
-                logger.warning("[DataGeneration] Unable to produce a valid transactional record user=%d record=%d after 5 attempts: %s",user_index,record_index,last_exc)
+                logger.warning("[DataGeneration] Unable to produce a valid transactional record user=%d record=%d after %d attempts: %s",user_index,record_index,GENERATION_MAX_ATTEMPTS_PER_RECORD,last_exc)
     return generated_records
 
 
@@ -2430,6 +2506,35 @@ def _enforce_authoritative_formulas(
     return rec, issues
 
 
+def _assert_authoritative_formulas(
+    rec: dict, variables: list[dict], rules: dict | None = None
+) -> None:
+    """Fail closed when a final record no longer satisfies a confirmed formula contract."""
+    variable_by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    for field, expr in _collect_formula_specs(variables, rules):
+        if field not in rec:
+            continue
+        field_def = variable_by_name.get(field) or {}
+        if _temporal_field_is_absent_by_scenario(field_def, rules) and rec.get(field) is None:
+            continue
+        if str(field_def.get("gen", "")).strip().lower() in {"derived_timestamp", "ts_offset"}:
+            if (field_def.get("params") or {}).get("delay_seconds") is not None:
+                continue
+        deps = _formula_dependencies(expr)
+        if any(rec.get(dep) is None for dep in deps):
+            continue
+        expected = _coerce_formula_result(_safe_formula(expr, rec), field_def)
+        if expected is None:
+            continue
+        actual = rec.get(field)
+        if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+            mismatch = not math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=0.01)
+        else:
+            mismatch = str(actual) != str(expected)
+        if mismatch:
+            raise ValueError(f"{field} violates confirmed formula '{expr}'")
+
+
 def _enforce_csv_contract(
     rec: dict, variables: list[dict], rules: dict | None = None, repair: bool = True
 ) -> tuple[dict, list[str]]:
@@ -2457,9 +2562,11 @@ def _enforce_csv_contract(
             constraint = _rule_constraint_for(name, rules)
             preferred = _coerce_rule_values(constraint.get("preferred_values"))
             selected = next((opt for opt in declared if any(_matches_declared_option(opt, p) for p in preferred)), None)
-            rec[name] = selected if selected is not None else declared[0]
+            if selected is None:
+                selected = _weighted_choice({"choices": declared, "weights": params.get("weights")}, rec)
+            rec[name] = selected
             value = rec[name]
-            issues.append(f"{name} restored to declared CSV value")
+            issues.append(f"{name} resampled from declared CSV values")
 
         precision_raw = params.get("precision")
         if precision_raw is not None and dtype in _NUMERIC_DTYPES and isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -2671,7 +2778,7 @@ def _lb_bound_number(var: dict, current: Any, *, floor: float | None = None, cei
         hi = lo
     value = _to_finite_float(current, None)
     if value is None or not math.isfinite(value):
-        value = lo if lo == hi else random.uniform(lo, hi)
+        value = lo if lo == hi else _rng().uniform(lo, hi)
     value = max(lo, min(hi, value))
     dtype = str(var.get("dtype") or "").lower()
     precision = int((params.get("precision", 2) or 2))
@@ -2903,7 +3010,7 @@ def _enforce_low_balance_topup_consistency(
         if balance >= threshold and threshold > 0:
             params = balance_var.get("params") or {}
             lo = _to_finite_float(params.get("min", params.get("lo")), 0.0) or 0.0
-            balance = round(max(lo, threshold * random.uniform(0.15, 0.85)), int(params.get("precision", 2) or 2))
+            balance = round(max(lo, threshold * _rng().uniform(0.15, 0.85)), int(params.get("precision", 2) or 2))
         _lb_set(rec, variables, balance_name, balance, issues, "remaining balance aligned with low-balance trigger threshold")
     else:
         balance = None
@@ -2943,12 +3050,12 @@ def _enforce_low_balance_topup_consistency(
                 request_name = name
                 break
     if request_dt is None:
-        request_dt = datetime.now(timezone.utc) - timedelta(hours=random.randint(1, 72), minutes=random.randint(0, 59))
+        request_dt = datetime.now(timezone.utc) - timedelta(hours=_rng().randint(1, 72), minutes=_rng().randint(0, 59))
 
     # Scenario-specific intervention may happen before the transaction request.
     trigger_field = _lb_first_name(variables, ("low_balance_trigger_timestamp",), "low", "balance", "trigger", "timestamp")
     if trigger_field and trigger_field in rec:
-        trigger_dt = request_dt - timedelta(minutes=random.randint(5, 120))
+        trigger_dt = request_dt - timedelta(minutes=_rng().randint(5, 120))
         _lb_set(rec, variables, trigger_field, _format_datetime_for_variable(trigger_dt, by_name[trigger_field]), issues, "low-balance trigger placed before recharge request")
 
     desired_status = "completed"
@@ -2964,7 +3071,7 @@ def _enforce_low_balance_topup_consistency(
     _lb_set_declared(rec, variables, execution_name, desired_status, issues, "top-up execution status aligned to TopupBalance status")
 
     success_state = desired_status in {"completed", "approved", "accepted", "success"}
-    confirmation_dt = request_dt + timedelta(minutes=random.randint(1, 60)) if success_state else None
+    confirmation_dt = request_dt + timedelta(minutes=_rng().randint(1, 60)) if success_state else None
 
     # Synchronize request/confirmation timestamps only inside the same canonical resource family.
     # Similar lifecycle words across sibling resources do not prove a shared event.
@@ -3034,7 +3141,7 @@ def _enforce_low_balance_topup_consistency(
     recurring_name = _lb_first_name(variables, ("topupbalance_recurring_period", "topupbalance_recurringperiod"), "recurring", "period")
     periods_name = _lb_first_name(variables, ("topupbalance_number_of_periods", "topupbalance_numberofperiods"), "number", "period")
     period_token = _normalize(rec.get(recurring_name)) if recurring_name else ""
-    default_plan_days = {"weekly": 7, "fortnightly": 14, "monthly": 30}.get(period_token, random.choice(plan_days_choices))
+    default_plan_days = {"weekly": 7, "fortnightly": 14, "monthly": 30}.get(period_token, _rng().choice(plan_days_choices))
     if plan_days_name and plan_days_name in rec:
         current_days = rec.get(plan_days_name)
         try:
@@ -3095,7 +3202,7 @@ def _enforce_low_balance_topup_consistency(
             canonical_amount = value
             break
     if canonical_amount is None:
-        canonical_amount = round(random.uniform(10.0, 1000.0), 2)
+        canonical_amount = round(_rng().uniform(10.0, 1000.0), 2)
     for name in amount_fields:
         var = by_name[name]
         value = _lb_bound_number(var, canonical_amount, floor=0.0, fallback=canonical_amount)
@@ -3122,7 +3229,7 @@ def _enforce_low_balance_topup_consistency(
     if auto_value:
         if recurring_name and recurring_name in rec:
             recurring_choices = _declared_param_options(by_name[recurring_name].get("params") or {})
-            recurring = next((c for c in recurring_choices if _normalize(c) in {"weekly", "fortnightly", "monthly"}), None) or (random.choice(recurring_choices) if recurring_choices else "monthly")
+            recurring = next((c for c in recurring_choices if _normalize(c) in {"weekly", "fortnightly", "monthly"}), None) or (_rng().choice(recurring_choices) if recurring_choices else "monthly")
             _lb_set(rec, variables, recurring_name, recurring, issues, "recurring period synchronized with enabled auto-top-up")
         if periods_name and periods_name in rec:
             pv = by_name[periods_name]
@@ -3130,7 +3237,7 @@ def _enforce_low_balance_topup_consistency(
             lo = max(1, int(_to_finite_float(pp.get("min", pp.get("lo")), 1) or 1))
             hi_raw = _to_finite_float(pp.get("max", pp.get("hi")), None)
             hi = max(lo, int(hi_raw if hi_raw is not None else max(lo, 12)))
-            _lb_set(rec, variables, periods_name, random.randint(lo, hi), issues, "auto-top-up period count made compatible with recurring behavior")
+            _lb_set(rec, variables, periods_name, _rng().randint(lo, hi), issues, "auto-top-up period count made compatible with recurring behavior")
     else:
         for name in (recurring_name, periods_name):
             if name and name in rec and by_name[name].get("nullable", True):
@@ -3186,7 +3293,7 @@ def _enforce_low_balance_topup_consistency(
     channel = next((str(rec[n]) for n in channel_names if rec.get(n)), None)
     channel_choices = ["APP", "WEB", "USSD", "SMS", "WHATSAPP", "IVR", "RETAIL"]
     if not channel or channel not in channel_choices:
-        channel = random.choice(channel_choices)
+        channel = _rng().choice(channel_choices)
     for name in channel_names:
         if name in rec:
             _lb_set(rec, variables, name, channel, issues, f"{name} synchronized to one recharge channel")
@@ -3195,7 +3302,7 @@ def _enforce_low_balance_topup_consistency(
     payment = next((str(rec[n]) for n in payment_names if rec.get(n)), None)
     payment_choices = ["UPI", "CREDIT_CARD", "DEBIT_CARD", "WALLET", "CASH", "AUTO_DEBIT"]
     if not payment or payment not in payment_choices:
-        payment = random.choice(payment_choices)
+        payment = _rng().choice(payment_choices)
     for name in payment_names:
         if name in rec:
             _lb_set(rec, variables, name, payment, issues, f"{name} synchronized to one recharge payment method")
@@ -3222,7 +3329,7 @@ def _enforce_low_balance_topup_consistency(
     if coherent_reason is None:
         preferred = ["LOW_BALANCE", "DATA_EXHAUSTED", "VALIDITY_EXPIRY", "CUSTOMER_REQUEST"]
         candidates = reason_choices or trigger_choices or preferred
-        coherent_reason = random.choice(candidates)
+        coherent_reason = _rng().choice(candidates)
     if reason_name and reason_name in rec:
         _lb_set_declared(rec, variables, reason_name, coherent_reason, issues, "TopupBalance reason synchronized to the recharge trigger")
     if trigger_reason_name and trigger_reason_name in rec:
@@ -3301,7 +3408,7 @@ def _enforce_low_balance_topup_consistency(
 
     # Deterministic reference ids/hrefs must describe the same underlying objects as the names/types.
     subscriber_suffix = re.search(r"([0-9]+)$", str(rec.get("subscriber_id") or ""))
-    suffix_value = subscriber_suffix.group(1) if subscriber_suffix else str(random.randint(1000000000, 9999999999))
+    suffix_value = subscriber_suffix.group(1) if subscriber_suffix else str(_rng().randint(1000000000, 9999999999))
     if "topupbalance_channel_id" in rec:
         channel_id = f"CHANNEL-{str(channel or 'APP')}-{suffix_value}"
         _lb_set(rec, variables, "topupbalance_channel_id", channel_id, issues, "channel id linked to channel value")
@@ -4032,8 +4139,15 @@ def _validate_record(
         declared_options = _declared_param_options(params)
         if declared_options and rec.get(name) is not None:
             if not any(_matches_declared_option(rec.get(name), opt) for opt in declared_options):
-                rec[name] = declared_options[0]
-                issues.append(f"{name} corrected to declared schema params")
+                preferred = _coerce_rule_values(_rule_constraint_for(name, rules).get("preferred_values"))
+                selected = next(
+                    (opt for opt in declared_options if any(_matches_declared_option(opt, pref) for pref in preferred)),
+                    None,
+                )
+                if selected is None:
+                    selected = _weighted_choice({"choices": declared_options, "weights": params.get("weights")}, rec)
+                rec[name] = selected
+                issues.append(f"{name} resampled from declared schema values")
             else:
                 for opt in declared_options:
                     if _matches_declared_option(rec.get(name), opt):
@@ -4215,6 +4329,11 @@ def _validate_record(
     rec, final_formula_issues = _enforce_authoritative_formulas(rec, variables, rules=rules)
     issues.extend(final_formula_issues)
     rec = _format_datetime_fields(rec, variables)
+
+    # Serialization is part of the client-facing contract. Re-check temporal relations and formulas
+    # after the final format conversion so presentation cannot hide an invalid causal or arithmetic gap.
+    _assert_temporal_consistency(rec, variables, relations=temporal_relations)
+    _assert_authoritative_formulas(rec, variables, rules=rules)
     _strict_validate_record(rec, variables, rules=rules)
 
     allowed = set(field_order)
@@ -4276,20 +4395,30 @@ def run_deterministic_agentic_generation(
         )
     else:
         transactional_fixes = []
+        from config.runtime import GENERATION_MAX_ATTEMPTS_PER_RECORD
         aggregate_plan = _build_generation_plan(variables, rules=state.rules)
         for index in range(state.count):
-            try:
-                state.raw_records.append(_generate_record(variables, rules=state.rules, plan=aggregate_plan, apply_repairs=False))
-            except Exception as exc:
-                state.record_errors.append({"record_index": index, "error": str(exc), "record": {}})
+            last_exc: Exception | None = None
+            for _attempt in range(GENERATION_MAX_ATTEMPTS_PER_RECORD):
+                try:
+                    state.raw_records.append(_generate_record(variables, rules=state.rules, plan=aggregate_plan, apply_repairs=False))
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+            if last_exc is not None:
+                state.record_errors.append({"record_index": index, "error": str(last_exc), "record": {}})
 
     checked: list[dict] = []
     fixes = 0
+    clean_records = 0
     if type_of_data == "transactional":
         # _transactional_records now runs the complete validator exactly once for every
         # accepted row, including its final strict validation boundary. Re-validating the
         # same rows here only duplicated the most expensive work.
         checked = list(state.raw_records)
+        clean_records = sum(1 for fix_count in transactional_fixes if fix_count == 0)
+        fixes = sum(transactional_fixes)
     else:
         for record_index, record in enumerate(state.raw_records):
             try:
@@ -4302,17 +4431,32 @@ def run_deterministic_agentic_generation(
                 )
                 checked.append(repaired)
                 fixes += len(issues)
+                if not issues:
+                    clean_records += 1
             except Exception as exc:
                 state.record_errors.append({"record_index": record_index, "error": str(exc), "record": dict(record)})
 
     state.final_records = checked
+    expected_records = state.count * state.records_per_user if type_of_data == "transactional" else state.count
+    valid_rate = (len(checked) / expected_records) if expected_records else 1.0
+    clean_rate = (clean_records / len(checked)) if checked else 0.0
+    repaired_record_count = max(0, len(checked) - clean_records)
+    repaired_record_rate = (repaired_record_count / len(checked)) if checked else 0.0
     state.validation_report = {
+        "requested_records": expected_records,
         "total_input": len(state.raw_records),
         "total_valid": len(checked),
         "total_dropped": len(state.record_errors),
         "record_errors": len(state.record_errors),
+        "valid_record_rate": round(valid_rate * 100.0, 3),
+        "clean_record_rate": round(clean_rate * 100.0, 3),
+        "repaired_record_rate": round(repaired_record_rate * 100.0, 3),
+        "target_valid_record_rate": 100.0,
+        "target_clean_record_rate": 95.0,
+        "quality_target_met": valid_rate >= 1.0 and clean_rate >= 0.95,
+        "contract_pass_rate": 100.0 if checked else 0.0,
         "recovered": 0,
-        "algo_fixes": fixes + sum(transactional_fixes),
+        "algo_fixes": fixes,
         "llm_fixes": 0,
         "llm_issues": 0,
         "deterministic_checks": [

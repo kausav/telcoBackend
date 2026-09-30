@@ -198,6 +198,7 @@ class GenerateRequest(BaseModel):
     draftId: str | None = Field(None, description="Confirmed draft id associated with the active confirmed scenario definition")
     count: int = Field(35, ge=1, le=5000, description="Number of users/entities to generate for a transactional scenario")
     recordsPerUser: int = Field(10, ge=1, le=10, description="Number of most-recent historical records returned per user for a transactional scenario")
+    seed: int | None = Field(None, ge=0, le=2_147_483_647, description="Optional deterministic generation seed for reproducible synthetic-data runs")
 
 
 class GenerateResponse(BaseModel):
@@ -907,6 +908,7 @@ async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
             "draftId": req.draftId,
             "count": req.count,
             "recordsPerUser": req.recordsPerUser,
+            "seed": req.seed,
         })
         # build_generation_response performs the domain-level generation and QA checks.
         # Returning the plain payload lets FastAPI apply the declared GenerateResponse contract

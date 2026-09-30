@@ -537,6 +537,8 @@ class SchemaCompiler:
                 return "ipv4_string", "string", string_params
             if fmt == "ipv6":
                 return "ipv6_string", "string", string_params
+            if string_params.get("pattern"):
+                return "pattern_string", "string", string_params
             return "semantic_string", "string", string_params
 
         # Some official Swagger string definitions encode a constrained vocabulary only
@@ -656,15 +658,12 @@ class SchemaCompiler:
         max_variables: int | None = None,
         include_all_registry_scalars: bool = True,
         include_all_json_source_scalars: bool = False,
-        include_application_telecom_anchors: bool = True,
         excluded_field_names: list[str] | None = None,
         business_scenario: str | None = None,
         context_text: str | None = None,
         candidate_variables_override: list[dict[str, object]] | None = None,
     ) -> list[GeneratedSchemaField]:
         normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
-        normalized_industry = str(intent.industry_type or "generic").strip().lower()
-        telecom_context = normalized_industry in {"telecom", "telecommunications", "telecommunication"}
         excluded_keys = {
             self._normalize_variable_key(name)
             for name in (excluded_field_names or [])
@@ -717,22 +716,6 @@ class SchemaCompiler:
                 "depends_on": [],
             }, force_name=entity_key)
 
-        # Subscriber is the canonical telecom subscriber identity for proposal generation.
-        # A separate customer_id is redundant in the flat scenario contract unless the caller
-        # explicitly requested customer_id as the transactional entity key. Suppress it before
-        # quality scoring so it cannot consume the variable budget or be reintroduced by
-        # standards expansion.
-        has_subscriber_anchor = any(
-            self._normalize_variable_key(str(item.get("name") or "")) == "subscriber_id"
-            for item in ideas
-        )
-        explicit_customer_entity_key = self._normalize_variable_name(entity_key or "") == "customer_id"
-        if telecom_context and has_subscriber_anchor and not explicit_customer_entity_key:
-            ideas = [
-                item for item in ideas
-                if self._normalize_variable_key(str(item.get("name") or "")) != "customer_id"
-            ]
-
         # For JSON-source compilation, candidate_variables_override has already passed through the
         # deterministic source relevance selector. Running a second quality-based pruning stage would
         # narrow the authoritative source-backed selection and could discard valid fields after the
@@ -771,14 +754,6 @@ class SchemaCompiler:
                 entity_key=entity_key,
             )
 
-        # Defensive post-selection guard for the same redundancy rule. This prevents any
-        # future quality-engine dependency closure change from reintroducing customer_id into
-        # a subscriber-anchored telecom proposal.
-        if telecom_context and has_subscriber_anchor and not explicit_customer_entity_key:
-            ideas = [
-                item for item in ideas
-                if self._normalize_variable_key(str(item.get("name") or "")) != "customer_id"
-            ]
         dependency_aliases = quality_report.get("dependency_aliases", {})
         if dependency_aliases:
             for idea in ideas:
@@ -968,26 +943,24 @@ class SchemaCompiler:
         for external in external_variable_definitions or []:
             if isinstance(external, dict):
                 external_semantic_aliases.update(semantic_exclusion_aliases(external))
-        selected_rows, selection_report = select_json_source_catalog(
-            catalog_rows,
-            business_context=business_context,
-            preferred_names=preferred_names,
-            preferred_models={str(value) for value in (intent.requested_entities or []) if str(value).strip()},
-            excluded_names=excluded,
-            excluded_semantic_keys=external_semantic_aliases,
-            max_fields=variable_budget,
-        )
-        selected_names = {normalize_lookup_key(row.get("name")) for row in selected_rows}
         external_keys = {
             normalize_lookup_key(name)
             for name in (external_variable_names or set())
             if normalize_lookup_key(name)
         }
 
-        all_identity_names = [
+        # Resolve the entity anchor before source selection so the quality policy can force it even
+        # when its field would otherwise score below the analytical quality floor.
+        role_identity_names = [
             normalize_lookup_key(row.get("name"))
             for row in catalog_rows
-            if normalize_lookup_key(row.get("name")) and self._normalize_variable_key(row.get("name"))
+            if normalize_lookup_key(row.get("name"))
+            and str(_catalog_role(row)).strip().lower() == "identity"
+        ]
+        all_identity_names = role_identity_names or [
+            normalize_lookup_key(row.get("name"))
+            for row in catalog_rows
+            if normalize_lookup_key(row.get("name"))
             and str(row.get("name") or "").lower().endswith(("_id", "_key"))
         ]
         resolved_entity_key = None
@@ -1000,12 +973,32 @@ class SchemaCompiler:
                     )
                 resolved_entity_key = entity_key.strip()
             else:
-                chosen_key = next((name for name in all_identity_names if name in selected_names), None) or (all_identity_names[0] if all_identity_names else None)
+                chosen_key = all_identity_names[0] if all_identity_names else None
                 if chosen_key:
                     resolved_entity_key = next(
                         (str(row.get("name")) for row in catalog_rows if normalize_lookup_key(row.get("name")) == chosen_key),
                         chosen_key,
                     )
+        if resolved_entity_key:
+            preferred_names.add(normalize_lookup_key(resolved_entity_key))
+
+        # Source relevance is intentionally recall-oriented. Give the quality policy a larger
+        # candidate pool, then let deterministic scoring keep the best source-backed concepts up to
+        # the requested budget. This preserves the variable ceiling while preferring useful fields
+        # over filling the budget with low-information metadata.
+        candidate_pool_budget = min(
+            len(catalog_rows),
+            max(variable_budget, variable_budget * 3, variable_budget + 50),
+        ) if variable_budget else 0
+        selected_rows, source_selection_report = select_json_source_catalog(
+            catalog_rows,
+            business_context=business_context,
+            preferred_names=preferred_names,
+            preferred_models={str(value) for value in (intent.requested_entities or []) if str(value).strip()},
+            excluded_names=excluded,
+            excluded_semantic_keys=external_semantic_aliases,
+            max_fields=candidate_pool_budget,
+        )
 
         selected_source_ideas: list[dict[str, object]] = []
         for spec in selected_rows:
@@ -1038,7 +1031,45 @@ class SchemaCompiler:
                 "_source_model": f"{spec.get('source_id','')}__{spec.get('model','')}",
                 "_source_required": bool(spec.get("required")),
                 "_source_nullable": not bool(spec.get("required")),
+                "_force_include": bool(spec.get("required")) or (
+                    normalized_type == "transactional"
+                    and resolved_entity_key
+                    and self._normalize_variable_key(str(spec.get("name") or "")) == self._normalize_variable_key(resolved_entity_key)
+                ),
             })
+
+        quality_engine = VariableQualityEngine(
+            max_variables=variable_budget,
+            min_score=SCHEMA_MIN_VARIABLE_SCORE,
+        )
+        quality_context = business_context or " ".join(
+            str(value or "") for value in (
+                intent.industry_type, intent.domain, intent.subdomain, intent.scenario_type,
+                intent.type_of_data, intent.use_case, intent.entity_key, business_scenario or "",
+            )
+        )
+        selected_source_ideas, quality_report = quality_engine.select(
+            selected_source_ideas,
+            context_text=quality_context,
+            entity_key=resolved_entity_key,
+        )
+        selected_rows = [
+            dict(idea.get("_json_source_spec") or {})
+            for idea in selected_source_ideas
+            if isinstance(idea.get("_json_source_spec"), dict)
+        ]
+        selected_names = {normalize_lookup_key(row.get("name")) for row in selected_rows}
+        selection_report = {
+            **source_selection_report,
+            "source_relevance_selected_count": source_selection_report.get("selected_count", 0),
+            "source_relevance_candidate_count": source_selection_report.get("candidate_count", 0),
+            "selected_count": len(selected_rows),
+            "quality_candidate_count": quality_report.get("candidate_count", len(selected_source_ideas)),
+            "quality_selected_count": quality_report.get("selected_count", len(selected_rows)),
+            "quality_duplicates_removed": quality_report.get("semantic_duplicates_removed", 0),
+            "quality_low_score_removed": quality_report.get("low_quality_candidates_removed", 0),
+            "quality_truncated": quality_report.get("quality_budget_truncated", 0),
+        }
 
         working_intent = intent
         build_entity_key = (
@@ -1056,7 +1087,6 @@ class SchemaCompiler:
             max_variables=max(len(selected_source_ideas), variable_budget),
             include_all_registry_scalars=False,
             include_all_json_source_scalars=False,
-            include_application_telecom_anchors=False,
             excluded_field_names=excluded_field_names,
             business_scenario=business_scenario,
             context_text=business_context,
@@ -1107,7 +1137,7 @@ class SchemaCompiler:
         if resolved_entity_key:
             hard_constraints.append(f"'{resolved_entity_key}' is the authoritative entity key for transactional grouping.")
         warnings = [
-            f"Source catalog selection: {selection_report['selected_count']} of {selection_report['candidate_count']} scalar variables were selected deterministically for this request.",
+            f"Source catalog selection: {selection_report.get('selected_count', 0)} final source variables retained after relevance and quality filtering from {selection_report.get('source_relevance_candidate_count', selection_report.get('candidate_count', 0))} catalog candidates.",
             "Adding or replacing industry/domain standard JSONs changes the available source catalog without requiring code changes.",
         ]
         # Reuse source metadata already loaded into the catalog; this avoids an extra MongoDB query on an uncached proposal.

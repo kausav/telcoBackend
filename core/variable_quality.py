@@ -13,11 +13,11 @@ import math
 import re
 from typing import Any, Iterable
 
+from core.variable_semantics import normalize_variable_name
+
 
 def _norm(value: str) -> str:
-    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value or ""))
-    text = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_").lower()
-    return re.sub(r"_+", "_", text)
+    return normalize_variable_name(value)
 
 
 def _tokens(value: str) -> set[str]:
@@ -52,29 +52,8 @@ class VariableQualityEngine:
     }
 
     # Cross-model synonyms that frequently produce duplicate columns after flattening.
-    SYNONYMS = {
-        "identifier": "id",
-        "key": "id",
-        "lifecycle_state": "status",
-        "lifecycle_status": "status",
-        "state": "status",
-        "is_shared_flag": "shared",
-        "shared_flag": "shared",
-        "requested_date_time": "requested_timestamp",
-        "requested_datetime": "requested_timestamp",
-        "confirmation_date_time": "confirmation_timestamp",
-        "confirmation_datetime": "confirmation_timestamp",
-        "valid_for_start_date_time": "valid_from",
-        "valid_for_end_date_time": "valid_to",
-    }
-
     # Generic technical prefixes introduced by flattened API paths. They should not force two
     # fields to be considered different concepts when the business concept is identical.
-    ENTITY_PREFIXES = {
-        "bucket", "topupbalance", "topup_balance", "customer", "subscriber",
-        "account", "party", "payment", "channel",
-    }
-
     ENTITY_CONTEXT_ALIASES = {
         "topupbalance": {"topup", "top_up", "balance", "recharge"},
         "topup_balance": {"topup", "top_up", "balance", "recharge"},
@@ -120,49 +99,24 @@ class VariableQualityEngine:
     def semantic_key(cls, idea: dict[str, Any]) -> str:
         """Return a conservative business-concept key used to collapse true semantic aliases.
 
-        The entity/object path is intentionally preserved. For example, ``bucket_id`` and
-        ``topupbalance_channel_id`` are different concepts even though both end in ``_id``.
-        Only well-known aliases in the same object path are normalized.
+        Source-backed ideas prefer the authoritative source ``semantic_key`` first, then its path.
+        Names are normalized with only structural aliases and adjacent-token collapse; generic leaf
+        aliases such as ``id`` or ``status`` are never used, so unrelated entities remain distinct.
         """
         raw = _norm(str(idea.get("name") or "field"))
         source_spec = idea.get("_json_source_spec")
         if isinstance(source_spec, dict):
-            source_path = _norm(str(source_spec.get("path") or source_spec.get("name") or ""))
-            if source_path:
-                raw = source_path
+            source_semantic = source_spec.get("semantic_key") or source_spec.get("source_semantic_key")
+            source_path = source_spec.get("path") or source_spec.get("name")
+            raw = _norm(str(source_semantic or source_path or raw))
 
-        replacements = (
-            ("_lifecycle_state", "_status"),
-            ("_lifecycle_status", "_status"),
-            ("_is_shared_flag", "_is_shared"),
-            ("_shared_flag", "_shared"),
-            ("_requested_date_time", "_requested_timestamp"),
-            ("_requested_datetime", "_requested_timestamp"),
-            ("_confirmation_date_time", "_confirmation_timestamp"),
-            ("_confirmation_datetime", "_confirmation_timestamp"),
-            ("_valid_for_start_date_time", "_valid_from"),
-            ("_valid_for_end_date_time", "_valid_to"),
-            ("_identifier", "_id"),
-        )
-        for old, new in replacements:
-            if raw.endswith(old):
-                raw = raw[: -len(old)] + new
-                break
-
-        # A small set of exact application identity fields remain independent even when they
-        # share common suffixes such as ``_id``.
-        identity_name = _norm(str(idea.get("name") or ""))
-        if identity_name in {"subscriber_id", "account_id", "customer_id", "msisdn", "user_id", "entity_id"}:
-            return identity_name
-
-        return raw
+        return raw or "field"
 
     @classmethod
     def _is_forced(cls, idea: dict[str, Any], entity_key: str | None) -> bool:
         name = _norm(str(idea.get("name") or ""))
         return bool(
             name == _norm(entity_key or "")
-            or name in {"subscriber_id", "account_id", "msisdn"}
             or bool(idea.get("_force_include"))
         )
 

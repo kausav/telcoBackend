@@ -22,6 +22,7 @@ class ScenarioUserVariableModel:
     def upsert_many(cls, user_id: str, requested_scenario_id: str, scenario_version: int,
                     variables: list[dict[str, Any]], state: str = "SELECTED") -> int:
         from core.agentic_models import GeneratedSchemaField
+        from core.variable_semantics import variable_semantic_identities
         requested = str(requested_scenario_id or "").strip()
         if not requested:
             raise ValueError("requested_scenario_id is required")
@@ -31,11 +32,37 @@ class ScenarioUserVariableModel:
             raise ValueError(f"Unsupported user variable state: {state}")
         now = time.time()
         count = 0
+        incoming_by_alias: dict[str, str] = {}
+        normalized_variables: list[dict[str, Any]] = []
         for variable in variables:
             normalized = GeneratedSchemaField.model_validate(variable).model_dump()
             key = str(normalized.get("name") or "").strip()
             if not key:
                 continue
+            aliases = variable_semantic_identities(normalized)
+            conflicts = sorted({incoming_by_alias[alias] for alias in aliases if alias in incoming_by_alias and incoming_by_alias[alias].casefold() != key.casefold()})
+            if conflicts:
+                raise ValueError(
+                    f"User variables '{key}' semantically duplicate existing selection(s): "
+                    + ", ".join(conflicts)
+                )
+            for alias in aliases:
+                incoming_by_alias[alias] = key
+            normalized_variables.append(normalized)
+
+        selected_keys = {str(item.get("name") or "").strip() for item in normalized_variables if str(item.get("name") or "").strip()}
+        if selected_keys:
+            cls.collection.update_many(
+                {
+                    "user_id": user_id, "requested_scenario_id": requested, "scenario_version": int(scenario_version),
+                    "selection_state": {"$in": ["SELECTED", "OVERRIDDEN"]}, "is_active": True,
+                    "variable_key": {"$nin": sorted(selected_keys)},
+                },
+                {"$set": {"selection_state": "DESELECTED", "is_active": False, "updated_at": now, "updated_by": user_id}},
+            )
+
+        for normalized in normalized_variables:
+            key = str(normalized.get("name") or "").strip()
             cls.collection.update_one(
                 {"user_id": user_id, "requested_scenario_id": requested, "scenario_version": int(scenario_version), "variable_key": key},
                 {"$set": {
