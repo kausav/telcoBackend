@@ -99,7 +99,7 @@ def _repair_legacy_categorical(var: dict[str, Any], norm_name: str) -> None:
             var["dtype"] = "categorical"
 
 
-def _repair_legacy_variables(variables: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _repair_legacy_variables(variables: list[dict[str, Any]], *, allow_legacy_telecom_vocab: bool = False) -> list[dict[str, Any]]:
     """Repair legacy confirmed variables so generation cannot replay placeholder artifacts."""
     repaired: list[dict[str, Any]] = []
     names = {
@@ -121,6 +121,8 @@ def _repair_legacy_variables(variables: list[dict[str, Any]]) -> list[dict[str, 
         dtype = str(var.get("dtype") or "").strip().lower()
         gen = str(var.get("gen") or "").strip().lower()
         params = dict(var.get("params") or {})
+        if allow_legacy_telecom_vocab:
+            params.setdefault("allow_legacy_telecom_vocab", True)
 
         # One canonical subscriber phone identifier: msisdn.
         if has_msisdn and norm_name in {"phonenumber", "mobilenumber", "telephonenumber"}:
@@ -141,6 +143,9 @@ def _repair_legacy_variables(variables: list[dict[str, Any]]) -> list[dict[str, 
         dtype = str(var.get("dtype") or dtype).strip().lower()
         gen = str(var.get("gen") or gen).strip().lower()
         params = dict(var.get("params") or {})
+        if allow_legacy_telecom_vocab:
+            params.setdefault("allow_legacy_telecom_vocab", True)
+        var["params"] = params
 
         # Mandatory telecom identity anchors are application-level contracts and must never
         # be downgraded to a generic generator during legacy migration.
@@ -265,7 +270,11 @@ def resolve_variables(requested_scenario_id: str) -> tuple[list[dict[str, Any]],
         ):
             variables = raw_variables
         else:
-            variables = _repair_legacy_variables(raw_variables)
+            normalized_industry = re.sub(r"[^a-z0-9]+", "", str(industry or "").lower())
+            variables = _repair_legacy_variables(
+                raw_variables,
+                allow_legacy_telecom_vocab=normalized_industry in {"telecom", "telecommunications", "telecommunication"},
+            )
         allowed = {str(v.get("name")) for v in variables if isinstance(v, dict) and v.get("name")}
         candidate_order = (
             [str(v.get("name")) for v in recommended_fallback if str(v.get("name") or "").strip()]
@@ -309,6 +318,7 @@ def resolve_scenario_context(requested_scenario_id: str) -> dict[str, Any]:
         },
         "db_variable_names": sorted(set(meta.get("db_variable_names") or []) | set((meta.get("db_variable_definitions") or {}).keys())),
         "db_variable_definitions": dict(meta.get("db_variable_definitions") or {}),
+        "behavioral_rules": list(meta.get("behavioral_rules") or []),
     }
 
 

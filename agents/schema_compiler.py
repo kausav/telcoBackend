@@ -161,9 +161,21 @@ class SchemaCompiler:
 
         return forms
 
+
     @classmethod
-    def _source_readable_names(cls, fields: list[GeneratedSchemaField]) -> dict[str, str]:
-        """Assign compact, meaningful, collision-safe names derived from the source semantic path."""
+    def _source_readable_names(
+        cls,
+        fields: list[GeneratedSchemaField],
+        all_source_specs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, str]:
+        """Assign stable source-derived runtime names independent of the selected field subset.
+
+        The old allocator chose a compact candidate by looking only at the currently selected
+        fields. That made an already-approved source variable change names when a later proposal
+        selected a second field with a similar leaf name. Runtime names now come from the immutable
+        source semantic path; a stable hash is used only when that readable base is ambiguous or
+        too long. This keeps MongoDB source identity and downloaded CSV/JSON column names stable.
+        """
         source_fields = [
             field for field in fields
             if str((field.provenance or {}).get("generated_from") or "").strip().lower() == "mongodb_json_source"
@@ -171,83 +183,89 @@ class SchemaCompiler:
         if not source_fields:
             return {}
 
-        paths: dict[str, list[str]] = {}
-        options: dict[str, list[str]] = {}
-        original_names: dict[str, str] = {}
-        for field in source_fields:
-            key = cls._normalize_variable_key(field.name)
-            paths[key] = cls._source_semantic_segments(field)
-            original_names[key] = field.name
-            # Existing runtime names that already fit the contract are preserved exactly.
-            # We only synthesize a shorter source-path name when the current name is too long.
-            if len(field.name) <= cls.SOURCE_RUNTIME_NAME_MAX_LENGTH:
-                options[key] = [field.name]
-            else:
-                options[key] = cls._source_candidate_forms(paths[key])
+        def candidate_from_segments(segments: list[str]) -> str:
+            tokens = cls._source_candidate_tokens(segments)
+            if not tokens:
+                return "scenario_attribute"
+            # Prefer the richest whole-word source context that still fits the public runtime name.
+            for size in range(min(len(tokens), 6), 0, -1):
+                candidate = cls._normalize_variable_key("_".join(tokens[-size:]))
+                if candidate and len(candidate) <= cls.SOURCE_RUNTIME_NAME_MAX_LENGTH:
+                    return candidate
+            digest = hashlib.sha1(".".join(segments).encode("utf-8")).hexdigest()[:6]
+            budget = max(8, cls.SOURCE_RUNTIME_NAME_MAX_LENGTH - len(digest) - 1)
+            base = cls._normalize_variable_key("_".join(tokens[-4:])) or "scenario_attribute"
+            return f"{base[:budget]}_{digest}"[: cls.SOURCE_RUNTIME_NAME_MAX_LENGTH]
+
+        # Build a stable ambiguity map from the complete active source catalog when available.
+        # This is the critical part: collision decisions must not depend on the subset selected by
+        # one particular scenario proposal.
+        catalog_candidates: dict[str, set[str]] = {}
+        for spec in all_source_specs or []:
+            if not isinstance(spec, dict):
+                continue
+            semantic_key = str(spec.get("semantic_key") or "").strip()
+            if not semantic_key:
+                continue
+            segments = [
+                cls._normalize_variable_key(part)
+                for part in semantic_key.split(".")
+                if cls._normalize_variable_key(part)
+            ]
+            base = candidate_from_segments(segments)
+            catalog_candidates.setdefault(cls._normalize_variable_key(base), set()).add(semantic_key.casefold())
 
         occupied = {
             cls._normalize_variable_key(field.name)
             for field in fields
             if str((field.provenance or {}).get("generated_from") or "").strip().lower() != "mongodb_json_source"
         }
-        assigned: dict[str, str] = {}
-        used = set(occupied)
+        replacements: dict[str, str] = {}
+        used: set[str] = set(occupied)
+        source_seen: dict[str, str] = {}
 
-        # Preserve existing short names first. Long names are compacted only when necessary, and
-        # their candidates are allocated from the most constrained fields outward.
-        short_names = sorted(
-            (key for key in options if len(original_names[key]) <= cls.SOURCE_RUNTIME_NAME_MAX_LENGTH),
-            key=lambda key: (len(original_names[key]), key),
-        )
-        for key in short_names:
-            original = original_names[key]
-            normalized_original = cls._normalize_variable_key(original)
-            if normalized_original not in used:
-                assigned[key] = original
-                used.add(normalized_original)
-            else:
-                # This should be rare because exact-name duplicates are normally resolved earlier.
-                # Leave it for the contextual candidate pass rather than silently changing an
-                # existing runtime name here.
-                options[key] = cls._source_candidate_forms(paths[key])
+        for field in sorted(source_fields, key=lambda item: str((item.provenance or {}).get("source_json_semantic_key") or item.name)):
+            key = cls._normalize_variable_key(field.name)
+            provenance = field.provenance or {}
+            semantic_key = str(provenance.get("source_json_semantic_key") or field.name).strip()
+            segments = [
+                cls._normalize_variable_key(part)
+                for part in semantic_key.split(".")
+                if cls._normalize_variable_key(part)
+            ] or [key]
+            base = candidate_from_segments(segments)
+            normalized_base = cls._normalize_variable_key(base)
+            ambiguous = len(catalog_candidates.get(normalized_base, {semantic_key.casefold()})) > 1
+            candidate = base
+            if ambiguous or normalized_base in occupied:
+                digest = hashlib.sha1(semantic_key.casefold().encode("utf-8")).hexdigest()[:6]
+                budget = cls.SOURCE_RUNTIME_NAME_MAX_LENGTH - len(digest) - 1
+                candidate = f"{base[:max(1, budget)].rstrip('_')}_{digest}"
+            candidate_key = cls._normalize_variable_key(candidate)
 
-        pending = sorted(
-            (key for key in options if key not in assigned),
-            key=lambda key: (len(options[key]) if options[key] else 999, len(options[key][0]) if options[key] else 999, key),
-        )
-        unresolved: list[str] = []
-        for key in pending:
-            chosen = next((candidate for candidate in options[key] if candidate not in used), None)
-            if chosen:
-                assigned[key] = chosen
-                used.add(chosen)
-            else:
-                unresolved.append(key)
+            # Same semantic key should always resolve to the same runtime name. Distinct concepts
+            # must remain distinct even when their readable bases collide.
+            previous = source_seen.get(semantic_key.casefold())
+            if previous:
+                replacements[key] = previous
+                continue
+            if candidate_key in used:
+                digest = hashlib.sha1(semantic_key.casefold().encode("utf-8")).hexdigest()[:6]
+                budget = cls.SOURCE_RUNTIME_NAME_MAX_LENGTH - len(digest) - 1
+                candidate = f"{base[:max(1, budget)].rstrip('_')}_{digest}"
+                candidate_key = cls._normalize_variable_key(candidate)
+            source_seen[semantic_key.casefold()] = candidate
+            replacements[key] = candidate
+            used.add(candidate_key)
 
-        # Extremely rare collision fallback. It never changes source words or truncates characters;
-        # a short stable suffix disambiguates two paths whose readable context is otherwise identical.
-        for key in unresolved:
-            tokens = cls._source_candidate_tokens(paths[key])
-            base_tokens = tokens[-4:] if len(tokens) >= 4 else tokens
-            base = cls._normalize_variable_key("_".join(base_tokens)) or "scenario_attribute"
-            digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:6]
-            budget = cls.SOURCE_RUNTIME_NAME_MAX_LENGTH - len(digest) - 1
-            parts = base.split("_")
-            while parts and len("_".join(parts)) > budget:
-                parts.pop(0)
-            base = "_".join(parts) or "scenario_attribute"
-            candidate = f"{base}_{digest}"
-            assigned[key] = candidate
-            used.add(candidate)
-
-        return assigned
+        return replacements
 
     @classmethod
-    def _compact_source_field_names(cls, fields: list[GeneratedSchemaField]) -> list[GeneratedSchemaField]:
+    def _compact_source_field_names(cls, fields: list[GeneratedSchemaField], all_source_specs: list[dict[str, Any]] | None = None) -> list[GeneratedSchemaField]:
         """Apply compact source-derived names while retaining the full original JSON identity."""
         if not fields:
             return fields
-        replacements = cls._source_readable_names(fields)
+        replacements = cls._source_readable_names(fields, all_source_specs=all_source_specs)
         if not replacements:
             return fields
 
@@ -524,6 +542,19 @@ class SchemaCompiler:
                 string_params["max_length"] = spec.get("maxLength")
             if spec.get("pattern") is not None:
                 string_params["pattern"] = spec.get("pattern")
+            source_examples = []
+            raw_examples = spec.get("examples")
+            if isinstance(raw_examples, (list, tuple)):
+                source_examples.extend(value for value in raw_examples if isinstance(value, str))
+            elif isinstance(raw_examples, str) and raw_examples.strip():
+                source_examples.append(raw_examples.strip())
+            if isinstance(spec.get("example"), str) and spec.get("example").strip():
+                source_examples.append(spec.get("example").strip())
+            if isinstance(spec.get("default"), str) and spec.get("default").strip():
+                source_examples.append(spec.get("default").strip())
+            source_examples = list(dict.fromkeys(source_examples))[:20]
+            if source_examples:
+                string_params["source_examples"] = source_examples
             # Every MongoDB-backed JSON string is source-contract-bound. There is no
             # filesystem/telecom fallback for an industry source field.
             string_params["source_contract"] = True
@@ -890,7 +921,7 @@ class SchemaCompiler:
                 provenance=provenance,
                 scope=grain,
             ))
-        return self._compact_source_field_names(fields)
+        return self._compact_source_field_names(fields, all_source_specs=catalog_rows)
 
     def _compile_json_source_grounded(
         self,

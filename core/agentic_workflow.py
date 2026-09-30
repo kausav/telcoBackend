@@ -6,6 +6,7 @@ HITL approval/edit action; scenario/generate executes only confirmed scenarios.
 from __future__ import annotations
 
 from typing import Any
+import ast
 import hashlib
 import json
 import logging
@@ -88,6 +89,71 @@ class AgenticSchemaWorkflow:
         }
         return tuple(sorted(names))
 
+    @staticmethod
+    def _canonicalize_behavioral_rules(
+        rules: list[dict[str, Any]] | None,
+        schema: ScenarioSchema,
+    ) -> list[dict[str, Any]]:
+        """Map proposal-time source names to final runtime names and fail closed on unknown fields."""
+        if not isinstance(rules, list):
+            return []
+        by_alias: dict[str, str] = {}
+        for field in schema.fields:
+            name = str(field.name or "").strip()
+            if not name:
+                continue
+            aliases = {name.casefold()}
+            provenance = field.provenance if isinstance(field.provenance, dict) else {}
+            for key in ("source_json_name", "source_json_original_name", "source_json_semantic_key"):
+                value = str(provenance.get(key) or "").strip()
+                if value:
+                    aliases.add(value.casefold())
+                    aliases.add(re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_"))
+            for alias in aliases:
+                by_alias[alias] = name
+
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for rule in rules[:30]:
+            if not isinstance(rule, dict):
+                continue
+            when = rule.get("when") if isinstance(rule.get("when"), dict) else {}
+            then = rule.get("then") if isinstance(rule.get("then"), dict) else {}
+            if not when or not then:
+                continue
+            canonical_when: dict[str, Any] = {}
+            canonical_then: dict[str, Any] = {}
+            valid = True
+            for raw_name, value in when.items():
+                lookup = str(raw_name or "").strip().casefold()
+                canonical = by_alias.get(lookup) or by_alias.get(re.sub(r"[^a-z0-9]+", "_", lookup).strip("_"))
+                if not canonical:
+                    valid = False
+                    break
+                canonical_when[canonical] = value
+            if not valid:
+                continue
+            for raw_name, value in then.items():
+                lookup = str(raw_name or "").strip().casefold()
+                canonical = by_alias.get(lookup) or by_alias.get(re.sub(r"[^a-z0-9]+", "_", lookup).strip("_"))
+                if not canonical:
+                    valid = False
+                    break
+                canonical_then[canonical] = value
+            if not valid:
+                continue
+            signature = json.dumps(
+                {"when": canonical_when, "then": canonical_then},
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            result.append({"when": canonical_when, "then": canonical_then})
+        return result
+
     @classmethod
     def _merge_db_variable_sources(
         cls,
@@ -165,7 +231,7 @@ class AgenticSchemaWorkflow:
             json.dumps(source_sources or source_manifest(req.industry_type, req.domain), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
         return (
-            "agentic_proposal_v33_complete_catalog_structural_dedupe",
+            "agentic_proposal_v34_stable_source_names_behavior_rules",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -276,6 +342,96 @@ class AgenticSchemaWorkflow:
                 len(output_removed),
                 ", ".join(sorted(output_removed)),
             )
+
+        # Resolve persisted cross-field references against the final compiled runtime names. A DB
+        # variable may legitimately refer to an official source field by its immutable source leaf
+        # name or semantic path; the downloaded contract, however, executes against the stable
+        # runtime name chosen by SchemaCompiler. Rewrite only the runtime field copy below -- the
+        # original MongoDB definition retained in ``raw_persisted_by_name`` remains untouched.
+        runtime_aliases: dict[str, str] = {}
+        for field in ordered:
+            canonical = str(field.name or "").strip()
+            if not canonical:
+                continue
+            provenance = field.provenance if isinstance(field.provenance, dict) else {}
+            aliases = {
+                canonical,
+                str(provenance.get("source_json_name") or "").strip(),
+                str(provenance.get("source_json_original_name") or "").strip(),
+                str(provenance.get("source_json_semantic_key") or "").strip(),
+                str(provenance.get("source_json_path") or "").strip(),
+            }
+            for alias in aliases:
+                normalized = re.sub(r"[^a-z0-9]+", "_", alias.casefold()).strip("_")
+                if normalized:
+                    runtime_aliases.setdefault(normalized, canonical)
+                    runtime_aliases.setdefault(alias.casefold(), canonical)
+
+        def resolve_runtime_name(value: Any) -> str | None:
+            raw = str(value or "").strip()
+            if not raw:
+                return None
+            normalized = re.sub(r"[^a-z0-9]+", "_", raw.casefold()).strip("_")
+            return runtime_aliases.get(normalized) or runtime_aliases.get(raw.casefold())
+
+        def rewrite_formula(expr: Any) -> str | None:
+            if not isinstance(expr, str) or not expr.strip():
+                return None if expr is None else str(expr)
+            result = expr
+            try:
+                tree = ast.parse(expr, mode="eval")
+                identifiers = sorted(
+                    {
+                        node.id
+                        for node in ast.walk(tree)
+                        if isinstance(node, ast.Name)
+                    },
+                    key=lambda item: (-len(item), item),
+                )
+            except SyntaxError:
+                identifiers = []
+            for identifier in identifiers:
+                replacement = resolve_runtime_name(identifier)
+                if replacement and replacement != identifier:
+                    result = re.sub(
+                        rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])",
+                        replacement,
+                        result,
+                    )
+            return result
+
+        final_names = {str(field.name or "").strip() for field in ordered if str(field.name or "").strip()}
+        allowed_formula_names = {"round", "min", "max", "abs", "sum", "DATE", "True", "False", "None"}
+        for field in ordered:
+            if field.depends_on:
+                resolved_dependencies: list[str] = []
+                for dependency in field.depends_on:
+                    resolved = resolve_runtime_name(dependency)
+                    if not resolved:
+                        raise ValueError(
+                            f"MongoDB variable '{field.name}' has unresolved dependency '{dependency}' in the confirmed schema"
+                        )
+                    if resolved not in resolved_dependencies:
+                        resolved_dependencies.append(resolved)
+                field.depends_on = resolved_dependencies
+
+            rewritten = rewrite_formula(field.formula)
+            if rewritten:
+                field.formula = rewritten
+                try:
+                    tree = ast.parse(rewritten, mode="eval")
+                    formula_dependencies = {
+                        node.id
+                        for node in ast.walk(tree)
+                        if isinstance(node, ast.Name) and node.id not in allowed_formula_names
+                    }
+                except SyntaxError as exc:
+                    raise ValueError(f"MongoDB variable '{field.name}' contains an invalid formula") from exc
+                unknown = sorted(name for name in formula_dependencies if name not in final_names)
+                if unknown:
+                    raise ValueError(
+                        f"MongoDB variable '{field.name}' formula references unknown field(s): {', '.join(unknown)}"
+                    )
 
         merged = schema.model_copy(update={"fields": ordered})
         return merged, source_by_name, raw_persisted_by_name
@@ -591,6 +747,10 @@ class AgenticSchemaWorkflow:
             entity_key=req.entity_key,
         )
 
+        behavioral_rules = self._canonicalize_behavioral_rules(
+            list(getattr(intent, "behavioral_rules", []) or []),
+            schema,
+        )
         unresolved_questions = self.compiler.approval_questions(intent, schema)
         variables, field_order = self._schema_to_variables(schema, raw_persisted_by_name)
         for variable in variables:
@@ -644,6 +804,7 @@ class AgenticSchemaWorkflow:
             "variable_source_ids": variable_source_ids,
             "db_variable_names": sorted(raw_persisted_by_name.keys()),
             "db_variable_definitions": raw_persisted_by_name,
+            "behavioral_rules": behavioral_rules,
         }
         save_draft(draft_id, draft)
         save_proposal(
@@ -658,6 +819,7 @@ class AgenticSchemaWorkflow:
                 "field_order": field_order,
                 "intent": intent.model_dump(),
                 "variable_sources": variable_sources,
+                "behavioral_rules": behavioral_rules,
             },
         )
         append_message(cid, "assistant", json.dumps({"intent": intent.model_dump(), "action": "schema_proposed"}, sort_keys=True), requested_scenario_id=requested_scenario_id)

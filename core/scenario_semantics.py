@@ -38,13 +38,16 @@ def classify_outcome_mode(
         "priority": "concurrent",
         "cross journey": "concurrent",
         "no clear priority": "concurrent",
-        "normal": "positive",
-        "standard": "positive",
+        # "Normal" means a representative population, not an all-success/happy-path journey.
+        # Treating it as positive caused deterministic guardrails to force acceptance/completion
+        # on every generated record, destroying behavioral distributions.
+        "normal": "mixed",
+        "standard": "mixed",
         "happy path": "positive",
         "success": "positive",
         "successful": "positive",
         "positive": "positive",
-        "nominal": "positive",
+        "nominal": "mixed",
     }
     if mode in exact:
         # Explicit outcome content can override ordinary "normal" wording, but not
@@ -268,9 +271,9 @@ def temporal_role(var: dict) -> str:
     text = f"{var.get('name', '')} {var.get('description', '')}".lower()
     if any(k in text for k in ("decision", "response", "reply", "decline", "acceptance")):
         return "response"
-    if any(k in text for k in ("completion", "completed", "finished", "settled", "processed", "fulfilled")):
+    if any(k in text for k in ("completion", "completed", "conversion", "converted", "finished", "settled", "processed", "fulfilled")):
         return "completion"
-    if any(k in text for k in ("presented", "displayed", "shown", "offered")):
+    if any(k in text for k in ("presented", "presentation", "impression", "displayed", "shown", "offered")):
         return "presentation"
     if any(k in text for k in ("sent", "dispatch", "dispatched", "notification")):
         return "dispatch"

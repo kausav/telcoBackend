@@ -52,3 +52,5 @@ SCHEMA_MAX_VARIABLES = int(os.getenv("SCHEMA_MAX_VARIABLES", "500"))
 SCHEMA_MIN_VARIABLE_SCORE = float(os.getenv("SCHEMA_MIN_VARIABLE_SCORE", "42"))
 
 GENERATION_MAX_ATTEMPTS_PER_RECORD = max(1, min(20, int(os.getenv("GENERATION_MAX_ATTEMPTS_PER_RECORD", "8"))))
+AGENTIC_REQUIRE_CLEAN_RECORDS = os.getenv("AGENTIC_REQUIRE_CLEAN_RECORDS", "true").strip().lower() in {"1", "true", "yes", "on"}
+AGENTIC_REQUIRE_EXACT_RECORD_COUNT = os.getenv("AGENTIC_REQUIRE_EXACT_RECORD_COUNT", "true").strip().lower() in {"1", "true", "yes", "on"}

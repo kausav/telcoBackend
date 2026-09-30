@@ -22,6 +22,7 @@ class ScenarioVariableModel:
                     variables: list[dict[str, Any]], actor_user_id: str | None = None) -> int:
         from core.agentic_models import GeneratedSchemaField
         from core.variable_semantics import variable_semantic_identities
+        from core.low_balance_variable_policy import validate_db_definition
         import time
         requested = str(requested_scenario_id or "").strip()
         if not requested:
@@ -33,6 +34,7 @@ class ScenarioVariableModel:
         normalized_variables: list[dict[str, Any]] = []
         for variable in variables:
             normalized = GeneratedSchemaField.model_validate(variable).model_dump()
+            validate_db_definition(normalized)
             key = str(normalized.get("name") or "").strip()
             if not key:
                 continue

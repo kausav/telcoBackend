@@ -34,6 +34,7 @@ from core.temporal_contract import (
     source_declared_max_delay_seconds,
     source_declared_min_delay_seconds,
 )
+from config.runtime import AGENTIC_REQUIRE_CLEAN_RECORDS, AGENTIC_REQUIRE_EXACT_RECORD_COUNT, GENERATION_MAX_ATTEMPTS_PER_RECORD
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +281,18 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         if len(parts) >= 2:
             return str(_rng().choice(parts))
 
+    # MongoDB source examples/defaults are the closest available value semantics for a free-form
+    # source field. Prefer them before the generic synthetic fallback; they are dynamic source data,
+    # not application/static vocabularies.
+    source_examples = p.get("source_examples")
+    if isinstance(source_examples, (list, tuple)):
+        usable_examples = [
+            str(value).strip() for value in source_examples
+            if value is not None and str(value).strip()
+        ]
+        if usable_examples:
+            return _fit_string_length(str(_rng().choice(usable_examples)), p)
+
     # Source-grounded free-form strings must not fall through into legacy telecom/domain
     # vocabularies. The authoritative source contract owns the value semantics. Pattern-backed
     # fields are handled by the dedicated pattern generator before this neutral fallback.
@@ -312,88 +325,91 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         prefix = re.sub(r"[^A-Z0-9]+", "_", n.upper()).strip("_") or "REF"
         return _prefixed_int({"prefix": f"{prefix}-", "digits": 10}, rec)
 
-    if "operating circle" in d or "regulatory service area" in d:
-        return _rng().choice([
-            "Delhi", "Haryana", "Punjab", "Rajasthan", "Uttar Pradesh East", "Uttar Pradesh West",
-            "Maharashtra", "Mumbai", "Gujarat", "Karnataka", "Tamil Nadu", "Kerala",
-            "Andhra Pradesh", "Telangana", "West Bengal", "Bihar", "Odisha", "Assam",
-            "North East", "Himachal Pradesh", "Jammu Kashmir", "Madhya Pradesh", "Kolkata",
-        ])
-    if "medium" in n and "contact" in d:
-        return _rng().choice(["email", "telephone", "postal_address"])
-    if "contact medium" in d:
-        return _rng().choice(["email", "telephone", "postal_address"])
-    if "type of contact" in d:
-        return _rng().choice(["mobile", "fixed_home", "fixed_office", "shipping_address"])
-    if "payment plan" in d or n == "plantype":
-        return _rng().choice(["prepaid", "postpaid", "hybrid"])
-    if "consumption counter" in d:
-        return _rng().choice(["used", "outOfBucket"])
-    if "currency" in d or "iso4217" in d:
-        return str(p.get("currency") or "INR").upper()
-    if "currency" in n:
-        return str(p.get("currency") or "INR").upper()
-    if "billing time period" in d or "repeat the application of the price" in d:
-        return _rng().choice(["week", "month", "quarter", "year"])
-    if "frequency of" in d or "frequency" == n:
-        return _rng().choice(["daily", "weekly", "monthly", "quarterly"])
-    if "price" in n and ("recurring" in d or "discount" in d or "allowance" in d or "penalty" in d):
-        return _rng().choice(["recurring", "discount", "allowance", "penalty"])
-    if "catalog" in n and "catalog" in d:
-        return _rng().choice(["product", "service", "resource"])
-    if "relationship" in n and ("relationship" in d or "migration" in d or "substitution" in d):
-        return _rng().choice(["override", "discount", "replace", "migrate"])
-    if n == "value_type" or ("kind of value" in d and "numeric" in d and "text" in d):
-        return _rng().choice(["numeric", "text"])
-    if n == "range_interval" or "inclusion or exclusion" in d:
-        return _rng().choice(["open", "closed", "closedBottom", "closedTop"])
-    if n == "adjust_type" or "recurringcharge" in d or "onetimecharge" in d:
-        return _rng().choice(["RecurringCharge", "OneTimeCharge"])
-    if "format of the exported data" in d or n == "content_type":
-        return _rng().choice(["application/json", "text/csv", "application/xml"])
-    if "attachment mime type" in d:
-        return _rng().choice(["application/pdf", "image/png", "video/mp4"])
-    if n == "attachment_type" or "attachment type" in d:
-        return _rng().choice(["document", "image", "video"])
-    if "type of notification" in d or "type of the notification" in d:
-        return _rng().choice(["LOW_BALANCE_ALERT", "RECHARGE_UPDATE", "PAYMENT_UPDATE", "SYSTEM_NOTIFICATION"])
-    if "network" in n and "capability" in n:
-        return _rng().choice(["2G", "3G", "4G", "5G"])
-    if "channel" in n:
-        return _rng().choice(["APP", "SMS", "WEB", "USSD", "WHATSAPP", "IVR", "RETAIL"])
-    if "payment" in n and ("method" in n or "instrument" in n):
-        return _rng().choice(["UPI", "CREDIT_CARD", "DEBIT_CARD", "WALLET", "CASH", "AUTO_DEBIT"])
-    if "reason" in n:
-        return _rng().choice(["LOW_BALANCE", "DATA_EXHAUSTED", "VALIDITY_EXPIRY", "CUSTOMER_REQUEST"])
-    if n in {"stateorprovince", "province", "state"} or n.endswith("_state_or_province"):
-        return _rng().choice(["Haryana", "Punjab", "Delhi", "Maharashtra", "Karnataka", "Tamil Nadu", "Gujarat"])
-    if n == "city" or n.endswith("_city"):
-        return _rng().choice(["Delhi", "Gurugram", "Ludhiana", "Chandigarh", "Mumbai", "Bengaluru", "Pune"])
-    if n in {"postcode", "postalcode", "postal_code", "postcode"}:
-        return str(_rng().randint(110001, 999999))
-    if "status reason" in d or n == "status_reason":
-        return _rng().choice(["CUSTOMER_REQUEST", "PAYMENT_FAILURE", "SYSTEM_ERROR", "POLICY_VIOLATION"])
-    if "status" in n or n.endswith("_state") or n in {"state"}:
-        return _rng().choice(["PENDING", "COMPLETED", "FAILED"])
-    if "offer" in n and any(token in d for token in ("incentive", "recommendation", "cash back", "validity booster")):
-        return _rng().choice(["EXTRA_DATA", "CASH_BACK", "VALIDITY_BOOSTER", "DISCOUNT_VOUCHER"])
-    if "segment" in n or "market segment" in d:
-        return _rng().choice(["ULTRA_LOW", "MASS", "MID_TIER", "HIGH_VALUE"])
-    if n in {"role", "partyroletype"} or n.endswith("_role"):
-        return _rng().choice(["subscriber", "customer", "agent", "system"])
-    if n == "name" or n.endswith("_name"):
-        return _rng().choice(["Recharge Plan", "Data Booster", "Talktime Pack", "Retention Offer"])
-    if n == "title" or n.endswith("_title"):
-        return _rng().choice(["Low Balance Alert", "Recharge Event", "Top-up Request"])
-    if n == "description" or n.endswith("_description"):
-        return _rng().choice(["Recharge operation", "Balance adjustment", "Retention intervention"])
-    if n in {"type", "basetype", "referredtype"} or n.endswith("_type"):
-        return _rng().choice(["PrepayBalance", "BalanceTopup", "ProductOffering", "Subscriber"])
-    if "code" in n:
-        return f"CODE-{_rng().randint(100000, 999999)}"
-    if "country" in n:
-        return str(p.get("country") or "IN").upper()
-
+    # Industry-specific fallback vocabulary is legacy-only. Agentic JSON/DB contracts should
+    # carry their own enum/choices/examples so the same confirmed variable cannot silently become
+    # telecom data when reused by another industry.
+    if p.get("allow_legacy_telecom_vocab") is True:
+        if "operating circle" in d or "regulatory service area" in d:
+            return _rng().choice([
+                "Delhi", "Haryana", "Punjab", "Rajasthan", "Uttar Pradesh East", "Uttar Pradesh West",
+                "Maharashtra", "Mumbai", "Gujarat", "Karnataka", "Tamil Nadu", "Kerala",
+                "Andhra Pradesh", "Telangana", "West Bengal", "Bihar", "Odisha", "Assam",
+                "North East", "Himachal Pradesh", "Jammu Kashmir", "Madhya Pradesh", "Kolkata",
+            ])
+        if "medium" in n and "contact" in d:
+            return _rng().choice(["email", "telephone", "postal_address"])
+        if "contact medium" in d:
+            return _rng().choice(["email", "telephone", "postal_address"])
+        if "type of contact" in d:
+            return _rng().choice(["mobile", "fixed_home", "fixed_office", "shipping_address"])
+        if "payment plan" in d or n == "plantype":
+            return _rng().choice(["prepaid", "postpaid", "hybrid"])
+        if "consumption counter" in d:
+            return _rng().choice(["used", "outOfBucket"])
+        if "currency" in d or "iso4217" in d:
+            return str(p.get("currency") or "INR").upper()
+        if "currency" in n:
+            return str(p.get("currency") or "INR").upper()
+        if "billing time period" in d or "repeat the application of the price" in d:
+            return _rng().choice(["week", "month", "quarter", "year"])
+        if "frequency of" in d or "frequency" == n:
+            return _rng().choice(["daily", "weekly", "monthly", "quarterly"])
+        if "price" in n and ("recurring" in d or "discount" in d or "allowance" in d or "penalty" in d):
+            return _rng().choice(["recurring", "discount", "allowance", "penalty"])
+        if "catalog" in n and "catalog" in d:
+            return _rng().choice(["product", "service", "resource"])
+        if "relationship" in n and ("relationship" in d or "migration" in d or "substitution" in d):
+            return _rng().choice(["override", "discount", "replace", "migrate"])
+        if n == "value_type" or ("kind of value" in d and "numeric" in d and "text" in d):
+            return _rng().choice(["numeric", "text"])
+        if n == "range_interval" or "inclusion or exclusion" in d:
+            return _rng().choice(["open", "closed", "closedBottom", "closedTop"])
+        if n == "adjust_type" or "recurringcharge" in d or "onetimecharge" in d:
+            return _rng().choice(["RecurringCharge", "OneTimeCharge"])
+        if "format of the exported data" in d or n == "content_type":
+            return _rng().choice(["application/json", "text/csv", "application/xml"])
+        if "attachment mime type" in d:
+            return _rng().choice(["application/pdf", "image/png", "video/mp4"])
+        if n == "attachment_type" or "attachment type" in d:
+            return _rng().choice(["document", "image", "video"])
+        if "type of notification" in d or "type of the notification" in d:
+            return _rng().choice(["LOW_BALANCE_ALERT", "RECHARGE_UPDATE", "PAYMENT_UPDATE", "SYSTEM_NOTIFICATION"])
+        if "network" in n and "capability" in n:
+            return _rng().choice(["2G", "3G", "4G", "5G"])
+        if "channel" in n:
+            return _rng().choice(["APP", "SMS", "WEB", "USSD", "WHATSAPP", "IVR", "RETAIL"])
+        if "payment" in n and ("method" in n or "instrument" in n):
+            return _rng().choice(["UPI", "CREDIT_CARD", "DEBIT_CARD", "WALLET", "CASH", "AUTO_DEBIT"])
+        if "reason" in n:
+            return _rng().choice(["LOW_BALANCE", "DATA_EXHAUSTED", "VALIDITY_EXPIRY", "CUSTOMER_REQUEST"])
+        if n in {"stateorprovince", "province", "state"} or n.endswith("_state_or_province"):
+            return _rng().choice(["Haryana", "Punjab", "Delhi", "Maharashtra", "Karnataka", "Tamil Nadu", "Gujarat"])
+        if n == "city" or n.endswith("_city"):
+            return _rng().choice(["Delhi", "Gurugram", "Ludhiana", "Chandigarh", "Mumbai", "Bengaluru", "Pune"])
+        if n in {"postcode", "postalcode", "postal_code", "postcode"}:
+            return str(_rng().randint(110001, 999999))
+        if "status reason" in d or n == "status_reason":
+            return _rng().choice(["CUSTOMER_REQUEST", "PAYMENT_FAILURE", "SYSTEM_ERROR", "POLICY_VIOLATION"])
+        if "status" in n or n.endswith("_state") or n in {"state"}:
+            return _rng().choice(["PENDING", "COMPLETED", "FAILED"])
+        if "offer" in n and any(token in d for token in ("incentive", "recommendation", "cash back", "validity booster")):
+            return _rng().choice(["EXTRA_DATA", "CASH_BACK", "VALIDITY_BOOSTER", "DISCOUNT_VOUCHER"])
+        if "segment" in n or "market segment" in d:
+            return _rng().choice(["ULTRA_LOW", "MASS", "MID_TIER", "HIGH_VALUE"])
+        if n in {"role", "partyroletype"} or n.endswith("_role"):
+            return _rng().choice(["subscriber", "customer", "agent", "system"])
+        if n == "name" or n.endswith("_name"):
+            return _rng().choice(["Recharge Plan", "Data Booster", "Talktime Pack", "Retention Offer"])
+        if n == "title" or n.endswith("_title"):
+            return _rng().choice(["Low Balance Alert", "Recharge Event", "Top-up Request"])
+        if n == "description" or n.endswith("_description"):
+            return _rng().choice(["Recharge operation", "Balance adjustment", "Retention intervention"])
+        if n in {"type", "basetype", "referredtype"} or n.endswith("_type"):
+            return _rng().choice(["PrepayBalance", "BalanceTopup", "ProductOffering", "Subscriber"])
+        if "code" in n:
+            return f"CODE-{_rng().randint(100000, 999999)}"
+        if "country" in n:
+            return str(p.get("country") or "IN").upper()
     label = re.sub(r"_+", "_", n.upper()).strip("_") or "VALUE"
     return _fit_string_length(f"SYN_{label[:24]}_{_rng().randint(1000, 9999)}", p)
 
@@ -1315,6 +1331,30 @@ def _apply_conditional_rules(rec: dict, rules: dict | None) -> dict:
         return str(v).strip().lower().replace("-", "_").replace(" ", "_")
 
     def matches(actual, expected):
+        if isinstance(expected, dict) and str(expected.get("op") or "").strip():
+            op = str(expected.get("op") or "").strip().lower()
+            operand = expected.get("value")
+            if op in {"in", "not_in", "notin"}:
+                values = operand if isinstance(operand, list) else [operand]
+                result = any(matches(actual, item) for item in values)
+                return result if op == "in" else not result
+            if op in {"=", "==", "eq"}:
+                return matches(actual, operand)
+            if op in {"!=", "ne"}:
+                return not matches(actual, operand)
+            actual_num = _to_finite_float(actual, None)
+            operand_num = _to_finite_float(operand, None)
+            if actual_num is None or operand_num is None:
+                return False
+            if op in {"<", "lt"}:
+                return actual_num < operand_num
+            if op in {"<=", "lte"}:
+                return actual_num <= operand_num
+            if op in {">", "gt"}:
+                return actual_num > operand_num
+            if op in {">=", "gte"}:
+                return actual_num >= operand_num
+            return False
         if isinstance(expected, list):
             return any(matches(actual, x) for x in expected)
         if isinstance(expected, bool):
@@ -1867,6 +1907,287 @@ def _enforce_mandatory_telecom_identity(
     return out
 
 
+def _history_event_tokens(name: str) -> set[str]:
+    """Extract stable business-event tokens from a history-derived field name."""
+    text = re.sub(r"[^a-z0-9]+", "_", str(name or "").casefold()).strip("_")
+    parts = [p for p in text.split("_") if p]
+    stop = {
+        "last", "previous", "prior", "avg", "average", "interval", "days", "day", "hours", "hour",
+        "minutes", "minute", "seconds", "second", "count", "number", "of", "the",
+        "current", "latest", "message", "messages", "24h", "24", "flag", "timestamp",
+        "datetime", "date", "time", "at", "on", "recent",
+    }
+    tokens = {p for p in parts if p not in stop and len(p) > 1}
+    aliases = {
+        "recharge": "topup",
+        "top_up": "topup",
+        "booster": "topup",
+        "topups": "topup",
+        "notifications": "message",
+        "contacts": "communication",
+    }
+    return {aliases.get(p, p) for p in tokens}
+
+
+def _history_qualifiers(name: str) -> set[str]:
+    text = re.sub(r"[^a-z0-9]+", "_", str(name or "").casefold()).strip("_")
+    parts = set(text.split("_"))
+    return {token for token in ("successful", "accepted", "completed") if token in parts}
+
+
+def _history_timestamp_candidates(rows: list[dict], event_tokens: set[str], require_tokens: set[str] | None = None) -> list[str]:
+    """Find transaction datetime fields describing the same event family."""
+    candidates: list[tuple[int, str]] = []
+    for name in rows[0].keys() if rows else []:
+        low = str(name).casefold()
+        # History snapshots themselves are copied into each row for entity-level output. They
+        # must never become the source of truth for recalculating history, otherwise reconciliation
+        # can become circular and preserve an independently generated random value.
+        if low.startswith(("last_", "previous_", "avg_")) or low.endswith("_count_24h"):
+            continue
+        if not any(token in low for token in ("timestamp", "datetime", "date_time", "_date", "_at")):
+            continue
+        name_tokens = _history_event_tokens(name)
+        overlap = len(event_tokens & name_tokens) if event_tokens else 0
+        if overlap <= 0:
+            continue
+        if require_tokens and not require_tokens.intersection(name_tokens):
+            continue
+        score = overlap * 10
+        if any(token in low for token in ("requested", "occurred", "event", "transaction", "created", "impression", "presentation")):
+            score += 4
+        if "confirmation" in low or "completed" in low or "completion" in low:
+            score += 2
+        if any(token in low for token in ("valid_for", "validity", "expiry", "expiration", "expir")):
+            score -= 20
+        candidates.append((score, str(name)))
+    return [name for _score, name in sorted(candidates, key=lambda item: (-item[0], item[1]))]
+
+
+def _history_status_is_success(row: dict, event_tokens: set[str]) -> bool:
+    """Return True when a row's status/outcome for an event is explicitly successful."""
+    positive = {"completed", "complete", "success", "successful", "accepted", "approved", "done", "fulfilled", "settled", "authorized"}
+    keys: list[tuple[int, str]] = []
+    for name, value in row.items():
+        low = str(name).casefold()
+        if not any(token in low for token in ("status", "state", "outcome", "result")):
+            continue
+        name_tokens = _history_event_tokens(name)
+        overlap = len(event_tokens & name_tokens) if event_tokens else 0
+        if overlap:
+            keys.append((overlap, str(value or "").casefold().replace("-", "_").replace(" ", "_")))
+    if not keys:
+        return False
+    keys.sort(key=lambda item: -item[0])
+    return any(value in positive for _overlap, value in keys[:3])
+
+
+def _history_set_derived_fields(compiled, rows: list[dict]) -> tuple[list[dict], list[str]]:
+    """Reconcile entity/history-derived fields against the transaction rows actually generated.
+
+    This is deliberately semantic rather than telecom-specific. It only derives fields whose names
+    explicitly describe history (last_*, avg_*_interval_days, previous_*_count, *_count_24h) and only
+    from matching transaction timestamps/statuses already present in the confirmed schema.
+    """
+    if not rows:
+        return rows, []
+    variables = list(compiled.variables)
+    by_name = {str(v.get("name") or ""): v for v in variables if v.get("name")}
+    entity_key = compiled.entity_key
+    if not entity_key:
+        return rows, []
+
+    user_fields = set(compiled.user_fields)
+    record_fields = set(compiled.record_fields)
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        key = str(row.get(entity_key) or "")
+        if key:
+            grouped.setdefault(key, []).append(row)
+
+    changed: list[str] = []
+    for entity_value, entity_rows in grouped.items():
+        # Sort oldest -> newest for every history-derived calculation.
+        anchor_name = _pick_timestamp_field(variables)
+        ordered = sorted(
+            entity_rows,
+            key=lambda row: _qa_parse_dt(row.get(anchor_name)) if anchor_name and _qa_parse_dt(row.get(anchor_name)) is not None else datetime.min.replace(tzinfo=timezone.utc),
+        )
+        latest = ordered[-1] if ordered else {}
+
+        # Entity-level "last_*" timestamps are snapshots of the generated history, not independent random dates.
+        for field_name in sorted(user_fields):
+            field_var = by_name.get(field_name, {})
+            dtype = str(field_var.get("dtype") or "").casefold()
+            low_name = field_name.casefold()
+            if dtype != "datetime" or not low_name.startswith("last_"):
+                continue
+            event_tokens = _history_event_tokens(field_name)
+            qualifiers = _history_qualifiers(field_name)
+            required_timestamp_tokens = {"accepted"} if "accepted" in qualifiers else None
+            candidates = _history_timestamp_candidates(ordered, event_tokens, require_tokens=required_timestamp_tokens)
+            if not candidates:
+                continue
+            if "successful" in qualifiers or "completed" in qualifiers:
+                success_rows = [
+                    row for row in ordered
+                    if _history_status_is_success(row, event_tokens)
+                    and any(row.get(c) is not None for c in candidates)
+                ]
+                if not success_rows:
+                    continue
+                target_rows = success_rows
+            else:
+                target_rows = ordered
+            target_values = []
+            for row in target_rows:
+                # Choose one canonical event timestamp per transaction. Using both requested and
+                # confirmation timestamps would turn a request/confirmation delay into an artificial
+                # inter-transaction interval. Candidate ordering already prefers request/event times.
+                for candidate in candidates:
+                    dt = _qa_parse_dt(row.get(candidate))
+                    if dt is not None:
+                        target_values.append((dt, candidate))
+                        break
+            if target_values:
+                target_dt = max(target_values, key=lambda item: item[0])[0]
+                field_params = field_var.get("params") or {}
+                formatted = _format_datetime_for_variable(target_dt, field_var)
+                if any(r.get(field_name) != formatted for r in ordered):
+                    for row in ordered:
+                        if field_name in row:
+                            row[field_name] = formatted
+                    changed.append(field_name)
+
+        # Previous-count snapshots can be computed from the corresponding event timestamps/statuses.
+        for field_name in sorted(user_fields):
+            field_var = by_name.get(field_name, {})
+            if str(field_var.get("dtype") or "").casefold() not in {"int", "integer"}:
+                continue
+            low_name = field_name.casefold()
+            if not low_name.startswith("previous_") or not low_name.endswith("_count"):
+                continue
+            event_match_tokens = _history_event_tokens(field_name)
+            candidates = _history_timestamp_candidates(ordered, event_match_tokens)
+            if not candidates:
+                continue
+
+            def row_matches_event(row: dict) -> bool:
+                # A matching timestamp establishes that the event family exists. For
+                # domain-qualified counts (for example previous_data_topups_count),
+                # additionally require the row's explicit usage/category values to contain
+                # the requested qualifier, preventing a voice top-up from being counted as data.
+                has_time = any(_qa_parse_dt(row.get(candidate)) is not None for candidate in candidates)
+                if not has_time:
+                    return False
+                qualifiers = {
+                    token
+                    for key, value in row.items()
+                    if any(token in str(key).casefold() for token in ("usage_type", "event_type", "transaction_type", "product_type", "category"))
+                    for token in _history_event_tokens(str(value))
+                }
+                requested_specific = event_match_tokens - {"topup", "balance", "recharge"}
+                if requested_specific and qualifiers and not requested_specific.intersection(qualifiers):
+                    return False
+                return True
+
+            count = sum(1 for row in ordered[:-1] if row_matches_event(row))
+            for row in ordered:
+                if field_name in row and row.get(field_name) != count:
+                    row[field_name] = count
+                    changed.append(field_name)
+
+        # Average interval fields are calculated from the matching event timestamps.
+        for field_name in sorted(user_fields):
+            field_var = by_name.get(field_name, {})
+            if str(field_var.get("dtype") or "").casefold() not in {"float", "decimal", "number", "numeric", "int", "integer"}:
+                continue
+            low_name = field_name.casefold()
+            if not low_name.startswith("avg_") or not low_name.endswith("_interval_days"):
+                continue
+            event_tokens = _history_event_tokens(field_name)
+            candidates = _history_timestamp_candidates(ordered, event_tokens)
+            timestamps = sorted(
+                {
+                    dt
+                    for row in ordered
+                    for dt in [next((_qa_parse_dt(row.get(candidate)) for candidate in candidates if _qa_parse_dt(row.get(candidate)) is not None), None)]
+                    if dt is not None
+                }
+            )
+            intervals = [max(0.0, (b - a).total_seconds() / 86400.0) for a, b in zip(timestamps, timestamps[1:])]
+            avg_days = round(sum(intervals) / len(intervals), int((field_var.get("params") or {}).get("precision", 2) or 2)) if intervals else 0
+            for row in ordered:
+                if field_name in row and row.get(field_name) != avg_days:
+                    row[field_name] = avg_days
+                    changed.append(field_name)
+
+        # *_count_24h fields are evaluated from communication/message/notification timestamps actually present.
+        for field_name in sorted(record_fields):
+            field_var = by_name.get(field_name, {})
+            dtype = str(field_var.get("dtype") or "").casefold()
+            if dtype not in {"int", "integer"} or not field_name.casefold().endswith("_count_24h"):
+                continue
+            event_tokens = _history_event_tokens(field_name)
+            if not any(token in field_name.casefold() for token in ("message", "notification", "communication", "contact")):
+                continue
+            candidates = _history_timestamp_candidates(ordered, event_tokens | {"communication", "notification"})
+            if not candidates:
+                continue
+            for row in ordered:
+                anchor = _qa_parse_dt(row.get(anchor_name)) if anchor_name else None
+                if anchor is None:
+                    continue
+                count = 0
+                for other in ordered:
+                    for candidate in candidates:
+                        dt = _qa_parse_dt(other.get(candidate))
+                        if dt is not None and timedelta(seconds=0) <= anchor - dt <= timedelta(hours=24):
+                            count += 1
+                            break
+                if row.get(field_name) != count:
+                    row[field_name] = count
+                    changed.append(field_name)
+
+    # Deduplicate change-report names while preserving order for diagnostics.
+    changed = list(dict.fromkeys(changed))
+    return rows, changed
+
+
+
+def _history_interval_driver_seconds(variables: list[dict], user_context: dict) -> int | None:
+    """Return a schema-driven inter-transaction interval when the contract exposes one.
+
+    Values such as ``avg_topup_interval_days`` are generated once per entity and should drive the
+    history spacing instead of being generated as a disconnected snapshot. If the field is absent
+    or non-positive, the generic generator retains its bounded default cadence.
+    """
+    candidates = []
+    for var in variables:
+        name = str(var.get("name") or "").strip()
+        low = name.casefold()
+        if not (low.startswith("avg_") and low.endswith("_interval_days")):
+            continue
+        value = _to_finite_float(user_context.get(name), None)
+        if value is None or value <= 0:
+            continue
+        params = var.get("params") if isinstance(var.get("params"), dict) else {}
+        minimum = _to_finite_float(params.get("min", params.get("lo")), None)
+        maximum = _to_finite_float(params.get("max", params.get("hi")), None)
+        if minimum is not None and value < minimum:
+            continue
+        if maximum is not None and value > maximum:
+            continue
+        candidates.append(value)
+    if not candidates:
+        return None
+    # The first candidate follows the confirmed variable order, which is stable for a scenario.
+    days = candidates[0]
+    # Add modest multiplicative jitter while preserving the generated population's average interval.
+    jitter = math.exp(_rng().gauss(0.0, 0.12))
+    return max(15 * 60, int(days * 86400.0 * jitter))
+
+
 def _transactional_records(compiled, user_count: int, records_per_user: int = 10,
                             rules: dict | None = None, record_errors_out: list[dict] | None = None,
                             country: str | None = None, fixes_out: list[int] | None = None) -> list[dict]:
@@ -1889,8 +2210,6 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
     record_field_names = set(compiled.record_fields)
     user_plan = _build_generation_plan(variables, user_field_names, rules)
     record_plan = _build_generation_plan(variables, record_field_names, rules)
-
-    from config.runtime import GENERATION_MAX_ATTEMPTS_PER_RECORD
 
     for user_index in range(user_count):
         try:
@@ -1996,9 +2315,12 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
         end_ts=datetime.now(timezone.utc)
         span=max(records_per_user,1)-1
         if span:
-            step_seconds=_rng().randint(6*3600, 72*3600)
+            step_seconds=_history_interval_driver_seconds(variables, user_context)
+            if step_seconds is None:
+                step_seconds=_rng().randint(6*3600, 72*3600)
             start_ts=end_ts-timedelta(seconds=step_seconds*span)
         else:
+            step_seconds=0
             start_ts=end_ts
         timestamps=[]
         if timestamp_field:
@@ -2093,7 +2415,14 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                                     if ref_name in row:
                                         row[ref_name] = None
 
+                    # Apply confirmed behavioral rules during generation, before QA. This makes
+                    # scenario relationships part of the generator rather than a repair side effect.
+                    row = _apply_conditional_rules(row, rules)
+                    row = _apply_scenario_semantics(row, rules)
+                    row, _ = _offer_lifecycle_consistency(row, variables)
+
                     # Apply scenario semantics before strict validation. Validation remains fail-closed.
+                    strict_clean = bool((rules or {}).get("agentic")) and AGENTIC_REQUIRE_CLEAN_RECORDS
                     repaired, issues = _validate_record(
                         row,
                         variables,
@@ -2104,6 +2433,11 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     )
                     if not isinstance(repaired, dict):
                         raise TypeError("Transactional validator returned a non-object record")
+                    if strict_clean and issues:
+                        raise ValueError(
+                            "agentic record required deterministic repair before delivery: "
+                            + "; ".join(issues[:6])
+                        )
                     generated_records.append(repaired)
                     if fixes_out is not None:
                         fixes_out.append(len(issues))
@@ -2115,6 +2449,18 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                 err={"user_index":user_index,"record_index":record_index,"error":str(last_exc),"record":dict(user_context),"attempts":GENERATION_MAX_ATTEMPTS_PER_RECORD}
                 if record_errors_out is not None: record_errors_out.append(err)
                 logger.warning("[DataGeneration] Unable to produce a valid transactional record user=%d record=%d after %d attempts: %s",user_index,record_index,GENERATION_MAX_ATTEMPTS_PER_RECORD,last_exc)
+    history_changes: list[str] = []
+    if bool((rules or {}).get("agentic")):
+        generated_records, history_changes = _history_set_derived_fields(compiled, generated_records)
+    if history_changes:
+        # History reconciliation is a generator-stage calculation, not a repair. Run a cheap
+        # fail-closed contract/causal assertion after it so the client never receives an edited
+        # snapshot that bypassed final QA.
+        for record in generated_records:
+            _assert_temporal_consistency(record, variables, relations=record_plan.temporal_relations)
+            _assert_authoritative_formulas(record, variables, rules=rules)
+            _strict_validate_record(record, variables, rules=rules)
+
     return generated_records
 
 
@@ -2327,11 +2673,15 @@ def _infer_temporal_relationships(
     # ``order_created_at`` and ``order_completed_at`` can be linked while unrelated resources
     # such as ``bucket_*`` and ``topup_*`` remain independent.
     lifecycle_pairs = {
-        ("presentation", "response"),
-        ("dispatch", "response"),
+        ("start", "presentation"),
+        ("start", "response"),
         ("start", "completion"),
         ("start", "end"),
+        ("dispatch", "presentation"),
+        ("dispatch", "response"),
+        ("presentation", "response"),
         ("presentation", "completion"),
+        ("response", "completion"),
     }
     datetime_vars = [v for v in variables if str(v.get("dtype", "")).strip().lower() == "datetime"]
     for parent in datetime_vars:
@@ -3900,6 +4250,67 @@ def _strict_validate_record(rec: dict, variables: list[dict], rules: dict | None
     if _lb_domain(rules):
         _assert_low_balance_topup_consistency(rec, variables, rules=rules)
 
+def _offer_lifecycle_consistency(rec: dict, variables: list[dict]) -> tuple[dict, list[str]]:
+    """Enforce obvious offer lifecycle dependencies without assuming an industry-specific schema."""
+    rec = dict(rec)
+    issues: list[str] = []
+    by_name = {str(v.get("name")): v for v in variables if v.get("name")}
+    names = list(by_name)
+
+    def find_flag(*tokens: str) -> str | None:
+        for name in names:
+            low = name.casefold()
+            if "flag" not in low:
+                continue
+            if "offer" not in low:
+                continue
+            if any(token in low for token in tokens):
+                return name
+        return None
+
+    presented = find_flag("presented", "presentation")
+    accepted = find_flag("accepted", "acceptance")
+    converted = find_flag("converted", "conversion")
+
+    def find_time(*tokens: str) -> str | None:
+        candidates = []
+        for name, var in by_name.items():
+            if str(var.get("dtype") or "").casefold() != "datetime":
+                continue
+            low = name.casefold()
+            if "offer" in low and all(token in low for token in tokens):
+                candidates.append(name)
+        return sorted(candidates)[0] if candidates else None
+
+    impression_ts = find_time("impression")
+    conversion_ts = find_time("conversion")
+
+    def set_value(name: str | None, value: Any, reason: str) -> None:
+        if not name or name not in rec:
+            return
+        if rec.get(name) != value:
+            rec[name] = value
+            issues.append(reason)
+
+    # An offer cannot be accepted or converted when the same record says it was never presented.
+    if presented and rec.get(presented) is False:
+        set_value(accepted, False, f"{accepted} set false because {presented} is false")
+        set_value(converted, False, f"{converted} set false because {presented} is false")
+        if impression_ts and by_name.get(impression_ts, {}).get("nullable", True):
+            set_value(impression_ts, None, f"{impression_ts} cleared because {presented} is false")
+
+    if accepted and rec.get(accepted) is False:
+        set_value(converted, False, f"{converted} set false because {accepted} is false")
+        if conversion_ts and by_name.get(conversion_ts, {}).get("nullable", True):
+            set_value(conversion_ts, None, f"{conversion_ts} cleared because {accepted} is false")
+
+    if converted and rec.get(converted) is True:
+        set_value(accepted, True, f"{accepted} set true because {converted} is true")
+        set_value(presented, True, f"{presented} set true because {converted} is true")
+
+    return rec, issues
+
+
 def _enforce_obvious_semantic_consistency(rec: dict, variables: list[dict]) -> tuple[dict, list[str]]:
     """Repair deterministic cross-field contradictions that are obvious from field semantics."""
     rec = dict(rec)
@@ -3913,6 +4324,9 @@ def _enforce_obvious_semantic_consistency(rec: dict, variables: list[dict]) -> t
 
     def dt(name: str) -> datetime | None:
         return _qa_parse_dt(rec.get(name)) if name in rec else None
+
+    rec, offer_issues = _offer_lifecycle_consistency(rec, variables)
+    issues.extend(offer_issues)
 
     # Generic paired numeric bounds: lower/min cannot exceed upper/max.
     for low, high in (
@@ -4393,6 +4807,12 @@ def run_deterministic_agentic_generation(
             country=state.country,
             fixes_out=transactional_fixes,
         )
+        expected_transactional_records = state.count * state.records_per_user
+        if AGENTIC_REQUIRE_EXACT_RECORD_COUNT and len(state.raw_records) != expected_transactional_records:
+            raise ValueError(
+                f"Agentic generation produced {len(state.raw_records)} clean transactional records; "
+                f"expected exactly {expected_transactional_records}. Refusing to deliver a partial dataset."
+            )
     else:
         transactional_fixes = []
         from config.runtime import GENERATION_MAX_ATTEMPTS_PER_RECORD

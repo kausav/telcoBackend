@@ -94,6 +94,19 @@ IMPORTANT BOUNDARIES:
 - If the business request asks for a behavioral concept that the supplied source models do not directly represent, do NOT substitute a nearby but different concept. Record that gap in ``notes`` using the source terminology (for example, qualification is not the same thing as acceptance, and a qualification result is not itself a conversion event).
 - Do not propose unsupported nested/object fields when a flat synthetic dataset cannot deterministically
   populate their nested structure.
+- Also return a small set of high-confidence behavioral_rules when the supplied fields support them.
+  These rules are semantic relationships, not generators or formulas. Every field referenced by a rule
+  MUST be an exact name from candidate_variables or a persisted MongoDB variable supplied to you.
+  Use only simple machine-checkable conditions and assignments so the backend can validate and execute them deterministically.
+  Equality example:
+  {"when":{"offer_presented_flag":false},"then":{"offer_accepted_flag":false}}
+  Threshold example:
+  {"when":{"days_to_depletion":{"op":"<=","value":2}},"then":{"offer_presented_flag":true}}
+  Conditions may use only equality/inequality (==, !=), numeric comparisons (<, <=, >, >=), or membership (in, not_in).
+  The operator object must be {"op":"<=","value":2}; assignments remain direct scalar/list values.
+  Only include relationships that are obvious from the field names/descriptions and the business scenario.
+  Do not force a positive outcome merely because scenarioType is "Normal"; normal means a realistic mix
+  of outcomes unless the business request explicitly specifies otherwise. Limit behavioral_rules to 30 items.
 
 Return this JSON shape. `subdomain` is optional domain context; use "unknown" when the supplied request/source catalog does not define a meaningful subdomain taxonomy.
 {
@@ -115,6 +128,16 @@ Return this JSON shape. `subdomain` is optional domain context; use "unknown" wh
       "dtype": "string|integer|float|decimal|boolean|categorical|datetime|date",
       "depends_on": ["existing_candidate_variable_name"],
       "useCase": "Relevant use-case label when applicable"
+    }
+  ],
+  "behavioral_rules": [
+    {
+      "when": {"exact_field_name": "exact_value"},
+      "then": {"exact_field_name": "exact_value"}
+    },
+    {
+      "when": {"exact_numeric_field": {"op": "<=", "value": 2}},
+      "then": {"exact_boolean_field": true}
     }
   ],
   "country": "...",
@@ -217,6 +240,41 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         seen.add(key)
         deduped.append(item)
     normalized["candidate_variables"] = deduped
+
+    # Keep only simple, machine-checkable behavioral relationships. Field names are validated
+    # against the candidate set + persisted DB variables later, after source naming is canonicalized.
+    raw_rules = normalized.get("behavioral_rules")
+    normalized_rules: list[dict[str, Any]] = []
+    if isinstance(raw_rules, list):
+        for raw_rule in raw_rules[:30]:
+            if not isinstance(raw_rule, dict):
+                continue
+            when = raw_rule.get("when") or raw_rule.get("conditions")
+            then = raw_rule.get("then") or raw_rule.get("set")
+            if not isinstance(when, dict) or not isinstance(then, dict) or not when or not then:
+                continue
+            safe_when = {}
+            safe_then = {}
+            for key, value in list(when.items())[:8]:
+                name = str(key or "").strip()
+                if not name:
+                    continue
+                if isinstance(value, dict):
+                    op = str(value.get("op") or "").strip().lower()
+                    operand = value.get("value")
+                    if op in {"=", "==", "eq", "!=", "ne", "<", "lt", "<=", "lte", ">", "gt", ">=", "gte", "in", "not_in", "notin"} and (isinstance(operand, (str, int, float, bool)) or isinstance(operand, list)) and not isinstance(operand, (dict, tuple, set)):
+                        if isinstance(operand, list) and any(isinstance(item, (dict, tuple, set)) for item in operand):
+                            continue
+                        safe_when[name[:120]] = {"op": op, "value": operand}
+                elif isinstance(value, (str, int, float, bool)):
+                    safe_when[name[:120]] = value
+            for key, value in list(then.items())[:8]:
+                name = str(key or "").strip()
+                if name and isinstance(value, (str, int, float, bool)):
+                    safe_then[name[:120]] = value
+            if safe_when and safe_then:
+                normalized_rules.append({"when": safe_when, "then": safe_then})
+    normalized["behavioral_rules"] = normalized_rules
 
     # These are backend-owned and are overwritten after validation, so invalid model
     # guesses here should never make the provider request or application response fail.
@@ -692,7 +750,7 @@ class GeminiIntentAgent:
                 raw = client.generate_json(
                     system_instruction=INSTRUCTIONS,
                     user_prompt=prompt,
-                    temperature=0.2,
+                    temperature=0.0,
                 )
                 payload = _extract_json_payload(raw)
             except LLMUpstreamError as exc:
@@ -709,7 +767,7 @@ class GeminiIntentAgent:
                         + "\n\nJSON MODE FALLBACK: output exactly one JSON object matching the requested shape. "
                         + "Do not add markdown, commentary, or code fences."
                     ),
-                    temperature=0.2,
+                    temperature=0.0,
                 )
                 payload = _parse_text_json(text)
 
@@ -777,6 +835,33 @@ class GeminiIntentAgent:
                         if not str(key).startswith("_")
                     })
                 payload["candidate_variables"] = sanitized_candidates
+                allowed_rule_names = {
+                    str(item.get("name") or "").strip().casefold()
+                    for item in sanitized_candidates
+                    if isinstance(item, dict) and str(item.get("name") or "").strip()
+                }
+                allowed_rule_names.update(
+                    str(item.get("name") or "").strip().casefold()
+                    for item in (persisted_variables or [])
+                    if isinstance(item, dict) and str(item.get("name") or "").strip()
+                )
+                cleaned_rules: list[dict[str, Any]] = []
+                for rule in payload.get("behavioral_rules") or []:
+                    if not isinstance(rule, dict):
+                        continue
+                    when = rule.get("when") if isinstance(rule.get("when"), dict) else {}
+                    then = rule.get("then") if isinstance(rule.get("then"), dict) else {}
+                    if not when or not then:
+                        continue
+                    if not all(str(name).strip().casefold() in allowed_rule_names for name in when):
+                        continue
+                    if not all(str(name).strip().casefold() in allowed_rule_names for name in then):
+                        continue
+                    cleaned_rules.append({
+                        "when": dict(when),
+                        "then": dict(then),
+                    })
+                payload["behavioral_rules"] = cleaned_rules[:30]
                 payload["notes"] = notes[:50]
             intent = ScenarioIntent.model_validate(payload)
         except LLMUpstreamError:

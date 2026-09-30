@@ -49,6 +49,10 @@ class ScenarioIntent(BaseModel):
     # Deliberately unbounded: the scenario and registry determine how many semantic
     # variables are appropriate. The application must never truncate this list by count.
     candidate_variables: list[VariableIdea] = Field(default_factory=list)
+    # Optional machine-checkable relationships returned by the proposal model. These are
+    # semantic guardrails only: every referenced field/value is validated against the
+    # approved executable schema before generation and may never introduce a new field.
+    behavioral_rules: list[dict[str, Any]] = Field(default_factory=list)
     country: str | None = None
     currency: str | None = None
     record_count: int | None = Field(default=None, ge=1, le=5_000_000)

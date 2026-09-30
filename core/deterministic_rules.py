@@ -23,6 +23,130 @@ _RULE_PARAM_KEYS = (
 )
 
 
+def _validated_behavioral_rules(state: Any, variables: list[dict]) -> list[dict[str, Any]]:
+    """Return only proposal rules that reference the confirmed executable schema."""
+    raw = (getattr(state, "scenario_context", {}) or {}).get("behavioral_rules") or []
+    if not isinstance(raw, list):
+        return []
+    by_name = {str(v.get("name") or "").strip(): v for v in variables if isinstance(v, dict) and v.get("name")}
+    allowed = set(by_name)
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for rule in raw[:30]:
+        if not isinstance(rule, dict):
+            continue
+        when = rule.get("when") if isinstance(rule.get("when"), dict) else {}
+        then = rule.get("then") if isinstance(rule.get("then"), dict) else {}
+        if not when or not then or not set(map(str, when)).issubset(allowed) or not set(map(str, then)).issubset(allowed):
+            continue
+        # Conditions may use a small comparison language; assignments remain scalar or a list
+        # of declared values. This lets proposal-time rules express thresholds such as
+        # days_to_depletion <= 2 without embedding industry-specific logic in the generator.
+        safe_when = {}
+        safe_condition = True
+        for field, value in when.items():
+            if isinstance(value, dict):
+                op = str(value.get("op") or "").strip().lower()
+                if op not in {"=", "==", "eq", "!=", "ne", "<", "lt", "<=", "lte", ">", "gt", ">=", "gte", "in", "not_in", "notin"}:
+                    safe_condition = False
+                    break
+                operand = value.get("value")
+                if isinstance(operand, (dict, tuple, set)) or operand is None:
+                    safe_condition = False
+                    break
+                safe_when[str(field)] = {"op": op, "value": operand}
+            elif isinstance(value, (str, int, float, bool)) or isinstance(value, list):
+                if isinstance(value, list) and any(isinstance(item, (dict, tuple, set)) for item in value):
+                    safe_condition = False
+                    break
+                safe_when[str(field)] = value
+            else:
+                safe_condition = False
+                break
+        if not safe_condition:
+            continue
+        safe_then = {}
+        if any(not (isinstance(v, (str, int, float, bool)) or isinstance(v, list)) for v in then.values()):
+            continue
+        if any(isinstance(v, list) and any(isinstance(item, (dict, tuple, set)) for item in v) for v in then.values()):
+            continue
+        for field, value in then.items():
+            safe_then[str(field)] = value
+        signature = repr((sorted((str(k), repr(v)) for k, v in safe_when.items()), sorted((str(k), repr(v)) for k, v in safe_then.items())))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        result.append({"when": safe_when, "then": safe_then})
+    return result
+
+
+def _deterministic_offer_rules(variables: list[dict]) -> list[dict[str, Any]]:
+    """Add universal offer lifecycle relationships when the confirmed schema exposes them."""
+    names = [str(v.get("name") or "") for v in variables if v.get("name")]
+
+    def find_flag(*tokens: str) -> str | None:
+        for name in names:
+            low = name.casefold()
+            if "flag" not in low or "offer" not in low:
+                continue
+            if any(token in low for token in tokens):
+                return name
+        return None
+
+    def find(*needles: str) -> str | None:
+        for name in names:
+            low = name.casefold()
+            if all(token in low for token in needles):
+                return name
+        return None
+
+    presented = find_flag("presented", "presentation")
+    accepted = find_flag("accepted", "acceptance")
+    converted = find_flag("converted", "conversion")
+    response = next((
+        name for name in names
+        if "offer" in name.casefold() and "response" in name.casefold()
+    ), None)
+
+    rules: list[dict[str, Any]] = []
+    if presented and accepted:
+        rules.append({"when": {presented: False}, "then": {accepted: False}})
+    if accepted and converted:
+        rules.append({"when": {accepted: False}, "then": {converted: False}})
+    if presented and converted:
+        rules.append({"when": {presented: False}, "then": {converted: False}})
+
+    if response and accepted:
+        response_var = next((v for v in variables if str(v.get("name") or "") == response), {})
+        choices = list((response_var.get("params") or {}).get("choices") or [])
+        positive = [
+            choice for choice in choices
+            if str(choice).casefold().replace("-", "_").replace(" ", "_") in {
+                "completed", "complete", "success", "successful", "accepted", "approved",
+                "converted", "fulfilled", "settled", "authorized", "done",
+            }
+        ]
+        negative = [
+            choice for choice in choices
+            if any(token in str(choice).casefold() for token in ("fail", "reject", "declin", "den", "error", "cancel"))
+        ]
+        if negative:
+            rules.append({"when": {response: negative}, "then": {accepted: False}})
+        if positive:
+            rules.append({"when": {accepted: True}, "then": {response: positive}})
+
+    # De-duplicate without making any assumption about fields that are not present.
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for rule in rules:
+        sig = repr(rule)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        deduped.append(rule)
+    return deduped
+
+
 def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, Any]:
     """Build deterministic rules from the confirmed schema and full scenario context."""
     names = {str(v.get("name")) for v in variables if v.get("name")}
@@ -86,11 +210,15 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
     # the fields belong to the same semantic family/resource. Explicit depends_on edges and
     # the suffix-based pairs below remain authoritative.
     lifecycle_pairs = {
-        ("presentation", "response"),
-        ("dispatch", "response"),
+        ("start", "presentation"),
+        ("start", "response"),
         ("start", "completion"),
         ("start", "end"),
+        ("dispatch", "presentation"),
+        ("dispatch", "response"),
+        ("presentation", "response"),
         ("presentation", "completion"),
+        ("response", "completion"),
     }
     for parent in datetime_vars:
         for child in datetime_vars:
@@ -169,7 +297,7 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
             "Causal timestamps must respect declared temporal order and bounded delays.",
             "Scenario outcome/state fields must follow deterministic scenario semantic guardrails.",
         ],
-        "conditional_rules": [],
+        "conditional_rules": _validated_behavioral_rules(state, variables) + _deterministic_offer_rules(variables),
         "generation_constraints": constraints,
         "formula_rules": formulas,
         "temporal_rules": temporal,
