@@ -26,6 +26,7 @@ from agents.intent_agent import GeminiIntentAgent
 from agents.schema_compiler import SchemaCompiler
 from core.industry_source_store import normalize_industry_key, semantic_exclusion_aliases, catalog_for_request
 from core.output_equivalence import output_equivalence_signature
+from core.scenario_planner import _context_tokens, select_source_rows, select_db_variables_for_scenario, add_derived_offer_presentation, add_derived_scenario_fields
 
 
 class AgenticSchemaWorkflow:
@@ -231,7 +232,7 @@ class AgenticSchemaWorkflow:
             json.dumps(source_sources or source_manifest(req.industry_type, req.domain), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
         return (
-            "agentic_proposal_v34_stable_source_names_behavior_rules",
+            "agentic_proposal_v35_scenario_relevance_contract",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -616,11 +617,33 @@ class AgenticSchemaWorkflow:
         # Persisted MongoDB variables remain authoritative overlays for every domain. The source
         # selector receives their definitions up front so its breadth budget is spent only on new
         # source concepts rather than fields that will later be replaced by DB-owned variables.
-        recommended = get_recommended(requested_scenario_id, 1)
+        recommended_all = get_recommended(requested_scenario_id, 1)
         user_selected = (
             get_user_variables(req.user_id.strip(), requested_scenario_id, 1)
             if req.user_id and req.user_id.strip()
             else []
+        )
+        # Persisted variables are an authoritative catalog, not an instruction to emit every field.
+        # Keep explicit user selections; select DB recommendations only when their semantics support
+        # the current request or a source model selected for that request. Dependencies are closed.
+        context_words = _context_tokens(req)
+        model_rows = [x for x in (source_catalog.get("models") or []) if isinstance(x, dict)]
+        # Use the same deterministic source relevance planner as the compiler. This prevents the DB
+        # selector from receiving a different, broader model set and then re-opening unrelated DB
+        # concepts that the compiler will never select from the source contract.
+        _source_preview, source_selection_report = select_source_rows(
+            model_rows,
+            context=context_words,
+            max_fields=max(1, len(model_rows)),
+        )
+        preliminary_models = set(source_selection_report.get("relevant_models") or [])
+        preliminary_models.update(source_selection_report.get("related_models") or [])
+        preliminary_models = sorted(preliminary_models)[:20]
+        recommended = select_db_variables_for_scenario(
+            recommended_all,
+            context=context_words,
+            selected_source_models=preliminary_models,
+            user_selected_names=[str(v.get("name") or "") for v in user_selected if isinstance(v, dict)],
         )
         db_variables = self._merge_db_variable_sources(recommended, user_selected)
         if not json_grounded and not db_variables:
@@ -738,8 +761,12 @@ class AgenticSchemaWorkflow:
                     unresolved_items=[] if db_fields else ["No persisted MongoDB scenario variables are available."],
                     warnings=["No industry-standard JSON source is registered for this industry/domain pair; MongoDB scenario variables are the complete executable source."],
                 )
+            # Business-stage enrichment is deterministic and happens after source/DB selection,
+            # never by copying a source catalog into the executable schema.
+            schema = schema.model_copy(update={"fields": add_derived_scenario_fields(add_derived_offer_presentation(list(schema.fields)), scenario_type=req.scenario_type, domain=req.domain, business_scenario=req.business_scenario)})
             set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
 
+        schema = schema.model_copy(update={"fields": add_derived_scenario_fields(add_derived_offer_presentation(list(schema.fields)), scenario_type=req.scenario_type, domain=req.domain, business_scenario=req.business_scenario)})
         schema, variable_sources, raw_persisted_by_name = self._merge_persisted_variables(
             schema,
             recommended,
@@ -759,10 +786,14 @@ class AgenticSchemaWorkflow:
             if persisted_source:
                 variable["source"] = persisted_source
                 continue
-            if json_grounded:
+            provenance = next((field.provenance for field in schema.fields if field.name.strip().casefold() == key), {})
+            generated_from = str((provenance or {}).get("generated_from") or "").strip().lower()
+            if generated_from == "scenario_derived":
+                variable["source"] = "DERIVED"
+            elif json_grounded:
                 variable["source"] = "MONGODB_JSON"
-                continue
-            variable["source"] = "LLM_GENERATED"
+            else:
+                variable["source"] = "LLM_GENERATED"
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
         entity_key = self._entity_key(req.entity_key, field_order, type_of_data)
         variable_source_ids = {}

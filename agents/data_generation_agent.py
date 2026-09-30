@@ -35,6 +35,7 @@ from core.temporal_contract import (
     source_declared_min_delay_seconds,
 )
 from config.runtime import AGENTIC_REQUIRE_CLEAN_RECORDS, AGENTIC_REQUIRE_EXACT_RECORD_COUNT, GENERATION_MAX_ATTEMPTS_PER_RECORD
+from config.country_metadata import COUNTRY_BASE
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +282,25 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         if len(parts) >= 2:
             return str(_rng().choice(parts))
 
+    # Identifier/reference and phone semantics must be resolved before the generic source-contract
+    # fallback. Otherwise every ``semantic_string`` ID/phone becomes a SYN_* placeholder even when
+    # the field name itself contains enough information to generate a stable structural value.
+    if (
+        n.endswith("_id") or n == "id" or n.endswith("_key")
+        or "identifier" in d or "reference id" in d or "unique reference" in d
+    ):
+        prefix_source = n[:-3] if n.endswith("_id") else n
+        prefix = re.sub(r"[^A-Z0-9]+", "_", prefix_source.upper()).strip("_") or "REF"
+        return _prefixed_int({"prefix": f"{prefix}-", "digits": 10}, rec)
+
+    if "phone" in n or "mobile" in n or n == "msisdn":
+        # Country is request-scoped. The generator receives it through the internal execution
+        # context so a US/GB/etc. request never silently falls back to India's +91 prefix.
+        country = str(p.get("country") or rec.get("__country__") or "").strip().upper()
+        country_code = str((COUNTRY_BASE.get(country) or COUNTRY_BASE.get("GLOBAL") or {}).get("phone_country_code") or "").strip()
+        if country_code:
+            return _e164_phone({"country_codes": [country_code]}, rec)
+
     # MongoDB source examples/defaults are the closest available value semantics for a free-form
     # source field. Prefer them before the generic synthetic fallback; they are dynamic source data,
     # not application/static vocabularies.
@@ -299,24 +319,6 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
     if p.get("source_contract"):
         return _fit_string_length(f"SYN_{(n.upper() or 'VALUE')[:32]}_{_rng().randint(1000, 9999)}", p)
 
-    # Identifier/reference semantics must be checked before broad words such as "offer",
-    # "type", or "status", because many TMF fields are references to another entity.
-    if (
-        n.endswith("_id") or n == "id" or n.endswith("_key")
-        or "identifier" in d or "reference id" in d or "unique reference" in d
-    ):
-        prefix_source = n[:-3] if n.endswith("_id") else n
-        prefix = re.sub(r"[^A-Z0-9]+", "_", prefix_source.upper()).strip("_") or "REF"
-        return _prefixed_int({"prefix": f"{prefix}-", "digits": 10}, rec)
-
-    if "phone" in n or "mobile" in n or n == "msisdn":
-        country = str(p.get("country") or "IN").upper()
-        dial_codes = {
-            "IN": "+91", "US": "+1", "CA": "+1", "GB": "+44", "AU": "+61",
-            "AE": "+971", "SG": "+65", "DE": "+49", "FR": "+33", "IT": "+39",
-        }
-        dial = dial_codes.get(country, "+91")
-        return _e164_phone({"country_codes": [dial], "country": country}, rec)
     if "email" in n:
         return f"user{_rng().randint(100000, 999999)}@example.test"
     if "uri" in d or "url" in d or any(token in n for token in ("href", "url", "schemalocation", "resourcepath", "path")):
@@ -823,11 +825,17 @@ def _generate_temporal_child_value_for_constraints(
               if max_gap is not None]
     upper = min(uppers) if uppers else None
 
-    # With no source-declared upper bound, there is no hard upper constraint. Pick the earliest
-    # causally valid instant rather than inventing a seven-day window that can later become a
-    # false validation failure.
+    # With no source-declared upper bound, retain causal ordering but avoid deterministic equality.
+    # If the client contract is minute-only, use at least a one-minute gap so serialization cannot
+    # collapse a valid sub-minute relation back into equal timestamps. If the contract explicitly
+    # allows only a sub-minute window, seconds are retained for that relational field.
+    output_params = dict(var.get("params") or {})
+    minute_only = "%S" not in _normalize_timestamp_format(output_params) and str(var.get("dtype") or "").casefold() != "date"
+    max_parent = max(parent_dt for _parent, parent_dt, _max_gap, _min_gap in constraints)
+    positive_causal_gap = lower > max_parent
     if upper is None:
-        desired = lower
+        delay_floor = 60 if minute_only and positive_causal_gap else 1
+        desired = lower + timedelta(seconds=_rng().randint(delay_floor, 3600))
     elif upper < lower:
         # A model-generated rule set can contain overlapping maximum-delay hints that are
         # impossible to satisfy simultaneously. Do not fabricate a pre-parent event. Preserve
@@ -837,10 +845,19 @@ def _generate_temporal_child_value_for_constraints(
         desired = lower
     else:
         span = int((upper - lower).total_seconds())
-        desired = lower + timedelta(seconds=_rng().randint(0, max(0, span)))
+        min_delay = 0
+        if minute_only and positive_causal_gap and span >= 60:
+            min_delay = 60
+        desired = lower + timedelta(seconds=_rng().randint(min_delay, max(min_delay, span)))
 
     if str(var.get("dtype") or "datetime").strip().lower() == "date":
         return desired.date().isoformat()
+    # A positive causal lower bound that cannot be represented in minute precision requires
+    # seconds in the serialized child. This branch is only used for sub-minute source-declared
+    # windows; ordinary unconstrained request/confirmation pairs stay minute-formatted with >=60s gaps.
+    if minute_only and positive_causal_gap and upper is not None and (upper - lower).total_seconds() < 60:
+        output_params["timestamp_format"] = "dd/mm/yyyy hh:mm:ss a"
+        return _format_datetime(desired, output_params)
     return _format_datetime_for_variable(desired, var)
 
 
@@ -1538,6 +1555,11 @@ def _validate_temporal_plan(relations: list[tuple[str, str, int | None, int]]) -
             raise ValueError(f"Conflicting temporal rules for '{child}' contain duplicate parents")
 
 
+def _public_record(rec: dict) -> dict:
+    """Remove generator-only execution context before a record reaches the API/client contract."""
+    return {key: value for key, value in rec.items() if not key.startswith("__") }
+
+
 def _build_generation_plan(
     variables: list[dict],
     selected_names: set[str] | None = None,
@@ -1564,6 +1586,8 @@ def _build_generation_plan(
 def _generate_record(variables: list[dict], rules: dict | None = None, plan: _GenerationPlan | None = None, apply_repairs: bool = True) -> dict:
     """Generate one record in dependency order, while safely handling cycles."""
     rec: dict = {}
+    if isinstance(rules, dict) and str(rules.get("country") or "").strip():
+        rec["__country__"] = str(rules.get("country")).strip().upper()
     plan = plan or _build_generation_plan(variables, rules=rules)
     ordered, cyclic, known_fields = plan.ordered, plan.cyclic, plan.known_fields
     temporal_child_rules = {}
@@ -1622,6 +1646,7 @@ def _generate_record(variables: list[dict], rules: dict | None = None, plan: _Ge
     if apply_repairs:
         rec = _apply_conditional_rules(rec, rules)
         rec = _apply_scenario_semantics(rec, rules)
+        rec, _ = _enforce_generic_business_consistency(rec, variables, rules=rules)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
         rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules, relations=plan.temporal_relations)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
@@ -1631,8 +1656,8 @@ def _generate_record(variables: list[dict], rules: dict | None = None, plan: _Ge
         rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
         rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
-        return _format_datetime_fields(rec, variables)
-    return rec
+        return _public_record(_format_datetime_fields(rec, variables))
+    return _public_record(rec)
 
 
 def _generate_selected_record(
@@ -1645,6 +1670,8 @@ def _generate_selected_record(
 ) -> dict:
     """Generate selected variables plus dependencies using a precomputed dependency plan."""
     rec = dict(base or {})
+    if isinstance(rules, dict) and str(rules.get("country") or "").strip() and "__country__" not in rec:
+        rec["__country__"] = str(rules.get("country")).strip().upper()
     plan = plan or _build_generation_plan(variables, selected_names, rules)
     ordered, cyclic, known_fields = plan.ordered, plan.cyclic, plan.known_fields
     temporal_child_rules = {}
@@ -1711,6 +1738,7 @@ def _generate_selected_record(
     if apply_repairs:
         rec = _apply_conditional_rules(rec, rules)
         rec = _apply_scenario_semantics(rec, rules)
+        rec, _ = _enforce_generic_business_consistency(rec, variables, rules=rules)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
         rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules, relations=plan.temporal_relations)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
@@ -1720,8 +1748,8 @@ def _generate_selected_record(
         rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
         rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
-        return _format_datetime_fields(rec, variables)
-    return rec
+        return _public_record(_format_datetime_fields(rec, variables))
+    return _public_record(rec)
 
 
 # -- Transactional/user-history generation helpers -----------------------------
@@ -1873,12 +1901,10 @@ def _enforce_mandatory_telecom_identity(
             out["account_id"]=current
 
     if "msisdn" in names:
-        iso=str(country or "IN").strip().upper()
-        dial_codes={
-            "IN":"+91","US":"+1","CA":"+1","GB":"+44","AU":"+61",
-            "AE":"+971","SG":"+65","DE":"+49","FR":"+33","IT":"+39",
-        }
-        dial=dial_codes.get(iso, iso if iso.startswith("+") else "+"+iso)
+        iso=str(country or "GLOBAL").strip().upper()
+        dial=str((COUNTRY_BASE.get(iso) or COUNTRY_BASE.get("GLOBAL") or {}).get("phone_country_code") or "").strip()
+        if not dial:
+            dial=iso if iso.startswith("+") else "+"+iso
         current=str(out.get("msisdn") or "")
         # In Low Balance, the DB definition is authoritative. If the generated value is missing
         # or collides, rerun that DB field's own generator instead of substituting an application
@@ -2188,6 +2214,164 @@ def _history_interval_driver_seconds(variables: list[dict], user_context: dict) 
     return max(15 * 60, int(days * 86400.0 * jitter))
 
 
+def _stateful_resource_contract(variables: list[dict], rules: dict | None = None) -> dict[str, Any]:
+    """Infer one stateful remaining-resource/recharge pair when the confirmed contract supports it."""
+    context = " ".join(str((rules or {}).get(k) or "") for k in ("domain", "scenario_type", "business_scenario", "use_case")).casefold()
+    context_tokens = set(re.findall(r"[a-z0-9]+", context))
+    is_state_journey = bool(context_tokens & {"balance", "depletion", "exhaustion", "depleted", "recharge", "recharge", "topup", "top"})
+    if not is_state_journey:
+        return {}
+
+    numeric = {"int", "integer", "float", "decimal", "number", "numeric"}
+    names = [str(v.get("name") or "") for v in variables if v.get("name")]
+    by_name = {str(v.get("name") or ""): v for v in variables if v.get("name")}
+
+    def score_remaining(name: str, var: dict) -> int:
+        text = f"{name} {var.get('description') or ''}".casefold()
+        if "remaining" not in text or str(var.get("dtype") or "").casefold() not in numeric:
+            return -1
+        score = 20
+        if "balance" in text:
+            score += 8
+        if "data" in text:
+            score += 6
+        if "bucket" in text or "resource" in text:
+            score += 4
+        return score
+
+    def score_recharge(name: str, var: dict) -> int:
+        text = f"{name} {var.get('description') or ''}".casefold()
+        if str(var.get("dtype") or "").casefold() not in numeric or not any(t in text for t in ("topup", "top up", "recharge", "reload", "purchase", "credited")):
+            return -1
+        score = 18
+        if "amount" in text or "value" in text or "quantity" in text:
+            score += 8
+        if "balance" in text:
+            score += 4
+        if "data" in text and "depletion" in context:
+            score += 4
+        return score
+
+    remaining = max(((score_remaining(n, by_name[n]), n) for n in names), key=lambda x: (x[0], x[1]), default=(-1, ""))
+    recharge = max(((score_recharge(n, by_name[n]), n) for n in names), key=lambda x: (x[0], x[1]), default=(-1, ""))
+    if remaining[0] < 0 or recharge[0] < 0:
+        return {}
+
+    rem_name = remaining[1]
+    rem_prefix = rem_name.casefold().rsplit("remaining", 1)[0].strip("_")
+    related_recharges = []
+    rem_tokens = set(re.findall(r"[a-z0-9]+", rem_name.casefold())) - {"remaining", "value", "amount", "quantity", "unit", "units"}
+    for name, var in by_name.items():
+        if score_recharge(name, var) < 0:
+            continue
+        tokens = set(re.findall(r"[a-z0-9]+", name.casefold()))
+        overlap = len(rem_tokens & tokens)
+        if overlap:
+            related_recharges.append((overlap + score_recharge(name, var) / 100.0, name))
+    recharge_name = max(related_recharges, default=(recharge[0] / 100.0, recharge[1]))[1]
+
+    status_candidates = []
+    for name, var in by_name.items():
+        text = f"{name} {var.get('description') or ''}".casefold()
+        if str(var.get("dtype") or "").casefold() not in {"categorical", "string"} or "status" not in text and "outcome" not in text and "state" not in text:
+            continue
+        if any(t in text for t in ("topup", "recharge", "reload", "purchase", "credit")):
+            status_candidates.append(name)
+    status_name = sorted(status_candidates)[0] if status_candidates else None
+
+    cap = None
+    params = by_name[rem_name].get("params") if isinstance(by_name[rem_name].get("params"), dict) else {}
+    try:
+        cap = float(params.get("max", params.get("hi"))) if params.get("max", params.get("hi")) is not None else None
+    except (TypeError, ValueError):
+        cap = None
+    return {
+        "remaining": rem_name,
+        "recharge_amount": recharge_name,
+        "recharge_status": status_name,
+        "cap": cap,
+        "low_balance": "low" in context and "balance" in context,
+        "depletion": bool(context_tokens & {"depletion", "exhaustion", "depleted"}),
+    }
+
+
+def _apply_stateful_resource_transition(
+    row: dict,
+    contract: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    first_row: bool,
+) -> dict:
+    """Carry a confirmed resource state forward between chronological transactions."""
+    if not contract:
+        return row
+    remaining_name = contract.get("remaining")
+    if not remaining_name or remaining_name not in row:
+        return row
+    precision = int(((contract.get("remaining_var") or {}).get("params") or {}).get("precision", 2) or 2) if isinstance(contract.get("remaining_var"), dict) else 2
+    try:
+        generated_remaining = float(row.get(remaining_name))
+    except (TypeError, ValueError):
+        generated_remaining = 0.0
+
+    cap = contract.get("cap")
+    if cap is None:
+        cap = max(generated_remaining, 0.0)
+    cap = max(0.0, float(cap))
+
+    if first_row or "post_balance" not in state:
+        current = max(0.0, min(cap if cap > 0 else generated_remaining, generated_remaining))
+        if contract.get("low_balance"):
+            reserved = None
+            for name, value in row.items():
+                low = str(name).casefold()
+                if "reserved" in low and isinstance(value, (int, float)) and not isinstance(value, bool):
+                    reserved = float(value)
+                    break
+            if reserved is not None and reserved > 0:
+                current = min(current, reserved * 0.25)
+        row[remaining_name] = round(current, precision)
+    else:
+        previous = max(0.0, float(state.get("post_balance", generated_remaining)))
+        # Use an exposed consumption velocity when available; otherwise consume a modest fraction
+        # of the previous state so history changes naturally without inventing industry-specific units.
+        consumption = None
+        for name, value in row.items():
+            low = str(name).casefold()
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and any(t in low for t in ("consumption_velocity", "usage_velocity", "consumption_rate", "usage_rate")):
+                try:
+                    consumption = max(0.0, float(value) / 30.0)
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if consumption is None:
+            fraction = 0.10 if contract.get("depletion") else 0.06
+            consumption = previous * _rng().uniform(fraction * 0.5, fraction * 1.5)
+        current = max(0.0, previous - consumption)
+        if cap > 0:
+            current = min(current, cap)
+        row[remaining_name] = round(current, precision)
+
+    # State after the current event. A successful/committed recharge is the only automatic state
+    # increase; failed/cancelled/created attempts do not credit the balance.
+    post = float(row.get(remaining_name) or 0.0)
+    amount_name = contract.get("recharge_amount")
+    amount = row.get(amount_name) if amount_name else None
+    try:
+        amount_value = max(0.0, float(amount))
+    except (TypeError, ValueError):
+        amount_value = 0.0
+    status_name = contract.get("recharge_status")
+    status_value = str(row.get(status_name) or "").casefold().replace("-", "_").replace(" ", "_") if status_name else ""
+    successful = status_value in {"completed", "complete", "success", "successful", "settled", "fulfilled", "done"}
+    if successful and amount_value > 0:
+        post += amount_value
+    if cap > 0:
+        post = min(cap, post)
+    state["post_balance"] = max(0.0, post)
+    return row
+
+
 def _transactional_records(compiled, user_count: int, records_per_user: int = 10,
                             rules: dict | None = None, record_errors_out: list[dict] | None = None,
                             country: str | None = None, fixes_out: list[int] | None = None) -> list[dict]:
@@ -2210,6 +2394,9 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
     record_field_names = set(compiled.record_fields)
     user_plan = _build_generation_plan(variables, user_field_names, rules)
     record_plan = _build_generation_plan(variables, record_field_names, rules)
+    stateful_contract = _stateful_resource_contract(variables, rules)
+    if stateful_contract:
+        stateful_contract["remaining_var"] = next((v for v in variables if str(v.get("name") or "") == stateful_contract.get("remaining")), {})
 
     for user_index in range(user_count):
         try:
@@ -2331,6 +2518,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                 timestamps.append(ts)
             timestamps=sorted(timestamps)
 
+        resource_state: dict[str, Any] = {}
         for record_index in range(records_per_user):
             last_exc: Exception | None = None
             for attempt in range(GENERATION_MAX_ATTEMPTS_PER_RECORD):
@@ -2419,7 +2607,11 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     # scenario relationships part of the generator rather than a repair side effect.
                     row = _apply_conditional_rules(row, rules)
                     row = _apply_scenario_semantics(row, rules)
-                    row, _ = _offer_lifecycle_consistency(row, variables)
+                    row, _ = _enforce_generic_business_consistency(row, variables, rules=rules)
+                    row = _apply_stateful_resource_transition(
+                        row, stateful_contract, resource_state, first_row=(record_index == 0)
+                    )
+                    row, _ = _enforce_generic_business_consistency(row, variables, rules=rules)
 
                     # Apply scenario semantics before strict validation. Validation remains fail-closed.
                     strict_clean = bool((rules or {}).get("agentic")) and AGENTIC_REQUIRE_CLEAN_RECORDS
@@ -2589,9 +2781,21 @@ def _infer_temporal_relationships(
         if str(by_name[child].get("dtype", "")).strip().lower() != "datetime":
             return
         key = (parent, child)
+        normalized_min = max(0, int(min_gap))
         if key not in seen:
             seen.add(key)
-            out.append((parent, child, max_gap, max(0, int(min_gap))))
+            out.append((parent, child, max_gap, normalized_min))
+            return
+        # Multiple evidence sources can describe the same edge. Preserve the strictest safe
+        # lower bound and any explicitly declared upper bound instead of letting an earlier
+        # dependency with min_gap=0 weaken the later universal request->confirmation invariant.
+        for index, (old_parent, old_child, old_max, old_min) in enumerate(out):
+            if old_parent == parent and old_child == child:
+                effective_max = old_max if old_max is not None else max_gap
+                if old_max is not None and max_gap is not None:
+                    effective_max = min(old_max, max_gap)
+                out[index] = (parent, child, effective_max, max(old_min, normalized_min))
+                break
 
     # 1) Explicit rules supplied by the schema layer. These rules are executable only when the
     # confirmed schema itself provides structural evidence: an explicit datetime dependency or an
@@ -2655,7 +2859,7 @@ def _infer_temporal_relationships(
             # First prefer an exact normalized prefix match; this is unambiguous and cheapest.
             exact = [end_name for end_name, end_prefix in ends if end_prefix == start_prefix]
             if exact:
-                add_relation(start_name, sorted(exact)[0], max_gap, 0)
+                add_relation(start_name, sorted(exact)[0], max_gap, 1 if any(suffix.endswith("requested_date") or suffix.endswith("requested_timestamp") or suffix.endswith("requested_datetime") or suffix.endswith("requested_date_time") for suffix in start_suffixes) else 0)
                 continue
 
             family = normalize_temporal_family(start_name)
@@ -2667,7 +2871,7 @@ def _infer_temporal_relationships(
             # Only use the fallback when the family has a single target. If multiple target
             # timestamps exist, ambiguity is safer to leave unconstrained than to invent a link.
             if len(family_matches) == 1:
-                add_relation(start_name, family_matches[0], max_gap, 0)
+                add_relation(start_name, family_matches[0], max_gap, 1 if any("requested" in suffix for suffix in start_suffixes) else 0)
 
     # 3) Same-resource lifecycle pairs. Normalize common lifecycle suffixes before matching so
     # ``order_created_at`` and ``order_completed_at`` can be linked while unrelated resources
@@ -4250,6 +4454,174 @@ def _strict_validate_record(rec: dict, variables: list[dict], rules: dict | None
     if _lb_domain(rules):
         _assert_low_balance_topup_consistency(rec, variables, rules=rules)
 
+
+def _enforce_generic_business_consistency(rec: dict, variables: list[dict], rules: dict | None = None) -> tuple[dict, list[str]]:
+    """Enforce high-confidence cross-field relationships inferred from the confirmed contract.
+
+    This layer is intentionally vocabulary-driven rather than industry/field-list driven. It handles
+    common state machines such as request->confirmation, offer presentation->acceptance, auto-run
+    configuration, and linked remaining/reserved values without inventing source semantics.
+    """
+    rec = dict(rec)
+    issues: list[str] = []
+    by_name = {str(v.get("name") or ""): v for v in variables if v.get("name")}
+
+    def norm(value: object) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", str(value or "").casefold()).strip("_")
+
+    def set_value(name: str, value: Any, reason: str) -> None:
+        if name in rec and rec.get(name) != value:
+            rec[name] = value
+            issues.append(reason)
+
+    def dt(name: str) -> datetime | None:
+        return _qa_parse_dt(rec.get(name)) if name in rec else None
+
+    names = list(by_name)
+    # 1) Auto-run configuration is a single stateful contract. A disabled recurring process has no
+    # recurring schedule/occurrence count; an enabled process needs both when the schema exposes them.
+    auto_fields = [n for n in names if "auto" in norm(n) and any(t in norm(n) for t in ("topup", "recharge", "recurring", "automatic"))]
+    auto = auto_fields[0] if auto_fields else None
+    if auto and isinstance(rec.get(auto), bool):
+        period_count = next((n for n in names if "period" in norm(n) and ("number" in norm(n) or "count" in norm(n))), None)
+        recurring = next((n for n in names if "period" in norm(n) and "recurr" in norm(n) and str(by_name[n].get("dtype") or "").lower() in {"categorical", "string"}), None)
+        if rec.get(auto) is False:
+            if period_count and by_name[period_count].get("nullable", True):
+                set_value(period_count, None, f"{period_count} cleared because {auto} is false")
+            if recurring and by_name[recurring].get("nullable", True):
+                set_value(recurring, None, f"{recurring} cleared because {auto} is false")
+        else:
+            if period_count and rec.get(period_count) in (None, 0):
+                params = by_name[period_count].get("params") or {}
+                lo = _to_finite_float(params.get("min", params.get("lo")), 1.0) or 1.0
+                hi = _to_finite_float(params.get("max", params.get("hi")), max(lo, 12.0))
+                candidate = int(round(lo if hi is None else _rng().uniform(max(1.0, lo), max(lo, hi))))
+                set_value(period_count, max(1, candidate), f"{period_count} aligned to enabled recurring processing")
+            if recurring and rec.get(recurring) is None:
+                choices = list((by_name[recurring].get("params") or {}).get("choices") or [])
+                if choices:
+                    set_value(recurring, _rng().choice(choices), f"{recurring} populated for enabled recurring processing")
+
+    # 2) Completed outcomes require a confirmation/completion instant when such an instant exists.
+    status_fields = [
+        n for n in names
+        if any(token in norm(n).split("_") for token in ("status", "state", "outcome", "result"))
+        and str(by_name[n].get("dtype") or "").lower() in {"categorical", "string"}
+    ]
+    for status_name in status_fields:
+        value = norm(rec.get(status_name))
+        if value not in {"completed", "complete", "success", "successful", "settled", "fulfilled", "done"}:
+            continue
+        base = norm(status_name)
+        prefix = base.rsplit("_status", 1)[0] if "_status" in base else base.rsplit("_state", 1)[0] if "_state" in base else base
+        confirmation = next((n for n in names if norm(n).startswith(prefix) and any(x in norm(n) for x in ("confirmation", "confirmed", "completion", "completed")) and str(by_name[n].get("dtype") or "").lower() == "datetime"), None)
+        requested = next((n for n in names if norm(n).startswith(prefix) and any(x in norm(n) for x in ("requested", "request")) and str(by_name[n].get("dtype") or "").lower() == "datetime"), None)
+        if confirmation and dt(confirmation) is None and requested and dt(requested) is not None:
+            params = by_name[confirmation].get("params") or {}
+            value_dt = dt(requested) + timedelta(seconds=_rng().randint(30, 900))
+            set_value(confirmation, _format_datetime_for_variable(value_dt, by_name[confirmation]), f"{confirmation} generated from completed {status_name}")
+
+    # 3) Accepted decisions imply a presented decision opportunity when both flags exist. Reuse the
+    # generic offer lifecycle helper for the actual implication; here only ground conversion on status.
+    rec, offer_issues = _offer_lifecycle_consistency(rec, variables)
+    issues.extend(offer_issues)
+
+    # 4) Numeric remaining/reserved relationship when the same resource exposes both quantities.
+    remaining_fields = [n for n in names if "remaining" in norm(n) and str(by_name[n].get("dtype") or "").lower() in _NUMERIC_DTYPES]
+    for remaining in remaining_fields:
+        r_value = _to_finite_float(rec.get(remaining), None)
+        if r_value is None:
+            continue
+        tokens = set(norm(remaining).split("_")) - {"remaining", "value", "amount", "quantity", "unit", "units"}
+        reserved = next((n for n in names if "reserved" in norm(n) and tokens & set(norm(n).split("_")) and str(by_name[n].get("dtype") or "").lower() in _NUMERIC_DTYPES), None)
+        if reserved:
+            reserved_value = _to_finite_float(rec.get(reserved), None)
+            if reserved_value is not None and r_value > reserved_value:
+                set_value(remaining, round(reserved_value, int((by_name[remaining].get("params") or {}).get("precision", 2) or 2)), f"{remaining} reduced to remain within {reserved}")
+
+    # 5) When the request explicitly describes a low-balance monetary resource and the contract has
+    # a usage-type enum containing 'monetary', align that resource vocabulary instead of generating
+    # unrelated voice/data/SMS resources. No telecom field names are referenced here.
+    context = " ".join(str((rules or {}).get(k) or "") for k in ("domain", "scenario_type", "business_scenario", "use_case")).casefold()
+    if "balance" in context and "low" in context:
+        usage_fields = [n for n in names if "usage" in norm(n) and "type" in norm(n)]
+        for name in usage_fields:
+            choices = list((by_name[name].get("params") or {}).get("choices") or [])
+            monetary = next((c for c in choices if norm(c) == "monetary"), None)
+            if monetary is not None:
+                set_value(name, monetary, f"{name} aligned to the low-balance monetary resource")
+
+    # 6) Validity windows must contain the transaction anchor when a same-resource anchor is obvious.
+    validity_starts = [n for n in names if norm(n).endswith(("_start_date_time", "_start_datetime", "_start_date", "_valid_from", "_validity_start")) and str(by_name[n].get("dtype") or "").lower() == "datetime"]
+    for start in validity_starts:
+        start_dt = dt(start)
+        end = None
+        stem = norm(start)
+        for suffix in ("_start_date_time", "_start_datetime", "_start_date", "_valid_from", "_validity_start"):
+            if stem.endswith(suffix):
+                prefix = stem[:-len(suffix)]
+                end = next((n for n in names if norm(n) == prefix + "_end_date_time" or norm(n) == prefix + "_end_datetime" or norm(n) == prefix + "_end_date" or norm(n) == prefix + "_valid_to" or norm(n) == prefix + "_validity_end"), None)
+                break
+        if not end:
+            continue
+        end_dt = dt(end)
+        anchors = [
+            n for n in names
+            if str(by_name[n].get("dtype") or "").lower() == "datetime"
+            and any(x in norm(n) for x in ("requested", "transaction", "event", "record", "created", "presentation", "response", "confirmation"))
+            and set(prefix.split("_")) & set(norm(n).split("_"))
+        ]
+        anchor = next((dt(n) for n in anchors if dt(n) is not None), None)
+        # Resource validity windows often belong to a different field family than the
+        # transaction that exercises the resource (for example a bucket validity window
+        # surrounding a top-up event). When no same-resource timestamp exists, use the
+        # primary scenario event timestamp as the anchor. This remains contract-driven:
+        # only transactional/event timestamps already present in the proposed schema are
+        # considered, and only for stateful balance/depletion journeys.
+        if anchor is None:
+            state_context = context
+            stateful_journey = ("balance" in state_context and "low" in state_context) or any(
+                token in state_context for token in ("data depletion", "data depletion", "depleted", "exhaustion", "depletion")
+            )
+            if stateful_journey:
+                primary_candidates = [
+                    n for n in names
+                    if str(by_name[n].get("dtype") or "").lower() == "datetime"
+                    and any(x in norm(n) for x in ("requested", "transaction", "event", "record", "presentation", "response", "confirmation"))
+                ]
+                def anchor_rank(name: str) -> tuple[int, int]:
+                    low = norm(name)
+                    if "requested" in low or low.endswith("_request"):
+                        rank = 0
+                    elif any(x in low for x in ("transaction", "event", "record")):
+                        rank = 1
+                    elif "presentation" in low or "presented" in low:
+                        rank = 2
+                    elif "response" in low:
+                        rank = 3
+                    elif "confirmation" in low or "confirmed" in low:
+                        rank = 4
+                    else:
+                        rank = 5
+                    return rank, names.index(name)
+                primary_candidates.sort(key=anchor_rank)
+                anchor = next((dt(n) for n in primary_candidates if dt(n) is not None), None)
+        if anchor is None:
+            continue
+        if start_dt is None or end_dt is None:
+            continue
+        if start_dt > anchor:
+            duration = max(1, int((end_dt - start_dt).total_seconds())) if end_dt > start_dt else 86400
+            new_start = anchor - timedelta(seconds=duration)
+            set_value(start, _format_datetime_for_variable(new_start, by_name[start]), f"{start} moved before its transaction anchor")
+            start_dt = new_start
+        if end_dt < anchor:
+            duration = max(1, int((end_dt - start_dt).total_seconds())) if start_dt is not None and end_dt > start_dt else 86400
+            new_end = anchor + timedelta(seconds=duration)
+            set_value(end, _format_datetime_for_variable(new_end, by_name[end]), f"{end} moved after its transaction anchor")
+
+    return rec, issues
+
 def _offer_lifecycle_consistency(rec: dict, variables: list[dict]) -> tuple[dict, list[str]]:
     """Enforce obvious offer lifecycle dependencies without assuming an industry-specific schema."""
     rec = dict(rec)
@@ -4311,7 +4683,7 @@ def _offer_lifecycle_consistency(rec: dict, variables: list[dict]) -> tuple[dict
     return rec, issues
 
 
-def _enforce_obvious_semantic_consistency(rec: dict, variables: list[dict]) -> tuple[dict, list[str]]:
+def _enforce_obvious_semantic_consistency(rec: dict, variables: list[dict], rules: dict | None = None) -> tuple[dict, list[str]]:
     """Repair deterministic cross-field contradictions that are obvious from field semantics."""
     rec = dict(rec)
     issues: list[str] = []
@@ -4341,80 +4713,82 @@ def _enforce_obvious_semantic_consistency(rec: dict, variables: list[dict]) -> t
                 set_value(low, low_val, f"{low} corrected to be <= {high}")
                 set_value(high, high_val, f"{high} corrected to be >= {low}")
 
-    # Low-balance/top-up causal chain.
-    trigger = dt("low_balance_trigger_timestamp")
-    recharge = dt("recharge_timestamp")
-    if trigger is not None and recharge is not None and "hours_to_recharge_after_trigger" in rec:
-        hours_params = by_name.get("hours_to_recharge_after_trigger", {}).get("params") or {}
-        precision = int(hours_params.get("precision", 2) or 2)
-        lo_hours = _to_finite_float(hours_params.get("min", hours_params.get("lo")), 0.0) or 0.0
-        hi_hours = _to_finite_float(hours_params.get("max", hours_params.get("hi")), None)
-        try:
-            requested_hours = float(rec.get("hours_to_recharge_after_trigger"))
-        except (TypeError, ValueError):
-            requested_hours = 1.0
-        if hi_hours is not None:
-            requested_hours = min(requested_hours, hi_hours)
-        requested_hours = max(lo_hours, requested_hours)
+    # Legacy low-balance fields are only meaningful when this is an explicit legacy-rule path.
+    # Agentic JSON/DB-grounded scenarios use their discovered contract instead of a fixed field list.
+    if _lb_domain(rules):
+        trigger = dt("low_balance_trigger_timestamp")
+        recharge = dt("recharge_timestamp")
+        if trigger is not None and recharge is not None and "hours_to_recharge_after_trigger" in rec:
+            hours_params = by_name.get("hours_to_recharge_after_trigger", {}).get("params") or {}
+            precision = int(hours_params.get("precision", 2) or 2)
+            lo_hours = _to_finite_float(hours_params.get("min", hours_params.get("lo")), 0.0) or 0.0
+            hi_hours = _to_finite_float(hours_params.get("max", hours_params.get("hi")), None)
+            try:
+                requested_hours = float(rec.get("hours_to_recharge_after_trigger"))
+            except (TypeError, ValueError):
+                requested_hours = 1.0
+            if hi_hours is not None:
+                requested_hours = min(requested_hours, hi_hours)
+            requested_hours = max(lo_hours, requested_hours)
 
-        elapsed_hours = max(0.0, (recharge - trigger).total_seconds() / 3600.0)
-        # The timestamp pair and duration are one contract. Choose a timestamp consistent with
-        # the bounded duration, rather than clamping the duration after the fact.
-        if abs(elapsed_hours - requested_hours) > (0.5 / (10 ** max(0, precision))):
-            repaired_recharge = trigger + timedelta(hours=requested_hours)
+            elapsed_hours = max(0.0, (recharge - trigger).total_seconds() / 3600.0)
+            # The timestamp pair and duration are one contract. Choose a timestamp consistent with
+            # the bounded duration, rather than clamping the duration after the fact.
+            if abs(elapsed_hours - requested_hours) > (0.5 / (10 ** max(0, precision))):
+                repaired_recharge = trigger + timedelta(hours=requested_hours)
+                params = by_name.get("recharge_timestamp", {}).get("params") or {}
+                set_value("recharge_timestamp", _format_datetime(repaired_recharge, params),
+                          "recharge_timestamp aligned to hours_to_recharge_after_trigger")
+                recharge = repaired_recharge
+                elapsed_hours = requested_hours
+            set_value("hours_to_recharge_after_trigger", round(elapsed_hours, precision),
+                      "hours_to_recharge_after_trigger recalculated from timestamps")
+        elif trigger is not None and recharge is not None and recharge < trigger:
             params = by_name.get("recharge_timestamp", {}).get("params") or {}
+            repaired_recharge = trigger + timedelta(hours=1)
             set_value("recharge_timestamp", _format_datetime(repaired_recharge, params),
-                      "recharge_timestamp aligned to hours_to_recharge_after_trigger")
+                      "recharge_timestamp moved after low_balance_trigger_timestamp")
             recharge = repaired_recharge
-            elapsed_hours = requested_hours
-        set_value("hours_to_recharge_after_trigger", round(elapsed_hours, precision),
-                  "hours_to_recharge_after_trigger recalculated from timestamps")
-    elif trigger is not None and recharge is not None and recharge < trigger:
-        params = by_name.get("recharge_timestamp", {}).get("params") or {}
-        repaired_recharge = trigger + timedelta(hours=1)
-        set_value("recharge_timestamp", _format_datetime(repaired_recharge, params),
-                  "recharge_timestamp moved after low_balance_trigger_timestamp")
-        recharge = repaired_recharge
 
-    if "pre_trigger_core_balance_inr" in rec and "threshold_breach_limit_inr" in rec:
-        pre = rec.get("pre_trigger_core_balance_inr")
-        threshold = rec.get("threshold_breach_limit_inr")
-        if isinstance(pre, (int, float)) and isinstance(threshold, (int, float)) and pre > threshold:
-            set_value("threshold_breach_limit_inr", round(float(pre), 2),
-                      "threshold_breach_limit_inr raised to contain pre-trigger balance")
+        if "pre_trigger_core_balance_inr" in rec and "threshold_breach_limit_inr" in rec:
+            pre = rec.get("pre_trigger_core_balance_inr")
+            threshold = rec.get("threshold_breach_limit_inr")
+            if isinstance(pre, (int, float)) and isinstance(threshold, (int, float)) and pre > threshold:
+                set_value("threshold_breach_limit_inr", round(float(pre), 2),
+                          "threshold_breach_limit_inr raised to contain pre-trigger balance")
 
-    if "zero_balance_outage_duration_hours" in rec and "hours_to_recharge_after_trigger" in rec:
-        outage = rec.get("zero_balance_outage_duration_hours")
-        elapsed = rec.get("hours_to_recharge_after_trigger")
-        if isinstance(outage, (int, float)) and isinstance(elapsed, (int, float)) and outage > elapsed:
-            max_outage = max(0, int(math.floor(float(elapsed))))
-            set_value("zero_balance_outage_duration_hours", max_outage,
-                      "zero_balance_outage_duration_hours capped by recharge delay")
+        if "zero_balance_outage_duration_hours" in rec and "hours_to_recharge_after_trigger" in rec:
+            outage = rec.get("zero_balance_outage_duration_hours")
+            elapsed = rec.get("hours_to_recharge_after_trigger")
+            if isinstance(outage, (int, float)) and isinstance(elapsed, (int, float)) and outage > elapsed:
+                max_outage = max(0, int(math.floor(float(elapsed))))
+                set_value("zero_balance_outage_duration_hours", max_outage,
+                          "zero_balance_outage_duration_hours capped by recharge delay")
 
-    if all(k in rec for k in ("pre_trigger_core_balance_inr", "credited_monetary_amount_inr", "emergency_credit_deducted_inr", "post_recharge_core_balance_inr")):
-        pre = rec.get("pre_trigger_core_balance_inr")
-        credited = rec.get("credited_monetary_amount_inr")
-        emergency = rec.get("emergency_credit_deducted_inr")
-        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (pre, credited, emergency)):
-            target_params = by_name.get("post_recharge_core_balance_inr", {}).get("params") or {}
-            post_lo = _to_finite_float(target_params.get("min", target_params.get("lo")), 0.0) or 0.0
-            post_hi = _to_finite_float(target_params.get("max", target_params.get("hi")), 100.0)
-            raw_expected = float(pre) + float(credited) - float(emergency)
-            if post_hi is not None and raw_expected > post_hi:
-                adjusted_credited = max(0.0, min(float(credited), float(post_hi) - float(pre) + float(emergency)))
-                set_value("credited_monetary_amount_inr", round(adjusted_credited, 2),
-                          "credited_monetary_amount_inr adjusted to preserve post-balance bounds")
-                credited = adjusted_credited
+        if all(k in rec for k in ("pre_trigger_core_balance_inr", "credited_monetary_amount_inr", "emergency_credit_deducted_inr", "post_recharge_core_balance_inr")):
+            pre = rec.get("pre_trigger_core_balance_inr")
+            credited = rec.get("credited_monetary_amount_inr")
+            emergency = rec.get("emergency_credit_deducted_inr")
+            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (pre, credited, emergency)):
+                target_params = by_name.get("post_recharge_core_balance_inr", {}).get("params") or {}
+                post_lo = _to_finite_float(target_params.get("min", target_params.get("lo")), 0.0) or 0.0
+                post_hi = _to_finite_float(target_params.get("max", target_params.get("hi")), 100.0)
                 raw_expected = float(pre) + float(credited) - float(emergency)
-            elif raw_expected < post_lo:
-                adjusted_emergency = max(0.0, min(float(emergency), float(pre) + float(credited) - float(post_lo)))
-                set_value("emergency_credit_deducted_inr", round(adjusted_emergency, 2),
-                          "emergency_credit_deducted_inr adjusted to preserve post-balance bounds")
-                emergency = adjusted_emergency
-                raw_expected = float(pre) + float(credited) - float(emergency)
-            expected = round(max(post_lo, min(post_hi if post_hi is not None else raw_expected, raw_expected)), 2)
-            set_value("post_recharge_core_balance_inr", expected,
-                      "post_recharge_core_balance_inr recalculated from balance movement")
+                if post_hi is not None and raw_expected > post_hi:
+                    adjusted_credited = max(0.0, min(float(credited), float(post_hi) - float(pre) + float(emergency)))
+                    set_value("credited_monetary_amount_inr", round(adjusted_credited, 2),
+                              "credited_monetary_amount_inr adjusted to preserve post-balance bounds")
+                    credited = adjusted_credited
+                    raw_expected = float(pre) + float(credited) - float(emergency)
+                elif raw_expected < post_lo:
+                    adjusted_emergency = max(0.0, min(float(emergency), float(pre) + float(credited) - float(post_lo)))
+                    set_value("emergency_credit_deducted_inr", round(adjusted_emergency, 2),
+                              "emergency_credit_deducted_inr adjusted to preserve post-balance bounds")
+                    emergency = adjusted_emergency
+                    raw_expected = float(pre) + float(credited) - float(emergency)
+                expected = round(max(post_lo, min(post_hi if post_hi is not None else raw_expected, raw_expected)), 2)
+                set_value("post_recharge_core_balance_inr", expected,
+                          "post_recharge_core_balance_inr recalculated from balance movement")
 
     # Intervention fields: a conversion cannot occur without an intervention being sent.
     if rec.get("proactive_nudge_sent_flag") is False:
@@ -4687,7 +5061,9 @@ def _validate_record(
         rec["customer_response_ts"] = _format_datetime(dispatch_ts, response_var.get("params") or {})
         issues.append("customer_response_ts corrected")
 
-    rec, semantic_issues = _enforce_obvious_semantic_consistency(rec, variables)
+    rec, generic_issues = _enforce_generic_business_consistency(rec, variables, rules=rules)
+    issues.extend(generic_issues)
+    rec, semantic_issues = _enforce_obvious_semantic_consistency(rec, variables, rules=rules)
     issues.extend(semantic_issues)
     rec, topup_issues = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
     issues.extend(topup_issues)

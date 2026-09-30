@@ -11,8 +11,9 @@ import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
 from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain
-from core.industry_source_store import catalog_for_request, normalize_lookup_key, select_json_source_catalog, canonical_variable_semantic_key, semantic_exclusion_aliases, _catalog_role
+from core.industry_source_store import catalog_for_request, normalize_lookup_key, canonical_variable_semantic_key, semantic_exclusion_aliases, _catalog_role
 from core.variable_quality import VariableQualityEngine
+from core.scenario_planner import select_source_rows
 from core.temporal_contract import is_supported_temporal_rule
 from config.runtime import SCHEMA_MAX_VARIABLES, SCHEMA_MIN_VARIABLE_SCORE
 
@@ -67,7 +68,7 @@ class SchemaCompiler:
         """
         return cls._normalize_variable_key(name)[:120]
 
-    SOURCE_RUNTIME_NAME_MAX_LENGTH = 32
+    SOURCE_RUNTIME_NAME_MAX_LENGTH = 120
     _GENERIC_SOURCE_LEAF_TOKENS = {
         "id", "key", "name", "label", "type", "status", "state", "reason", "value",
         "amount", "unit", "date", "time", "datetime", "timestamp", "role", "code",
@@ -168,13 +169,13 @@ class SchemaCompiler:
         fields: list[GeneratedSchemaField],
         all_source_specs: list[dict[str, Any]] | None = None,
     ) -> dict[str, str]:
-        """Assign stable source-derived runtime names independent of the selected field subset.
+        """Preserve stable source field names in the public scenario contract.
 
-        The old allocator chose a compact candidate by looking only at the currently selected
-        fields. That made an already-approved source variable change names when a later proposal
-        selected a second field with a similar leaf name. Runtime names now come from the immutable
-        source semantic path; a stable hash is used only when that readable base is ambiguous or
-        too long. This keeps MongoDB source identity and downloaded CSV/JSON column names stable.
+        MongoDB source names are the authoritative client vocabulary. Earlier implementations
+        rebuilt names from flattened semantic paths and added hashes on collisions, which caused
+        stable source fields such as ``adjust_balance_amount_amount`` to drift between proposals.
+        Keep the exact source field name whenever it is already a valid executable identifier.
+        Ambiguous names fail closed; never expose a run-specific hash suffix.
         """
         source_fields = [
             field for field in fields
@@ -183,81 +184,31 @@ class SchemaCompiler:
         if not source_fields:
             return {}
 
-        def candidate_from_segments(segments: list[str]) -> str:
-            tokens = cls._source_candidate_tokens(segments)
-            if not tokens:
-                return "scenario_attribute"
-            # Prefer the richest whole-word source context that still fits the public runtime name.
-            for size in range(min(len(tokens), 6), 0, -1):
-                candidate = cls._normalize_variable_key("_".join(tokens[-size:]))
-                if candidate and len(candidate) <= cls.SOURCE_RUNTIME_NAME_MAX_LENGTH:
-                    return candidate
-            digest = hashlib.sha1(".".join(segments).encode("utf-8")).hexdigest()[:6]
-            budget = max(8, cls.SOURCE_RUNTIME_NAME_MAX_LENGTH - len(digest) - 1)
-            base = cls._normalize_variable_key("_".join(tokens[-4:])) or "scenario_attribute"
-            return f"{base[:budget]}_{digest}"[: cls.SOURCE_RUNTIME_NAME_MAX_LENGTH]
-
-        # Build a stable ambiguity map from the complete active source catalog when available.
-        # This is the critical part: collision decisions must not depend on the subset selected by
-        # one particular scenario proposal.
-        catalog_candidates: dict[str, set[str]] = {}
-        for spec in all_source_specs or []:
-            if not isinstance(spec, dict):
-                continue
-            semantic_key = str(spec.get("semantic_key") or "").strip()
-            if not semantic_key:
-                continue
-            segments = [
-                cls._normalize_variable_key(part)
-                for part in semantic_key.split(".")
-                if cls._normalize_variable_key(part)
-            ]
-            base = candidate_from_segments(segments)
-            catalog_candidates.setdefault(cls._normalize_variable_key(base), set()).add(semantic_key.casefold())
-
-        occupied = {
-            cls._normalize_variable_key(field.name)
-            for field in fields
-            if str((field.provenance or {}).get("generated_from") or "").strip().lower() != "mongodb_json_source"
-        }
         replacements: dict[str, str] = {}
-        used: set[str] = set(occupied)
-        source_seen: dict[str, str] = {}
-
-        for field in sorted(source_fields, key=lambda item: str((item.provenance or {}).get("source_json_semantic_key") or item.name)):
-            key = cls._normalize_variable_key(field.name)
+        used: dict[str, str] = {}
+        for field in sorted(
+            source_fields,
+            key=lambda item: str((item.provenance or {}).get("source_json_semantic_key") or item.name).casefold(),
+        ):
             provenance = field.provenance or {}
-            semantic_key = str(provenance.get("source_json_semantic_key") or field.name).strip()
-            segments = [
-                cls._normalize_variable_key(part)
-                for part in semantic_key.split(".")
-                if cls._normalize_variable_key(part)
-            ] or [key]
-            base = candidate_from_segments(segments)
-            normalized_base = cls._normalize_variable_key(base)
-            ambiguous = len(catalog_candidates.get(normalized_base, {semantic_key.casefold()})) > 1
-            candidate = base
-            if ambiguous or normalized_base in occupied:
-                digest = hashlib.sha1(semantic_key.casefold().encode("utf-8")).hexdigest()[:6]
-                budget = cls.SOURCE_RUNTIME_NAME_MAX_LENGTH - len(digest) - 1
-                candidate = f"{base[:max(1, budget)].rstrip('_')}_{digest}"
-            candidate_key = cls._normalize_variable_key(candidate)
-
-            # Same semantic key should always resolve to the same runtime name. Distinct concepts
-            # must remain distinct even when their readable bases collide.
-            previous = source_seen.get(semantic_key.casefold())
-            if previous:
-                replacements[key] = previous
-                continue
-            if candidate_key in used:
-                digest = hashlib.sha1(semantic_key.casefold().encode("utf-8")).hexdigest()[:6]
-                budget = cls.SOURCE_RUNTIME_NAME_MAX_LENGTH - len(digest) - 1
-                candidate = f"{base[:max(1, budget)].rstrip('_')}_{digest}"
-                candidate_key = cls._normalize_variable_key(candidate)
-            source_seen[semantic_key.casefold()] = candidate
-            replacements[key] = candidate
-            used.add(candidate_key)
-
+            original = str(
+                provenance.get("source_json_original_name")
+                or provenance.get("source_json_name")
+                or field.name
+            ).strip()
+            candidate = cls._normalize_variable_key(original)
+            if not candidate:
+                raise ValueError("Source field has no usable canonical output name")
+            # Source contracts are authoritative and must not silently truncate public names.
+            semantic = str(provenance.get("source_json_semantic_key") or original).strip()
+            existing = used.get(candidate)
+            if existing and existing != semantic.casefold():
+                raise ValueError(
+                    f"Source schema contains duplicate public field name '{candidate}' for semantic paths "
+                    f"'{existing}' and '{semantic}'. Resolve the source semantic identity before proposing the scenario."
+                )
+            used[candidate] = semantic.casefold()
+            replacements[cls._normalize_variable_key(field.name)] = candidate
         return replacements
 
     @classmethod
@@ -997,7 +948,7 @@ class SchemaCompiler:
         ]
         resolved_entity_key = None
         if normalized_type == "transactional":
-            requested_key = self._normalize_variable_key(entity_key or "")
+            requested_key = self._normalize_variable_key(entity_key) if str(entity_key or "").strip() else ""
             if requested_key:
                 if requested_key not in {self._normalize_variable_key(row.get("name")) for row in catalog_rows} and requested_key not in external_keys:
                     raise ValueError(
@@ -1005,12 +956,18 @@ class SchemaCompiler:
                     )
                 resolved_entity_key = entity_key.strip()
             else:
-                chosen_key = all_identity_names[0] if all_identity_names else None
-                if chosen_key:
-                    resolved_entity_key = next(
-                        (str(row.get("name")) for row in catalog_rows if normalize_lookup_key(row.get("name")) == chosen_key),
-                        chosen_key,
-                    )
+                entity_candidates = [
+                    row for row in catalog_rows
+                    if normalize_lookup_key(row.get("name")) in set(all_identity_names)
+                    and _is_entity_catalog_row(row)
+                ]
+                entity_candidates.sort(key=lambda row: (
+                    0 if any(token in normalize_lookup_key(row.get("name")) for token in ("customer", "subscriber", "user", "member", "patient")) else 1,
+                    0 if str(row.get("required")) == "True" else 1,
+                    normalize_lookup_key(row.get("name")),
+                ))
+                if entity_candidates:
+                    resolved_entity_key = str(entity_candidates[0].get("name"))
         if resolved_entity_key:
             preferred_names.add(normalize_lookup_key(resolved_entity_key))
 
@@ -1018,13 +975,10 @@ class SchemaCompiler:
         # candidate pool, then let deterministic scoring keep the best source-backed concepts up to
         # the requested budget. This preserves the variable ceiling while preferring useful fields
         # over filling the budget with low-information metadata.
-        candidate_pool_budget = min(
-            len(catalog_rows),
-            max(variable_budget, variable_budget * 3, variable_budget + 50),
-        ) if variable_budget else 0
-        selected_rows, source_selection_report = select_json_source_catalog(
+        candidate_pool_budget = min(len(catalog_rows), max(variable_budget, 1)) if variable_budget else 0
+        selected_rows, source_selection_report = select_source_rows(
             catalog_rows,
-            business_context=business_context,
+            context=set(re.findall(r"[a-z0-9]+", business_context.casefold())) - {"and", "the", "of", "to", "in", "for", "with", "a", "an", "is", "are"},
             preferred_names=preferred_names,
             preferred_models={str(value) for value in (intent.requested_entities or []) if str(value).strip()},
             excluded_names=excluded,

@@ -1234,7 +1234,7 @@ def catalog_for_request(industry_type: str, domain: str) -> dict[str, Any]:
             "Referenced objects and arrays are traversed to their scalar leaves; scalar arrays themselves are not invented as serialized variables.",
             "Base, create/update/delete, and event representations of the same business field are collapsed by semantic path and retain all supporting source provenance.",
             "Reference/support schemas remain available through their owning business resource paths but are not selected as standalone breadth models.",
-            "The LLM may provide relevance hints, but deterministic selection is recall-first and can expand relevant source-backed models without inventing vocabulary.",
+            "The LLM may provide relevance hints, but deterministic selection is scenario-relevance-first; source models and scalar leaves are never emitted solely because they exist in the source catalog.",
         ],
     }
     with _CATALOG_CACHE_LOCK:

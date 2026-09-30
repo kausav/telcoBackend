@@ -280,11 +280,11 @@ def build_deterministic_rules(state: Any, variables: list[dict]) -> dict[str, An
             "A correctly generated record should normally require zero validation repairs; repeated repair/retry is treated as a generator defect.",
         ],
         "domain_invariants": [
-            "Low Balance & Top-up records must keep customer_id/account_id/msisdn stable across a customer history.",
-            "Low Balance & Top-up balances, usage types, units, top-up amounts, statuses, and timestamps must describe the same recharge lifecycle.",
-            "Low Balance & Top-up validity windows must be derived from the recharge/plan timeline rather than independently sampled.",
-            "MongoDB-supplied Low Balance fields may extend the official source model, but they must remain consistent with official status and transaction state fields.",
-        ] if "low balance" in domain.lower() else [],
+            "Stable entity identities must remain unchanged across that entity's generated history.",
+            "Fields belonging to one resource lifecycle must describe the same state/transition rather than independent random events.",
+            "Validity windows must contain their related event/transaction timeline when the source contract exposes the relationship.",
+            "Source-backed fields and persisted business extensions must remain consistent with their selected lifecycle state and declared relationships.",
+        ],
         "field_constraints": {
             name: {
                 "description": str(var.get("description", "")),

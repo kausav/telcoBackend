@@ -1,0 +1,594 @@
+"""Scenario-aware planning helpers.
+
+The source catalog and persisted DB variables are catalogs, not output schemas.  This module
+selects only concepts supported by the request, preserves explicit user selections, closes
+reference dependencies, and keeps the result domain-neutral.
+"""
+from __future__ import annotations
+
+import re
+from typing import Any, Iterable
+
+from core.industry_source_store import (
+    _catalog_role,
+    _normalize_model_name,
+    _source_owner_family,
+    canonical_variable_semantic_key,
+    normalize_lookup_key,
+)
+
+_STOP = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "case", "country", "data",
+    "dataset", "do", "for", "from", "generate", "high", "in", "industry", "is", "it", "of",
+    "on", "or", "pii", "scenario", "sensitive", "the", "this", "to", "type", "use", "used",
+    "using", "with", "without", "normal", "transactional", "aggregational", "fidelity", "synthetic",
+}
+_GENERIC_ROLE_WORDS = {
+    "id", "key", "name", "type", "status", "state", "date", "time", "timestamp", "amount", "value",
+    "unit", "units", "reason", "code", "description", "reference", "identifier", "field", "record",
+    "records", "resource", "entity", "object", "data", "model", "detail", "details", "profile", "balance",
+}
+_ENTITY_WORDS = {
+    "customer", "subscriber", "user", "member", "patient", "account", "policyholder", "client",
+    "tenant", "person", "organization", "company", "party", "msisdn", "phone", "mobile",
+}
+
+
+def _tokens(value: Any) -> set[str]:
+    text = str(value or "").casefold()
+    raw = re.findall(r"[a-z0-9]+", text)
+    out: set[str] = set()
+    # Treat common hyphen/space punctuation variants as one semantic term (for example
+    # ``top-up`` and ``top up``). This is normalization, not an industry-specific field list.
+    if re.search(r"\btop[\s_-]+up\b", text):
+        raw.append("topup")
+    for token in raw:
+        if token in _STOP:
+            continue
+        # Keep compound source names usable without a telecom-specific dictionary.
+        if token.endswith("balance") and len(token) > len("balance") + 2:
+            out.add(token[:-len("balance")])
+            out.add("balance")
+        if token.endswith("topup") and len(token) > len("topup") + 2:
+            out.add(token[:-len("topup")])
+            out.add("topup")
+        out.add(token)
+        if token.endswith("ies") and len(token) > 4:
+            out.add(token[:-3] + "y")
+        elif token.endswith("s") and len(token) > 4 and not token.endswith(("ss", "us")):
+            out.add(token[:-1])
+    return out
+
+
+def _context_tokens(request: Any) -> set[str]:
+    values = (
+        getattr(request, "scenario_type", ""), getattr(request, "industry_type", ""), getattr(request, "domain", ""),
+        getattr(request, "business_scenario", ""), getattr(request, "use_case", ""), getattr(request, "country", ""),
+        getattr(request, "type_of_data", ""),
+    )
+    return _tokens(" ".join(str(x or "") for x in values))
+
+
+def _field_text(row: dict[str, Any]) -> str:
+    return " ".join(str(row.get(k) or "") for k in (
+        "name", "semantic_key", "path", "description", "model", "business_model",
+        "source_owner_model", "source_owner_relation", "model_description",
+    ))
+
+
+def _source_direct_signal(row: dict[str, Any], context: set[str]) -> set[str]:
+    """Return business-term evidence without counting the owning resource name as field evidence."""
+    business_context = context - _GENERIC_ROLE_WORDS - _ENTITY_WORDS
+    model_tokens = _tokens(row.get("business_model") or row.get("model"))
+    field_tokens = _tokens(row.get("field") or row.get("name"))
+    description_tokens = _tokens(row.get("description"))
+    semantic_tokens = _tokens(row.get("semantic_key") or row.get("path"))
+    # Remove owning model tokens from full flattened names/paths so every ``topupbalance_*`` field
+    # does not become a direct hit merely because the scenario is about top-ups.
+    signal = (field_tokens | description_tokens | semantic_tokens) - model_tokens
+    return signal & business_context
+
+
+def _relevance_score(row: dict[str, Any], context: set[str]) -> float:
+    name = _tokens(row.get("name"))
+    semantic = _tokens(row.get("semantic_key"))
+    path = _tokens(row.get("path"))
+    description = _tokens(row.get("description"))
+    model = _tokens(row.get("business_model") or row.get("model"))
+    strong_context = context - _GENERIC_ROLE_WORDS
+    score = 0.0
+    score += 14.0 * len(name & strong_context)
+    score += 10.0 * len(semantic & strong_context)
+    score += 7.0 * len(path & strong_context)
+    score += 5.0 * len(description & strong_context)
+    score += 12.0 * len(model & strong_context)
+    if _catalog_role(row) == "identity":
+        score += 8.0
+    elif _catalog_role(row) in {"status", "timing", "measurement", "metric", "decision", "transaction", "event"}:
+        score += 4.0
+    if row.get("required"):
+        score += 3.0
+    return score
+
+
+def _model_evidence(rows: list[dict[str, Any]], context: set[str], preferred_models: Iterable[str] | None = None) -> set[str]:
+    requested = {_normalize_model_name(v) for v in (preferred_models or ()) if _normalize_model_name(v)}
+    result: set[str] = set()
+    for row in rows:
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
+        if not model:
+            continue
+        model_tokens = _tokens(model) - _GENERIC_ROLE_WORDS - _ENTITY_WORDS
+        strong_context = context - _GENERIC_ROLE_WORDS - _ENTITY_WORDS
+        strong = model_tokens & strong_context
+        direct = _source_direct_signal(row, context)
+        if strong or direct:
+            result.add(model)
+            continue
+        # An exact LLM model request is accepted only when it has an independent strong field signal.
+        if model in requested and _relevance_score(row, context) >= 32:
+            result.add(model)
+    return result
+
+
+def _same_owner(row: dict[str, Any], model: str) -> bool:
+    return _source_owner_family(row.get("source_owner_model") or row.get("model")) == _source_owner_family(model)
+
+
+def select_source_rows(
+    rows: list[dict[str, Any]],
+    *,
+    context: set[str],
+    preferred_names: set[str] | None = None,
+    preferred_models: set[str] | None = None,
+    excluded_names: set[str] | None = None,
+    excluded_semantic_keys: set[str] | None = None,
+    max_fields: int = 500,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select scenario-relevant source leaves without whole-model expansion."""
+    limit = max(0, int(max_fields))
+    preferred = {normalize_lookup_key(x) for x in preferred_names or set() if normalize_lookup_key(x)}
+    excluded = {normalize_lookup_key(x) for x in excluded_names or set() if normalize_lookup_key(x)}
+    excluded_sem = {normalize_lookup_key(x) for x in excluded_semantic_keys or set() if normalize_lookup_key(x)}
+
+    canonical: list[dict[str, Any]] = []
+    seen_semantics: set[str] = set()
+    for raw in rows or []:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        name = normalize_lookup_key(row.get("name"))
+        semantic = canonical_variable_semantic_key(row)
+        if not name or name in excluded:
+            continue
+        if semantic and (semantic in seen_semantics or semantic in excluded_sem):
+            continue
+        if semantic:
+            seen_semantics.add(semantic)
+        kind = str(row.get("model_kind") or "resource")
+        if kind in {"support", "support_reference", "abstract", "auxiliary", "crud_wrapper"}:
+            continue
+        canonical.append(row)
+
+    models = _model_evidence(canonical, context, preferred_models)
+    # LLM-selected source field names are useful evidence, but they must still clear a deterministic
+    # relevance floor before their owning model is opened. This lets a valid field selection activate
+    # its model without allowing a single noisy profile/reference field to resurrect an entire model.
+    for row in canonical:
+        name = normalize_lookup_key(row.get("name"))
+        if name not in preferred:
+            continue
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
+        if not model or _catalog_role(row) in {"profile", "configuration", "support", "support_reference", "abstract", "auxiliary", "other"}:
+            continue
+        direct = bool(_source_direct_signal(row, context))
+        if direct or _relevance_score(row, context) >= 28:
+            models.add(model)
+    anchor_models: set[str] = set()
+
+    # Entity/resource anchors are selected without allowing generic "id" or "account" words to
+    # open an unrelated source model.
+    entity_candidates = [
+        row for row in canonical
+        if _catalog_role(row) == "identity"
+        and (_tokens(row.get("name")) & _ENTITY_WORDS)
+    ]
+    for row in sorted(entity_candidates, key=lambda r: (-_relevance_score(r, context), str(r.get("name") or ""))):
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
+        if model:
+            models.add(model)
+            anchor_models.add(model)
+            break
+
+    # Add source-defined related models only one hop from an already relevant model.  This is a
+    # structural relation, not a broad resource expansion.
+    related: set[str] = set()
+    all_models = {
+        _normalize_model_name(r.get("business_model") or r.get("model"))
+        for r in canonical
+        if _normalize_model_name(r.get("business_model") or r.get("model"))
+    }
+    graph: dict[str, set[str]] = {}
+    for row in canonical:
+        source_model = _normalize_model_name(row.get("business_model") or row.get("model"))
+        if not source_model:
+            continue
+        for target in row.get("linked_business_models") or []:
+            target_model = _normalize_model_name(target)
+            if target_model in all_models and target_model != source_model:
+                graph.setdefault(source_model, set()).add(target_model)
+    for source in sorted(models):
+        for target in sorted(graph.get(source, set())):
+            if target not in models:
+                related.add(target)
+
+    def admissible(row: dict[str, Any], model: str, *, direct: bool, related_model: bool = False) -> bool:
+        role = _catalog_role(row)
+        if direct or row.get("required"):
+            return True
+        # Entity anchor models are opened only to provide identity/relationship anchors unless the
+        # request explicitly mentions one of their other concepts. This prevents customer-profile
+        # fields such as credit score/risk rating from leaking into unrelated transactional scenarios.
+        if model in anchor_models and role != "identity":
+            return False
+        if role in {"profile", "configuration", "other"}:
+            return False
+        if related_model and role not in {"identity", "status", "timing", "measurement", "metric", "decision", "transaction", "event"}:
+            return False
+        if role == "categorical":
+            # Generic descriptive categorical leaves (channel_name, method_name, etc.) are not
+            # structurally required. Keep categorical state/type fields only when they have direct
+            # scenario evidence or belong to an explicitly selected source model.
+            leaf_tokens = _tokens(row.get("field") or row.get("name"))
+            if not (leaf_tokens & {"status", "state", "usage", "category", "mode", "type", "decision", "outcome", "auto", "automatic", "recurring", "period"}):
+                return False
+        return True
+
+    scored: list[tuple[float, dict[str, Any], str]] = []
+    for row in canonical:
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
+        if model not in models and model not in related:
+            continue
+        score = _relevance_score(row, context)
+        name = normalize_lookup_key(row.get("name"))
+        direct = bool(_source_direct_signal(row, context))
+        if name in preferred:
+            score += 100.0
+            direct = True
+        role = _catalog_role(row)
+        if model in related:
+            score -= 10.0
+            if direct:
+                score += 12.0
+            elif role not in {"identity", "status", "timing", "measurement", "metric"}:
+                score -= 14.0
+        if model not in models:
+            continue
+        if not admissible(row, model, direct=direct, related_model=(model in related)):
+            continue
+        scored.append((score, row, model))
+
+    # Keep a small amount of structural coverage per relevant model, then the strongest direct fields.
+    selected: list[dict[str, Any]] = []
+    selected_sem: set[str] = set()
+    for model in sorted(models):
+        candidates = sorted(
+            [item for item in scored if item[2] == model],
+            key=lambda item: (-item[0], item[1].get("depth", 0), normalize_lookup_key(item[1].get("name"))),
+        )
+        for score, row, _ in candidates[:12]:
+            sem = canonical_variable_semantic_key(row) or normalize_lookup_key(row.get("name"))
+            if sem in selected_sem:
+                continue
+            direct = bool(_source_direct_signal(row, context))
+            if not admissible(row, model, direct=direct, related_model=False):
+                continue
+            selected.append(dict(row)); selected_sem.add(sem)
+
+    for score, row, model in sorted(scored, key=lambda x: (-x[0], x[2], normalize_lookup_key(x[1].get("name")))):
+        if len(selected) >= limit:
+            break
+        sem = canonical_variable_semantic_key(row) or normalize_lookup_key(row.get("name"))
+        if sem in selected_sem:
+            continue
+        direct = bool(_source_direct_signal(row, context))
+        if not admissible(row, model, direct=direct, related_model=(model in related)):
+            continue
+        if model in related and score < 18 and normalize_lookup_key(row.get("name")) not in preferred:
+            continue
+        selected.append(dict(row)); selected_sem.add(sem)
+
+    # Resolve explicit preferred fields last only when their owning model is scenario-relevant. This
+    # protects against one noisy LLM field opening a sibling operation model.
+    for row in canonical:
+        if len(selected) >= limit:
+            break
+        name = normalize_lookup_key(row.get("name"))
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
+        sem = canonical_variable_semantic_key(row) or name
+        if name not in preferred or sem in selected_sem or model not in models:
+            continue
+        selected.append(dict(row)); selected_sem.add(sem)
+
+    selected = selected[:limit]
+    report = {
+        "candidate_count": len(canonical),
+        "canonical_candidate_count": len(canonical),
+        "eligible_count_before_cap": len(selected),
+        "selected_count": len(selected),
+        "max_fields": limit,
+        "capped": len(selected) >= limit and len(scored) > limit,
+        "truncated_count": max(0, len(scored) - len(selected)),
+        "selection_mode": "scenario_relevance_no_whole_model_expansion",
+        "relevant_models": sorted(models),
+        "related_models": sorted(related),
+        "selected_business_models": sorted({_normalize_model_name(r.get("business_model") or r.get("model")) for r in selected}),
+        "selected_names": [str(r.get("name") or "") for r in selected],
+        "preferred_names_used": sorted(set(normalize_lookup_key(r.get("name")) for r in selected) & preferred),
+        "excluded_names": sorted(excluded),
+        "excluded_semantic_keys": sorted(excluded_sem),
+    }
+    return selected, report
+
+
+def select_db_variables_for_scenario(
+    variables: list[dict[str, Any]],
+    *,
+    context: Iterable[str],
+    selected_source_models: Iterable[str] = (),
+    user_selected_names: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    """Select relevant persisted DB concepts; USER_SELECTED is always retained."""
+    context_set = set(context or set())
+    strong_context = context_set - _GENERIC_ROLE_WORDS - _ENTITY_WORDS
+    model_tokens = _tokens(" ".join(selected_source_models)) - _GENERIC_ROLE_WORDS
+    explicit = {normalize_lookup_key(x) for x in user_selected_names if normalize_lookup_key(x)}
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for raw in variables or []:
+        item = dict(raw)
+        name = normalize_lookup_key(item.get("name"))
+        if not name:
+            continue
+        if name in explicit:
+            scored.append((1000.0, item)); continue
+        text_tokens = _tokens(_field_text(item))
+        field_name_tokens = _tokens(item.get("name"))
+        direct = (_tokens(item.get("description")) | _tokens(item.get("field"))) & strong_context
+        model_overlap = text_tokens & model_tokens
+        role = _catalog_role(item)
+        relationship_markers = {
+            "party", "requestor", "owner", "receiver", "related", "payment", "method",
+            "channel", "product", "logical", "resource", "voucher", "reference", "href", "role",
+        }
+        explicit_entity_name = bool(field_name_tokens & {"msisdn", "phone", "mobile"}) or normalize_lookup_key(item.get("name")) in {
+            "customer_id", "subscriber_id", "user_id", "member_id", "patient_id", "account_id"
+        }
+        entity_identity = explicit_entity_name or (
+            role == "identity"
+            and bool(field_name_tokens & {"customer", "subscriber", "user", "member", "patient"})
+            and not (field_name_tokens & relationship_markers)
+        )
+        resource_identity = bool(role == "identity" and model_overlap and not (field_name_tokens & relationship_markers))
+        relationship_identity = role == "identity" and not entity_identity and not resource_identity
+        if field_name_tokens & relationship_markers and not direct:
+            # Party/channel/payment/reference metadata is auxiliary unless the scenario explicitly
+            # asks for that relationship. Do not widen an otherwise focused contract with these leaves.
+            continue
+        matched_model = ""
+        field_norm = normalize_lookup_key(item.get("name"))
+        for model_name in sorted(set(_normalize_model_name(v) for v in selected_source_models if _normalize_model_name(v)), key=len, reverse=True):
+            model_norm = normalize_lookup_key(model_name)
+            if model_norm and (field_norm == model_norm or field_norm.startswith(model_norm + "_")):
+                matched_model = model_norm
+                break
+        entity_model = bool(matched_model and _tokens(matched_model) & _ENTITY_WORDS)
+        decision_context = context_set & {
+            "offer", "accepted", "accept", "acceptance", "response", "decision",
+            "intervention", "communication", "contact", "recharge", "topup", "upsell",
+        }
+        score = 14.0 * len(direct) + 8.0 * len(model_overlap)
+        # A low-balance/recharge-style scenario has an implicit decision point when the persisted
+        # catalog exposes a concrete offer/acceptance concept. This is semantic evidence from the
+        # request terms, not a field-name allowlist for one industry.
+        if (field_name_tokens & {"offer", "accepted", "accept", "acceptance", "recommend", "recommended"}) and (context_set & {"topup", "recharge", "intervention", "upsell", "offer"}):
+            score += 18
+            direct = True
+        # Entity identity is structurally useful even if no model is explicitly named in the request.
+        if entity_identity:
+            score += 22
+        if role in {"status", "timing", "measurement", "metric", "decision", "transaction", "event"}:
+            score += 6
+        # A relationship/reference identity (party/account/requestor/payment-method/etc.) is not
+        # automatically required just because it shares the selected resource model. Keep only
+        # identities that are themselves the scenario/entity anchor or are directly requested.
+        relationship_identity = role == "identity" and not entity_identity
+        if model_overlap and role == "identity" and not relationship_identity:
+            score += 10
+        elif relationship_identity and not direct:
+            score -= 18
+        # Keep state/type categorical fields that materially define the selected resource, but not
+        # descriptive names such as channel_name/payment_method_name.
+        categorical_leaf = field_name_tokens & {"status", "state", "usage", "category", "mode", "type", "decision", "outcome"}
+        if model_overlap and role == "categorical" and categorical_leaf:
+            score += 6
+        # Quantity/unit pairs are useful support fields when a selected resource exposes both sides.
+        if model_overlap and (field_name_tokens & {"unit", "units", "amount", "value", "quantity", "remaining", "reserved"}):
+            score += 6
+        # Auto/recurring configuration belongs with the transaction resource, not with the generic DB catalog.
+        if model_overlap and field_name_tokens & {"auto", "automatic", "recurring", "period", "occurrence", "occurrences"}:
+            score += 6
+        # Only source/DB concepts that materially contribute to the request are retained. Generic entity
+        # profile/status/validity metadata is not enough on its own.
+        if role == "other" and not direct and not model_overlap and not entity_identity:
+            continue
+        if not direct and role == "categorical":
+            leaf_tokens = _tokens(item.get("name"))
+            if not (leaf_tokens & {"status", "state", "usage", "category", "mode", "type", "decision", "outcome", "auto", "automatic", "recurring", "period"}):
+                continue
+        # Generic descriptive leaves need stronger evidence than their resource prefix. For example,
+        # a ``reason`` field is useful for exception/suppression/recovery journeys, but should not be
+        # emitted merely because the scenario is about top-ups.
+        leaf_tokens = set(_tokens(item.get("name")))
+        exception_context = context_set & {"failure", "failed", "exception", "suppression", "decline", "declined", "rejected", "rejection", "recovery", "retry", "reason", "cause"}
+        if not exception_context and leaf_tokens & {"reason", "voucher"}:
+            continue
+        # A free-form semantic string without authoritative choices/examples/pattern is not useful
+        # merely because its resource prefix matches. Omit it unless the request directly asks for
+        # that concept.
+        params = item.get("params") if isinstance(item.get("params"), dict) else {}
+        if (
+            not direct
+            and str(item.get("dtype") or "string").casefold() == "string"
+            and not params.get("choices") and not params.get("values") and params.get("pattern") is None
+            and not params.get("source_examples")
+            and role in {"categorical", "other"}
+            and not entity_identity
+            and not (field_name_tokens & {"unit", "units"})
+        ):
+            continue
+        if relationship_identity and not direct:
+            continue
+        # Customer/subscriber profile/status metadata is an entity catalog, not a reason to widen a
+        # transaction scenario. Retain identity anchors and response/decision attributes when the
+        # request explicitly contains a decision/response concept.
+        entity_decision_signal = bool(decision_context and role in {"timing", "decision", "event"} and any(
+            token in field_name_tokens for token in {"response", "event", "interaction", "engaged", "engagement", "decision"}
+        ))
+        if entity_model and not entity_identity and not direct and not entity_decision_signal:
+            continue
+        if score >= 14:
+            scored.append((score, item))
+
+    selected = [item for _score, item in sorted(scored, key=lambda x: (-x[0], normalize_lookup_key(x[1].get("name"))))]
+
+    # Close persisted dependencies so a selected DB variable can execute without resurrecting an
+    # otherwise irrelevant variable later in the generator.
+    by_name = {normalize_lookup_key(v.get("name")): v for v in variables or [] if normalize_lookup_key(v.get("name"))}
+    selected_names = {normalize_lookup_key(v.get("name")) for v in selected}
+    changed = True
+    while changed:
+        changed = False
+        for item in list(selected):
+            for dep in item.get("depends_on", []) or []:
+                key = normalize_lookup_key(dep)
+                dep_item = by_name.get(key)
+                if dep_item and key not in selected_names:
+                    selected.append(dict(dep_item)); selected_names.add(key); changed = True
+
+    return selected
+
+
+def add_derived_offer_presentation(fields: list[Any]) -> list[Any]:
+    """Add a derived presentation flag only when an acceptance decision exists without one."""
+    names = {str(getattr(f, "name", "") or "").casefold() for f in fields}
+    accepted = next((str(getattr(f, "name", "")) for f in fields if "offer" in str(getattr(f, "name", "")).casefold() and "accept" in str(getattr(f, "name", "")).casefold()), None)
+    presented = next((str(getattr(f, "name", "")) for f in fields if "offer" in str(getattr(f, "name", "")).casefold() and ("present" in str(getattr(f, "name", "")).casefold() or "presentation" in str(getattr(f, "name", "")).casefold())), None)
+    if not accepted or presented or "offer_presented_flag" in names:
+        return fields
+
+    from core.agentic_models import GeneratedSchemaField
+    support = [
+        str(getattr(f, "name", "")) for f in fields
+        if "intervention" in str(getattr(f, "name", "")).casefold() or "recommend" in str(getattr(f, "name", "")).casefold()
+    ]
+    if not support:
+        return fields
+    dependencies = support[:2]
+    fields.append(GeneratedSchemaField(
+        name="offer_presented_flag",
+        dtype="boolean",
+        description="Derived flag indicating that a decisionable offer or recommendation was presented to the customer.",
+        gen="formula",
+        params={},
+        depends_on=dependencies,
+        nullable=False,
+        required=False,
+        formula=" and ".join(f"{dep} != None" for dep in dependencies),
+        scope="transaction",
+        provenance={"generated_from": "scenario_derived", "role": "decision", "derived_from": dependencies},
+    ))
+    return fields
+
+
+def add_derived_scenario_fields(
+    fields: list[Any],
+    *,
+    scenario_type: str = "",
+    domain: str = "",
+    business_scenario: str = "",
+) -> list[Any]:
+    """Add only high-confidence missing decision/derived concepts required by the scenario.
+
+    These are executable derived concepts, not copied source fields. The additions are
+    domain-neutral and depend on semantic evidence already present in the selected contract.
+    """
+    from core.agentic_models import GeneratedSchemaField
+
+    out = list(fields)
+    existing = {str(getattr(f, "name", "") or "").casefold() for f in out}
+    context = _tokens(" ".join((scenario_type, domain, business_scenario)))
+
+    # Suppression scenarios need an explicit observable decision, even when the source schema
+    # exposes only the communication inputs. This makes scenarioType semantically testable.
+    suppression = "suppression" in context or "suppressed" in context or "do_not_contact" in context
+    if suppression:
+        if "suppression_flag" not in existing:
+            out.append(GeneratedSchemaField(
+                name="suppression_flag",
+                dtype="boolean",
+                description="Derived flag indicating that the applicable communication or intervention was suppressed for this scenario event.",
+                gen="formula",
+                params={},
+                depends_on=[],
+                nullable=False,
+                required=False,
+                formula="True",
+                scope="transaction",
+                provenance={"generated_from": "scenario_derived", "role": "decision", "scenario_semantics": "suppression"},
+            ))
+            existing.add("suppression_flag")
+        if "communication_allowed" not in existing:
+            out.append(GeneratedSchemaField(
+                name="communication_allowed",
+                dtype="boolean",
+                description="Derived flag indicating whether the communication or intervention is allowed for the scenario event.",
+                gen="formula",
+                params={},
+                depends_on=["suppression_flag"],
+                nullable=False,
+                required=False,
+                formula="not suppression_flag",
+                scope="transaction",
+                provenance={"generated_from": "scenario_derived", "role": "eligibility", "derived_from": ["suppression_flag"]},
+            ))
+            existing.add("communication_allowed")
+
+    # A depletion journey benefits from a machine-computable depletion horizon when the selected
+    # contract already exposes compatible remaining quantity and consumption velocity concepts.
+    depletion_context = bool({"depletion", "exhaustion", "depleted"} & context)
+    data_context = bool({"data", "consumption"} & context)
+    if depletion_context and data_context and "days_to_depletion" not in existing:
+        remaining = [f for f in out if str(getattr(f, "dtype", "") or "").casefold() in {"int", "integer", "float", "decimal", "number", "numeric"} and "remaining" in str(getattr(f, "name", "") or "").casefold()]
+        velocity = [f for f in out if str(getattr(f, "dtype", "") or "").casefold() in {"int", "integer", "float", "decimal", "number", "numeric"} and any(t in str(getattr(f, "name", "") or "").casefold() for t in ("velocity", "consumption_rate", "usage_rate", "per_day"))]
+        if remaining and velocity:
+            rem = remaining[0]
+            vel = velocity[0]
+            rem_text = f"{getattr(rem, 'name', '')} {getattr(rem, 'description', '')}".casefold()
+            vel_text = f"{getattr(vel, 'name', '')} {getattr(vel, 'description', '')}".casefold()
+            compatible_unit = any(unit in rem_text and unit in vel_text for unit in ("mb", "gb", "byte", "bytes"))
+            if compatible_unit:
+                formula = f"max(0, {rem.name} / {vel.name})"
+                out.append(GeneratedSchemaField(
+                    name="days_to_depletion",
+                    dtype="float",
+                    description="Derived number of days until the remaining resource is depleted at the current consumption velocity.",
+                    gen="formula",
+                    params={"min": 0, "precision": 2},
+                    depends_on=[rem.name, vel.name],
+                    nullable=False,
+                    required=False,
+                    formula=formula,
+                    scope="transaction",
+                    provenance={"generated_from": "scenario_derived", "role": "derived", "derived_from": [rem.name, vel.name]},
+                ))
+    return out
