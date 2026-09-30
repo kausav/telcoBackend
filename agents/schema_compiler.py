@@ -693,6 +693,7 @@ class SchemaCompiler:
         business_scenario: str | None = None,
         context_text: str | None = None,
         candidate_variables_override: list[dict[str, object]] | None = None,
+        all_source_specs: list[dict[str, Any]] | None = None,
     ) -> list[GeneratedSchemaField]:
         normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
         excluded_keys = {
@@ -921,7 +922,7 @@ class SchemaCompiler:
                 provenance=provenance,
                 scope=grain,
             ))
-        return self._compact_source_field_names(fields, all_source_specs=catalog_rows)
+        return self._compact_source_field_names(fields, all_source_specs=all_source_specs)
 
     def _compile_json_source_grounded(
         self,
@@ -1122,6 +1123,7 @@ class SchemaCompiler:
             business_scenario=business_scenario,
             context_text=business_context,
             candidate_variables_override=selected_source_ideas,
+            all_source_specs=catalog_rows,
         )
 
         actual_names = {self._normalize_variable_key(field.name) for field in fields}
