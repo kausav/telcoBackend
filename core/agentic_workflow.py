@@ -165,7 +165,7 @@ class AgenticSchemaWorkflow:
             json.dumps(source_sources or source_manifest(req.industry_type, req.domain), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
         return (
-            "agentic_proposal_v32_generic_source_semantic_boundary",
+            "agentic_proposal_v33_complete_catalog_structural_dedupe",
             req.industry_type.strip().lower(),
             req.country.strip().upper(),
             req.domain.strip().lower(),
@@ -385,6 +385,20 @@ class AgenticSchemaWorkflow:
 
             for indices in groups.values():
                 if len(indices) < 2:
+                    continue
+                # Output equivalence is deliberately weaker than business/source identity. Two
+                # source-backed fields can legitimately emit the same fixed value (for example two
+                # different flags both being false) while remaining distinct analytical attributes.
+                # Only collapse a source-backed output-equivalence group when all source-backed members
+                # resolve to the same source semantic concept. This prevents the final cleanup pass
+                # from undoing the structural source deduplication contract.
+                source_semantics = {
+                    str((current_fields[index].provenance or {}).get("source_json_semantic_key") or "").strip().casefold()
+                    for index in indices
+                    if str((current_fields[index].provenance or {}).get("generated_from") or "").strip().casefold() == "mongodb_json_source"
+                }
+                source_semantics.discard("")
+                if len(source_semantics) > 1:
                     continue
                 winner = min(indices, key=source_priority)
                 winner_name = current_fields[winner].name

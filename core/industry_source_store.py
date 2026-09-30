@@ -321,21 +321,39 @@ def _schema_refs_from_paths(document: dict[str, Any]) -> set[str]:
 def _model_kind(model_name: str, model_schema: dict[str, Any], api_root_models: set[str]) -> str:
     normalized = _normalize_model_name(model_name)
     description = str(model_schema.get("description") or "").casefold()
+    properties = model_schema.get("properties") if isinstance(model_schema, dict) else {}
     if normalized in _AUXILIARY_MODEL_MARKERS or any(marker in normalized for marker in ("error", "event_subscription")):
         return "auxiliary"
-    if normalized.endswith("_ref") or _is_reference_model_name(model_name, model_schema):
+    if normalized.endswith("_ref") or normalized.endswith("_ref_or_value") or normalized.endswith("_or_value") or _is_reference_model_name(model_name, model_schema):
         return "support_reference"
     if _is_event_model_name(model_name):
         return "event_wrapper"
     if _is_crud_wrapper_model_name(model_name):
         return "crud_wrapper"
+    # Query/task wrappers are transport/query surfaces around a concrete business resource. If the
+    # concrete resource definition is present in the same source, keep the query wrapper out of the
+    # primary synthetic feature catalog so query metadata cannot crowd out the underlying resource.
+    if normalized.startswith("query_") or normalized.endswith("_query"):
+        return "support"
     if "abstract resource" in description or normalized == "addressable":
         return "abstract"
     normalized_roots = {_normalize_model_name(item) for item in api_root_models}
-    # Pure JSON Schema documents often have no API paths. In that shape every concrete top-level
-    # definition is a candidate business resource unless it is explicitly a reference/support model.
     if normalized in normalized_roots or not api_root_models:
         return "resource"
+
+    # Some TMF APIs expose a query/task resource at the endpoint while returning the actual business
+    # resource only through a referenced property (for example QueryUsageConsumption -> UsageConsumption).
+    # The old path treated that referenced business resource as generic support and consequently made
+    # every one of its scalar leaves invisible to selection. Detect such concrete resource definitions
+    # structurally: an id/href identity pair plus resource/task/business-purpose prose. Reference/value
+    # schemas are already excluded above, so this does not promote ProductRefOrValue/BucketRefOrValue.
+    if isinstance(properties, dict) and {"id", "href"}.issubset({str(key) for key in properties}):
+        resource_markers = (
+            "resource", "entity", "task", "enables", "allows", "provides", "represents",
+            "used to", "used for", "can be ", "manage the", "retrieve the",
+        )
+        if any(marker in description for marker in resource_markers):
+            return "resource"
     return "support"
 
 
@@ -383,6 +401,40 @@ def _canonical_semantic_path(
     return ".".join([base_model, *segments[1:]])
 
 
+def _source_owner_family(value: Any) -> str:
+    """Canonicalize a referenced schema owner into its business concept family.
+
+    Reference/value wrappers such as ``ProductRefOrValue`` and CRUD/event wrappers are structural
+    containers, not different business concepts. Removing those wrappers here lets duplicate
+    detection operate on the schema definition that actually owns the scalar leaf.
+    """
+    name = _normalize_model_name(value)
+    if not name:
+        return ""
+    name = _strip_schema_wrappers(name)
+    changed = True
+    while changed:
+        changed = False
+        for suffix in ("_ref_or_value", "_or_value", "_ref"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)].rstrip("_")
+                changed = True
+                break
+    return name or _normalize_model_name(value)
+
+
+def _normalize_source_relative_path(value: Any) -> str:
+    """Normalize the scalar path relative to its owning schema definition."""
+    parts = [
+        _normalize_model_name(part.replace("[]", ""))
+        for part in str(value or "").split(".")
+        if _normalize_model_name(part.replace("[]", ""))
+    ]
+    if not parts:
+        return ""
+    return ".".join(parts)
+
+
 def _scalar_spec(
     *,
     source_id: str,
@@ -399,6 +451,10 @@ def _scalar_spec(
     model_kind: str = "support",
     source_ref: str | None = None,
     model_description: str | None = None,
+    source_owner_model: str | None = None,
+    source_owner_kind: str | None = None,
+    source_owner_relation: str | None = None,
+    source_owner_relative_path: str | None = None,
 ) -> dict[str, Any] | None:
     schema_type = _schema_type(schema)
     enum_values = list(schema.get("enum") or [])
@@ -436,6 +492,13 @@ def _scalar_spec(
         "required": bool(required),
         "depth": depth,
         "source_ref": source_ref,
+        "source_owner_model": _source_owner_family(source_owner_model or model),
+        "source_owner_kind": str(source_owner_kind or model_kind or "").strip(),
+        # Relationship roles use the same wrapper canonicalization as owner models. This turns
+        # ``product_ref_or_value`` into the reusable ``product`` relationship without collapsing
+        # genuinely different roles such as ``alternate_product`` or ``user``.
+        "source_owner_relation": _source_owner_family(source_owner_relation or source_owner_model or model),
+        "source_owner_relative_path": _normalize_source_relative_path(source_owner_relative_path or field_name),
         **_property_constraints(schema),
     }
 
@@ -473,6 +536,10 @@ def _expand_model(
         stack: tuple[str, ...],
         depth: int,
         linked_business_models: tuple[str, ...] = (),
+        owner_model: str | None = None,
+        owner_kind: str | None = None,
+        owner_relation: str | None = None,
+        owner_relative_prefix: str = "",
     ) -> None:
         if depth > max_depth:
             return
@@ -499,13 +566,30 @@ def _expand_model(
                     item_ref = _ref_name(str(items.get("$ref") or ""))
                     item_schema = _merge_composed_schema(items, schemas, seen=stack + ((def_name,) if def_name else ()))
                     if item_ref and item_ref in schemas and isinstance(item_schema.get("properties"), dict):
+                        target_kind = _model_kind(
+                            item_ref,
+                            schemas.get(item_ref) if isinstance(schemas.get(item_ref), dict) else item_schema,
+                            api_root_models,
+                        )
                         visit(
                             item_ref, item_schema, path + "[]", is_required, stack + (item_ref,), depth + 1,
                             linked_business_models,
+                            owner_model=_source_owner_family(item_ref),
+                            owner_kind=target_kind,
+                            owner_relation=str(field_name),
+                            owner_relative_prefix="",
                         )
                         continue
                     if isinstance(item_schema.get("properties"), dict):
-                        visit(None, item_schema, path + "[]", is_required, stack, depth + 1, linked_business_models)
+                        visit(
+                            None, item_schema, path + "[]", is_required, stack, depth + 1, linked_business_models,
+                            owner_model=owner_model or model_name,
+                            owner_kind=owner_kind or root_kind,
+                            owner_relation=owner_relation or owner_model or model_name,
+                            owner_relative_prefix=(
+                                f"{owner_relative_prefix}.{field_name}" if owner_relative_prefix else str(field_name)
+                            ),
+                        )
                         continue
                 # Scalar arrays cannot be represented as one scalar executable variable without inventing
                 # a serialization contract, so they remain intentionally excluded.
@@ -520,10 +604,30 @@ def _expand_model(
                     target_kind = _model_kind(target_schema_name, target_schema if isinstance(target_schema, dict) else {}, api_root_models)
                     if target_kind in {"resource", "crud_wrapper", "event_wrapper"}:
                         next_links = tuple(dict.fromkeys((*linked_business_models, target_model)))
-                visit(ref, prop, path, is_required, stack + (ref,), depth + 1, next_links)
+                target_schema_name = target_schema_name or ref
+                target_kind = _model_kind(
+                    target_schema_name,
+                    schemas.get(target_schema_name) if isinstance(schemas.get(target_schema_name), dict) else prop,
+                    api_root_models,
+                )
+                visit(
+                    ref, prop, path, is_required, stack + (ref,), depth + 1, next_links,
+                    owner_model=_source_owner_family(target_schema_name),
+                    owner_kind=target_kind,
+                    owner_relation=str(field_name),
+                    owner_relative_prefix="",
+                )
                 continue
             if isinstance(prop.get("properties"), dict):
-                visit(None, prop, path, is_required, stack, depth + 1, linked_business_models)
+                visit(
+                    None, prop, path, is_required, stack, depth + 1, linked_business_models,
+                    owner_model=owner_model or model_name,
+                    owner_kind=owner_kind or root_kind,
+                    owner_relation=owner_relation or owner_model or model_name,
+                    owner_relative_prefix=(
+                        f"{owner_relative_prefix}.{field_name}" if owner_relative_prefix else str(field_name)
+                    ),
+                )
                 continue
 
             spec = _scalar_spec(
@@ -545,13 +649,22 @@ def _expand_model(
                 model_kind=root_kind,
                 source_ref=ref,
                 model_description=str(model_schema.get("description") or ""),
+                source_owner_model=owner_model or model_name,
+                source_owner_kind=owner_kind or root_kind,
+                source_owner_relation=owner_relation or model_name,
+                source_owner_relative_path=(
+                    f"{owner_relative_prefix}.{field_name}" if owner_relative_prefix else str(field_name)
+                ),
             )
             if spec is not None and linked_business_models:
                 spec["linked_business_models"] = list(linked_business_models)
             if spec is not None:
                 rows.append(spec)
 
-    visit(model_name, model_schema, model_name, True, (model_name,), 0)
+    visit(
+        model_name, model_schema, model_name, True, (model_name,), 0,
+        owner_model=model_name, owner_kind=root_kind, owner_relation=model_name, owner_relative_prefix="",
+    )
     return rows
 
 
@@ -888,6 +1001,10 @@ def _merge_semantic_catalog_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
         source_paths: list[str] = []
         source_models: list[str] = []
         source_names: list[str] = []
+        source_owner_models: list[str] = []
+        source_owner_kinds: list[str] = []
+        source_owner_relations: list[str] = []
+        source_owner_relative_paths: list[str] = []
         linked_models: list[str] = []
         conflicts: dict[str, list[Any]] = {}
         for candidate in candidates:
@@ -896,6 +1013,10 @@ def _merge_semantic_catalog_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
                 ("source_paths", source_paths),
                 ("source_models", source_models),
                 ("source_names", source_names),
+                ("source_owner_models", source_owner_models),
+                ("source_owner_kinds", source_owner_kinds),
+                ("source_owner_relations", source_owner_relations),
+                ("source_owner_relative_paths", source_owner_relative_paths),
                 ("linked_business_models", linked_models),
             ):
                 values = candidate.get(field)
@@ -928,6 +1049,18 @@ def _merge_semantic_catalog_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
             base["source_models"] = source_models
         if source_names:
             base["source_names"] = source_names
+        if source_owner_models:
+            base["source_owner_models"] = source_owner_models
+            base["source_owner_model"] = source_owner_models[0]
+        if source_owner_kinds:
+            base["source_owner_kinds"] = source_owner_kinds
+            base["source_owner_kind"] = source_owner_kinds[0]
+        if source_owner_relations:
+            base["source_owner_relations"] = source_owner_relations
+            base["source_owner_relation"] = source_owner_relations[0]
+        if source_owner_relative_paths:
+            base["source_owner_relative_paths"] = source_owner_relative_paths
+            base["source_owner_relative_path"] = source_owner_relative_paths[0]
         if linked_models:
             base["linked_business_models"] = linked_models
         base["semantic_key"] = semantic_key
@@ -991,58 +1124,48 @@ def _semantic_aliases_for_row(row: dict[str, Any]) -> set[str]:
 
 
 def _source_redundancy_signature(row: dict[str, Any]) -> tuple[Any, ...] | None:
-    """Return a conservative signature for source fields that are analytically redundant.
+    """Return a structural business-concept signature for source-backed duplicate suppression.
 
-    This is intentionally narrower than ``canonical_variable_semantic_key``. The canonical key
-    preserves source identity (resource + path), while this signature answers a different question:
-    whether two source leaves describe the same business attribute with the same executable shape.
-    Resource identifiers are never collapsed because their owner context is part of their meaning.
-    ``datetime`` leaves are only collapsed when their relative source leaf and description are the
-    same, preserving distinct lifecycle timestamps such as requested vs confirmation times.
+    The key is based on the schema definition that owns the scalar leaf rather than the flattened
+    resource path. This is important for TMF documents because the same reusable ``Product``,
+    ``Price`` or ``RelatedParty`` concept can appear through many resource wrappers. At the same
+    time, the owning concept and relationship role remain in the signature so unrelated fields such
+    as ``Bucket.status`` and ``TopupBalance.status`` do not collapse merely because their contracts
+    are identical.
+
+    This is deliberately structural: no industry-specific keep/remove field list is used.
     """
     if not isinstance(row, dict):
         return None
-    semantic = canonical_variable_semantic_key(row)
-    if not semantic:
-        return None
-    model = normalize_lookup_key(row.get("business_model") or row.get("model"))
-    leaf = semantic
-    prefix = f"{model}_" if model else ""
-    if prefix and leaf.startswith(prefix):
-        leaf = leaf[len(prefix):]
-    leaf = normalize_lookup_key(leaf)
-    leaf = re.sub(r"_amount_amount$", "_amount", leaf)
-    if not leaf or leaf.endswith(("_id", "_key")) or leaf in {"id", "key"}:
-        return None
 
-    dtype = _canonical_catalog_dtype(row.get("dtype"), bool(row.get("enum_values")))
-    description = re.sub(r"\s+", " ", str(row.get("description") or "").strip().casefold())
-    fmt = normalize_lookup_key(row.get("format"))
-    enum_values = row.get("enum_values") or []
-    enum_signature = tuple(sorted(
-        normalize_lookup_key(str(value)) if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
-        for value in enum_values
-    ))
-
-    # Keep identity-like strings, names and relationship roles distinct unless the source leaf
-    # itself is identical. These fields often identify different entities/relationships despite
-    # sharing an execution contract.
-    generic_distinct_leafs = {
-        "name", "description", "role", "reason", "href", "url", "reference",
-    }
-    if leaf in generic_distinct_leafs and not enum_signature:
+    owner = _source_owner_family(
+        row.get("source_owner_model")
+        or row.get("model")
+        or row.get("business_model")
+    )
+    relation = _normalize_model_name(
+        row.get("source_owner_relation")
+        or owner
+        or row.get("business_model")
+    )
+    relative_path = _normalize_source_relative_path(
+        row.get("source_owner_relative_path")
+        or row.get("field")
+        or row.get("name")
+    )
+    if not owner or not relative_path:
         return None
 
-    constraints = tuple(sorted(
-        (key, json.dumps(row.get(key), sort_keys=True, default=str))
-        for key in (
-            "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
-            "minLength", "maxLength", "pattern", "format", "default",
-        )
-        if key in row
-    ))
-    contract = (dtype, fmt, enum_signature, constraints)
-    return (leaf, description, contract)
+    # Executable dtype/enum/constraint differences are deliberately NOT part of structural identity.
+    # TMF reference/value wrappers frequently restate the same business property with weaker or
+    # incomplete constraints (for example BucketRefOrValue.status has no enum while Bucket.status
+    # carries the authoritative vocabulary). When owner + role + relative property path are identical,
+    # they describe the same source concept and one canonical representative must win. The selection
+    # layer separately prefers the direct owning business resource over a nested reference wrapper.
+    #
+    # This also handles repeated scalar concepts such as RelatedParty.id, Money.taxIncludedAmount.value,
+    # ProductTerm.duration.amount, and recurring period fields without maintaining a field-name list.
+    return (owner, relation, relative_path)
 
 
 def _compact_name_alias(value: Any) -> str:
@@ -1150,8 +1273,25 @@ def set_source_active(source_id: str, active: bool) -> bool:
     return result.matched_count > 0
 
 
-def validate_catalog_selection(variables: Iterable[dict[str, Any]], catalog: dict[str, dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
-    """Validate LLM-selected names against a canonical source catalog."""
+def validate_catalog_selection(
+    variables: Iterable[dict[str, Any]],
+    catalog: dict[str, dict[str, Any]],
+    *,
+    business_context: str = "",
+    preferred_names: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Validate LLM-selected names against the canonical source catalog and request context.
+
+    Validation is intentionally conservative: an LLM cannot reintroduce transport wrappers,
+    unrelated secondary metadata branches, or presentation-only fields merely by naming them.
+    The rule is structural/contextual, not a DU-01 field allowlist, so pricing/agreement/note/etc.
+    become eligible automatically when the request genuinely asks for those concepts.
+    """
+    context_tokens = _canonical_context_tokens(_catalog_text_tokens(business_context))
+    preferred = {
+        normalize_lookup_key(value) for value in (preferred_names or set())
+        if normalize_lookup_key(value)
+    }
     selected: list[dict[str, Any]] = []
     rejected: list[str] = []
     seen_semantics: set[str] = set()
@@ -1172,6 +1312,25 @@ def validate_catalog_selection(variables: Iterable[dict[str, Any]], catalog: dic
         semantic = canonical_variable_semantic_key(spec)
         if semantic and semantic in seen_semantics:
             continue
+        # Never allow an LLM candidate to bypass the same structural eligibility rules used by
+        # deterministic source selection. Support/reference/auxiliary schemas are not independent
+        # business resources; their scalar leaves are either wrapper transport or reusable nested
+        # concepts owned by a concrete resource. Event wrappers are admitted only when the request
+        # explicitly asks for event/history-style data.
+        model_kind = str(spec.get("model_kind") or "").strip().lower()
+        if model_kind in {"support", "support_reference", "abstract", "auxiliary", "crud_wrapper"}:
+            rejected.append(name)
+            continue
+        if model_kind == "event_wrapper" and not (context_tokens & {"event", "history", "audit", "timeline", "log", "ledger", "notification"}):
+            rejected.append(name)
+            continue
+        if context_tokens:
+            if not _catalog_secondary_branch_relevant(spec, context_tokens=context_tokens):
+                rejected.append(name)
+                continue
+            if _catalog_display_only(spec, context_tokens=context_tokens, preferred=preferred):
+                rejected.append(name)
+                continue
         redundancy = _source_redundancy_signature(spec)
         if redundancy is not None and redundancy in seen_redundancy:
             continue
@@ -1249,16 +1408,46 @@ def _catalog_grain(spec: dict[str, Any]) -> str:
 
 
 def _catalog_role(spec: dict[str, Any]) -> str:
-    text = f"{spec.get('name', '')} {spec.get('path', '')} {spec.get('description', '')}".lower()
+    """Classify a scalar field by the leaf property and its description.
+
+    Ancestor path tokens are intentionally excluded from broad role heuristics: a field such as
+    ``TopupBalance.product.name`` contains ``balance`` in its flattened path but is a descriptive
+    product name, not a numeric measurement. Looking at the leaf property plus its description also
+    lets lifecycle words (status/state/result/reason/decision) win over numeric/container terms.
+    """
+    raw_name = str(spec.get("name") or "")
+    raw_field = str(spec.get("field") or "")
+    raw_path = str(spec.get("path") or "")
+    leaf_name = raw_field or raw_name.rsplit(".", 1)[-1] or raw_name.rsplit("_", 1)[-1]
+    description = str(spec.get("description") or "").lower()
+    leaf = _snake_case(leaf_name).lower()
+    semantic_text = f"{leaf} {description}"
+    semantic_tokens = _catalog_text_tokens(semantic_text)
     dtype = _canonical_catalog_dtype(spec.get("dtype"), bool(spec.get("enum_values")))
-    if dtype in {"datetime", "date"} or any(token in text for token in ("timestamp", "date", "time", "effective", "expiry", "expiration")):
+
+    if dtype in {"datetime", "date"} or bool(semantic_tokens & {
+        "timestamp", "date", "time", "effective", "expiry", "expiration"
+    }):
         return "timing"
-    if dtype in {"integer", "float"} or any(token in text for token in ("amount", "balance", "value", "quantity", "count", "rate", "score", "limit", "price")):
-        return "measurement"
-    if bool(spec.get("enum_values")) or any(token in text for token in ("status", "state", "reason", "type", "category", "class", "code", "method", "channel")):
-        return "status" if any(token in text for token in ("status", "state", "reason")) else "categorical"
-    if str(spec.get("name") or "").lower().endswith(("_id", "_key")) or str(spec.get("path") or "").lower().endswith(".id"):
+
+    lifecycle_signals = {"status", "state", "reason", "outcome", "result", "decision", "action"}
+    if semantic_tokens & lifecycle_signals:
+        return "status"
+
+    categorical_signals = {"type", "category", "class", "code", "method", "channel", "mode", "role"}
+    if bool(spec.get("enum_values")) or semantic_tokens & categorical_signals:
+        return "categorical"
+
+    if leaf.endswith(("_id", "_key")) or raw_path.lower().endswith(".id"):
         return "identity"
+
+    measurement_signals = {
+        "amount", "balance", "value", "quantity", "count", "rate", "score", "limit", "price",
+        "percentage", "duration", "remaining", "consumed", "usage", "velocity", "volume",
+    }
+    if dtype in {"integer", "float", "number"} or semantic_tokens & measurement_signals:
+        return "measurement"
+
     return "other"
 
 
@@ -1296,21 +1485,101 @@ def _catalog_business_metadata_penalty(row: dict[str, Any]) -> float:
     return penalty
 
 
-def _catalog_display_only(row: dict[str, Any], *, context_tokens: set[str], preferred: set[str]) -> bool:
-    """Identify source leaves that usually add presentation noise instead of business signal."""
-    name = normalize_lookup_key(row.get("name"))
-    leaf = name.rsplit("_", 1)[-1] if name else ""
-    if name in preferred:
-        return False
-    if leaf in {"href", "url", "uri", "schema_location", "base_type", "referred_type", "display_label", "display_name", "formatted"}:
+_CATALOG_SECONDARY_BRANCH_TOKENS = {
+    # Structural branches that are often legitimate source metadata but should not enter an
+    # executable scenario merely because an LLM selected the parent resource. They become eligible
+    # when the request itself contains evidence for that branch. This is intentionally generic: the
+    # rule is about source structure (notes, agreements, pricing, places, etc.), not DU-01 field names.
+    "note", "agreement", "agreement_item", "place", "serial", "serial_number", "category",
+    "termination", "error", "price", "pricing", "tax", "alteration", "contact_medium",
+    "product", "product_offering",
+}
+
+_CATALOG_BRANCH_CONTEXT_ALIASES = {
+    "upsell": {"offer", "offering", "product", "product_offering", "qualification"},
+    "offer": {"product", "product_offering", "qualification"},
+    "offering": {"offer", "product", "product_offering", "qualification"},
+    "recharge": {"topup"},
+    "top_up": {"topup"},
+    "consumption": {"usage", "remaining", "depletion"},
+    "depletion": {"usage", "remaining", "consumption"},
+    "retention": {"intervention", "nudge", "offer"},
+}
+
+
+def _catalog_context_branch_tokens(row: dict[str, Any]) -> set[str]:
+    """Return nested business-branch tokens from the complete source path.
+
+    The deepest scalar owner is not sufficient to identify an excluded branch: a pricing leaf such as
+    ``Product.productPrice[].price.dutyFreeAmount.value`` is ultimately owned by ``Money``. Looking only
+    at the deepest owner would therefore lose the fact that the value lives under ``price``. The full
+    source path retains that structural evidence while the root business-model tokens are removed.
+    """
+    root_model = _source_owner_family(row.get("business_model") or row.get("model"))
+    root_tokens = _catalog_text_tokens(root_model)
+    path_tokens = _catalog_text_tokens(row.get("path"))
+    owner_tokens = _catalog_text_tokens(
+        row.get("source_owner_model") or row.get("model") or row.get("business_model")
+    )
+    relation_tokens = _catalog_text_tokens(
+        row.get("source_owner_relation") or row.get("source_owner_model") or row.get("relation")
+    )
+    return (path_tokens | owner_tokens | relation_tokens) - root_tokens
+
+
+def _catalog_secondary_branch_relevant(
+    row: dict[str, Any],
+    *,
+    context_tokens: set[str],
+) -> bool:
+    """Return whether a secondary source branch has request evidence to enter the schema."""
+    branch_tokens = _catalog_context_branch_tokens(row)
+    secondary = branch_tokens & _CATALOG_SECONDARY_BRANCH_TOKENS
+    if not secondary:
         return True
+    effective = set(context_tokens or set())
+    for token in list(effective):
+        effective.update(_CATALOG_BRANCH_CONTEXT_ALIASES.get(token, set()))
+    # A compound nested branch is eligible only when every excluded branch component is supported by
+    # the request. For example, `product + offering` is valid for an upsell request, while
+    # `product + price` is not unless pricing was requested explicitly. This prevents a broad parent
+    # concept such as `product` from accidentally authorizing unrelated pricing/notes/agreement leaves.
+    return secondary <= effective
+
+
+def _catalog_display_only(row: dict[str, Any], *, context_tokens: set[str], preferred: set[str]) -> bool:
+    """Identify source leaves that primarily add transport/display noise instead of business signal."""
+    name = normalize_lookup_key(row.get("name"))
+    if not name or name in preferred:
+        return False
+
+    # Flattened TMF names end in the final scalar leaf, so checking only the last underscore token
+    # cannot recognize nested display labels such as ``remaining_value.name``. Match structural
+    # suffixes instead; these rules are schema-shape rules, not scenario-specific field names.
+    if name.endswith((
+        "_href", "_url", "_uri", "_schema_location", "_base_type", "_referred_type",
+        "_display_label", "_display_name", "_formatted", "_remaining_value_name",
+        "_logical_resource_name", "_party_account_name", "_related_party_name",
+    )):
+        return True
+
+    leaf = name.rsplit("_", 1)[-1]
     if leaf == "description":
         return "description" not in context_tokens
+
     if leaf == "name":
-        # Names are retained when the request explicitly discusses named products/plans/channels/offers/resources.
-        return not bool(context_tokens & {"product", "plan", "offer", "channel", "resource_name", "named", "name"})
-    if leaf == "remaining_value_name":
-        return True
+        # Keep names only when the name belongs to a business concept explicitly represented in the
+        # request. The root/branch identity matters: a request mentioning `product` must not pull
+        # ``bucket_name`` merely because both are strings named `name`.
+        root_model = _source_owner_family(row.get("business_model") or row.get("model"))
+        root_tokens = _catalog_text_tokens(root_model)
+        branch_tokens = _catalog_context_branch_tokens(row)
+        name_context = {
+            "product", "product_offering", "offering", "offer", "plan", "channel",
+            "payment_method", "service", "resource", "resource_name", "named", "name",
+        }
+        return not bool((root_tokens | branch_tokens) & context_tokens & name_context)
+
     return False
 
 
@@ -1495,6 +1764,19 @@ _CATALOG_RELATIONSHIP_MODEL_TOKENS = {
 }
 
 
+_CATALOG_CONTEXT_EXPANSIONS = {
+    # Business terminology can map to several source-vocabulary concepts at once. The expansion
+    # is used only for relevance evidence; it never invents source fields or models.
+    "depletion": {"usage", "remaining", "consumption"},
+    "consumption": {"usage", "remaining", "depletion"},
+    "recharge": {"topup"},
+    "top_up": {"topup"},
+    "upsell": {"offer", "offering", "product", "product_offering", "qualification"},
+    "offer": {"offering", "product", "product_offering", "qualification"},
+    "offering": {"offer", "product", "product_offering", "qualification"},
+    "retention": {"intervention", "nudge", "offer"},
+}
+
 _CATALOG_CONTEXT_ALIASES = {
     "top_up": "topup",
     "recharge": "topup",
@@ -1502,7 +1784,15 @@ _CATALOG_CONTEXT_ALIASES = {
     "client": "customer",
     "member": "customer",
     "mobile": "subscriber",
-    "retention": "retention",
+    # Scenario language does not always use the exact TMF resource name. These aliases bridge
+    # ordinary business terminology to source vocabulary without selecting any individual field.
+    "depletion": "usage",
+    "consumption": "usage",
+    "usage": "usage",
+    "upsell": "product",
+    "offer": "product",
+    "offering": "product",
+    "retention": "intervention",
 }
 
 
@@ -1521,7 +1811,10 @@ def _canonical_context_tokens(tokens: Iterable[str]) -> set[str]:
         value = str(token or "").casefold()
         if not value or value in _CATALOG_CONTEXT_STOPWORDS:
             continue
-        result.add(_CATALOG_CONTEXT_ALIASES.get(value, value))
+        canonical = _CATALOG_CONTEXT_ALIASES.get(value, value)
+        result.add(canonical)
+        result.update(_CATALOG_CONTEXT_EXPANSIONS.get(value, set()))
+        result.update(_CATALOG_CONTEXT_EXPANSIONS.get(canonical, set()))
     return result
 
 
@@ -1565,6 +1858,7 @@ def select_json_source_catalog(
     *,
     business_context: str = "",
     preferred_names: set[str] | None = None,
+    preferred_models: set[str] | None = None,
     excluded_names: set[str] | None = None,
     excluded_semantic_keys: set[str] | None = None,
     max_fields: int = 500,
@@ -1602,6 +1896,9 @@ def select_json_source_catalog(
     preferred = {
         normalize_lookup_key(value) for value in (preferred_names or set()) if normalize_lookup_key(value)
     }
+    preferred_source_models = {
+        _source_owner_family(value) for value in (preferred_models or set()) if _source_owner_family(value)
+    }
     raw_context_tokens = _catalog_text_tokens(business_context)
     context_tokens = _canonical_context_tokens(raw_context_tokens)
 
@@ -1619,7 +1916,10 @@ def select_json_source_catalog(
             and (semantic in seen_semantics or semantic in excluded_semantics or compact_semantic in excluded_semantics_compact)
         ):
             continue
-        if str(row.get("model_kind") or "resource") in {"support", "support_reference", "abstract", "auxiliary"}:
+        kind = str(row.get("model_kind") or "resource")
+        if kind in {"support", "support_reference", "abstract", "auxiliary", "crud_wrapper"}:
+            continue
+        if kind == "event_wrapper" and not (context_tokens & {"event", "events", "history", "audit", "notification", "timeline"}):
             continue
         if semantic:
             seen_semantics.add(semantic)
@@ -1639,7 +1939,7 @@ def select_json_source_catalog(
     preferred_model_hits: dict[str, int] = {}
     for item in scored:
         row = item["row"]
-        model = normalize_lookup_key(row.get("business_model") or row.get("model"))
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
         if not model:
             continue
         meta = item["meta"]
@@ -1681,12 +1981,19 @@ def select_json_source_catalog(
         # A source model is a primary relevance candidate when its own distinctive name token is
         # requested. Generic model/category terms require either multiple independent field signals
         # or a relationship-model description explicitly referring to an already relevant resource.
+        # Open a new source model primarily from field/path evidence. Model descriptions often use
+        # generic prose such as “used for”, “available”, or “provides usage information”; counting that
+        # prose as independent field evidence causes unrelated sibling resources to become relevant.
         field_signal = (
             _canonical_context_tokens(meta.get("name_overlap") or [])
             | _canonical_context_tokens(meta.get("semantic_overlap") or [])
             | _canonical_context_tokens(meta.get("path_overlap") or [])
-            | _canonical_context_tokens(meta.get("description_overlap") or [])
         ) - _CATALOG_WEAK_CONTEXT_TOKENS - _CATALOG_MODEL_GENERIC_TOKENS
+        if not field_signal:
+            description_signal = _canonical_context_tokens(meta.get("description_overlap") or []) - _CATALOG_WEAK_CONTEXT_TOKENS - _CATALOG_MODEL_GENERIC_TOKENS
+            description_signal -= {"use", "used", "using", "available", "provides", "provide", "allows", "can"}
+            if len(description_signal) >= 2:
+                field_signal = description_signal
         preferred_hit = normalize_lookup_key(row.get("name")) in preferred
         # One LLM-selected field is only a ranking preference. Multiple independent preferred fields
         # from the same model are stronger evidence that the model itself is relevant. This lets the
@@ -1703,17 +2010,24 @@ def select_json_source_catalog(
             and bool(model_description_signal)
             and len(model_description_signal) >= 1
         )
-        preferred_model_support = preferred_model_hits.get(model, 0) >= 2
+        # LLM-preferred fields are field-level evidence, not permission to expand an entire model.
+        # Explicitly requested source model names are separately validated and can open that model.
+        preferred_model_support = model in preferred_source_models
         qualifies = (
             bool(model_specific_overlap)
             or (len(field_signal) >= 2)
-            or preferred_model_support
             or relationship_support
+            or preferred_model_support
         )
         if is_event_model:
             qualifies = bool(model_signal) and bool(model_specific_overlap)
         if qualifies:
-            signal = float(item["score"]) + (30.0 if model_specific_overlap else 0.0) + (10.0 if relationship_support else 0.0)
+            signal = (
+                float(item["score"])
+                + (30.0 if model_specific_overlap else 0.0)
+                + (10.0 if relationship_support else 0.0)
+                + (24.0 if preferred_model_support else 0.0)
+            )
             model_scores[model] = max(model_scores.get(model, float("-inf")), signal)
             if relationship_model:
                 relationship_models.add(model)
@@ -1721,7 +2035,7 @@ def select_json_source_catalog(
             if preferred_hit:
                 reasons.add("preferred_field_in_relevant_model")
             if preferred_model_support:
-                reasons.add("multiple_preferred_fields_in_model")
+                reasons.add("llm_requested_source_model")
             if model_specific_overlap:
                 reasons.add("business_model_specific_context_overlap")
             if field_signal and not is_event_model:
@@ -1742,32 +2056,44 @@ def select_json_source_catalog(
     for row in rows:
         name = normalize_lookup_key(row.get("name"))
         if name in entity_anchor_names:
-            model = normalize_lookup_key(row.get("business_model") or row.get("model"))
+            model = _normalize_model_name(row.get("business_model") or row.get("model"))
             if model:
                 preferred_models.add(model)
     relevant_models = set(model_scores) | preferred_models
+    focused_models = preferred_source_models - relevant_models
+    for model in focused_models:
+        model_evidence.setdefault(model, set()).add("llm_requested_source_model_focused_expansion")
 
     # Relationship expansion comes from actual source references. This is how a primary model can
     # reach a source-defined related business model (e.g. TopupBalance -> Bucket) without guessing
-    # industry concepts. Use one hop to avoid graph explosion.
+    # industry concepts. Use exactly one hop from directly relevant models; never traverse from a
+    # newly-related model into its sibling transaction resources (Bucket -> Adjust/Reserve/Transfer).
+    relationship_seed_models = set(model_scores) | set(preferred_models)
     model_graph: dict[str, set[str]] = {}
+    related_models: set[str] = set()
     all_business_models = {
-        normalize_lookup_key(row.get("business_model") or row.get("model"))
+        _normalize_model_name(row.get("business_model") or row.get("model"))
         for row in rows
-        if normalize_lookup_key(row.get("business_model") or row.get("model"))
+        if _normalize_model_name(row.get("business_model") or row.get("model"))
     }
     for row in rows:
-        source_model = normalize_lookup_key(row.get("business_model") or row.get("model"))
+        source_model = _normalize_model_name(row.get("business_model") or row.get("model"))
         for linked in row.get("linked_business_models") or []:
-            target = normalize_lookup_key(linked)
+            target = _normalize_model_name(linked)
             if target and target != source_model and target in all_business_models:
                 model_graph.setdefault(source_model, set()).add(target)
 
-    for source_model in sorted(list(relevant_models)):
+    for source_model in sorted(relationship_seed_models):
         for linked in sorted(model_graph.get(source_model, set())):
             relevant_models.add(linked)
+            if linked not in relationship_seed_models:
+                related_models.add(linked)
             model_scores[linked] = max(model_scores.get(linked, 0.0), model_scores.get(source_model, 0.0) - 8.0)
             model_evidence.setdefault(linked, set()).add("source_relationship_expansion")
+
+    # Only direct/context-relevant models receive the larger field budget. Relationship-expanded
+    # models are handled separately with a small bounded budget below.
+    primary_models = (relevant_models - relationship_models) - related_models
 
     selected: dict[str, dict[str, Any]] = {}
     selected_reasons: dict[str, set[str]] = {}
@@ -1776,15 +2102,53 @@ def select_json_source_catalog(
 
     def add(item: dict[str, Any], reason: str) -> None:
         nonlocal redundancy_collapsed
-        semantic = canonical_variable_semantic_key(item["row"]) or normalize_lookup_key(item["row"].get("name"))
+        # Enforce branch relevance centrally so no later selection path (seed, primary, related,
+        # fallback, or focus) can accidentally reintroduce an unrelated metadata/pricing branch.
+        add_row = item["row"]
+        if not _catalog_secondary_branch_relevant(add_row, context_tokens=context_tokens):
+            return
+        semantic = canonical_variable_semantic_key(add_row) or normalize_lookup_key(add_row.get("name"))
         if not semantic or semantic in selected:
             if semantic in selected:
                 selected_reasons.setdefault(semantic, set()).add(reason)
             return
         redundancy = _source_redundancy_signature(item["row"])
         if redundancy is not None and redundancy in selected_redundancy:
-            redundancy_collapsed += 1
             existing_semantic = selected_redundancy[redundancy]
+            existing_item = selected.get(existing_semantic)
+            candidate_model = _normalize_model_name(item["row"].get("business_model") or item["row"].get("model"))
+            existing_model = _normalize_model_name((existing_item or {}).get("row", {}).get("business_model") or (existing_item or {}).get("row", {}).get("model"))
+            candidate_name = normalize_lookup_key(item["row"].get("name"))
+            existing_name = normalize_lookup_key((existing_item or {}).get("row", {}).get("name"))
+            candidate_priority = (
+                0 if candidate_name in preferred else 1,
+                0 if candidate_model in preferred_source_models else 1,
+                0 if candidate_model in relationship_seed_models else 1,
+                0 if candidate_model in model_scores and candidate_model not in related_models else 1,
+                0 if candidate_model in relevant_models else 1,
+                0 if _source_owner_family(item["row"].get("source_owner_model") or item["row"].get("model")) == candidate_model else 1,
+                int(item["row"].get("depth", 0) or 0),
+                candidate_name,
+            )
+            existing_priority = (
+                0 if existing_name in preferred else 1,
+                0 if existing_model in preferred_source_models else 1,
+                0 if existing_model in relationship_seed_models else 1,
+                0 if existing_model in model_scores and existing_model not in related_models else 1,
+                0 if existing_model in relevant_models else 1,
+                0 if _source_owner_family((existing_item or {}).get("row", {}).get("source_owner_model") or (existing_item or {}).get("row", {}).get("model")) == existing_model else 1,
+                int((existing_item or {}).get("row", {}).get("depth", 0) or 0),
+                existing_name,
+            )
+            if existing_item is not None and candidate_priority < existing_priority:
+                del selected[existing_semantic]
+                selected_reasons.pop(existing_semantic, None)
+                selected[semantic] = item
+                selected_reasons[semantic] = {reason, "source_redundancy_replacement"}
+                selected_redundancy[redundancy] = semantic
+                redundancy_collapsed += 1
+                return
+            redundancy_collapsed += 1
             selected_reasons.setdefault(existing_semantic, set()).add("source_redundancy_collapsed")
             return
         selected[semantic] = item
@@ -1807,51 +2171,233 @@ def select_json_source_catalog(
         row = item["row"]
         meta = item["meta"]
         name = normalize_lookup_key(row.get("name"))
-        model = normalize_lookup_key(row.get("business_model") or row.get("model"))
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
         if meta.get("privacy_sensitive") or meta.get("metadata_penalty", 0.0) >= 30.0:
             continue
         if _catalog_display_only(row, context_tokens=context_tokens, preferred=preferred):
             continue
+        if not _catalog_secondary_branch_relevant(row, context_tokens=context_tokens):
+            continue
         # Supporting history/audit/summary models are evaluated separately after primary-model
         # expansion. Do not let their required fields or a single LLM preference bypass the
         # cross-model duplicate/relevance guard.
-        if model in relationship_models:
+        if model in relationship_models or model in related_models:
             continue
-        if name in preferred and (model in relevant_models or name in entity_anchor_names):
-            add(item, "llm_preferred")
+        if name in preferred:
+            add(item, "llm_preferred_field")
         elif row.get("required") and model in relevant_models:
             add(item, "source_required")
-        elif model in relevant_models and (meta["informative_overlap"] or meta.get("semantic_overlap") or meta.get("model_overlap")):
-            add(item, "direct_context_match")
+        # Contextual fields from a relevant model are intentionally NOT seeded here. They are
+        # admitted by the bounded primary-model field budget below. Seeding every context match
+        # made the per-model cap ineffective and allowed large TMF resources to flood the schema.
 
-    # Expand every meaningful field from primary relevant business models. Technical/display metadata
-    # and privacy-sensitive fields are excluded regardless of score so the cap is not spent on noise.
-    # Supporting history/audit/summary models are deliberately handled separately below: these models
-    # often repeat the same status/amount/date/reference fields as the primary transaction model.
-    primary_models = relevant_models - relationship_models
-    for item in sorted(
-        scored,
-        key=lambda item: (
-            0 if normalize_lookup_key(item["row"].get("business_model") or item["row"].get("model")) in primary_models else 1,
-            -float(item["score"]),
-            int(item["row"].get("depth", 0) or 0),
-            item["index"],
-        ),
-    ):
+    # Expand each directly relevant business model with a bounded, role-diverse field budget.
+    # Selecting an entire TMF resource can consume the schema budget with transport metadata,
+    # pricing, agreement, and wrapper branches even when those branches are not part of the request.
+    # The LLM-selected fields remain highest priority; this deterministic pass only supplies a
+    # structural recall buffer inside the relevant model.
+    primary_model_cap = max(8, min(24, (limit + max(1, len(primary_models)) - 1) // max(1, len(primary_models))))
+    for primary_model in sorted(primary_models):
+        candidates = [
+            item for item in scored
+            if _normalize_model_name(item["row"].get("business_model") or item["row"].get("model")) == primary_model
+        ]
+        candidates = [
+            item for item in candidates
+            if not item["meta"].get("privacy_sensitive")
+            and item["meta"].get("metadata_penalty", 0.0) < 30.0
+            and not _catalog_display_only(item["row"], context_tokens=context_tokens, preferred=preferred)
+            and _catalog_secondary_branch_relevant(item["row"], context_tokens=context_tokens)
+        ]
+        if not candidates:
+            continue
+
+        def primary_rank(item: dict[str, Any]) -> tuple[Any, ...]:
+            row = item["row"]
+            meta = item["meta"]
+            name = normalize_lookup_key(row.get("name"))
+            role = str(meta.get("role") or "other")
+            preferred_rank = 0 if name in preferred else 1
+            core_overlap = len(
+                _canonical_context_tokens(meta.get("name_overlap") or [])
+                | _canonical_context_tokens(meta.get("semantic_overlap") or [])
+                | _canonical_context_tokens(meta.get("path_overlap") or [])
+            )
+            role_rank = {"status": 0, "timing": 1, "measurement": 2, "categorical": 3, "identity": 4, "other": 5}.get(role, 5)
+            owner = _source_owner_family(row.get("source_owner_model") or row.get("model"))
+            relation = normalize_lookup_key(row.get("source_owner_relation") or owner)
+            return (
+                preferred_rank,
+                -core_overlap,
+                role_rank,
+                0 if row.get("required") else 1,
+                0 if owner == _source_owner_family(row.get("business_model") or row.get("model")) else 1,
+                -float(item["score"]),
+                int(row.get("depth", 0) or 0),
+                owner, relation, name,
+            )
+
+        selected_for_model: list[dict[str, Any]] = []
+        seen_model_names: set[str] = set()
+        seen_clusters: set[tuple[str, str]] = set()
+
+        # Reserve part of every primary model's budget for high-value lifecycle, timing, and
+        # measurement evidence BEFORE structural breadth is filled. Without this reservation, a TMF
+        # model with many identifiers/reference branches can occupy the cap before state/result/usage
+        # signals are considered. This is generic semantic-role coverage, not an industry field list.
+        coverage_targets = (("status", 3), ("timing", 3), ("measurement", 4), ("categorical", 2), ("identity", 2))
+        for target_role, target_count in coverage_targets:
+            existing_count = 0
+            for item in sorted(candidates, key=primary_rank):
+                if len(selected_for_model) >= primary_model_cap or existing_count >= target_count:
+                    break
+                name = normalize_lookup_key(item["row"].get("name"))
+                if not name or name in seen_model_names or str(item["meta"].get("role") or "other") != target_role:
+                    continue
+                selected_for_model.append(item)
+                seen_model_names.add(name)
+                existing_count += 1
+
+        # Fill the remaining capacity with distinct structural branches, then use the strongest
+        # remaining fields.
+        clusters: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for item in candidates:
+            row = item["row"]
+            owner = _source_owner_family(row.get("source_owner_model") or row.get("model"))
+            relation = normalize_lookup_key(row.get("source_owner_relation") or owner)
+            clusters.setdefault((owner, relation), []).append(item)
+        for cluster in sorted(clusters):
+            if len(selected_for_model) >= primary_model_cap:
+                break
+            item = min(clusters[cluster], key=primary_rank)
+            name = normalize_lookup_key(item["row"].get("name"))
+            if not name or name in seen_model_names:
+                continue
+            selected_for_model.append(item)
+            seen_model_names.add(name)
+            seen_clusters.add(cluster)
+
+        for item in sorted(candidates, key=primary_rank):
+            if len(selected_for_model) >= primary_model_cap:
+                break
+            name = normalize_lookup_key(item["row"].get("name"))
+            if not name or name in seen_model_names:
+                continue
+            selected_for_model.append(item)
+            seen_model_names.add(name)
+
+        for item in selected_for_model:
+            add(item, "relevant_model_field_budget")
+
+    # Related business resources come only from an explicit source-defined edge. They receive a
+    # bounded, relevance-ranked expansion rather than the full breadth of the primary model. This
+    # prevents one relationship hub such as Bucket/Product from opening every sibling/admin branch.
+    related_field_cap = max(4, min(12, limit // max(1, len(related_models) * 3)))
+    for related_model in sorted(related_models):
+        added_for_model = 0
+        candidates = [
+            item for item in scored
+            if _normalize_model_name(item["row"].get("business_model") or item["row"].get("model")) == related_model
+        ]
+        for item in sorted(
+            candidates,
+            key=lambda item: (
+                0 if item["meta"].get("role") in {"timing", "measurement", "status", "categorical", "identity"} else 1,
+                0 if item["row"].get("required") else 1,
+                0 if float(item["meta"].get("metadata_penalty", 0.0)) < 30.0 else 1,
+                -float(item["score"]),
+                int(item["row"].get("depth", 0) or 0),
+                item["index"],
+            ),
+        ):
+            row = item["row"]
+            meta = item["meta"]
+            if meta.get("privacy_sensitive") or meta.get("metadata_penalty", 0.0) >= 30.0:
+                continue
+            if _catalog_display_only(row, context_tokens=context_tokens, preferred=preferred):
+                continue
+            if not _catalog_secondary_branch_relevant(row, context_tokens=context_tokens):
+                continue
+            before = len(selected)
+            add(item, "source_relationship_expansion")
+            if len(selected) > before:
+                added_for_model += 1
+            if added_for_model >= related_field_cap:
+                break
+
+    # An LLM-selected source model is a strong indication that the model belongs in the scenario,
+    # but broad expansion of the entire model recreates TMF noise. Instead, expand only the local
+    # structural neighborhoods around fields the LLM actually selected. A neighborhood is the reusable
+    # source owner + relationship role (for example ConsumptionSummary.bucketCounter or Quantity.value).
+    # This captures companion scalar leaves such as amount/units, counterType/level, or start/end
+    # dates without pulling unrelated note/agreement/product branches.
+    preferred_focus_groups: set[tuple[str, str]] = set()
+    for item in scored:
         row = item["row"]
-        meta = item["meta"]
-        model = normalize_lookup_key(row.get("business_model") or row.get("model"))
-        if model not in primary_models:
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
+        name = normalize_lookup_key(row.get("name"))
+        if model not in focused_models or name not in preferred:
             continue
-        if meta["privacy_sensitive"] or meta["metadata_penalty"] >= 30.0:
+        owner = _source_owner_family(row.get("source_owner_model") or row.get("model"))
+        relation = _normalize_model_name(row.get("source_owner_relation") or owner)
+        if owner and relation:
+            preferred_focus_groups.add((owner, relation))
+
+    focus_group_counts: dict[str, int] = {}
+    focused_model_fields: dict[str, int] = {}
+    grouped_focus_rows: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for item in scored:
+        row = item["row"]
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
+        if model not in focused_models:
             continue
-        if _catalog_display_only(row, context_tokens=context_tokens, preferred=preferred):
-            continue
-        add(item, "relevant_model_expansion" if model in model_scores and "source_relationship_expansion" not in model_evidence.get(model, set()) else "related_model_expansion")
+        owner = _source_owner_family(row.get("source_owner_model") or row.get("model"))
+        relation = _normalize_model_name(row.get("source_owner_relation") or owner)
+        key = (model, owner, relation)
+        if (owner, relation) in preferred_focus_groups:
+            grouped_focus_rows.setdefault(key, []).append(item)
+
+    focus_per_group = max(2, min(8, max(2, limit // max(1, len(preferred_focus_groups) * 2))))
+    for group_key in sorted(grouped_focus_rows):
+        items = sorted(
+            grouped_focus_rows[group_key],
+            key=lambda item: (
+                0 if normalize_lookup_key(item["row"].get("name")) in preferred else 1,
+                0 if item["row"].get("required") else 1,
+                0 if item["meta"].get("role") in {"timing", "measurement", "status", "categorical", "identity"} else 1,
+                0 if float(item["meta"].get("metadata_penalty", 0.0)) < 30.0 else 1,
+                int(item["row"].get("depth", 0) or 0),
+                -float(item["score"]),
+                item["index"],
+                normalize_lookup_key(item["row"].get("name")),
+            ),
+        )
+        added = 0
+        group_models: set[str] = set()
+        for item in items:
+            row = item["row"]
+            meta = item["meta"]
+            model = _normalize_model_name(row.get("business_model") or row.get("model"))
+            if meta.get("privacy_sensitive") or meta.get("metadata_penalty", 0.0) >= 30.0:
+                continue
+            if _catalog_display_only(row, context_tokens=context_tokens, preferred=preferred):
+                continue
+            if not _catalog_secondary_branch_relevant(row, context_tokens=context_tokens):
+                continue
+            before = len(selected)
+            add(item, "llm_selected_source_neighborhood")
+            if len(selected) > before:
+                added += 1
+                group_models.add(model)
+            if added >= focus_per_group:
+                break
+        for model in group_models:
+            focused_model_fields[model] = focused_model_fields.get(model, 0) + added
+        focus_group_counts[f"{group_key[0]}::{group_key[1]}::{group_key[2]}"] = added
 
     def _model_leaf_signature(row: dict[str, Any]) -> str:
         semantic = canonical_variable_semantic_key(row)
-        model = normalize_lookup_key(row.get("business_model") or row.get("model"))
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
         prefix = f"{model}_" if model else ""
         if prefix and semantic.startswith(prefix):
             return semantic[len(prefix):]
@@ -1877,8 +2423,10 @@ def select_json_source_catalog(
     ):
         row = item["row"]
         meta = item["meta"]
-        model = normalize_lookup_key(row.get("business_model") or row.get("model"))
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
         if model not in relationship_models:
+            continue
+        if not (context_tokens & {"history", "audit", "timeline", "log", "ledger"}):
             continue
         if meta["privacy_sensitive"] or meta["metadata_penalty"] >= 30.0:
             continue
@@ -1906,7 +2454,7 @@ def select_json_source_catalog(
             continue
         meta = item["meta"]
         row = item["row"]
-        model = normalize_lookup_key(row.get("business_model") or row.get("model"))
+        model = _normalize_model_name(row.get("business_model") or row.get("model"))
         # Models already classified as relevant were handled by the primary/supporting expansion
         # above. This fallback is only for a genuinely independent model with strong field-level
         # evidence; it must not re-add supporting history/audit models wholesale.
@@ -1918,11 +2466,15 @@ def select_json_source_catalog(
             continue
         if str(row.get("model_kind") or "") == "event_wrapper" and normalize_lookup_key(row.get("business_model")) not in relevant_models:
             continue
+        # Independent models may enter only through strong field/path evidence. Model-name overlap
+        # alone is insufficient here because generic terms such as "balance", "product", or
+        # "customer" occur throughout TMF sibling resources. This fallback is deliberately stricter
+        # than primary-model selection.
         direct_signal = (
-            _canonical_context_tokens(meta["informative_overlap"])
+            _canonical_context_tokens(meta.get("name_overlap", []))
             | _canonical_context_tokens(meta.get("semantic_overlap", []))
-            | _canonical_context_tokens(meta["model_overlap"])
-        ) - _CATALOG_WEAK_CONTEXT_TOKENS
+            | _canonical_context_tokens(meta.get("path_overlap", []))
+        ) - _CATALOG_WEAK_CONTEXT_TOKENS - _CATALOG_MODEL_GENERIC_TOKENS
         if len(direct_signal) >= 2 and float(item["score"]) >= 32.0:
             add(item, "strong_cross_model_context_match")
 
@@ -1961,8 +2513,13 @@ def select_json_source_catalog(
         "relevant_models": sorted(relevant_models),
         "relationship_models": sorted(relationship_models),
         "primary_models": sorted(primary_models),
+        "related_models": sorted(related_models),
+        "focused_models": sorted(focused_models),
+        "focused_model_field_counts": {key: int(value) for key, value in sorted(focused_model_fields.items())},
+        "focused_source_neighborhoods": {key: int(value) for key, value in sorted(focus_group_counts.items())},
         "model_evidence": {key: sorted(value) for key, value in sorted(model_evidence.items())},
         "preferred_model_hits": {key: count for key, count in sorted(preferred_model_hits.items())},
+        "llm_requested_source_models": sorted(preferred_source_models),
         "selected_business_models": sorted({str(row.get("business_model") or row.get("model") or "") for row in selected_rows}),
         "privacy_sensitive_fields_excluded": sum(1 for item in scored if item["meta"].get("privacy_sensitive")),
         "technical_or_display_fields_excluded": sum(

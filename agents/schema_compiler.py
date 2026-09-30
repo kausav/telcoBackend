@@ -11,7 +11,7 @@ import re
 from difflib import SequenceMatcher
 from core.scenario_semantics import classify_outcome_mode
 from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain
-from core.industry_source_store import catalog_for_request, normalize_lookup_key, select_json_source_catalog, canonical_variable_semantic_key, semantic_exclusion_aliases
+from core.industry_source_store import catalog_for_request, normalize_lookup_key, select_json_source_catalog, canonical_variable_semantic_key, semantic_exclusion_aliases, _catalog_role
 from core.variable_quality import VariableQualityEngine
 from core.temporal_contract import is_supported_temporal_rule
 from config.runtime import SCHEMA_MAX_VARIABLES, SCHEMA_MIN_VARIABLE_SCORE
@@ -892,6 +892,10 @@ class SchemaCompiler:
                 "source_json_semantic_key": source_spec.get("semantic_key") if source_from_json else None,
                 "source_json_paths": list(source_spec.get("source_paths") or []) if source_from_json else [],
                 "source_json_aliases": list(source_spec.get("source_aliases") or []) if source_from_json else [],
+                "source_owner_model": source_spec.get("source_owner_model") if source_from_json else None,
+                "source_owner_kind": source_spec.get("source_owner_kind") if source_from_json else None,
+                "source_owner_relation": source_spec.get("source_owner_relation") if source_from_json else None,
+                "source_owner_relative_path": source_spec.get("source_owner_relative_path") if source_from_json else None,
                 "grain": grain,
                 "quality_score": quality_engine.score(idea, selection_context, entity_key).score,
                 "quality_reasons": list(quality_engine.score(idea, selection_context, entity_key).reasons),
@@ -907,6 +911,7 @@ class SchemaCompiler:
                 required=required,
                 # Source formulas are not copied unless explicitly represented by the source contract.
                 formula=None,
+                useCase=(str(idea.get("useCase") or "").strip() or str(intent.use_case or "").strip() or None),
                 provenance=provenance,
                 scope=grain,
             ))
@@ -967,6 +972,7 @@ class SchemaCompiler:
             catalog_rows,
             business_context=business_context,
             preferred_names=preferred_names,
+            preferred_models={str(value) for value in (intent.requested_entities or []) if str(value).strip()},
             excluded_names=excluded,
             excluded_semantic_keys=external_semantic_aliases,
             max_fields=variable_budget,
@@ -1013,14 +1019,11 @@ class SchemaCompiler:
                 else "boolean" if dtype in {"boolean", "bool"}
                 else "string"
             )
-            role = (
-                "timing" if normalized_dtype in {"datetime", "date"}
-                else "measurement" if normalized_dtype in {"integer", "float"}
-                else "identity" if normalize_lookup_key(spec.get("name")).endswith(("_id", "_key"))
-                else "status" if spec.get("enum_values") and any(token in f"{spec.get('name','')} {spec.get('path','')}".lower() for token in ("status", "state", "reason"))
-                else "categorical" if spec.get("enum_values")
-                else "other"
-            )
+            source_role = _catalog_role(spec)
+            role = source_role if source_role in {
+                "identity", "profile", "event", "transaction", "status", "measurement",
+                "metric", "timing", "decision", "configuration", "derived", "categorical", "other",
+            } else "other"
             grain = "entity" if _is_entity_catalog_row(spec) else "transaction"
             selected_source_ideas.append({
                 "name": str(spec["name"]),
