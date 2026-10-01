@@ -22,7 +22,7 @@ class ScenarioVariableModel:
                     variables: list[dict[str, Any]], actor_user_id: str | None = None) -> int:
         from core.agentic_models import GeneratedSchemaField
         from core.variable_semantics import variable_semantic_identities
-        from core.low_balance_variable_policy import validate_db_definition
+        from core.variable_contract import validate_db_definition
         import time
         requested = str(requested_scenario_id or "").strip()
         if not requested:

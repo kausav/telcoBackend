@@ -9,7 +9,6 @@ The policy is intentionally deterministic: no LLM is consulted during ranking or
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 import re
 from typing import Any, Iterable
 
@@ -48,19 +47,15 @@ class VariableQualityEngine:
     DISPLAY_TOKENS = {"description", "display", "label", "formatted", "friendly"}
     RELATION_METADATA_TOKENS = {
         "party_account", "engaged_party", "related_party", "requestor",
-        "referred_type", "balance_topup",
+        "referred_type",
     }
 
     # Cross-model synonyms that frequently produce duplicate columns after flattening.
     # Generic technical prefixes introduced by flattened API paths. They should not force two
     # fields to be considered different concepts when the business concept is identical.
     ENTITY_CONTEXT_ALIASES = {
-        "topupbalance": {"topup", "top_up", "balance", "recharge"},
-        "topup_balance": {"topup", "top_up", "balance", "recharge"},
-        "bucket": {"bucket"},
-        "customer": {"customer", "subscriber", "account", "party"},
-        "subscriber": {"subscriber", "customer", "account"},
-        "account": {"account", "subscriber", "customer"},
+        "customer": {"customer", "account", "party"},
+        "account": {"account", "customer"},
     }
 
     HIGH_VALUE_ROLES = {

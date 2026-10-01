@@ -265,8 +265,6 @@ def derive_scenario_semantics(state, variables: list[dict]) -> dict:
     }
 
 
-
-
 def temporal_role(var: dict) -> str:
     text = f"{var.get('name', '')} {var.get('description', '')}".lower()
     if any(k in text for k in ("decision", "response", "reply", "decline", "acceptance")):
@@ -284,18 +282,3 @@ def temporal_role(var: dict) -> str:
     return "generic"
 
 
-def temporal_delay_limit_seconds(child: dict, parent: dict) -> int | None:
-    """Return only an explicitly declared upper bound; never invent a scenario-wide ceiling."""
-    text = f"{child.get('name','')} {child.get('description','')}".lower()
-    match = re.search(r"within\s+(\d+)\s*(second|seconds|minute|minutes|hour|hours|day|days)", text)
-    if match:
-        amount = int(match.group(1))
-        return amount * {
-            "second": 1, "seconds": 1,
-            "minute": 60, "minutes": 60,
-            "hour": 3600, "hours": 3600,
-            "day": 86400, "days": 86400,
-        }[match.group(2)]
-    if "same day" in text or "same-day" in text:
-        return 86400
-    return None

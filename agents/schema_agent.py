@@ -53,7 +53,7 @@ Return a JSON object with:
 
 SOURCE BOUNDARY IS MANDATORY:
 - The only authoritative external/domain inputs are the confirmed scenario variables and, when present, the active MongoDB industry/domain source catalog represented by those variables.
-- Do not use static telecom registries, bundled standards files, country/industry profiles, external URLs, templates, examples, memory, or generic industry knowledge as a source of field names or categorical values.
+- Do not use static industry registries, bundled standards files, country/industry profiles, external URLs, templates, examples, memory, or generic industry knowledge as a source of field names or categorical values.
 
 SEMANTIC ACCURACY IS MANDATORY:
 - Every field and every categorical value must be relevant to the target industry,
@@ -75,7 +75,7 @@ SEMANTIC ACCURACY IS MANDATORY:
   depends_on the parent datetime field OR both fields clearly belong to the same business resource
   and form an unambiguous lifecycle pair (for example the same resource's requestedDate ->
   confirmationDate or validFor.startDateTime -> validFor.endDateTime). Never connect timestamps from
-  sibling resources such as TopupBalance, AdjustBalance, TransferBalance, Bucket, Customer, etc. merely
+  sibling resources (for example a Payment and a Refund, or an Order and a Customer) merely
   because their field names both contain request/confirmation/start/end. Never create Cartesian products
   of all request timestamps against all confirmation timestamps. If the relationship is not structurally
   supported, omit the temporal rule.
@@ -85,17 +85,16 @@ SEMANTIC ACCURACY IS MANDATORY:
   value must belong to the target industry's real vocabulary. Do not accept a value
   merely because it is syntactically valid or common in another industry.
 - REAL ENTITY FIELDS require real target-industry/country entities. For example, a
-  telecom service_provider must be an actual telecom operator; a banking provider
-  must be a bank/payment institution when such a field is appropriate; a retail
-  provider/merchant must be retail-appropriate. Never use Provider_A, Company_A,
-  telecom brands in banking/retail/etc., or any other cross-industry placeholder.
+  a service_provider must be an actual operator of the target industry and country; a
+  provider/merchant must be appropriate to that industry. Never use Provider_A, Company_A,
+  brands from another industry, or any other cross-industry placeholder.
 - If the confirmed MongoDB source contract has no authoritative entity list for a field, do NOT borrow
   an entity list from another industry. Use only supplied scenario vocabulary or leave the field
   unconstrained rather than introducing unrelated entities.
 - Treat semantic relevance as a HARD validation rule. If a variable/value fails the
   industry + country + scenario audit, reject or replace it before generation.
 - Encode important state dependencies explicitly. Example: if a scenario states that
-  transaction failure causes recharge failure, encode that as a machine-checkable
+  a failed payment causes a failed order, encode that as a machine-checkable
   conditional rule; do not leave the relationship only in prose.
 - SCENARIO SEMANTICS MUST COME FROM THE COMPLETE INPUT CONTEXT, NOT FROM ONE FIELD.
   Consider scenarioType together with businessScenario, businessResponse, expectedOutcome,
@@ -117,7 +116,7 @@ SEMANTIC ACCURACY IS MANDATORY:
   min/max distribution. A compact/exported range token such as 10002999 represents 1000-2999 when
   the confirmed parser has normalized it; reason over the normalized value, not a guessed alternative.
 - Field descriptions are binding semantic requirements. Do not contradict a description (for example,
-  a field described as a successful recharge amount must not become a failed/refund amount).
+  a field described as a successful payment amount must not become a failed/refund amount).
 - Never create a mathematically or semantically inconsistent state because fields were generated
   independently. When an outcome controls another field, encode and enforce the dependency deterministically.
 """
@@ -212,7 +211,7 @@ class SchemaAgent:
             f"Variables (authoritative): {field_summary}\n"
             f"Complete confirmed scenario context (source of truth): {json.dumps(state.scenario_context, default=str, sort_keys=True)}\n\n"
             "SOURCE BOUNDARY: use only the confirmed scenario variables and the MongoDB-backed source definitions represented by them. "
-            "Do not use static telecom registries, bundled standards files, external standards URLs, country/industry profiles, templates, examples, memory, or generic industry knowledge. "
+            "Do not use static industry registries, bundled standards files, external standards URLs, country/industry profiles, templates, examples, memory, or generic industry knowledge. "
             "generation_constraints, cross_field_rules, and formula_rules are machine-readable and must be derived from the supplied scenario contract. "
             "Confirmed literal choices, numeric bounds, buckets, weights, precision, currency, timestamp format, dependencies, and formulas are authoritative and must not be changed. "
             "Validate and produce execution notes. Time relationships must preserve causal order and use realistic delays supported by the confirmed contract. "

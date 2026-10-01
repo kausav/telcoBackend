@@ -901,7 +901,6 @@ def _coerce_executable_generator(gen: str, params: dict[str, Any], dtype: str, f
         return gen, params
 
     p = dict(params or {})
-    g = str(gen or "").strip().lower()
     d = str(dtype or "string").strip().lower()
 
     if formula:
@@ -1204,15 +1203,7 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
     requested=str(type_of_data or "").strip().lower()
     if requested and requested not in {"transactional","aggregational"}:
         raise ValueError("typeOfData must be 'transactional' or 'aggregational'")
-    detected_type=requested or infer_type_of_data(csv_text)
 
-    known_gens=set(SUPPORTED_GENERATORS) | {
-        "unique_id","indian_msisdn","uuid","timestamp","recent_timestamp","choice","range",
-        "dependent_range","derived_distribution","derived_timestamp","derived","datetime",
-        "synthetic_event","configuration","derived_state","derived_event","categorical","category",
-        "string","text","object","varchar","int","integer","float","decimal","number","numeric",
-        "bool","boolean","date","weighted_bucket",
-    }
 
     variables=[]; field_order=[]; variable_by_name={}; all_names=set()
     for row_number,row in enumerate(raw_rows,start=2):

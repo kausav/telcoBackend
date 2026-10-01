@@ -19,7 +19,7 @@ from core.dynamic_scenarios import (
     resolve_variables,
     scenario_exists,
 )
-from agents.data_generation_agent import generation_seed, run_deterministic_agentic_generation
+from agents.data_generation_agent import _pick_timestamp_field, generation_seed, run_deterministic_agentic_generation
 from core.pipeline import run_pipeline
 from core.industry_source_store import list_source_documents
 from core.scenario_variable_store import get_recommended
@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 def _timestamp_sort_key(value: Any):
-    from datetime import datetime, timezone
     if isinstance(value, datetime):
         dt = value
     else:
@@ -112,6 +111,10 @@ def _require_generation_source(
             # source label or the preserved source document id. DB overlays remain allowed.
             if source in {"MONGODB_JSON", "DB_RECOMMENDED", "USER_SELECTED"} or source_id:
                 continue
+            # Derived columns are computed by the application itself (a behaviour pack's opt-in facts, or a
+            # scenario-semantics decision such as a suppression flag), so they are not LLM output.
+            if source == "DERIVED" and str(row.get("gen") or "") in {"behavior_pack", "formula"}:
+                continue
             # Legacy confirmed agentic rows may predate source metadata preservation. They are
             # still inside an approved mongodb source-policy contract and were schema-validated
             # before confirmation, so keep them executable rather than rejecting a valid history.
@@ -192,6 +195,7 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
     records_per_user = int(req_payload.get("recordsPerUser", 10) or 10)
     seed_raw = req_payload.get("seed")
     seed = int(seed_raw) if seed_raw is not None else None
+    as_of = req_payload.get("asOf")
 
     if draft_id:
         resolved = resolve_requested_scenario_id_from_draft(draft_id)
@@ -217,6 +221,8 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
                 type_of_data=scenario_context.get("type_of_data", resolve_data_type(requested_scenario_id)),
                 scenario_context=scenario_context,
                 records_per_user=records_per_user,
+                seed=seed,
+                as_of=as_of,
             )
         else:
             state = run_pipeline(
@@ -285,34 +291,9 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
         user_fields = compiled.user_fields
         user_field_names = set(user_fields)
         user_field_names.add(entity_key)
+        history_timestamp_field = _pick_timestamp_field(compiled.variables)
         for entity_value, rows in grouped.items():
-            timestamp_field = next(
-                (f for f in (
-                    "event_timestamp", "event_datetime", "event_date_time",
-                    "transaction_timestamp", "transaction_datetime", "transaction_date_time",
-                    "record_timestamp", "record_datetime", "record_date_time",
-                    "topup_balance_requested_date", "topup_balance_requested_date_time",
-                    "topupbalance_requested_date", "topupbalance_requested_datetime", "topupbalance_requested_date_time",
-                    "recharge_timestamp", "recharge_datetime", "recharge_date_time",
-                    "requested_timestamp", "requested_datetime", "requested_date_time",
-                    "occurred_at", "occurred_timestamp", "created_at", "creation_date_time",
-                    "start_date_time", "start_datetime", "start_date",
-                ) if f in rows[0]),
-                None,
-            )
-            if timestamp_field is None:
-                candidates = [
-                    f for f in rows[0]
-                    if any(token in f.casefold() for token in (
-                        "event", "transaction", "record", "occurred", "requested", "request",
-                        "start", "created", "timestamp",
-                    ))
-                    and not any(token in f.casefold() for token in (
-                        "confirmation", "confirmed", "decision", "end", "expiry", "expiration", "updated",
-                        "valid_for_end", "validity_end",
-                    ))
-                ]
-                timestamp_field = next((f for f in candidates if f in rows[0]), None)
+            timestamp_field = history_timestamp_field
             if timestamp_field:
                 rows = sorted(rows, key=lambda r: _timestamp_sort_key(r.get(timestamp_field)), reverse=True)
             latest = rows[0] if rows else {}

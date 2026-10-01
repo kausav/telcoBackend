@@ -22,21 +22,16 @@ from core.dynamic_scenarios import (
     save_draft,
     pop_draft,
     resolve_requested_scenario_id_from_draft,
-    resolve_scenario_meta,
     scenario_exists,
-    resolve_data_type,
-    resolve_scenario_context,
-    resolve_variables,
 )
-from core.compiled_schema import invalidate_scenario, infer_history_field_sets
+from core.compiled_schema import invalidate_scenario
 from core.runtime_cache import clear_scenario
 from core.agentic_models import ScenarioProposeRequest, ScenarioImportResponse
 from core.csv_scenario import infer_type_of_data, parse_definition_csv
 from config.country_metadata import COUNTRY_BASE
 from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES, INDUSTRY_SOURCE_MAX_JSON_BYTES
 from core.agentic_workflow import AgenticSchemaWorkflow, get_agentic_workflow
-from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain
-from core.low_balance_variable_policy import validate_low_balance_variable_sources
+from core.json_domain_policy import is_json_grounded_domain
 from core.scenario_variable_store import upsert_recommended, get_recommended, set_user_variables, get_user_variables, get_user_variable_records, delete_user_variable
 from models.database import ping as ping_mongodb
 from models.model_registry import ensure_indexes as ensure_model_indexes
@@ -50,8 +45,6 @@ from core.industry_source_store import (
     generate_internal_source_id,
     invalidate_catalog_cache,
 )
-
-
 
 
 def _is_placeholder(value) -> bool:
@@ -199,6 +192,7 @@ class GenerateRequest(BaseModel):
     count: int = Field(35, ge=1, le=5000, description="Number of users/entities to generate for a transactional scenario")
     recordsPerUser: int = Field(10, ge=1, le=10, description="Number of most-recent historical records returned per user for a transactional scenario")
     seed: int | None = Field(None, ge=0, le=2_147_483_647, description="Optional deterministic generation seed for reproducible synthetic-data runs")
+    as_of: str | None = Field(None, alias="asOf", max_length=40, description="Optional ISO-8601 reference time (\"now\") for behaviour-pack generation; with a seed it makes a run exactly reproducible")
 
 
 class GenerateResponse(BaseModel):
@@ -284,23 +278,6 @@ class IndustrySourceResponse(BaseModel):
     sources: list[dict] = Field(default_factory=list)
     uploaded: int = 0
     errors: list[dict] = Field(default_factory=list)
-
-
-
-def _normalize_upload_metadata(values: list[str] | None, file_count: int, field_name: str) -> list[str | None]:
-    """Normalize repeated multipart metadata so per-file source IDs/names are unambiguous."""
-    if not values:
-        return [None] * file_count
-    cleaned = [str(value).strip() for value in values]
-    if len(cleaned) == 1 and file_count == 1:
-        return cleaned
-    if len(cleaned) != file_count:
-        raise HTTPException(400, detail={
-            "error": f"{field_name} must be omitted or supplied once per uploaded file",
-            "expected": file_count,
-            "received": len(cleaned),
-        })
-    return cleaned
 
 
 @app.get("/")
@@ -643,16 +620,13 @@ def import_scenario_csv(
 
     This path remains intentionally separate from /scenario/propose so clients can
     choose between an explicit CSV schema definition and agentic schema proposal.
-    Low Balance & Top-up is intentionally source-locked to TMF654/TMF629 or MongoDB
-    variables, so CSV cannot become a third variable source for that domain.
+    A domain backed by registered source documents is source-locked, so CSV cannot become a
+    second variable source for it.
     """
-    if is_low_balance_domain(domain, industryType) or is_json_grounded_domain(domain, industryType):
-        message = (
-            "Low Balance & Top-up variables cannot be defined through CSV. Use the active MongoDB industry source documents or scenario variables."
-            if is_low_balance_domain(domain, industryType)
-            else "This JSON-source-backed industry/domain cannot be defined through CSV. Use the active MongoDB industry source documents."
-        )
-        raise HTTPException(status_code=400, detail={"error": message})
+    if is_json_grounded_domain(domain, industryType):
+        raise HTTPException(status_code=400, detail={
+            "error": "This JSON-source-backed industry/domain cannot be defined through CSV. "
+                     "Use the active MongoDB industry source documents."})
     csv_text = _read_csv_upload(file)
 
     try:
@@ -672,7 +646,7 @@ def import_scenario_csv(
             entityKey = next((name for name in variable_names if name.lower() == token.lower()), None)
         if not entityKey:
             preferred = (
-                "subscriber_id", "customer_id", "account_id", "user_id",
+                "customer_id", "account_id", "user_id",
                 "entity_id", "customer_key", "entity_key", "id",
             )
             entityKey = next((name for name in preferred if name in variable_names), None)
@@ -724,7 +698,6 @@ def import_scenario_csv(
     )
 
 
-
 @app.post("/scenario/confirm", response_model=ConfirmResponse)
 def confirm_scenario_route(req: ConfirmRequest):
     """HITL approval boundary: approve/edit the draft and persist it for /scenario/generate."""
@@ -754,21 +727,11 @@ def confirm_scenario_route(req: ConfirmRequest):
             cleaned=_clean_dict(new_var); name=cleaned.get("name")
             if not _is_placeholder(name): by_name[str(name)]=cleaned
         variables=list(by_name.values()); field_order=[str(v["name"]) for v in variables if v.get("name")]
-    if is_low_balance_domain(draft.get("domain"), draft.get("industry_type")) and not draft.get("agentic"):
-        try:
-            validate_low_balance_variable_sources(
-                variables,
-                variable_sources,
-                db_variable_names=db_variable_names,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-
     type_of_data=draft.get("type_of_data","aggregational")
 
     entity_key=draft.get("entity_key") if type_of_data=="transactional" else None
     if type_of_data=="transactional" and entity_key not in {v.get("name") for v in variables}:
-        preferred=("subscriber_id","customer_id","account_id","user_id","entity_id","customer_key","entity_key","id")
+        preferred=("customer_id","account_id","user_id","entity_id","customer_key","entity_key","id")
         names={str(v.get("name")) for v in variables if v.get("name")}
         entity_key=next((n for n in preferred if n in names),None) or (next(iter(names),None) if names else None)
     requested_scenario_id=str(draft.get("requested_scenario_id") or draft.get("scenario_id") or "").strip() or None
@@ -791,6 +754,9 @@ def confirm_scenario_route(req: ConfirmRequest):
         "source_policy": draft.get("source_policy", "scenario_variables"),
         "source_documents": list(draft.get("source_documents") or []),
         "behavioral_rules": [dict(rule) for rule in (draft.get("behavioral_rules") or []) if isinstance(rule, dict)],
+        # The behaviour pack pinned at proposal time; generation must use exactly this pack.
+        "behavior_pack_id": draft.get("behavior_pack_id"),
+        "behavior_pack_version": draft.get("behavior_pack_version"),
         # Preserve the immutable JSON source provenance through HITL confirmation.
         # Generation must rely on the confirmed contract rather than querying live source
         # document IDs on every request; source IDs remain useful for audit/debugging.
@@ -910,6 +876,7 @@ async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
             "count": req.count,
             "recordsPerUser": req.recordsPerUser,
             "seed": req.seed,
+            "asOf": req.as_of,
         })
         # build_generation_response performs the domain-level generation and QA checks.
         # Returning the plain payload lets FastAPI apply the declared GenerateResponse contract

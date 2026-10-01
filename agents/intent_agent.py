@@ -20,7 +20,6 @@ from core.json_domain_policy import is_json_grounded_domain
 from core.industry_source_store import (
     catalog_for_request,
     normalize_lookup_key,
-    select_json_source_catalog,
     _catalog_business_metadata_penalty,
     _catalog_display_only,
     _catalog_role,
@@ -28,7 +27,6 @@ from core.industry_source_store import (
     _canonical_context_tokens,
     _source_owner_family,
     _normalize_model_name,
-    semantic_exclusion_aliases,
     validate_catalog_selection,
     dedupe_catalog_against_db,
 )
@@ -75,7 +73,7 @@ IMPORTANT BOUNDARIES:
   are identical. A generic leaf such as ``status``, ``amount``, ``id``, ``percentage`` or ``date`` is NOT a global
   duplicate key. Treat two fields as duplicates only when the supplied source structure identifies the same owning
   business concept, relationship role, relative property path, and executable contract. Do not collapse
-  ``Bucket.status`` with ``TopupBalance.status`` merely because both are named ``status``. Conversely, repeated
+  ``Payment.status`` with ``Order.status`` merely because both are named ``status``. Conversely, repeated
   API wrappers of the same reusable schema concept should be represented by one canonical field. Never add copies
   merely to increase variable count.
 - For transactional data, distinguish stable entity/profile fields from repeated transaction/event/decision fields using grain.
@@ -358,7 +356,7 @@ def _compact_source_catalog_for_llm(
         numeric_measurement = 0 if role == "measurement" and str(row.get("dtype") or "").lower() in {"integer", "float", "number"} else 1
         # Prefer analytically specific leaf properties over transport/display-style leaves. This is
         # structural and vocabulary-independent: ``remainingValue.amount`` beats ``remainingValue.name``
-        # without ever naming a telecom field explicitly.
+        # without ever naming a domain field explicitly.
         leaf_name = str(row.get("field") or row.get("name") or "").strip()
         leaf_tokens = _catalog_text_tokens(leaf_name)
         specificity_tokens = leaf_tokens - {
@@ -389,10 +387,6 @@ def _compact_source_catalog_for_llm(
         for row in ordered:
             role = str(_catalog_role(row) or "other")
             by_role.setdefault(role, []).append(row)
-        meaningful_by_role = {
-            role: [row for row in values if float(_catalog_business_metadata_penalty(row)) < 30.0]
-            for role, values in by_role.items()
-        }
 
         selected: list[dict[str, Any]] = []
         seen_names: set[str] = set()
@@ -612,7 +606,7 @@ class GeminiIntentAgent:
         self,
         request_context: str,
         country: str | None = None,
-        industry_type: str = "telecom",
+        industry_type: str = "",
         domain_query: str | None = None,
         excluded_variable_names: list[str] | None = None,
         persisted_variables: list[dict[str, Any]] | None = None,
@@ -713,7 +707,7 @@ class GeminiIntentAgent:
             "Use the scenario's domain, use case, business scenario, scenario type, data type, entity key, and country as relevance evidence. "
             "Review ALL supplied model cards before deciding. requested_entities must contain only exact source business model identifiers from the model cards that are materially relevant; use it to identify source models whose local structural neighborhoods should be inspected, not as permission to import every nested field. "
             "candidate_variables must name exact source scalar fields that are especially important. A candidate field from a relevant model is valid even when the field name itself does not lexically match the request, provided the model description/field semantics support it. "
-            "For behavior-oriented scenarios, explicitly check source models that describe usage/consumption, balance/depletion, recharge/top-up, eligibility/qualification, outcomes and customer context before returning the selection. "
+            "For behavior-oriented scenarios, explicitly check source models that describe the triggering event, state/measurement, eligibility/qualification, outcomes and customer context before returning the selection. "
             "The final deterministic compiler evaluates the complete canonical MongoDB source catalog, so this LLM output is a relevance signal only, never the final variable-count gate. " + mandatory_line + "\n"
             + (
                 "PERSISTED MONGODB VARIABLES (IMMUTABLE; NEVER RENAME OR MODIFY):\n"
@@ -808,6 +802,7 @@ class GeminiIntentAgent:
                     catalog_by_name,
                     business_context=request_context,
                     preferred_names={str(item.get("name") or "") for item in (payload.get("candidate_variables") or []) if isinstance(item, dict)},
+                    industry_type=industry_type,
                 )
                 filtered, duplicates = dedupe_catalog_against_db(filtered, persisted_variables or [])
                 if rejected:

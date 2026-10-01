@@ -6,14 +6,12 @@ variable contract plus request context into machine-readable generation guardrai
 from __future__ import annotations
 
 from typing import Any
-import re
 
 from core.scenario_semantics import derive_scenario_semantics, temporal_role
 from core.temporal_contract import (
     is_supported_temporal_rule,
     normalize_temporal_family,
     source_declared_max_delay_seconds,
-    source_declared_min_delay_seconds,
 )
 
 

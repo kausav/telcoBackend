@@ -1,7 +1,6 @@
 """Persistence model for confirmed scenarios."""
 from __future__ import annotations
 
-import re
 import time
 from typing import Any
 from pymongo.errors import DuplicateKeyError
@@ -21,42 +20,6 @@ class ScenarioModel:
         cls.collection.create_index("scenario_id", unique=True, sparse=True)
         cls.collection.create_index("draft_id")
 
-    @classmethod
-    def next_id(cls) -> str:
-        # Legacy helper retained for compatibility. New scenarios must supply the requested
-        # scenario id and are never silently renamed.
-        ids = cls.collection.find({}, {"requested_scenario_id": 1, "scenario_id": 1, "_id": 0})
-        numbers = []
-        for row in ids:
-            value = row.get("requested_scenario_id") or row.get("scenario_id")
-            if match := re.match(r"LB-(\d+)$", str(value)):
-                numbers.append(int(match.group(1)))
-        return f"LB-{(max(numbers) + 1) if numbers else 1:02d}"
-
-    @classmethod
-    def create(cls, scenario_id: str, requested_scenario_id: str | None, draft_id: str | None,
-               meta: dict[str, Any], variables: list[dict[str, Any]], field_order: list[str],
-               reassigned: bool = False) -> None:
-        now = time.time()
-        canonical = str(requested_scenario_id or "").strip() or None
-        if not canonical:
-            raise ValueError("requested_scenario_id is required")
-        if str(scenario_id).strip() != canonical:
-            raise ValueError("scenario_id must equal requested_scenario_id")
-        persisted_meta = dict(meta)
-        persisted_meta["requested_scenario_id"] = canonical
-        persisted_meta["scenario_id"] = canonical
-        cls.collection.insert_one({
-            "scenario_id": canonical,
-            "requested_scenario_id": canonical,
-            "scenario_id_reassigned": reassigned,
-            "draft_id": draft_id,
-            "meta": persisted_meta,
-            "variables": variables,
-            "field_order": field_order,
-            "created_at": now,
-            "updated_at": now,
-        })
 
     @classmethod
     def create_with_allocation(cls, requested_id: str | None, draft_id: str | None,

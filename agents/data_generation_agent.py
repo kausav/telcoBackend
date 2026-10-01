@@ -84,7 +84,7 @@ _CHUNK = max(1, int(os.getenv("QA_LLM_CHUNK_SIZE", "10")))
 _QA_SYSTEM = """You are the final QA validator for generated synthetic data.
 
 Validate every supplied record against the FULL confirmed scenario contract, official source
-semantics, business/cross-field rules, and subscriber-history rules. The goal is not merely
+semantics, business/cross-field rules, and entity-history rules. The goal is not merely
 to produce syntactically valid rows: every record must represent a logically possible business
 event sequence. Treat the generated dataset as if it were emitted by the real business system
 defined by the confirmed scenario and its approved industry/domain source documents.
@@ -96,25 +96,25 @@ enum values or substitute synonyms. Never use a free-form value from one field a
 were the semantic value of a different field.
 
 For every record, validate ALL dimensions, not only timestamps:
-1. Entity identity consistency: subscriber/account/customer/bucket identities and stable keys.
+1. Entity identity consistency: entity/account/customer/resource identities and stable keys.
 2. Reference integrity: ids, hrefs, names, roles, and @referredType semantics agree with the
    referenced resource type.
 3. Enum/category fidelity: every choice is inside the declared/source value set.
 4. Datatype/range/precision/bucket/weight constraints.
-5. Amount and unit consistency: values describing the same balance or recharge agree.
-6. Balance invariants: remaining/reserved/recharge quantities cannot contradict one another.
+5. Amount and unit consistency: values describing the same quantity agree.
+6. Quantity invariants: remaining/reserved/added quantities cannot contradict one another.
 7. State-machine consistency: status, outcome, eligibility, suppression, decision, and execution
    state cannot describe mutually exclusive states simultaneously.
-8. Auto-top-up consistency: recurrence fields are present only when auto-top-up is enabled and
+8. Recurrence consistency: recurrence fields are present only when the recurring/automatic flag is enabled and
    their period/count agree with that behavior.
-9. Plan/validity consistency: a recharge validity window is tied to the recharge/plan event and
+9. Validity consistency: a validity window is tied to the event that grants it and
    is never an independently sampled unrelated date range.
 10. Temporal causality: request <= confirmation, activation/start <= expiry/end, and dependent
     events follow their parent events within declared or domain-appropriate bounds.
 11. Dependency consistency: values derived from another field must actually agree with that field.
 12. Formula/arithmetic consistency: formulas and calculated values must match exactly within the
     declared precision.
-13. Subscriber history consistency: repeated transactions for one entity must form a plausible
+13. Entity history consistency: repeated transactions for one entity must form a plausible
     chronological history; identity context must remain stable.
 14. Scenario semantics: the requested scenarioType/business scenario must materially constrain
     the relevant state transitions and outcomes.
@@ -227,7 +227,7 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
     """Generate a useful synthetic string from field name/description semantics.
 
     This is intentionally conservative: explicit params remain authoritative, then clear
-    description examples and well-known telecom/domain semantics are used before the final
+    description examples and generic name semantics are used before the final
     synthetic fallback. The fallback never echoes the schema field name verbatim.
     """
     p = dict(var.get("params") or {})
@@ -293,7 +293,7 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         prefix = re.sub(r"[^A-Z0-9]+", "_", prefix_source.upper()).strip("_") or "REF"
         return _prefixed_int({"prefix": f"{prefix}-", "digits": 10}, rec)
 
-    if "phone" in n or "mobile" in n or n == "msisdn":
+    if "phone" in n or "mobile" in n:
         # Country is request-scoped. The generator receives it through the internal execution
         # context so a US/GB/etc. request never silently falls back to India's +91 prefix.
         country = str(p.get("country") or rec.get("__country__") or "").strip().upper()
@@ -313,8 +313,7 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         if usable_examples:
             return _fit_string_length(str(_rng().choice(usable_examples)), p)
 
-    # Source-grounded free-form strings must not fall through into legacy telecom/domain
-    # vocabularies. The authoritative source contract owns the value semantics. Pattern-backed
+    # Source-grounded free-form strings must not fall through into domain vocabularies. The authoritative source contract owns the value semantics. Pattern-backed
     # fields are handled by the dedicated pattern generator before this neutral fallback.
     if p.get("source_contract"):
         return _fit_string_length(f"SYN_{(n.upper() or 'VALUE')[:32]}_{_rng().randint(1000, 9999)}", p)
@@ -327,91 +326,6 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         prefix = re.sub(r"[^A-Z0-9]+", "_", n.upper()).strip("_") or "REF"
         return _prefixed_int({"prefix": f"{prefix}-", "digits": 10}, rec)
 
-    # Industry-specific fallback vocabulary is legacy-only. Agentic JSON/DB contracts should
-    # carry their own enum/choices/examples so the same confirmed variable cannot silently become
-    # telecom data when reused by another industry.
-    if p.get("allow_legacy_telecom_vocab") is True:
-        if "operating circle" in d or "regulatory service area" in d:
-            return _rng().choice([
-                "Delhi", "Haryana", "Punjab", "Rajasthan", "Uttar Pradesh East", "Uttar Pradesh West",
-                "Maharashtra", "Mumbai", "Gujarat", "Karnataka", "Tamil Nadu", "Kerala",
-                "Andhra Pradesh", "Telangana", "West Bengal", "Bihar", "Odisha", "Assam",
-                "North East", "Himachal Pradesh", "Jammu Kashmir", "Madhya Pradesh", "Kolkata",
-            ])
-        if "medium" in n and "contact" in d:
-            return _rng().choice(["email", "telephone", "postal_address"])
-        if "contact medium" in d:
-            return _rng().choice(["email", "telephone", "postal_address"])
-        if "type of contact" in d:
-            return _rng().choice(["mobile", "fixed_home", "fixed_office", "shipping_address"])
-        if "payment plan" in d or n == "plantype":
-            return _rng().choice(["prepaid", "postpaid", "hybrid"])
-        if "consumption counter" in d:
-            return _rng().choice(["used", "outOfBucket"])
-        if "currency" in d or "iso4217" in d:
-            return str(p.get("currency") or "INR").upper()
-        if "currency" in n:
-            return str(p.get("currency") or "INR").upper()
-        if "billing time period" in d or "repeat the application of the price" in d:
-            return _rng().choice(["week", "month", "quarter", "year"])
-        if "frequency of" in d or "frequency" == n:
-            return _rng().choice(["daily", "weekly", "monthly", "quarterly"])
-        if "price" in n and ("recurring" in d or "discount" in d or "allowance" in d or "penalty" in d):
-            return _rng().choice(["recurring", "discount", "allowance", "penalty"])
-        if "catalog" in n and "catalog" in d:
-            return _rng().choice(["product", "service", "resource"])
-        if "relationship" in n and ("relationship" in d or "migration" in d or "substitution" in d):
-            return _rng().choice(["override", "discount", "replace", "migrate"])
-        if n == "value_type" or ("kind of value" in d and "numeric" in d and "text" in d):
-            return _rng().choice(["numeric", "text"])
-        if n == "range_interval" or "inclusion or exclusion" in d:
-            return _rng().choice(["open", "closed", "closedBottom", "closedTop"])
-        if n == "adjust_type" or "recurringcharge" in d or "onetimecharge" in d:
-            return _rng().choice(["RecurringCharge", "OneTimeCharge"])
-        if "format of the exported data" in d or n == "content_type":
-            return _rng().choice(["application/json", "text/csv", "application/xml"])
-        if "attachment mime type" in d:
-            return _rng().choice(["application/pdf", "image/png", "video/mp4"])
-        if n == "attachment_type" or "attachment type" in d:
-            return _rng().choice(["document", "image", "video"])
-        if "type of notification" in d or "type of the notification" in d:
-            return _rng().choice(["LOW_BALANCE_ALERT", "RECHARGE_UPDATE", "PAYMENT_UPDATE", "SYSTEM_NOTIFICATION"])
-        if "network" in n and "capability" in n:
-            return _rng().choice(["2G", "3G", "4G", "5G"])
-        if "channel" in n:
-            return _rng().choice(["APP", "SMS", "WEB", "USSD", "WHATSAPP", "IVR", "RETAIL"])
-        if "payment" in n and ("method" in n or "instrument" in n):
-            return _rng().choice(["UPI", "CREDIT_CARD", "DEBIT_CARD", "WALLET", "CASH", "AUTO_DEBIT"])
-        if "reason" in n:
-            return _rng().choice(["LOW_BALANCE", "DATA_EXHAUSTED", "VALIDITY_EXPIRY", "CUSTOMER_REQUEST"])
-        if n in {"stateorprovince", "province", "state"} or n.endswith("_state_or_province"):
-            return _rng().choice(["Haryana", "Punjab", "Delhi", "Maharashtra", "Karnataka", "Tamil Nadu", "Gujarat"])
-        if n == "city" or n.endswith("_city"):
-            return _rng().choice(["Delhi", "Gurugram", "Ludhiana", "Chandigarh", "Mumbai", "Bengaluru", "Pune"])
-        if n in {"postcode", "postalcode", "postal_code", "postcode"}:
-            return str(_rng().randint(110001, 999999))
-        if "status reason" in d or n == "status_reason":
-            return _rng().choice(["CUSTOMER_REQUEST", "PAYMENT_FAILURE", "SYSTEM_ERROR", "POLICY_VIOLATION"])
-        if "status" in n or n.endswith("_state") or n in {"state"}:
-            return _rng().choice(["PENDING", "COMPLETED", "FAILED"])
-        if "offer" in n and any(token in d for token in ("incentive", "recommendation", "cash back", "validity booster")):
-            return _rng().choice(["EXTRA_DATA", "CASH_BACK", "VALIDITY_BOOSTER", "DISCOUNT_VOUCHER"])
-        if "segment" in n or "market segment" in d:
-            return _rng().choice(["ULTRA_LOW", "MASS", "MID_TIER", "HIGH_VALUE"])
-        if n in {"role", "partyroletype"} or n.endswith("_role"):
-            return _rng().choice(["subscriber", "customer", "agent", "system"])
-        if n == "name" or n.endswith("_name"):
-            return _rng().choice(["Recharge Plan", "Data Booster", "Talktime Pack", "Retention Offer"])
-        if n == "title" or n.endswith("_title"):
-            return _rng().choice(["Low Balance Alert", "Recharge Event", "Top-up Request"])
-        if n == "description" or n.endswith("_description"):
-            return _rng().choice(["Recharge operation", "Balance adjustment", "Retention intervention"])
-        if n in {"type", "basetype", "referredtype"} or n.endswith("_type"):
-            return _rng().choice(["PrepayBalance", "BalanceTopup", "ProductOffering", "Subscriber"])
-        if "code" in n:
-            return f"CODE-{_rng().randint(100000, 999999)}"
-        if "country" in n:
-            return str(p.get("country") or "IN").upper()
     label = re.sub(r"_+", "_", n.upper()).strip("_") or "VALUE"
     return _fit_string_length(f"SYN_{label[:24]}_{_rng().randint(1000, 9999)}", p)
 
@@ -420,7 +334,6 @@ def _generic_value(var: dict, rec: dict):
     """Best-effort generic generator for client vocab not known to the core."""
     p = dict(var.get("params") or {})
     dtype = str(var.get("dtype") or "string").lower()
-    name = str(var.get("name") or rec.get("__current_field__") or "")
     if var.get("formula"):
         return _formula(var, rec)
     if "choices" in p or "values" in p:
@@ -861,26 +774,6 @@ def _generate_temporal_child_value_for_constraints(
     return _format_datetime_for_variable(desired, var)
 
 
-def _generate_temporal_child_value(
-    var: dict,
-    parent_dt: datetime,
-    max_gap: int | None,
-    min_gap: int = 0,
-) -> str:
-    """Generate a lifecycle child from an already-generated temporal parent."""
-    lower = max(0, int(min_gap or 0))
-    try:
-        upper = int(max_gap) if max_gap is not None else lower
-    except (TypeError, ValueError):
-        upper = lower
-    upper = max(lower, upper)
-    gap = _rng().randint(lower, upper) if upper > lower else lower
-    desired = parent_dt + timedelta(seconds=gap)
-    if str(var.get("dtype") or "datetime").strip().lower() == "date":
-        return desired.date().isoformat()
-    return _format_datetime_for_variable(desired, var)
-
-
 def _ts_offset(params: dict, rec: dict) -> str:
     base_field = str(params.get("base_field") or params.get("source_field") or "").strip()
     if not base_field:
@@ -1126,7 +1019,6 @@ _GENERATORS = {
 }
 
 
-
 def _rule_constraint_for(field_name: str, rules: dict | None) -> dict:
     """Return machine-readable generation constraints for a field.
 
@@ -1286,7 +1178,7 @@ def _temporal_field_is_absent_by_scenario(var: dict, rules: dict | None) -> bool
 
     This is deliberately role-based.  It prevents a field such as
     ``customer_response_timestamp`` from being generated for a ``No Response`` scenario
-    without maintaining a list of telecom/Low-Balance field names.
+    without maintaining a list of industry-specific field names.
     """
     if not isinstance(rules, dict):
         return False
@@ -1426,9 +1318,6 @@ def _apply_conditional_rules(rec: dict, rules: dict | None) -> dict:
         if not changed:
             break
     return rec
-
-
-
 
 
 def _formula_from_rules(field_name: str, rules: dict | None):
@@ -1594,7 +1483,6 @@ def _generate_record(variables: list[dict], rules: dict | None = None, plan: _Ge
     for parent, child, max_gap, min_gap in plan.temporal_relations:
         temporal_child_rules.setdefault(child, []).append((parent, max_gap, min_gap))
     for var in ordered:
-        gen_type = var["gen"]
         effective_var = var
         # A formula is authoritative when it can be evaluated.  For a dependency
         # cycle, seed the cyclic field from its declared generator so the remaining
@@ -1652,8 +1540,6 @@ def _generate_record(variables: list[dict], rules: dict | None = None, plan: _Ge
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
         rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
         rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules, relations=plan.temporal_relations)
-        rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-        rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
         rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
         return _public_record(_format_datetime_fields(rec, variables))
@@ -1745,8 +1631,6 @@ def _generate_selected_record(
         rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
         rec, _ = _enforce_temporal_consistency(rec, variables, rules=rules, relations=plan.temporal_relations)
         rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
-        rec, _ = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
-        rec, _ = _enforce_authoritative_formulas(rec, variables, rules=rules)
         rec, _ = _enforce_csv_contract(rec, variables, rules=rules)
         return _public_record(_format_datetime_fields(rec, variables))
     return _public_record(rec)
@@ -1766,15 +1650,16 @@ def _pick_timestamp_field(variables: list[dict]) -> str | None:
         "event_timestamp", "event_datetime", "event_date_time",
         "transaction_timestamp", "transaction_datetime", "transaction_date_time",
         "record_timestamp", "record_datetime", "record_date_time",
-        "topup_balance_requested_date", "topup_balance_requested_date_time",
-        "topupbalance_requested_date", "topupbalance_requested_datetime", "topupbalance_requested_date_time",
-        "recharge_timestamp", "recharge_datetime", "recharge_date_time",
         "requested_timestamp", "requested_datetime", "requested_date_time",
         "occurred_at", "occurred_timestamp", "created_at", "creation_date_time",
         "start_date_time", "start_datetime", "start_date",
     )
     names={str(v.get("name")):v for v in variables if v.get("name")}
     valid_dtypes={"datetime","date"}
+    # A behaviour pack names its history clock explicitly; that beats any name-based guess.
+    for name,var in names.items():
+        if var.get("primary_timestamp") is True and str(var.get("dtype","")).strip().lower() in valid_dtypes:
+            return name
     for name in exact_preferred:
         var=names.get(name)
         if var and str(var.get("dtype","")).strip().lower() in valid_dtypes:
@@ -1802,137 +1687,6 @@ def _pick_timestamp_field(variables: list[dict]) -> str | None:
     return None
 
 
-def _declared_db_variable_names(rules: dict | None) -> set[str]:
-    return {
-        str(name) for name in ((rules or {}).get("db_variable_names") or []) if str(name).strip()
-    }
-
-
-def _regenerate_declared_field(
-    variables: list[dict],
-    field_name: str,
-    base: dict | None = None,
-    *,
-    rules: dict | None = None,
-) -> Any:
-    """Regenerate one declared field using its persisted/compiled generator.
-
-    The target field is removed from the base first; otherwise _generate_selected_record treats
-    the existing value as authoritative and returns it unchanged, making collision retries a no-op.
-    """
-    candidate_base = dict(base or {})
-    candidate_base.pop(field_name, None)
-    generated = _generate_selected_record(
-        variables, {field_name}, base=candidate_base, rules=rules, apply_repairs=False
-    )
-    return generated.get(field_name)
-
-
-def _enforce_mandatory_telecom_identity(
-    user_context: dict,
-    variables: list[dict],
-    *,
-    country: str | None = None,
-    used_values: dict[str, set[str]] | None = None,
-    low_balance: bool = False,
-    rules: dict | None = None,
-) -> dict:
-    """Repair mandatory telecom identity anchors before transactional grouping.
-
-    Confirmed scenarios can outlive compiler changes and may still contain legacy generic
-    generators that emit placeholders such as ``SUBSCRIBER_ID``, ``MSISDN`` or ``{}``.
-    These fields are part of the API contract, so generation must normalize them regardless
-    of the generator stored in the older confirmed draft.
-    """
-    out=dict(user_context)
-    names={str(v.get("name")) for v in variables if v.get("name")}
-    used_values = used_values if used_values is not None else {
-        "subscriber_id": set(), "account_id": set(), "msisdn": set(), "customer_id": set()
-    }
-    used_values.setdefault("customer_id", set())
-
-    def unique_prefixed(prefix: str, digits: int, field: str) -> str:
-        for _ in range(1000):
-            candidate=_prefixed_int({"prefix":prefix, "digits":digits}, out)
-            if candidate not in used_values[field]:
-                used_values[field].add(candidate)
-                return candidate
-        raise RuntimeError(f"Unable to generate a unique {field}")
-
-    if "subscriber_id" in names:
-        current=str(out.get("subscriber_id") or "")
-        if not re.fullmatch(r"SUB-[0-9]+", current) or current in used_values["subscriber_id"]:
-            current=unique_prefixed("SUB-", 10, "subscriber_id")
-        else:
-            used_values["subscriber_id"].add(current)
-        out["subscriber_id"]=current
-
-    if "customer_id" in names:
-        current=str(out.get("customer_id") or "")
-        if not re.fullmatch(r"cust-[0-9]{8}", current) or current in used_values["customer_id"]:
-            # The Low Balance customer_id contract is fixed by policy. Whether the field is
-            # source-grounded in TMF629 or supplied by MongoDB, its executable representation
-            # is exactly cust- + 8 digits. Do not substitute any other identifier format.
-            current=unique_prefixed("cust-", 8, "customer_id")
-        else:
-            used_values["customer_id"].add(current)
-        out["customer_id"]=current
-
-    if "account_id" in names:
-        if low_balance:
-            current=str(out.get("account_id") or "")
-            if (not current) or current in used_values["account_id"]:
-                generated = _regenerate_declared_field(variables, "account_id", out, rules=rules)
-                current=str(generated or "")
-            if not current:
-                raise RuntimeError("Low Balance account_id DB variable generated an empty value")
-            if current in used_values["account_id"]:
-                raise RuntimeError("Low Balance account_id DB variable produced a duplicate value")
-            used_values["account_id"].add(current)
-            out["account_id"]=current
-        else:
-            subscriber=str(out.get("subscriber_id") or "")
-            suffix=re.search(r"([0-9]+)$", subscriber)
-            current=f"ACC-{suffix.group(1)}" if suffix else ""
-            if (not current) or current in used_values["account_id"]:
-                current=unique_prefixed("ACC-", 10, "account_id")
-            else:
-                used_values["account_id"].add(current)
-            out["account_id"]=current
-
-    if "msisdn" in names:
-        iso=str(country or "GLOBAL").strip().upper()
-        dial=str((COUNTRY_BASE.get(iso) or COUNTRY_BASE.get("GLOBAL") or {}).get("phone_country_code") or "").strip()
-        if not dial:
-            dial=iso if iso.startswith("+") else "+"+iso
-        current=str(out.get("msisdn") or "")
-        # In Low Balance, the DB definition is authoritative. If the generated value is missing
-        # or collides, rerun that DB field's own generator instead of substituting an application
-        # generated phone contract. For other telecom domains retain the historical normalization.
-        if low_balance:
-            if (not current) or current in used_values["msisdn"]:
-                generated = _regenerate_declared_field(variables, "msisdn", out, rules=rules)
-                current=str(generated or "")
-            if not current:
-                raise RuntimeError("Low Balance msisdn DB variable generated an empty value")
-            if current in used_values["msisdn"]:
-                raise RuntimeError("Low Balance msisdn DB variable produced a duplicate value")
-        else:
-            valid=bool(re.fullmatch(r"\+[1-9][0-9]{6,14}", current))
-            if (not valid) or current in used_values["msisdn"]:
-                for _ in range(1000):
-                    candidate=_e164_phone({"country_codes":[dial], "country":iso}, out)
-                    if candidate not in used_values["msisdn"]:
-                        current=candidate
-                        break
-                else:
-                    raise RuntimeError("Unable to generate a unique msisdn")
-        used_values["msisdn"].add(current)
-        out["msisdn"]=current
-
-    return out
-
-
 def _history_event_tokens(name: str) -> set[str]:
     """Extract stable business-event tokens from a history-derived field name."""
     text = re.sub(r"[^a-z0-9]+", "_", str(name or "").casefold()).strip("_")
@@ -1945,10 +1699,6 @@ def _history_event_tokens(name: str) -> set[str]:
     }
     tokens = {p for p in parts if p not in stop and len(p) > 1}
     aliases = {
-        "recharge": "topup",
-        "top_up": "topup",
-        "booster": "topup",
-        "topups": "topup",
         "notifications": "message",
         "contacts": "communication",
     }
@@ -2011,7 +1761,7 @@ def _history_status_is_success(row: dict, event_tokens: set[str]) -> bool:
 def _history_set_derived_fields(compiled, rows: list[dict]) -> tuple[list[dict], list[str]]:
     """Reconcile entity/history-derived fields against the transaction rows actually generated.
 
-    This is deliberately semantic rather than telecom-specific. It only derives fields whose names
+    This is deliberately semantic rather than domain-specific. It only derives fields whose names
     explicitly describe history (last_*, avg_*_interval_days, previous_*_count, *_count_24h) and only
     from matching transaction timestamps/statuses already present in the confirmed schema.
     """
@@ -2039,7 +1789,6 @@ def _history_set_derived_fields(compiled, rows: list[dict]) -> tuple[list[dict],
             entity_rows,
             key=lambda row: _qa_parse_dt(row.get(anchor_name)) if anchor_name and _qa_parse_dt(row.get(anchor_name)) is not None else datetime.min.replace(tzinfo=timezone.utc),
         )
-        latest = ordered[-1] if ordered else {}
 
         # Entity-level "last_*" timestamps are snapshots of the generated history, not independent random dates.
         for field_name in sorted(user_fields):
@@ -2077,7 +1826,6 @@ def _history_set_derived_fields(compiled, rows: list[dict]) -> tuple[list[dict],
                         break
             if target_values:
                 target_dt = max(target_values, key=lambda item: item[0])[0]
-                field_params = field_var.get("params") or {}
                 formatted = _format_datetime_for_variable(target_dt, field_var)
                 if any(r.get(field_name) != formatted for r in ordered):
                     for row in ordered:
@@ -2100,9 +1848,9 @@ def _history_set_derived_fields(compiled, rows: list[dict]) -> tuple[list[dict],
 
             def row_matches_event(row: dict) -> bool:
                 # A matching timestamp establishes that the event family exists. For
-                # domain-qualified counts (for example previous_data_topups_count),
+                # domain-qualified counts (for example previous_data_events_count),
                 # additionally require the row's explicit usage/category values to contain
-                # the requested qualifier, preventing a voice top-up from being counted as data.
+                # the requested qualifier, preventing one kind of event from being counted as another.
                 has_time = any(_qa_parse_dt(row.get(candidate)) is not None for candidate in candidates)
                 if not has_time:
                     return False
@@ -2112,7 +1860,7 @@ def _history_set_derived_fields(compiled, rows: list[dict]) -> tuple[list[dict],
                     if any(token in str(key).casefold() for token in ("usage_type", "event_type", "transaction_type", "product_type", "category"))
                     for token in _history_event_tokens(str(value))
                 }
-                requested_specific = event_match_tokens - {"topup", "balance", "recharge"}
+                requested_specific = event_match_tokens - {t for c in candidates for t in _history_event_tokens(str(c))}
                 if requested_specific and qualifiers and not requested_specific.intersection(qualifiers):
                     return False
                 return True
@@ -2180,11 +1928,10 @@ def _history_set_derived_fields(compiled, rows: list[dict]) -> tuple[list[dict],
     return rows, changed
 
 
-
 def _history_interval_driver_seconds(variables: list[dict], user_context: dict) -> int | None:
     """Return a schema-driven inter-transaction interval when the contract exposes one.
 
-    Values such as ``avg_topup_interval_days`` are generated once per entity and should drive the
+    Values such as ``avg_event_interval_days`` are generated once per entity and should drive the
     history spacing instead of being generated as a disconnected snapshot. If the field is absent
     or non-positive, the generic generator retains its bounded default cadence.
     """
@@ -2214,164 +1961,6 @@ def _history_interval_driver_seconds(variables: list[dict], user_context: dict) 
     return max(15 * 60, int(days * 86400.0 * jitter))
 
 
-def _stateful_resource_contract(variables: list[dict], rules: dict | None = None) -> dict[str, Any]:
-    """Infer one stateful remaining-resource/recharge pair when the confirmed contract supports it."""
-    context = " ".join(str((rules or {}).get(k) or "") for k in ("domain", "scenario_type", "business_scenario", "use_case")).casefold()
-    context_tokens = set(re.findall(r"[a-z0-9]+", context))
-    is_state_journey = bool(context_tokens & {"balance", "depletion", "exhaustion", "depleted", "recharge", "recharge", "topup", "top"})
-    if not is_state_journey:
-        return {}
-
-    numeric = {"int", "integer", "float", "decimal", "number", "numeric"}
-    names = [str(v.get("name") or "") for v in variables if v.get("name")]
-    by_name = {str(v.get("name") or ""): v for v in variables if v.get("name")}
-
-    def score_remaining(name: str, var: dict) -> int:
-        text = f"{name} {var.get('description') or ''}".casefold()
-        if "remaining" not in text or str(var.get("dtype") or "").casefold() not in numeric:
-            return -1
-        score = 20
-        if "balance" in text:
-            score += 8
-        if "data" in text:
-            score += 6
-        if "bucket" in text or "resource" in text:
-            score += 4
-        return score
-
-    def score_recharge(name: str, var: dict) -> int:
-        text = f"{name} {var.get('description') or ''}".casefold()
-        if str(var.get("dtype") or "").casefold() not in numeric or not any(t in text for t in ("topup", "top up", "recharge", "reload", "purchase", "credited")):
-            return -1
-        score = 18
-        if "amount" in text or "value" in text or "quantity" in text:
-            score += 8
-        if "balance" in text:
-            score += 4
-        if "data" in text and "depletion" in context:
-            score += 4
-        return score
-
-    remaining = max(((score_remaining(n, by_name[n]), n) for n in names), key=lambda x: (x[0], x[1]), default=(-1, ""))
-    recharge = max(((score_recharge(n, by_name[n]), n) for n in names), key=lambda x: (x[0], x[1]), default=(-1, ""))
-    if remaining[0] < 0 or recharge[0] < 0:
-        return {}
-
-    rem_name = remaining[1]
-    rem_prefix = rem_name.casefold().rsplit("remaining", 1)[0].strip("_")
-    related_recharges = []
-    rem_tokens = set(re.findall(r"[a-z0-9]+", rem_name.casefold())) - {"remaining", "value", "amount", "quantity", "unit", "units"}
-    for name, var in by_name.items():
-        if score_recharge(name, var) < 0:
-            continue
-        tokens = set(re.findall(r"[a-z0-9]+", name.casefold()))
-        overlap = len(rem_tokens & tokens)
-        if overlap:
-            related_recharges.append((overlap + score_recharge(name, var) / 100.0, name))
-    recharge_name = max(related_recharges, default=(recharge[0] / 100.0, recharge[1]))[1]
-
-    status_candidates = []
-    for name, var in by_name.items():
-        text = f"{name} {var.get('description') or ''}".casefold()
-        if str(var.get("dtype") or "").casefold() not in {"categorical", "string"} or "status" not in text and "outcome" not in text and "state" not in text:
-            continue
-        if any(t in text for t in ("topup", "recharge", "reload", "purchase", "credit")):
-            status_candidates.append(name)
-    status_name = sorted(status_candidates)[0] if status_candidates else None
-
-    cap = None
-    params = by_name[rem_name].get("params") if isinstance(by_name[rem_name].get("params"), dict) else {}
-    try:
-        cap = float(params.get("max", params.get("hi"))) if params.get("max", params.get("hi")) is not None else None
-    except (TypeError, ValueError):
-        cap = None
-    return {
-        "remaining": rem_name,
-        "recharge_amount": recharge_name,
-        "recharge_status": status_name,
-        "cap": cap,
-        "low_balance": "low" in context and "balance" in context,
-        "depletion": bool(context_tokens & {"depletion", "exhaustion", "depleted"}),
-    }
-
-
-def _apply_stateful_resource_transition(
-    row: dict,
-    contract: dict[str, Any],
-    state: dict[str, Any],
-    *,
-    first_row: bool,
-) -> dict:
-    """Carry a confirmed resource state forward between chronological transactions."""
-    if not contract:
-        return row
-    remaining_name = contract.get("remaining")
-    if not remaining_name or remaining_name not in row:
-        return row
-    precision = int(((contract.get("remaining_var") or {}).get("params") or {}).get("precision", 2) or 2) if isinstance(contract.get("remaining_var"), dict) else 2
-    try:
-        generated_remaining = float(row.get(remaining_name))
-    except (TypeError, ValueError):
-        generated_remaining = 0.0
-
-    cap = contract.get("cap")
-    if cap is None:
-        cap = max(generated_remaining, 0.0)
-    cap = max(0.0, float(cap))
-
-    if first_row or "post_balance" not in state:
-        current = max(0.0, min(cap if cap > 0 else generated_remaining, generated_remaining))
-        if contract.get("low_balance"):
-            reserved = None
-            for name, value in row.items():
-                low = str(name).casefold()
-                if "reserved" in low and isinstance(value, (int, float)) and not isinstance(value, bool):
-                    reserved = float(value)
-                    break
-            if reserved is not None and reserved > 0:
-                current = min(current, reserved * 0.25)
-        row[remaining_name] = round(current, precision)
-    else:
-        previous = max(0.0, float(state.get("post_balance", generated_remaining)))
-        # Use an exposed consumption velocity when available; otherwise consume a modest fraction
-        # of the previous state so history changes naturally without inventing industry-specific units.
-        consumption = None
-        for name, value in row.items():
-            low = str(name).casefold()
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and any(t in low for t in ("consumption_velocity", "usage_velocity", "consumption_rate", "usage_rate")):
-                try:
-                    consumption = max(0.0, float(value) / 30.0)
-                    break
-                except (TypeError, ValueError):
-                    pass
-        if consumption is None:
-            fraction = 0.10 if contract.get("depletion") else 0.06
-            consumption = previous * _rng().uniform(fraction * 0.5, fraction * 1.5)
-        current = max(0.0, previous - consumption)
-        if cap > 0:
-            current = min(current, cap)
-        row[remaining_name] = round(current, precision)
-
-    # State after the current event. A successful/committed recharge is the only automatic state
-    # increase; failed/cancelled/created attempts do not credit the balance.
-    post = float(row.get(remaining_name) or 0.0)
-    amount_name = contract.get("recharge_amount")
-    amount = row.get(amount_name) if amount_name else None
-    try:
-        amount_value = max(0.0, float(amount))
-    except (TypeError, ValueError):
-        amount_value = 0.0
-    status_name = contract.get("recharge_status")
-    status_value = str(row.get(status_name) or "").casefold().replace("-", "_").replace(" ", "_") if status_name else ""
-    successful = status_value in {"completed", "complete", "success", "successful", "settled", "fulfilled", "done"}
-    if successful and amount_value > 0:
-        post += amount_value
-    if cap > 0:
-        post = min(cap, post)
-    state["post_balance"] = max(0.0, post)
-    return row
-
-
 def _transactional_records(compiled, user_count: int, records_per_user: int = 10,
                             rules: dict | None = None, record_errors_out: list[dict] | None = None,
                             country: str | None = None, fixes_out: list[int] | None = None) -> list[dict]:
@@ -2388,15 +1977,10 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
     timestamp_var = next((v for v in variables if str(v.get("name") or "") == str(timestamp_field or "")), None)
     generated_records=[]
     used_entity_keys=set()
-    used_identity_values={name:set() for name in ("subscriber_id", "account_id", "msisdn", "customer_id")}
-    used_resource_ids={name:set() for name in ("bucket_id", "topupbalance_id", "topup_transaction_id")}
     user_field_names = set(compiled.user_fields)
     record_field_names = set(compiled.record_fields)
     user_plan = _build_generation_plan(variables, user_field_names, rules)
     record_plan = _build_generation_plan(variables, record_field_names, rules)
-    stateful_contract = _stateful_resource_contract(variables, rules)
-    if stateful_contract:
-        stateful_contract["remaining_var"] = next((v for v in variables if str(v.get("name") or "") == stateful_contract.get("remaining")), {})
 
     for user_index in range(user_count):
         try:
@@ -2408,27 +1992,6 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                 key_var=compiled.variable_by_name.get(entity_key)
                 if key_var:
                     user_context=_generate_selected_record(variables,{entity_key},base=user_context,rules=rules)
-            # Repair application-level telecom identity anchors before grouping. This is
-            # intentionally independent of the confirmed draft's stored generators so old
-            # scenarios cannot collapse all requested users into a single subscriber.
-            industry_key = re.sub(r"[^a-z0-9]+", "", str((rules or {}).get("industry_type") or "").lower())
-            telecom_industry = industry_key in {"telecom", "telecommunications", "telecommunication"}
-            source_grounded_agentic = bool((rules or {}).get("agentic")) and str((rules or {}).get("source_policy") or "").strip() == "mongodb_industry_source_documents"
-            legacy_telecom_policy = telecom_industry and not source_grounded_agentic
-            low_balance_domain = legacy_telecom_policy and "low balance" in str((rules or {}).get("domain") or "").lower() and "top" in str((rules or {}).get("domain") or "").lower()
-            if legacy_telecom_policy:
-                user_context=_enforce_mandatory_telecom_identity(
-                    user_context,
-                    variables,
-                    country=country,
-                    used_values=used_identity_values,
-                    low_balance=low_balance_domain,
-                    rules=rules,
-                )
-            # Establish stable entity-level domain context before transaction rows are created.
-            if low_balance_domain:
-                user_context, _ = _enforce_low_balance_topup_consistency(user_context, variables, rules=rules)
-
             if entity_key and entity_key in user_context:
                 attempts=0
                 while str(user_context[entity_key]) in used_entity_keys and attempts < 100:
@@ -2438,59 +2001,6 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                     attempts+=1
                 used_entity_keys.add(str(user_context.get(entity_key)))
 
-            # Enforce unique stable telecom identity anchors only for telecom scenarios.
-            # Other industries may legitimately use fields such as account_id/customer_id with different contracts.
-            variable_names={str(v.get("name")) for v in variables if v.get("name")}
-            if legacy_telecom_policy:
-                for identity_name in ("subscriber_id", "account_id", "msisdn", "customer_id"):
-                    if identity_name not in variable_names:
-                        continue
-                    identity_value=str(user_context.get(identity_name) or "")
-                    attempts=0
-                    while identity_value in used_identity_values[identity_name] and attempts < 100:
-                        if identity_name == "account_id" and low_balance_domain:
-                            regenerated = _regenerate_declared_field(variables, "account_id", user_context, rules=rules)
-                            user_context["account_id"] = regenerated
-                        elif identity_name == "account_id":
-                            user_context=_generate_selected_record(
-                                variables,{"subscriber_id","account_id"},base=user_context,rules=rules
-                            )
-                        else:
-                            regenerated = _regenerate_declared_field(variables, identity_name, user_context, rules=rules)
-                            user_context[identity_name] = regenerated
-                        identity_value=str(user_context.get(identity_name) or "")
-                        attempts+=1
-                    if identity_value:
-                        used_identity_values[identity_name].add(identity_value)
-
-            # Resource-specific bucket linking is a legacy telecom rule. Modern source-grounded
-            # scenarios must keep the identifier contract supplied by their confirmed source.
-            if legacy_telecom_policy and "bucket_id" in variable_names:
-                bucket_id_value = str(user_context.get("bucket_id") or "")
-                if (not bucket_id_value) or bucket_id_value in used_resource_ids["bucket_id"]:
-                    db_names = _declared_db_variable_names(rules)
-                    if "bucket_id" in db_names:
-                        for _ in range(100):
-                            regenerated_bucket_id = _regenerate_declared_field(variables, "bucket_id", user_context, rules=rules)
-                            candidate = str(regenerated_bucket_id or "")
-                            if candidate and candidate not in used_resource_ids["bucket_id"]:
-                                bucket_id_value = candidate
-                                break
-                        else:
-                            raise RuntimeError("MongoDB/declared generator could not produce a unique bucket_id")
-                    else:
-                        for _ in range(1000):
-                            candidate = _prefixed_int({"prefix": "BUCKET-", "digits": 10}, user_context)
-                            if candidate not in used_resource_ids["bucket_id"]:
-                                bucket_id_value = candidate
-                                break
-                        else:
-                            raise RuntimeError("Unable to generate a unique bucket_id")
-                    user_context["bucket_id"] = bucket_id_value
-                used_resource_ids["bucket_id"].add(bucket_id_value)
-                # All bucket references are synchronized later, but the stable user context
-                # should already carry the authoritative bucket id.
-                user_context["balance_bucket_id"] = bucket_id_value if "balance_bucket_id" in variable_names else user_context.get("balance_bucket_id")
         except Exception as exc:
             err={"user_index":user_index,"error":str(exc),"record":{}}
             if record_errors_out is not None: record_errors_out.append(err)
@@ -2518,7 +2028,6 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                 timestamps.append(ts)
             timestamps=sorted(timestamps)
 
-        resource_state: dict[str, Any] = {}
         for record_index in range(records_per_user):
             last_exc: Exception | None = None
             for attempt in range(GENERATION_MAX_ATTEMPTS_PER_RECORD):
@@ -2546,71 +2055,11 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
                         else:
                             row[timestamp_field] = timestamps[record_index].isoformat()
 
-                    # Resource-specific identifiers and RelatedTopupBalance synchronization are
-                    # legacy telecom semantics. Source-grounded agentic scenarios must derive these
-                    # relationships from their confirmed source contract instead of hardcoded names.
-                    if legacy_telecom_policy:
-                        db_names = _declared_db_variable_names(rules)
-                        for id_name, prefix in (("topupbalance_id", "TOPUPBALANCE-"), ("topup_transaction_id", "TOPUP_TRANSACTION-")):
-                            if id_name in row:
-                                candidate = str(row.get(id_name) or "")
-                                if (not candidate) or candidate in used_resource_ids[id_name]:
-                                    if id_name in db_names:
-                                        for _ in range(100):
-                                            generated_id = _regenerate_declared_field(variables, id_name, row, rules=rules)
-                                            candidate = str(generated_id or "")
-                                            if candidate and candidate not in used_resource_ids[id_name]:
-                                                break
-                                        else:
-                                            raise RuntimeError(f"MongoDB/declared generator could not produce a unique {id_name}")
-                                    else:
-                                        for _ in range(1000):
-                                            generated_id = _prefixed_int({"prefix": prefix, "digits": 10}, row)
-                                            if generated_id not in used_resource_ids[id_name]:
-                                                candidate = generated_id
-                                                break
-                                        else:
-                                            raise RuntimeError(f"Unable to generate a unique {id_name}")
-                                    row[id_name] = candidate
-                                if id_name == "topupbalance_id" and "topupbalance_href" in row:
-                                    row["topupbalance_href"] = f"https://example.test/telecom/topupBalance/{candidate}"
-                                used_resource_ids[id_name].add(candidate)
-
-                        if "topupbalance_balance_topup_id" in row and "topupbalance_id" in row:
-                            previous_topup_id = (
-                                generated_records[-1].get("topupbalance_id")
-                                if generated_records and generated_records[-1].get(entity_key) == row.get(entity_key)
-                                else None
-                            )
-                            if previous_topup_id and str(previous_topup_id) != str(row.get("topupbalance_id")):
-                                row["topupbalance_balance_topup_id"] = previous_topup_id
-                                if "topupbalance_balance_topup_href" in row:
-                                    row["topupbalance_balance_topup_href"] = f"https://example.test/telecom/topupBalance/{previous_topup_id}"
-                                if "topupbalance_balance_topup_name" in row:
-                                    row["topupbalance_balance_topup_name"] = "Related Top-up"
-                                if "topupbalance_balance_topup_role" in row:
-                                    row["topupbalance_balance_topup_role"] = "child"
-                                if "topupbalance_balance_topup_referred_type" in row:
-                                    row["topupbalance_balance_topup_referred_type"] = "TopupBalance"
-                            elif previous_topup_id is None:
-                                for ref_name in (
-                                    "topupbalance_balance_topup_id",
-                                    "topupbalance_balance_topup_href",
-                                    "topupbalance_balance_topup_name",
-                                    "topupbalance_balance_topup_role",
-                                    "topupbalance_balance_topup_referred_type",
-                                ):
-                                    if ref_name in row:
-                                        row[ref_name] = None
-
                     # Apply confirmed behavioral rules during generation, before QA. This makes
                     # scenario relationships part of the generator rather than a repair side effect.
                     row = _apply_conditional_rules(row, rules)
                     row = _apply_scenario_semantics(row, rules)
                     row, _ = _enforce_generic_business_consistency(row, variables, rules=rules)
-                    row = _apply_stateful_resource_transition(
-                        row, stateful_contract, resource_state, first_row=(record_index == 0)
-                    )
                     row, _ = _enforce_generic_business_consistency(row, variables, rules=rules)
 
                     # Apply scenario semantics before strict validation. Validation remains fail-closed.
@@ -2656,14 +2105,6 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
     return generated_records
 
 
-def _default_for_dtype(dtype: str):
-    if dtype in _NUMERIC_DTYPES:
-        return 0
-    if dtype == "boolean":
-        return False
-    return ""
-
-
 def _qa_parse_dt(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         dt = value
@@ -2676,7 +2117,6 @@ def _qa_parse_dt(value: Any) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
-
 
 
 _FORMULA_ALLOWED_NODES = (
@@ -2754,9 +2194,6 @@ def _safe_formula(expr: str, rec: dict):
 
 def _normalize(v: Any) -> str:
     return str(v).strip().lower().replace(" ", "_").replace("-", "_")
-
-
-
 
 
 def _infer_temporal_relationships(
@@ -2839,8 +2276,8 @@ def _infer_temporal_relationships(
         """Pair lifecycle fields only when their canonical resource families agree.
 
         Exact prefix matches are preferred. A canonical-family fallback handles harmless naming
-        variants such as ``topupbalance_*`` vs ``topup_balance_*`` without ever pairing different
-        resources such as ``adjust_balance_*`` with ``topupbalance_*``.
+        variants such as ``resourcex_*`` vs ``resource_x_*`` without ever pairing different
+        resources.
         """
         starts: list[tuple[str, str]] = []
         ends: list[tuple[str, str]] = []
@@ -2875,7 +2312,7 @@ def _infer_temporal_relationships(
 
     # 3) Same-resource lifecycle pairs. Normalize common lifecycle suffixes before matching so
     # ``order_created_at`` and ``order_completed_at`` can be linked while unrelated resources
-    # such as ``bucket_*`` and ``topup_*`` remain independent.
+    # such as ``resource_a_*`` and ``resource_b_*`` remain independent.
     lifecycle_pairs = {
         ("start", "presentation"),
         ("start", "response"),
@@ -3182,7 +2619,7 @@ def _is_placeholder_value(field_name: str, value: Any, var: dict) -> bool:
         return True
     if norm_field and norm_value == norm_field:
         return True
-    # Catch generated placeholders such as LOW_BALANCE_EVENT_ID for low_balance_event_id.
+    # Catch generated placeholders that echo the field name, e.g. FIELD_NAME_ID for field_name_id.
     return bool(norm_field and norm_value == norm_field.replace("scenario", ""))
 
 def _strip_unusable_placeholders(rec: dict, variables: list[dict]) -> tuple[dict, list[str]]:
@@ -3198,1104 +2635,13 @@ def _strip_unusable_placeholders(rec: dict, variables: list[dict]) -> tuple[dict
     return out, issues
 
 
-
-def _lb_domain(rules: dict | None) -> bool:
-    """Whether the legacy Low Balance repair/validation layer is enabled.
-
-    New agentic JSON-grounded scenarios already have an executable source-backed contract. The
-    historical Low Balance layer contains broad domain assumptions that can turn independently
-    declared variables into artificial aliases or lifecycle links. Keep it only for legacy/non-agentic
-    scenarios so a newly confirmed scenario cannot be rejected by a rule it never declared.
-    """
-    payload = rules or {}
-    domain = str(payload.get("domain") or "").strip().lower()
-    source_policy = str(payload.get("source_policy") or "").strip()
-    agentic = bool(payload.get("agentic"))
-    # Every newly confirmed agentic scenario must use the persisted executable schema as its
-    # contract. The legacy Low Balance layer is deliberately disabled for the entire agentic path;
-    # otherwise its field-name heuristics can manufacture relationships absent from that contract.
-    if agentic:
-        return False
-    if source_policy == "mongodb_industry_source_documents":
-        return False
-    return "low balance" in domain and any(token in domain for token in ("top up", "top-up", "recharge"))
-
-
-def _lb_variables_by_name(variables: list[dict]) -> dict[str, dict]:
+def _variables_by_name(variables: list[dict]) -> dict[str, dict]:
     return {str(v.get("name")): v for v in variables if v.get("name")}
-
-
-def _lb_find_fields(variables: list[dict], *predicates) -> list[str]:
-    names = []
-    for var in variables:
-        name = str(var.get("name") or "")
-        if not name:
-            continue
-        text = f"{name} {var.get('description') or ''}".lower()
-        if all(predicate(name.lower(), text, var) for predicate in predicates):
-            names.append(name)
-    return names
-
-
-def _lb_first_name(variables: list[dict], candidates: tuple[str, ...], *fallback_tokens: str) -> str | None:
-    by_name = _lb_variables_by_name(variables)
-    for candidate in candidates:
-        if candidate in by_name:
-            return candidate
-    for name in by_name:
-        lowered = name.lower()
-        if fallback_tokens and all(token in lowered for token in fallback_tokens):
-            return name
-    return None
-
-
-def _lb_var(variables: list[dict], name: str | None) -> dict:
-    if not name:
-        return {}
-    return _lb_variables_by_name(variables).get(name, {})
-
-
-def _lb_semantic_key(var: dict) -> str:
-    """Return the strongest semantic identity available for a persisted variable."""
-    provenance = var.get("provenance") if isinstance(var.get("provenance"), dict) else {}
-    explicit = (
-        var.get("semantic_key")
-        or provenance.get("source_json_semantic_key")
-        or var.get("canonical_semantic_key")
-    )
-    if explicit:
-        return _normalize(str(explicit))
-    # Without explicit source provenance, the variable name is its identity. Similar words are
-    # deliberately not treated as aliases (e.g. account_id != bucket_party_account_id).
-    return _normalize(str(var.get("name") or ""))
-
-
-def _lb_declared_alias(a: dict, b: dict) -> bool:
-    """Return True only when the confirmed contract explicitly links two values."""
-    if not a or not b:
-        return False
-    a_name = str(a.get("name") or "").strip()
-    b_name = str(b.get("name") or "").strip()
-    if not a_name or not b_name:
-        return False
-    a_sem = _lb_semantic_key(a)
-    b_sem = _lb_semantic_key(b)
-    if a_sem and a_sem == b_sem:
-        return True
-    a_deps = {str(dep).strip() for dep in (a.get("depends_on") or []) if str(dep).strip()}
-    b_deps = {str(dep).strip() for dep in (b.get("depends_on") or []) if str(dep).strip()}
-    return a_name in b_deps or b_name in a_deps
-
-
-def _lb_exact_declared(var: dict, desired: Any) -> Any:
-    choices = _declared_param_options(var.get("params") or {})
-    if not choices:
-        return desired
-    for choice in choices:
-        if _matches_declared_option(choice, desired):
-            return choice
-    normalized_desired = _normalize(desired)
-    for choice in choices:
-        if _normalize(choice) == normalized_desired:
-            return choice
-    return choices[0]
-
-
-def _lb_set(rec: dict, variables: list[dict], name: str | None, value: Any, issues: list[str], reason: str) -> None:
-    if not name or name not in rec:
-        return
-    if rec.get(name) != value:
-        rec[name] = value
-        issues.append(reason)
-
-
-def _lb_set_declared(rec: dict, variables: list[dict], name: str | None, desired: Any, issues: list[str], reason: str) -> None:
-    if not name or name not in rec:
-        return
-    value = _lb_exact_declared(_lb_var(variables, name), desired)
-    _lb_set(rec, variables, name, value, issues, reason)
-
-
-def _lb_bound_number(var: dict, current: Any, *, floor: float | None = None, ceiling: float | None = None, fallback: float = 0.0) -> float:
-    params = var.get("params") or {}
-    lo = _to_finite_float(params.get("min", params.get("lo")), floor)
-    hi = _to_finite_float(params.get("max", params.get("hi")), ceiling)
-    if floor is not None:
-        lo = max(lo if lo is not None else floor, floor)
-    if ceiling is not None:
-        hi = min(hi if hi is not None else ceiling, ceiling)
-    if lo is None:
-        lo = 0.0
-    if hi is None:
-        hi = max(lo, fallback)
-    if hi < lo:
-        hi = lo
-    value = _to_finite_float(current, None)
-    if value is None or not math.isfinite(value):
-        value = lo if lo == hi else _rng().uniform(lo, hi)
-    value = max(lo, min(hi, value))
-    dtype = str(var.get("dtype") or "").lower()
-    precision = int((params.get("precision", 2) or 2))
-    return float(round(value, precision) if dtype in _NUMERIC_DTYPES else value)
-
-
-def _lb_unit_for_usage(usage: Any) -> str:
-    token = _normalize(usage)
-    return {
-        "monetary": "INR",
-        "voice": "MIN",
-        "data": "GB",
-        "sms": "SMS",
-        "other": "UNIT",
-    }.get(token, "INR")
-
-
-def _lb_choose_usage(rec: dict, variables: list[dict]) -> str:
-    names = _lb_find_fields(variables, lambda n, t, v: "usage_type" in n or "usagetype" in n)
-    for name in names:
-        choices = _declared_param_options(_lb_var(variables, name).get("params") or {})
-        existing = rec.get(name)
-        if existing is not None and (not choices or any(_matches_declared_option(existing, c) for c in choices)):
-            return str(existing)
-    return "monetary"
-
-
-def _lb_history_timestamp_name(variables: list[dict]) -> str | None:
-    # Prefer a top-up request timestamp because it is the natural anchor for a
-    # transactional recharge history when the schema has no generic timestamp field.
-    candidates = (
-        "topup_requested_date_time", "topupbalance_requested_date", "topupbalance_requesteddate",
-        "topup_request_timestamp", "recharge_timestamp", "transaction_timestamp", "record_timestamp", "timestamp",
-    )
-    for candidate in candidates:
-        var = _lb_var(variables, candidate)
-        if var and str(var.get("dtype", "")).lower() in {"datetime", "date"}:
-            return candidate
-    for var in variables:
-        if str(var.get("dtype", "")).lower() == "datetime" and var.get("name"):
-            name = str(var["name"]).lower()
-            if any(token in name for token in ("request", "recharge", "transaction")):
-                return str(var["name"])
-    return _pick_timestamp_field(variables)
-
-
-def _lb_plan_validity_days(rec: dict, variables: list[dict]) -> int:
-    # The source Swagger models validFor but does not prescribe a plan-duration enumeration.
-    # When the compiled scenario exposes the synthetic plan-duration field, it is authoritative
-    # for the synthetic contract; otherwise the auto-top-up cadence supplies a sensible duration.
-    plan_days_name = _lb_first_name(variables, ("recharge_plan_validity_days",), "plan", "validity", "days")
-    if plan_days_name and rec.get(plan_days_name) is not None:
-        try:
-            candidate = int(float(rec.get(plan_days_name)))
-            if candidate in {1, 7, 14, 28, 30, 56, 84}:
-                return candidate
-        except (TypeError, ValueError):
-            pass
-    period_name = _lb_first_name(
-        variables,
-        ("topupbalance_recurring_period", "topupbalance_recurringperiod"),
-        "recurring", "period",
-    )
-    token = _normalize(rec.get(period_name)) if period_name else ""
-    if token == "weekly":
-        return 7
-    if token == "fortnightly":
-        return 14
-    if token == "monthly":
-        return 30
-    return 28
-
-
-def _lb_sync_reference_fields(rec: dict, variables: list[dict], issues: list[str]) -> None:
-    by_name = _lb_variables_by_name(variables)
-    def copy(source: str | None, targets: tuple[str, ...], reason: str) -> None:
-        if not source or source not in rec or rec.get(source) is None:
-            return
-        for target in targets:
-            if target in by_name and target in rec:
-                _lb_set(rec, variables, target, rec[source], issues, reason)
-
-    bucket_id = _lb_first_name(variables, ("bucket_id",), "bucket", "id")
-    account_id = _lb_first_name(variables, ("account_id",))
-    topup_id = _lb_first_name(variables, ("topupbalance_id", "topup_transaction_id"), "topup", "id")
-    customer_id = _lb_first_name(variables, ("customer_id",), "customer", "id")
-    copy(bucket_id, ("topupbalance_bucket_id", "balance_bucket_id"), "top-up/balance bucket references linked to the subscriber bucket")
-    copy(bucket_id, ("topupbalance_bucket_href",), "top-up bucket href linked to bucket context")
-    # Party-account fields from different resources are independent unless the confirmed
-    # contract explicitly declares them to be aliases/dependents. Never infer equality from names.
-    for target in ("bucket_party_account_id", "topupbalance_party_account_id"):
-        target_var = by_name.get(target)
-        source_var = by_name.get(account_id) if account_id else None
-        if source_var and target_var and _lb_declared_alias(source_var, target_var):
-            copy(account_id, (target,), "party-account reference linked by the confirmed variable contract")
-    if account_id and account_id in rec and rec.get(account_id) is not None:
-        account_value = str(rec.get(account_id))
-        for target in ("bucket_party_account_href", "topupbalance_party_account_href"):
-            if target in by_name and target in rec:
-                _lb_set(rec, variables, target, f"https://example.test/telecom/party-account/{account_value}", issues, "party-account href linked to the subscriber account")
-    if account_id and account_id in rec:
-        _lb_set(rec, variables, "customer_engaged_party_id", rec.get("subscriber_id"), issues, "customer engaged party linked to subscriber")
-    if customer_id and customer_id in rec and rec.get(customer_id) is None:
-        customer_var = by_name.get(customer_id)
-        if customer_var is not None:
-            # Low Balance customer_id is authoritative when supplied by MongoDB. Reuse the
-            # declared generator/parameters rather than inventing a second identifier contract.
-            generator = str(customer_var.get("gen") or "").strip().lower()
-            params = customer_var.get("params") if isinstance(customer_var.get("params"), dict) else {}
-            if generator == "prefixed_int":
-                generated_customer_id = _prefixed_int(params, rec)
-                _lb_set(
-                    rec,
-                    variables,
-                    customer_id,
-                    generated_customer_id,
-                    issues,
-                    "customer identity generated from the authoritative Low Balance variable contract",
-                )
-    if topup_id and topup_id in rec:
-        topup_value = rec.get(topup_id)
-        if topup_value is not None:
-            _lb_set(rec, variables, "topup_transaction_id", topup_value, issues, "transaction id linked to TopupBalance resource")
-    # Do not invent a RelatedTopupBalance resource. The transactional generator is responsible
-    # for supplying a real earlier transaction id when one exists. Keeping a missing optional
-    # reference null prevents orphaned ids and fabricated relationships.
-
-    if "bucket_id" in rec:
-        bucket_id_value = str(rec.get("bucket_id") or "")
-        if bucket_id_value:
-            _lb_set(rec, variables, "bucket_href", f"https://example.test/telecom/bucket/{bucket_id_value}", issues, "bucket href linked to bucket id")
-    if "customer_id" in rec:
-        customer_id_value = str(rec.get("customer_id") or "")
-        if customer_id_value:
-            _lb_set(rec, variables, "customer_href", f"https://example.test/telecom/customer/{customer_id_value}", issues, "customer href linked to customer id")
-    if "topupbalance_id" in rec:
-        topup_value = str(rec.get("topupbalance_id") or "")
-        if topup_value:
-            _lb_set(rec, variables, "topupbalance_href", f"https://example.test/telecom/topupBalance/{topup_value}", issues, "top-up href linked to top-up id")
-
-
-def _lb_response_variant(rules: dict | None) -> str:
-    """Return the explicit customer-response variant for decline/no-response scenarios."""
-    if not isinstance(rules, dict):
-        return "declined"
-    scenario_type = str(rules.get("scenario_type") or "").strip().lower()
-    sem = rules.get("scenario_semantics") if isinstance(rules.get("scenario_semantics"), dict) else {}
-    expected = str(sem.get("expected_outcome") or "").strip().lower()
-    context = re.sub(r"[^a-z0-9]+", " ", f"{scenario_type} {expected}")
-    if "no response" in context and "decline" not in context:
-        return "no_response"
-    if "reject" in context and "decline" not in context:
-        return "rejected"
-    return "declined"
-
-
-def _enforce_low_balance_topup_consistency(
-    rec: dict, variables: list[dict], rules: dict | None = None
-) -> tuple[dict, list[str]]:
-    """Build and enforce a coherent Low Balance & Top-up business record.
-
-    The official Swagger artifacts define the resource structure and field meanings, but not
-    synthetic behavioral distributions. This function is retained as a compatibility layer for
-    legacy/non-agentic Low Balance scenarios. New agentic scenarios are governed by their persisted
-    executable schema and dependency graph and never enter this heuristic repair path.
-    """
-    rec = dict(rec)
-    if not _lb_domain(rules):
-        return rec, []
-
-    issues: list[str] = []
-    by_name = _lb_variables_by_name(variables)
-    outcome_mode = str((rules or {}).get("scenario_mode") or (rules or {}).get("scenario_semantics", {}).get("outcome_mode") or "mixed").lower()
-
-    # -------------------- entity identity/context --------------------
-    _lb_sync_reference_fields(rec, variables, issues)
-
-    usage_names = _lb_find_fields(variables, lambda n, t, v: "usage_type" in n or "usagetype" in n)
-    usage = _lb_choose_usage(rec, variables)
-    for name in usage_names:
-        if name in rec:
-            _lb_set_declared(rec, variables, name, usage, issues, f"{name} aligned to one coherent balance usage type")
-
-    unit_names = _lb_find_fields(variables, lambda n, t, v: n.endswith("_unit") or n.endswith("_units") or "currency_unit" in n or "usage_unit" in n)
-    unit = _lb_unit_for_usage(usage)
-    for name in unit_names:
-        if name in rec and str(by_name.get(name, {}).get("dtype", "")).lower() in {"string", "str", "text", "categorical"}:
-            _lb_set(rec, variables, name, unit, issues, f"{name} aligned to usage-specific unit {unit}")
-
-    # Entity-level lifecycle fields describe the same subscriber/customer/bucket context.
-    customer_status = _lb_first_name(variables, ("customer_status",), "customer", "status")
-    if customer_status:
-        _lb_set_declared(rec, variables, customer_status, "active", issues, "customer lifecycle status aligned to an active prepaid customer")
-    customer_status_reason = _lb_first_name(variables, ("customer_status_reason",), "customer", "status", "reason")
-    if customer_status_reason and customer_status_reason in rec:
-        _lb_set(rec, variables, customer_status_reason, "CURRENT_PREPAID_CUSTOMER", issues, "customer status reason aligned to the active prepaid lifecycle")
-    bucket_status = _lb_first_name(variables, ("bucket_status",), "bucket", "status")
-    if bucket_status:
-        _lb_set_declared(rec, variables, bucket_status, "active", issues, "bucket lifecycle status aligned to active balance usage")
-    bucket_name = _lb_first_name(variables, ("bucket_name",), "bucket", "name")
-    if bucket_name:
-        name_map = {"monetary": "Prepaid Wallet", "voice": "Voice Balance", "data": "Data Balance", "sms": "SMS Balance", "other": "Prepaid Balance"}
-        _lb_set(rec, variables, bucket_name, name_map.get(_normalize(usage), "Prepaid Balance"), issues, "bucket name aligned to usage type")
-    if "bucket_description" in by_name and "bucket_description" in rec:
-        _lb_set(rec, variables, "bucket_description", f"Prepaid {str(usage).lower()} balance bucket", issues, "bucket description aligned to usage type")
-    customer_label = "Prepaid Subscriber"
-    suffix = re.search(r"([0-9]+)$", str(rec.get("subscriber_id") or ""))
-    if suffix:
-        customer_label = f"Prepaid Subscriber {suffix.group(1)}"
-    if "customer_name" in by_name and "customer_name" in rec:
-        _lb_set(rec, variables, "customer_name", customer_label, issues, "customer name linked to subscriber context")
-    # customer_id is an immutable source-backed identity field. Do not derive or rewrite it from
-    # subscriber_id (Low Balance no longer permits an application-generated subscriber alias).
-
-    # Balance amounts are one snapshot, not independent random columns.
-    remaining_names = [n for n in by_name if ("remaining" in n and "amount" in n) and str(by_name[n].get("dtype", "")).lower() in _NUMERIC_DTYPES]
-    reserved_names = [n for n in by_name if ("reserved" in n and "amount" in n) and str(by_name[n].get("dtype", "")).lower() in _NUMERIC_DTYPES]
-    threshold_name = _lb_first_name(variables, ("low_balance_trigger_threshold",), "low", "balance", "threshold")
-    if threshold_name and threshold_name in rec:
-        threshold = _lb_bound_number(by_name[threshold_name], rec.get(threshold_name), floor=1.0, fallback=300.0)
-        _lb_set(rec, variables, threshold_name, threshold, issues, "low-balance threshold kept positive and within its declared bounds")
-    else:
-        threshold = 300.0
-    balance_name = _lb_first_name(variables, ("balance_remaining_amount",), "balance", "remaining", "amount")
-    if balance_name and balance_name in rec:
-        balance_var = by_name[balance_name]
-        balance = _lb_bound_number(balance_var, rec.get(balance_name), floor=0.0, ceiling=threshold, fallback=max(0.0, threshold * 0.5))
-        # Keep trigger records meaningfully below threshold, not merely equal by accident.
-        if balance >= threshold and threshold > 0:
-            params = balance_var.get("params") or {}
-            lo = _to_finite_float(params.get("min", params.get("lo")), 0.0) or 0.0
-            balance = round(max(lo, threshold * _rng().uniform(0.15, 0.85)), int(params.get("precision", 2) or 2))
-        _lb_set(rec, variables, balance_name, balance, issues, "remaining balance aligned with low-balance trigger threshold")
-    else:
-        balance = None
-
-    # Keep source-backed bucket snapshot values coherent with the transactional balance when
-    # they are actually generated at transaction grain.
-    for name in remaining_names:
-        var = by_name[name]
-        if str(var.get("scope") or "").lower() == "transaction" and balance is not None:
-            _lb_set(rec, variables, name, _lb_bound_number(var, balance, floor=0.0, ceiling=1000.0, fallback=balance), issues, f"{name} aligned with transactional remaining balance")
-    reserved_cap = balance if balance is not None else None
-    for name in reserved_names:
-        var = by_name[name]
-        current = rec.get(name)
-        if reserved_cap is not None:
-            _lb_set(rec, variables, name, _lb_bound_number(var, current, floor=0.0, ceiling=reserved_cap, fallback=max(0.0, reserved_cap * 0.2)), issues, f"{name} constrained not to exceed remaining balance")
-
-    # -------------------- transaction timeline --------------------
-    request_fields = [
-        n for n in by_name
-        if ("request" in n or "requested" in n) and ("topup" in n or "recharge" in n or n.startswith("bucket_"))
-        and str(by_name[n].get("dtype", "")).lower() == "datetime"
-    ]
-    confirmation_fields = [
-        n for n in by_name
-        if ("confirm" in n or "completion" in n) and ("topup" in n or "recharge" in n or n.startswith("bucket_"))
-        and str(by_name[n].get("dtype", "")).lower() == "datetime"
-    ]
-    request_name = _lb_history_timestamp_name(variables)
-    request_dt = _qa_parse_dt(rec.get(request_name)) if request_name and request_name in rec else None
-    if request_dt is None:
-        # Use an existing request timestamp if available; otherwise create one once for the
-        # complete transaction instead of independently sampling each request-like field.
-        for name in request_fields:
-            request_dt = _qa_parse_dt(rec.get(name))
-            if request_dt is not None:
-                request_name = name
-                break
-    if request_dt is None:
-        request_dt = datetime.now(timezone.utc) - timedelta(hours=_rng().randint(1, 72), minutes=_rng().randint(0, 59))
-
-    # Scenario-specific intervention may happen before the transaction request.
-    trigger_field = _lb_first_name(variables, ("low_balance_trigger_timestamp",), "low", "balance", "trigger", "timestamp")
-    if trigger_field and trigger_field in rec:
-        trigger_dt = request_dt - timedelta(minutes=_rng().randint(5, 120))
-        _lb_set(rec, variables, trigger_field, _format_datetime_for_variable(trigger_dt, by_name[trigger_field]), issues, "low-balance trigger placed before recharge request")
-
-    desired_status = "completed"
-    if outcome_mode == "negative":
-        desired_status = "failed"
-    elif outcome_mode == "decline_or_no_response":
-        desired_status = "cancelled"
-
-    status_name = _lb_first_name(variables, ("topupbalance_status",), "topup", "status")
-    execution_name = _lb_first_name(variables, ("topup_execution_status",), "topup", "execution", "status")
-    outcome_name = _lb_first_name(variables, ("recharge_outcome",), "recharge", "outcome")
-    _lb_set_declared(rec, variables, status_name, desired_status, issues, "TopupBalance status aligned to scenario lifecycle")
-    _lb_set_declared(rec, variables, execution_name, desired_status, issues, "top-up execution status aligned to TopupBalance status")
-
-    success_state = desired_status in {"completed", "approved", "accepted", "success"}
-    confirmation_dt = request_dt + timedelta(minutes=_rng().randint(1, 60)) if success_state else None
-
-    # Synchronize request/confirmation timestamps only inside the same canonical resource family.
-    # Similar lifecycle words across sibling resources do not prove a shared event.
-    request_by_family: dict[str, list[str]] = {}
-    confirmation_by_family: dict[str, list[str]] = {}
-    for name in request_fields:
-        request_by_family.setdefault(normalize_temporal_family(name), []).append(name)
-    for name in confirmation_fields:
-        confirmation_by_family.setdefault(normalize_temporal_family(name), []).append(name)
-
-    for family, names_in_family in request_by_family.items():
-        family_request_dt = next((
-            _qa_parse_dt(rec.get(name)) for name in names_in_family
-            if _qa_parse_dt(rec.get(name)) is not None
-        ), request_dt)
-        for name in names_in_family:
-            _lb_set(
-                rec, variables, name,
-                _format_datetime_for_variable(family_request_dt, by_name[name]),
-                issues,
-                f"{name} synchronized within its own resource lifecycle",
-            )
-        if success_state and confirmation_dt is not None:
-            family_confirmation_dt = next((
-                _qa_parse_dt(rec.get(name)) for name in confirmation_by_family.get(family, ())
-                if _qa_parse_dt(rec.get(name)) is not None
-            ), confirmation_dt)
-            if family_confirmation_dt < family_request_dt:
-                family_confirmation_dt = family_request_dt + timedelta(minutes=1)
-            for name in confirmation_by_family.get(family, ()):
-                _lb_set(
-                    rec, variables, name,
-                    _format_datetime_for_variable(family_confirmation_dt, by_name[name]),
-                    issues,
-                    f"{name} synchronized within its own resource lifecycle",
-                )
-        else:
-            for name in confirmation_by_family.get(family, ()):
-                if by_name[name].get("nullable", True):
-                    _lb_set(
-                        rec, variables, name, None, issues,
-                        f"{name} cleared because its resource transaction did not complete",
-                    )
-
-    # Confirmation-only resource families remain untouched; this layer never invents an
-    # unrelated lifecycle simply because a confirmation-like field exists.
-
-    recharge_timestamp = _lb_first_name(variables, ("recharge_timestamp",), "recharge", "timestamp")
-    if recharge_timestamp and recharge_timestamp in rec:
-        recharge_dt = confirmation_dt or request_dt
-        _lb_set(rec, variables, recharge_timestamp, _format_datetime_for_variable(recharge_dt, by_name[recharge_timestamp]), issues, "recharge timestamp linked to transaction lifecycle")
-
-    topup_req = _lb_first_name(variables, ("topupbalance_requested_date", "topupbalance_requesteddate"), "topup", "requested")
-    topup_conf = _lb_first_name(variables, ("topupbalance_confirmation_date", "topupbalance_confirmationdate"), "topup", "confirmation")
-    if topup_req:
-        _lb_set(rec, variables, topup_req, _format_datetime_for_variable(request_dt, by_name[topup_req]), issues, "TopupBalance requestedDate linked to transaction request")
-    if topup_conf:
-        if confirmation_dt is not None:
-            _lb_set(rec, variables, topup_conf, _format_datetime_for_variable(confirmation_dt, by_name[topup_conf]), issues, "TopupBalance confirmationDate linked to transaction confirmation")
-        elif by_name[topup_conf].get("nullable", True):
-            _lb_set(rec, variables, topup_conf, None, issues, "TopupBalance confirmationDate cleared for unsuccessful transaction")
-
-    # Plan/validity lifecycle. validFor is a period, not two independent random timestamps.
-    plan_days_name = _lb_first_name(variables, ("recharge_plan_validity_days",), "plan", "validity", "days")
-    plan_code_name = _lb_first_name(variables, ("recharge_plan_code",), "plan", "code")
-    plan_days_choices = (1, 7, 14, 28, 30, 56, 84)
-    recurring_name = _lb_first_name(variables, ("topupbalance_recurring_period", "topupbalance_recurringperiod"), "recurring", "period")
-    periods_name = _lb_first_name(variables, ("topupbalance_number_of_periods", "topupbalance_numberofperiods"), "number", "period")
-    period_token = _normalize(rec.get(recurring_name)) if recurring_name else ""
-    default_plan_days = {"weekly": 7, "fortnightly": 14, "monthly": 30}.get(period_token, _rng().choice(plan_days_choices))
-    if plan_days_name and plan_days_name in rec:
-        current_days = rec.get(plan_days_name)
-        try:
-            current_days = int(float(current_days))
-        except (TypeError, ValueError):
-            current_days = default_plan_days
-        if current_days not in plan_days_choices:
-            current_days = default_plan_days
-        _lb_set(rec, variables, plan_days_name, int(current_days), issues, "recharge plan validity duration normalized to a supported synthetic prepaid plan")
-        default_plan_days = int(current_days)
-    if plan_code_name and plan_code_name in rec:
-        code = f"PREPAID_{default_plan_days}D"
-        _lb_set_declared(rec, variables, plan_code_name, code, issues, "recharge plan code synchronized with plan validity duration")
-
-    validity_pairs = []
-    for prefix in ("topupbalance", "topup"):
-        start = _lb_first_name(variables, (f"{prefix}_valid_for_start_date_time", f"{prefix}_validity_start_date_time"), prefix, "valid", "start")
-        end = _lb_first_name(variables, (f"{prefix}_valid_for_end_date_time", f"{prefix}_validity_end_date_time"), prefix, "valid", "end")
-        if start or end:
-            validity_pairs.append((start, end))
-    duration_days = _lb_plan_validity_days(rec, variables)
-    for start_name, end_name in validity_pairs:
-        if start_name and start_name in rec:
-            if success_state and confirmation_dt is not None:
-                start_dt = confirmation_dt
-                end_dt = start_dt + timedelta(days=duration_days)
-                _lb_set(rec, variables, start_name, _format_datetime_for_variable(start_dt, by_name[start_name]), issues, f"{start_name} derived from recharge confirmation")
-                if end_name and end_name in rec:
-                    _lb_set(rec, variables, end_name, _format_datetime_for_variable(end_dt, by_name[end_name]), issues, f"{end_name} derived from plan validity duration")
-            elif by_name[start_name].get("nullable", True):
-                _lb_set(rec, variables, start_name, None, issues, f"{start_name} cleared because no successful recharge validity was created")
-                if end_name and by_name[end_name].get("nullable", True):
-                    _lb_set(rec, variables, end_name, None, issues, f"{end_name} cleared because no successful recharge validity was created")
-        elif end_name and end_name in rec and by_name[end_name].get("nullable", True):
-            _lb_set(rec, variables, end_name, None, issues, f"{end_name} cleared because its validity start is unavailable")
-
-    # Stable entity validity windows describe the entity itself and contain the operational history.
-    now = datetime.now(timezone.utc)
-    for token in ("bucket", "customer"):
-        starts = [n for n in by_name if token in n and "valid_for_start" in n and str(by_name[n].get("dtype", "")).lower() == "datetime"]
-        ends = [n for n in by_name if token in n and "valid_for_end" in n and str(by_name[n].get("dtype", "")).lower() == "datetime"]
-        if starts and ends:
-            stable_start = now - timedelta(days=365)
-            stable_end = now + timedelta(days=365)
-            for name in starts:
-                if str(by_name[name].get("scope") or "").lower() == "entity" and name in rec:
-                    _lb_set(rec, variables, name, _format_datetime_for_variable(stable_start, by_name[name]), issues, f"{name} aligned to stable entity validity window")
-            for name in ends:
-                if str(by_name[name].get("scope") or "").lower() == "entity" and name in rec:
-                    _lb_set(rec, variables, name, _format_datetime_for_variable(stable_end, by_name[name]), issues, f"{name} aligned to stable entity validity window")
-
-    # Monetary movement is one transaction-level quantity. Keep all amount aliases equal.
-    amount_fields = [n for n in by_name if "topup" in n and "amount" in n and "unit" not in n and str(by_name[n].get("dtype", "")).lower() in _NUMERIC_DTYPES]
-    canonical_amount = None
-    for name in amount_fields:
-        value = _to_finite_float(rec.get(name), None)
-        if value is not None and math.isfinite(value) and value >= 0:
-            canonical_amount = value
-            break
-    if canonical_amount is None:
-        canonical_amount = round(_rng().uniform(10.0, 1000.0), 2)
-    for name in amount_fields:
-        var = by_name[name]
-        value = _lb_bound_number(var, canonical_amount, floor=0.0, fallback=canonical_amount)
-        _lb_set(rec, variables, name, value, issues, f"{name} aligned to the transaction recharge amount")
-
-    # Same-transaction operational dimensions must share one context.
-    auto_names = [n for n in by_name if "auto_topup" in n or "autotopup" in n or ("auto" in n and "topup" in n)]
-    auto_value = None
-    for name in auto_names:
-        existing = _boolean_semantic(rec.get(name))
-        if existing is not None:
-            auto_value = existing
-            break
-    if auto_value is None:
-        auto_value = False
-    # A customer decline/no-response scenario represents an explicit customer interaction, not
-    # an autonomous recharge. Keep auto-top-up off for that scenario.
-    if outcome_mode == "decline_or_no_response":
-        auto_value = False
-    for name in auto_names:
-        if name in rec:
-            _lb_set(rec, variables, name, auto_value, issues, f"{name} synchronized to one auto-top-up state")
-
-    if auto_value:
-        if recurring_name and recurring_name in rec:
-            recurring_choices = _declared_param_options(by_name[recurring_name].get("params") or {})
-            recurring = next((c for c in recurring_choices if _normalize(c) in {"weekly", "fortnightly", "monthly"}), None) or (_rng().choice(recurring_choices) if recurring_choices else "monthly")
-            _lb_set(rec, variables, recurring_name, recurring, issues, "recurring period synchronized with enabled auto-top-up")
-        if periods_name and periods_name in rec:
-            pv = by_name[periods_name]
-            pp = pv.get("params") or {}
-            lo = max(1, int(_to_finite_float(pp.get("min", pp.get("lo")), 1) or 1))
-            hi_raw = _to_finite_float(pp.get("max", pp.get("hi")), None)
-            hi = max(lo, int(hi_raw if hi_raw is not None else max(lo, 12)))
-            _lb_set(rec, variables, periods_name, _rng().randint(lo, hi), issues, "auto-top-up period count made compatible with recurring behavior")
-    else:
-        for name in (recurring_name, periods_name):
-            if name and name in rec and by_name[name].get("nullable", True):
-                _lb_set(rec, variables, name, None, issues, f"{name} cleared because auto-top-up is disabled")
-
-    # Low-balance warning/intervention semantics.
-    warning_name = _lb_first_name(variables, ("low_balance_warning_sent_flag",), "low", "balance", "warning", "sent")
-    suppression_name = _lb_first_name(variables, ("intervention_suppression_state",), "suppression", "state")
-    eligibility_name = _lb_first_name(variables, ("intervention_eligibility",), "intervention", "eligibility")
-    offer_name = _lb_first_name(variables, ("retention_intervention_offer_code",), "retention", "offer")
-    decision_name = _lb_first_name(variables, ("customer_decision",), "customer", "decision")
-    decline_reason_name = _lb_first_name(variables, ("decline_reason",), "decline", "reason")
-
-    if outcome_mode == "suppression":
-        if suppression_name:
-            _lb_set_declared(rec, variables, suppression_name, "SUPPRESSED", issues, "suppression scenario explicitly marks intervention as suppressed")
-        if eligibility_name:
-            _lb_set(rec, variables, eligibility_name, False, issues, "suppressed intervention is not eligible")
-        if warning_name:
-            _lb_set(rec, variables, warning_name, False, issues, "suppressed intervention cannot send a warning")
-        if offer_name and by_name[offer_name].get("nullable", True):
-            _lb_set(rec, variables, offer_name, None, issues, "suppressed intervention has no retention offer")
-    elif outcome_mode == "decline_or_no_response":
-        response_variant = _lb_response_variant(rules)
-        response_value = {"declined": "DECLINED", "rejected": "REJECTED", "no_response": "NO_RESPONSE"}[response_variant]
-        if decision_name:
-            _lb_set_declared(rec, variables, decision_name, response_value, issues, "customer response synchronized to the explicit scenario variant")
-        if decline_reason_name:
-            reason_value = "TIMEOUT" if response_variant == "no_response" else ("TRUST" if response_variant == "rejected" else "PRICE")
-            declared_reasons = _declared_param_options(by_name.get(decline_reason_name, {}).get("params") or {})
-            if declared_reasons and not any(_normalize(reason_value) == _normalize(x) for x in declared_reasons):
-                reason_value = declared_reasons[0]
-            _lb_set_declared(rec, variables, decline_reason_name, reason_value, issues, "customer response reason synchronized to the explicit scenario variant")
-        if eligibility_name:
-            _lb_set(rec, variables, eligibility_name, True, issues, "customer response scenario keeps the intervention eligible before the response")
-        if warning_name:
-            _lb_set(rec, variables, warning_name, True, issues, "customer response scenario requires an intervention presentation event")
-        if offer_name and offer_name in rec:
-            choices = _declared_param_options(by_name[offer_name].get("params") or {})
-            if choices:
-                _lb_set(rec, variables, offer_name, choices[0], issues, "customer response scenario includes a presented intervention")
-    else:
-        if eligibility_name:
-            _lb_set(rec, variables, eligibility_name, True, issues, "active intervention scenario keeps the subscriber eligible")
-        if warning_name and outcome_mode != "mixed":
-            _lb_set(rec, variables, warning_name, True, issues, "low-balance intervention scenario requires a warning event")
-        if offer_name and offer_name in rec and rec.get(offer_name) is None and not by_name[offer_name].get("nullable", True):
-            choices = _declared_param_options(by_name[offer_name].get("params") or {})
-            if choices:
-                _lb_set(rec, variables, offer_name, choices[0], issues, "required intervention offer populated")
-
-    channel_names = [n for n in by_name if "channel_name" in n or (n.endswith("_channel") and "referred_type" not in n)]
-    channel = next((str(rec[n]) for n in channel_names if rec.get(n)), None)
-    channel_choices = ["APP", "WEB", "USSD", "SMS", "WHATSAPP", "IVR", "RETAIL"]
-    if not channel or channel not in channel_choices:
-        channel = _rng().choice(channel_choices)
-    for name in channel_names:
-        if name in rec:
-            _lb_set(rec, variables, name, channel, issues, f"{name} synchronized to one recharge channel")
-
-    payment_names = [n for n in by_name if "payment_method_name" in n or ("paymentmethod" in n and n.endswith("_name"))]
-    payment = next((str(rec[n]) for n in payment_names if rec.get(n)), None)
-    payment_choices = ["UPI", "CREDIT_CARD", "DEBIT_CARD", "WALLET", "CASH", "AUTO_DEBIT"]
-    if not payment or payment not in payment_choices:
-        payment = _rng().choice(payment_choices)
-    for name in payment_names:
-        if name in rec:
-            _lb_set(rec, variables, name, payment, issues, f"{name} synchronized to one recharge payment method")
-
-    # A voucher is meaningful only for a voucher-based payment path. This source contract does
-    # not declare VOUCHER as one of the generated payment choices above, so optional voucher
-    # fields are cleared instead of carrying an unrelated identifier.
-    for name in by_name:
-        if "voucher" in name and name in rec and by_name[name].get("nullable", True):
-            if _normalize(payment) != "voucher":
-                _lb_set(rec, variables, name, None, issues, f"{name} cleared because payment method is not voucher-based")
-
-    # The source model describes reason, trigger, channel and payment method as properties of
-    # the same recharge. Keep the aliases synchronized rather than independently sampled.
-    reason_name = _lb_first_name(variables, ("topupbalance_reason",), "topup", "reason")
-    trigger_reason_name = _lb_first_name(variables, ("topup_trigger_reason",), "topup", "trigger", "reason")
-    reason_choices = _declared_param_options(by_name.get(reason_name, {}).get("params") or {}) if reason_name else []
-    trigger_choices = _declared_param_options(by_name.get(trigger_reason_name, {}).get("params") or {}) if trigger_reason_name else []
-    coherent_reason = None
-    if reason_name and rec.get(reason_name) is not None:
-        coherent_reason = rec.get(reason_name)
-    elif trigger_reason_name and rec.get(trigger_reason_name) is not None:
-        coherent_reason = rec.get(trigger_reason_name)
-    if coherent_reason is None:
-        preferred = ["LOW_BALANCE", "DATA_EXHAUSTED", "VALIDITY_EXPIRY", "CUSTOMER_REQUEST"]
-        candidates = reason_choices or trigger_choices or preferred
-        coherent_reason = _rng().choice(candidates)
-    if reason_name and reason_name in rec:
-        _lb_set_declared(rec, variables, reason_name, coherent_reason, issues, "TopupBalance reason synchronized to the recharge trigger")
-    if trigger_reason_name and trigger_reason_name in rec:
-        _lb_set_declared(rec, variables, trigger_reason_name, coherent_reason, issues, "top-up trigger reason synchronized with TopupBalance reason")
-
-    # Source-backed reference names and types must describe the same objects.
-    bucket_name = _lb_first_name(variables, ("bucket_name",), "bucket", "name")
-    account_name = f"Prepaid Account {str(rec.get('account_id') or '').replace('ACC-', '')}".strip() or "Prepaid Account"
-    subscriber_label = f"Prepaid Subscriber {re.search(r'([0-9]+)$', str(rec.get('subscriber_id') or '')).group(1)}" if re.search(r'([0-9]+)$', str(rec.get('subscriber_id') or '')) else "Prepaid Subscriber"
-    canonical_bucket_label = str(rec.get(bucket_name) or "Prepaid Balance") if bucket_name else "Prepaid Balance"
-    for name in ("topupbalance_bucket_name",):
-        if name in rec:
-            _lb_set(rec, variables, name, canonical_bucket_label, issues, f"{name} linked to the authoritative bucket name")
-    for name in ("bucket_party_account_name", "topupbalance_party_account_name"):
-        if name in rec:
-            _lb_set(rec, variables, name, account_name, issues, f"{name} linked to the subscriber account")
-    for name in ("topupbalance_requestor_name",):
-        if name in rec:
-            _lb_set(rec, variables, name, "Auto Top-up Service" if auto_value else subscriber_label, issues, f"{name} linked to the actor performing the recharge")
-    for name in ("customer_engaged_party_name",):
-        if name in rec:
-            _lb_set(rec, variables, name, subscriber_label, issues, f"{name} linked to subscriber identity")
-    for name in ("bucket_party_account_status", "topupbalance_party_account_status"):
-        if name in rec:
-            _lb_set(rec, variables, name, "paid", issues, f"{name} aligned with prepaid account semantics")
-    for name in ("bucket_remaining_value_name",):
-        if name in rec and balance is not None:
-            _lb_set(rec, variables, name, f"{balance:.2f} {unit}", issues, f"{name} formatted from the authoritative remaining balance")
-
-    # Keep source-backed amount/unit aliases together.
-    for name in ("bucket_remaining_value_units", "bucket_reserved_value_units", "topupbalance_amount_units", "topup_amount_currency_unit"):
-        if name in rec:
-            _lb_set(rec, variables, name, unit, issues, f"{name} aligned to the transaction usage unit")
-    for name in ("bucket_is_shared", "balance_is_shared"):
-        if name in rec:
-            shared = _boolean_semantic(rec.get(name))
-            if shared is None:
-                shared = False
-            _lb_set(rec, variables, name, shared, issues, f"{name} synchronized to one bucket sharing state")
-
-    # Link the canonical top-up aliases.
-    for source, targets in ((
-        "topupbalance_channel_name", ("topup_channel_name",)),
-        ("topupbalance_payment_method_name", ("topup_payment_method_name",)),
-        ("topupbalance_is_auto_topup", ("is_auto_topup_enabled",)),
-        ("topupbalance_amount_amount", ("topup_recharge_amount",)),
-        ("topupbalance_valid_for_start_date_time", ("topup_validity_start_date_time",)),
-        ("topupbalance_valid_for_end_date_time", ("topup_validity_end_date_time",)),
-    ):
-        if source in rec:
-            for target in targets:
-                if target in rec:
-                    _lb_set(rec, variables, target, rec.get(source), issues, f"{target} synchronized to its source-backed top-up alias")
-
-    # Reference role/type semantics are source-derived where descriptions define the vocabulary.
-    # A related top-up reference is only populated when it points to a real, distinct prior
-    # transaction. Otherwise the optional flattened reference fields stay null.
-    related_topup_value = rec.get("topupbalance_balance_topup_id")
-    current_topup_value = rec.get("topupbalance_id")
-    if related_topup_value and current_topup_value and str(related_topup_value) != str(current_topup_value):
-        _lb_set_declared(rec, variables, "topupbalance_balance_topup_role", "child", issues, "related TopupBalance role constrained to a real earlier child reference")
-        _lb_set_declared(rec, variables, "topupbalance_balance_topup_referred_type", "TopupBalance", issues, "related TopupBalance reference type aligned")
-    else:
-        for _name in ("topupbalance_balance_topup_id", "topupbalance_balance_topup_href", "topupbalance_balance_topup_name", "topupbalance_balance_topup_role", "topupbalance_balance_topup_referred_type"):
-            if _name in rec and _name in _lb_variables_by_name(variables) and _lb_variables_by_name(variables)[_name].get("nullable", True):
-                _lb_set(rec, variables, _name, None, issues, "optional related TopupBalance reference cleared when no real related resource exists")
-    _lb_set_declared(rec, variables, "topupbalance_bucket_referred_type", "Bucket", issues, "bucket reference type aligned")
-    _lb_set_declared(rec, variables, "topupbalance_channel_referred_type", "Channel", issues, "channel reference type aligned")
-    _lb_set_declared(rec, variables, "topupbalance_payment_method_referred_type", "PaymentMethod", issues, "payment-method reference type aligned")
-    _lb_set_declared(rec, variables, "bucket_party_account_referred_type", "PartyAccount", issues, "bucket party-account reference type aligned")
-    _lb_set_declared(rec, variables, "topupbalance_party_account_referred_type", "PartyAccount", issues, "top-up party-account reference type aligned")
-    _lb_set_declared(rec, variables, "customer_engaged_party_role", "subscriber", issues, "customer engaged-party role aligned to subscriber")
-    _lb_set_declared(rec, variables, "customer_engaged_party_referred_type", "Individual", issues, "customer engaged-party reference type aligned")
-    _lb_set_declared(rec, variables, "topupbalance_requestor_role", "system" if auto_value else "subscriber", issues, "requestor role aligned to the recharge actor")
-    _lb_set_declared(rec, variables, "topupbalance_requestor_referred_type", "Organization" if auto_value else "Individual", issues, "requestor reference type aligned to the recharge actor")
-
-    # Deterministic reference ids/hrefs must describe the same underlying objects as the names/types.
-    subscriber_suffix = re.search(r"([0-9]+)$", str(rec.get("subscriber_id") or ""))
-    suffix_value = subscriber_suffix.group(1) if subscriber_suffix else str(_rng().randint(1000000000, 9999999999))
-    if "topupbalance_channel_id" in rec:
-        channel_id = f"CHANNEL-{str(channel or 'APP')}-{suffix_value}"
-        _lb_set(rec, variables, "topupbalance_channel_id", channel_id, issues, "channel id linked to channel value")
-        if "topupbalance_channel_href" in rec:
-            _lb_set(rec, variables, "topupbalance_channel_href", f"https://example.test/telecom/channel/{channel_id}", issues, "channel href linked to channel id")
-    if "topupbalance_payment_method_id" in rec:
-        payment_id = f"PAYMENT_METHOD-{str(payment or 'UPI')}-{suffix_value}"
-        _lb_set(rec, variables, "topupbalance_payment_method_id", payment_id, issues, "payment method id linked to payment method value")
-        if "topupbalance_payment_method_href" in rec:
-            _lb_set(rec, variables, "topupbalance_payment_method_href", f"https://example.test/telecom/payment-method/{payment_id}", issues, "payment method href linked to payment method id")
-    if "topupbalance_requestor_id" in rec:
-        requestor_id = f"REQUESTOR-{suffix_value}"
-        _lb_set(rec, variables, "topupbalance_requestor_id", requestor_id, issues, "requestor id linked to subscriber actor")
-        if "topupbalance_requestor_href" in rec:
-            _lb_set(rec, variables, "topupbalance_requestor_href", f"https://example.test/telecom/requestor/{requestor_id}", issues, "requestor href linked to requestor id")
-    if "customer_engaged_party_href" in rec:
-        _lb_set(rec, variables, "customer_engaged_party_href", f"https://example.test/telecom/party/{rec.get('subscriber_id')}", issues, "engaged party href linked to subscriber")
-    # Link a related TopupBalance only to a real prior transaction supplied by the history
-    # generator. Never fabricate a RELATED_TOPUP id.
-    related_id = rec.get("topupbalance_balance_topup_id")
-    current_id = rec.get("topupbalance_id")
-    if related_id and current_id and str(related_id) != str(current_id):
-        if "topupbalance_balance_topup_role" in rec:
-            _lb_set_declared(rec, variables, "topupbalance_balance_topup_role", "child", issues, "related TopupBalance role linked to an actual prior transaction")
-        if "topupbalance_balance_topup_referred_type" in rec:
-            _lb_set_declared(rec, variables, "topupbalance_balance_topup_referred_type", "TopupBalance", issues, "related TopupBalance type linked to an actual prior transaction")
-        if "topupbalance_balance_topup_href" in rec:
-            _lb_set(rec, variables, "topupbalance_balance_topup_href", f"https://example.test/telecom/topupBalance/{related_id}", issues, "related TopupBalance href linked to actual reference id")
-        if "topupbalance_balance_topup_name" in rec:
-            _lb_set(rec, variables, "topupbalance_balance_topup_name", "Related Top-up", issues, "related TopupBalance name describes the referenced resource")
-    else:
-        for _name in ("topupbalance_balance_topup_id", "topupbalance_balance_topup_href", "topupbalance_balance_topup_name", "topupbalance_balance_topup_role", "topupbalance_balance_topup_referred_type"):
-            if _name in rec and _name in by_name and by_name[_name].get("nullable", True):
-                _lb_set(rec, variables, _name, None, issues, "optional related TopupBalance fields cleared when no real reference exists")
-
-    # Scenario outcome mirrors the authoritative execution state, using the scenario field's
-    # own declared vocabulary rather than inventing a new enum.
-    if outcome_name and outcome_name in rec:
-        if outcome_mode == "negative":
-            desired_outcome = "FAILED"
-        elif outcome_mode == "decline_or_no_response":
-            response_value = {"declined": "DECLINED", "rejected": "REJECTED", "no_response": "NO_RESPONSE"}[_lb_response_variant(rules)]
-            desired_outcome = response_value
-        elif desired_status == "completed":
-            desired_outcome = "COMPLETED"
-        else:
-            desired_outcome = str(desired_status).upper()
-        _lb_set_declared(rec, variables, outcome_name, desired_outcome, issues, "scenario outcome synchronized with transaction execution state")
-
-    # Latency is derived from the actual timestamps, never independently sampled.
-    latency_name = _lb_first_name(variables, ("recharge_latency_hours",), "recharge", "latency", "hours")
-    if latency_name and latency_name in rec:
-        end_dt = confirmation_dt or request_dt
-        start_dt = _qa_parse_dt(rec.get(trigger_field)) if trigger_field else None
-        if start_dt is None:
-            start_dt = request_dt
-        hours = max(0.0, (end_dt - start_dt).total_seconds() / 3600.0)
-        params = by_name[latency_name].get("params") or {}
-        lo = _to_finite_float(params.get("min", params.get("lo")), 0.0) or 0.0
-        hi = _to_finite_float(params.get("max", params.get("hi")), None)
-        if hi is not None:
-            hours = min(hours, hi)
-        hours = max(hours, lo)
-        precision = int(params.get("precision", 2) or 2)
-        latency_value = round(hours, precision)
-        if str(by_name[latency_name].get("dtype") or "").lower() in {"int", "integer"}:
-            latency_value = int(round(latency_value))
-        _lb_set(rec, variables, latency_name, latency_value, issues, "recharge latency derived from trigger/request/confirmation timestamps")
-
-    # Descriptive aliases should not contradict the same object.
-    if "topupbalance_description" in rec:
-        _lb_set(rec, variables, "topupbalance_description", "Prepaid recharge transaction", issues, "top-up description aligned to resource semantics")
-    if "topupbalance_usagetype" in rec:
-        _lb_set_declared(rec, variables, "topupbalance_usagetype", usage, issues, "TopupBalance usageType aligned to bucket usage")
-    if "bucket_usagetype" in rec:
-        _lb_set_declared(rec, variables, "bucket_usagetype", usage, issues, "bucket usageType aligned to top-up usage")
-
-    # Generic paired start/end periods across the full schema.
-    paired: list[tuple[str, str]] = []
-    for name in by_name:
-        lname = name.lower()
-        if lname.endswith("_start_date_time"):
-            candidate = name[:-len("_start_date_time")] + "_end_date_time"
-        elif lname.endswith("_start_datetime"):
-            candidate = name[:-len("_start_datetime")] + "_end_datetime"
-        else:
-            continue
-        if candidate in by_name:
-            paired.append((name, candidate))
-    for start_name, end_name in paired:
-        start_dt = _qa_parse_dt(rec.get(start_name))
-        end_dt = _qa_parse_dt(rec.get(end_name))
-        if start_dt is not None and end_dt is not None and end_dt < start_dt:
-            _lb_set(rec, variables, end_name, _format_datetime_for_variable(start_dt, by_name[end_name]), issues, f"{end_name} corrected to be on/after {start_name}")
-
-    return rec, issues
-
-
-def _assert_low_balance_topup_consistency(rec: dict, variables: list[dict], rules: dict | None = None) -> None:
-    """Fail closed on the complete Low Balance business contract after all repairs."""
-    if not _lb_domain(rules):
-        return
-    by_name = _lb_variables_by_name(variables)
-    errors: list[str] = []
-
-    def dt(name: str) -> datetime | None:
-        return _qa_parse_dt(rec.get(name)) if name in rec else None
-
-    # Schema-level type/options/required checks are performed separately; here focus on
-    # cross-field business invariants that cannot be expressed as a scalar parameter.
-    for name, var in by_name.items():
-        if bool(var.get("required")) and (name not in rec or rec.get(name) is None):
-            errors.append(f"required field '{name}' is missing")
-        if name in rec and rec.get(name) is not None:
-            declared = _declared_param_options(var.get("params") or {})
-            if declared and not any(_matches_declared_option(rec.get(name), opt) for opt in declared):
-                errors.append(f"{name} is outside its declared choice set")
-
-    # Every obvious validity period must be ordered.
-    for start, end in (
-        ("bucket_valid_for_start_date_time", "bucket_valid_for_end_date_time"),
-        ("topupbalance_valid_for_start_date_time", "topupbalance_valid_for_end_date_time"),
-        ("topup_validity_start_date_time", "topup_validity_end_date_time"),
-        ("customer_valid_for_start_date_time", "customer_valid_for_end_date_time"),
-    ):
-        if start in rec and end in rec:
-            a, b = dt(start), dt(end)
-            if a is not None and b is not None and a > b:
-                errors.append(f"{start} occurs after {end}")
-
-    request_fields = [n for n in by_name if ("requested" in n or "request" in n) and str(by_name[n].get("dtype", "")).lower() == "datetime" and "topup" in n]
-    confirmation_fields = [n for n in by_name if ("confirmation" in n or "confirm" in n or "completion" in n) and str(by_name[n].get("dtype", "")).lower() == "datetime" and "topup" in n]
-    request_dt = next((dt(n) for n in request_fields if dt(n) is not None), None)
-    confirmation_dt = next((dt(n) for n in confirmation_fields if dt(n) is not None), None)
-    if request_dt is not None and confirmation_dt is not None and confirmation_dt < request_dt:
-        errors.append("TopupBalance confirmation occurs before request")
-
-    # Duplicate aliases must represent the same event.
-    alias_groups = (
-        ("topupbalance_requested_date", "topup_requested_date_time"),
-        ("topupbalance_confirmation_date", "topup_confirmation_date_time"),
-        ("topupbalance_amount_amount", "topup_recharge_amount"),
-        ("bucket_id", "topupbalance_bucket_id", "balance_bucket_id"),
-    )
-    for group in alias_groups:
-        present_names = [n for n in group if n in rec and rec.get(n) is not None and n in by_name]
-        if len(present_names) < 2:
-            continue
-        linked_names: list[str] = [present_names[0]]
-        for candidate in present_names[1:]:
-            if any(_lb_declared_alias(by_name[existing], by_name[candidate]) for existing in linked_names):
-                linked_names.append(candidate)
-        if len(linked_names) >= 2:
-            values = [rec[n] for n in linked_names]
-            if len({_normalize(v) for v in values}) > 1:
-                errors.append(f"related aliases disagree: {tuple(linked_names)}")
-
-    # Monetary balance logic.
-    rem = _to_finite_float(rec.get("balance_remaining_amount"), None)
-    threshold = _to_finite_float(rec.get("low_balance_trigger_threshold"), None)
-    reserved = _to_finite_float(rec.get("balance_reserved_amount"), None)
-    if rem is not None and threshold is not None and rem > threshold + 1e-9:
-        errors.append("remaining balance exceeds low-balance trigger threshold")
-    if rem is not None and reserved is not None and reserved > rem + 1e-9:
-        errors.append("reserved balance exceeds remaining balance")
-
-    # Usage/unit coherence.
-    usage_values = {str(rec[n]) for n in by_name if "usage_type" in n or "usagetype" in n if n in rec and rec.get(n) is not None}
-    if len(usage_values) > 1:
-        errors.append("usageType fields disagree")
-    expected_unit = _lb_unit_for_usage(next(iter(usage_values), "monetary"))
-    unit_values = {str(rec[n]) for n in by_name if (n.endswith("_unit") or n.endswith("_units") or "currency_unit" in n or "usage_unit" in n) and n in rec and rec.get(n) is not None}
-    if unit_values and expected_unit not in unit_values:
-        errors.append(f"unit fields are not aligned to usage type ({expected_unit})")
-
-    # Same-event aliases must describe one transaction.
-    alias_groups = (
-        ("topupbalance_channel_name", "topup_channel_name"),
-        ("topupbalance_payment_method_name", "topup_payment_method_name"),
-        ("topupbalance_is_auto_topup", "is_auto_topup_enabled"),
-        ("topupbalance_amount_amount", "topup_recharge_amount"),
-        ("topupbalance_amount_units", "topup_amount_currency_unit"),
-        ("topupbalance_valid_for_start_date_time", "topup_validity_start_date_time"),
-        ("topupbalance_valid_for_end_date_time", "topup_validity_end_date_time"),
-        ("bucket_name", "topupbalance_bucket_name"),
-        ("account_id", "bucket_party_account_id", "topupbalance_party_account_id"),
-        ("subscriber_id", "customer_engaged_party_id"),
-    )
-    for group in alias_groups:
-        present_names = [n for n in group if n in rec and rec.get(n) is not None and n in by_name]
-        if len(present_names) < 2:
-            continue
-        linked_names: list[str] = [present_names[0]]
-        for candidate in present_names[1:]:
-            if any(_lb_declared_alias(by_name[existing], by_name[candidate]) for existing in linked_names):
-                linked_names.append(candidate)
-        if len(linked_names) >= 2:
-            vals = [rec[n] for n in linked_names]
-            if len({_normalize(v) for v in vals}) > 1:
-                errors.append(f"related aliases disagree: {tuple(linked_names)}")
-
-    # Top-up recurrence is conditional on the auto-top-up flag.
-    auto_name = _lb_first_name(variables, ("topupbalance_is_auto_topup", "is_auto_topup_enabled"), "auto", "topup")
-    auto = _boolean_semantic(rec.get(auto_name)) if auto_name else None
-    rec_period_name = _lb_first_name(variables, ("topupbalance_recurring_period", "topupbalance_recurringperiod"), "recurring", "period")
-    periods_name = _lb_first_name(variables, ("topupbalance_number_of_periods", "topupbalance_numberofperiods"), "number", "period")
-    if auto is False:
-        if rec_period_name and rec.get(rec_period_name) is not None:
-            errors.append("recurring period is populated while auto-top-up is disabled")
-        if periods_name and rec.get(periods_name) is not None:
-            errors.append("number of periods is populated while auto-top-up is disabled")
-    elif auto is True:
-        if rec_period_name and rec.get(rec_period_name) is None:
-            errors.append("auto-top-up is enabled but recurring period is missing")
-        if periods_name and rec.get(periods_name) is not None and _to_finite_float(rec.get(periods_name), 0) < 1:
-            errors.append("auto-top-up number of periods must be at least 1")
-
-    # Reference-type semantics.
-    expected_refs = {
-        "topupbalance_bucket_referred_type": "bucket",
-        "topupbalance_channel_referred_type": "channel",
-        "topupbalance_payment_method_referred_type": "paymentmethod",
-        "topupbalance_balance_topup_referred_type": "topupbalance",
-    }
-    for name, expected in expected_refs.items():
-        if name in rec and rec.get(name) is not None and _normalize(rec.get(name)) != _normalize(expected):
-            errors.append(f"{name} is not a valid reference type")
-    if "topupbalance_balance_topup_role" in rec and rec.get("topupbalance_balance_topup_role") is not None:
-        role_value = _normalize(rec.get("topupbalance_balance_topup_role"))
-        if role_value not in {"parent", "child"}:
-            errors.append("topupbalance_balance_topup_role is outside parent/child semantics")
-        if "topupbalance_balance_topup_id" in rec and "topupbalance_id" in rec:
-            related_id = rec.get("topupbalance_balance_topup_id")
-            current_id = rec.get("topupbalance_id")
-            if related_id is not None and current_id is not None and str(related_id) != str(current_id) and role_value != "child":
-                errors.append("related TopupBalance reference must use role=child when it points to an earlier top-up")
-            if related_id is not None and "topupbalance_balance_topup_href" in rec and rec.get("topupbalance_balance_topup_href") is not None:
-                if str(related_id) not in str(rec.get("topupbalance_balance_topup_href")):
-                    errors.append("topupbalance_balance_topup_href does not reference topupbalance_balance_topup_id")
-    if "topupbalance_balance_topup_id" in rec and rec.get("topupbalance_balance_topup_id") is None:
-        for _name in ("topupbalance_balance_topup_href", "topupbalance_balance_topup_name", "topupbalance_balance_topup_role"):
-            if _name in rec and rec.get(_name) is not None:
-                errors.append(f"{_name} is populated without a related TopupBalance id")
-
-    # Reference identity and hrefs must agree with the object they reference.
-    for ref_name, id_name in (
-        ("topupbalance_bucket_href", "bucket_id"),
-        ("bucket_href", "bucket_id"),
-        ("customer_href", "customer_id"),
-        ("topupbalance_href", "topupbalance_id"),
-    ):
-        if ref_name in rec and id_name in rec and rec.get(ref_name) is not None and rec.get(id_name) is not None:
-            if str(rec[id_name]) not in str(rec[ref_name]):
-                errors.append(f"{ref_name} does not reference {id_name}")
-    if "account_id" in rec and "subscriber_id" in rec:
-        account = str(rec.get("account_id") or "")
-        subscriber = str(rec.get("subscriber_id") or "")
-        if subscriber.startswith("SUB-") and account != f"ACC-{subscriber[4:]}" :
-            errors.append("account_id does not mirror subscriber_id")
-    if "msisdn" in rec and rec.get("msisdn") is not None:
-        msisdn = str(rec["msisdn"])
-        country = str((rules or {}).get("country") or "IN").strip().upper()
-        if country == "IN":
-            valid_msisdn = bool(re.fullmatch(r"\+91[0-9]{10}", msisdn))
-        else:
-            valid_msisdn = bool(re.fullmatch(r"\+[1-9][0-9]{6,14}", msisdn))
-        if not valid_msisdn:
-            errors.append(f"msisdn is not a valid synthetic {country or 'global'} number")
-    if "customer_id" in rec and rec.get("customer_id") is not None:
-        if not re.fullmatch(r"cust-[0-9]{8}", str(rec.get("customer_id"))):
-            errors.append("customer_id must match the Low Balance contract cust-<8 digits>")
-
-    # Requestor must describe the same actor represented by the auto-top-up state.
-    if "topupbalance_requestor_role" in rec and "topupbalance_requestor_referred_type" in rec:
-        role = _normalize(rec.get("topupbalance_requestor_role"))
-        ref_type = _normalize(rec.get("topupbalance_requestor_referred_type"))
-        auto_name = _lb_first_name(variables, ("topupbalance_is_auto_topup", "is_auto_topup_enabled"), "auto", "topup")
-        auto_value = _boolean_semantic(rec.get(auto_name)) if auto_name else None
-        if auto_value is True and not (role == "system" and ref_type == "organization"):
-            errors.append("auto-top-up requestor must be a system/organization actor")
-        if auto_value is False and not (role == "subscriber" and ref_type == "individual"):
-            errors.append("manual top-up requestor must be a subscriber/individual actor")
-
-    # Status/outcome consistency.
-    status = _normalize(rec.get("topupbalance_status")) if rec.get("topupbalance_status") is not None else None
-    execution = _normalize(rec.get("topup_execution_status")) if rec.get("topup_execution_status") is not None else None
-    outcome = _normalize(rec.get("recharge_outcome")) if rec.get("recharge_outcome") is not None else None
-    if status and execution and status != execution:
-        # Both are separate schema concepts but in this synthetic transaction contract they
-        # represent the same processing lifecycle and must not contradict each other.
-        errors.append("TopupBalance status and execution status disagree")
-    if status in {"completed", "failed", "cancelled"} and outcome:
-        mode = str((rules or {}).get("scenario_mode") or (rules or {}).get("scenario_semantics", {}).get("outcome_mode") or "mixed").lower()
-        if status == "cancelled" and mode == "decline_or_no_response":
-            if outcome not in {"declined", "no_response", "rejected"}:
-                errors.append("decline scenario recharge_outcome is not a decline/no-response outcome")
-        else:
-            expected = {"completed": "completed", "failed": "failed", "cancelled": "cancelled"}[status]
-            if outcome != expected:
-                errors.append("recharge_outcome disagrees with the transaction status")
-    if status == "completed":
-        if request_dt is None or confirmation_dt is None:
-            errors.append("completed top-up must have request and confirmation timestamps")
-    if status in {"failed", "cancelled"} and confirmation_dt is not None:
-        errors.append(f"{status} top-up must not have a successful confirmation timestamp")
-
-    # Scenario semantics must remain coherent with intervention state.
-    mode = str((rules or {}).get("scenario_mode") or (rules or {}).get("scenario_semantics", {}).get("outcome_mode") or "mixed").lower()
-    if mode == "suppression":
-        if rec.get("intervention_eligibility") not in (None, False):
-            errors.append("suppressed intervention is still marked eligible")
-        if rec.get("low_balance_warning_sent_flag") is True:
-            errors.append("suppressed intervention emitted a warning")
-        if rec.get("retention_intervention_offer_code") not in (None, ""):
-            errors.append("suppressed intervention contains an offer")
-    if mode == "decline_or_no_response":
-        decision_norm = _normalize(rec.get("customer_decision")) if rec.get("customer_decision") is not None else None
-        if decision_norm is not None and decision_norm not in {"declined", "no_response", "rejected"}:
-            errors.append("customer_decision contradicts the decline/no-response scenario")
-        expected_variant = _lb_response_variant(rules)
-        if decision_norm is not None and decision_norm != expected_variant:
-            errors.append(f"customer_decision does not match the explicit {expected_variant} scenario")
-        outcome_norm = _normalize(rec.get("recharge_outcome")) if rec.get("recharge_outcome") is not None else None
-        if outcome_norm is not None and outcome_norm != expected_variant:
-            errors.append(f"recharge_outcome does not match the explicit {expected_variant} scenario")
-
-    if errors:
-        raise ValueError("Low Balance logical validation failed: " + "; ".join(errors))
 
 
 def _strict_validate_record(rec: dict, variables: list[dict], rules: dict | None = None) -> None:
     """Final fail-closed validation for the complete confirmed contract."""
-    by_name = _lb_variables_by_name(variables)
+    by_name = _variables_by_name(variables)
     for name, var in by_name.items():
         value = rec.get(name)
         if bool(var.get("required")) and value is None:
@@ -4451,9 +2797,6 @@ def _strict_validate_record(rec: dict, variables: list[dict], rules: dict | None
         elif str(actual) != str(expected):
             raise ValueError(f"formula field '{field}' is inconsistent with its formula")
 
-    if _lb_domain(rules):
-        _assert_low_balance_topup_consistency(rec, variables, rules=rules)
-
 
 def _enforce_generic_business_consistency(rec: dict, variables: list[dict], rules: dict | None = None) -> tuple[dict, list[str]]:
     """Enforce high-confidence cross-field relationships inferred from the confirmed contract.
@@ -4480,7 +2823,7 @@ def _enforce_generic_business_consistency(rec: dict, variables: list[dict], rule
     names = list(by_name)
     # 1) Auto-run configuration is a single stateful contract. A disabled recurring process has no
     # recurring schedule/occurrence count; an enabled process needs both when the schema exposes them.
-    auto_fields = [n for n in names if "auto" in norm(n) and any(t in norm(n) for t in ("topup", "recharge", "recurring", "automatic"))]
+    auto_fields = [n for n in names if "auto" in norm(n) and any(t in norm(n) for t in ("recurring", "automatic", "renew"))]
     auto = auto_fields[0] if auto_fields else None
     if auto and isinstance(rec.get(auto), bool):
         period_count = next((n for n in names if "period" in norm(n) and ("number" in norm(n) or "count" in norm(n))), None)
@@ -4539,18 +2882,6 @@ def _enforce_generic_business_consistency(rec: dict, variables: list[dict], rule
             if reserved_value is not None and r_value > reserved_value:
                 set_value(remaining, round(reserved_value, int((by_name[remaining].get("params") or {}).get("precision", 2) or 2)), f"{remaining} reduced to remain within {reserved}")
 
-    # 5) When the request explicitly describes a low-balance monetary resource and the contract has
-    # a usage-type enum containing 'monetary', align that resource vocabulary instead of generating
-    # unrelated voice/data/SMS resources. No telecom field names are referenced here.
-    context = " ".join(str((rules or {}).get(k) or "") for k in ("domain", "scenario_type", "business_scenario", "use_case")).casefold()
-    if "balance" in context and "low" in context:
-        usage_fields = [n for n in names if "usage" in norm(n) and "type" in norm(n)]
-        for name in usage_fields:
-            choices = list((by_name[name].get("params") or {}).get("choices") or [])
-            monetary = next((c for c in choices if norm(c) == "monetary"), None)
-            if monetary is not None:
-                set_value(name, monetary, f"{name} aligned to the low-balance monetary resource")
-
     # 6) Validity windows must contain the transaction anchor when a same-resource anchor is obvious.
     validity_starts = [n for n in names if norm(n).endswith(("_start_date_time", "_start_datetime", "_start_date", "_valid_from", "_validity_start")) and str(by_name[n].get("dtype") or "").lower() == "datetime"]
     for start in validity_starts:
@@ -4572,40 +2903,6 @@ def _enforce_generic_business_consistency(rec: dict, variables: list[dict], rule
             and set(prefix.split("_")) & set(norm(n).split("_"))
         ]
         anchor = next((dt(n) for n in anchors if dt(n) is not None), None)
-        # Resource validity windows often belong to a different field family than the
-        # transaction that exercises the resource (for example a bucket validity window
-        # surrounding a top-up event). When no same-resource timestamp exists, use the
-        # primary scenario event timestamp as the anchor. This remains contract-driven:
-        # only transactional/event timestamps already present in the proposed schema are
-        # considered, and only for stateful balance/depletion journeys.
-        if anchor is None:
-            state_context = context
-            stateful_journey = ("balance" in state_context and "low" in state_context) or any(
-                token in state_context for token in ("data depletion", "data depletion", "depleted", "exhaustion", "depletion")
-            )
-            if stateful_journey:
-                primary_candidates = [
-                    n for n in names
-                    if str(by_name[n].get("dtype") or "").lower() == "datetime"
-                    and any(x in norm(n) for x in ("requested", "transaction", "event", "record", "presentation", "response", "confirmation"))
-                ]
-                def anchor_rank(name: str) -> tuple[int, int]:
-                    low = norm(name)
-                    if "requested" in low or low.endswith("_request"):
-                        rank = 0
-                    elif any(x in low for x in ("transaction", "event", "record")):
-                        rank = 1
-                    elif "presentation" in low or "presented" in low:
-                        rank = 2
-                    elif "response" in low:
-                        rank = 3
-                    elif "confirmation" in low or "confirmed" in low:
-                        rank = 4
-                    else:
-                        rank = 5
-                    return rank, names.index(name)
-                primary_candidates.sort(key=anchor_rank)
-                anchor = next((dt(n) for n in primary_candidates if dt(n) is not None), None)
         if anchor is None:
             continue
         if start_dt is None or end_dt is None:
@@ -4712,92 +3009,6 @@ def _enforce_obvious_semantic_consistency(rec: dict, variables: list[dict], rule
                 low_val, high_val = rec[high], rec[low]
                 set_value(low, low_val, f"{low} corrected to be <= {high}")
                 set_value(high, high_val, f"{high} corrected to be >= {low}")
-
-    # Legacy low-balance fields are only meaningful when this is an explicit legacy-rule path.
-    # Agentic JSON/DB-grounded scenarios use their discovered contract instead of a fixed field list.
-    if _lb_domain(rules):
-        trigger = dt("low_balance_trigger_timestamp")
-        recharge = dt("recharge_timestamp")
-        if trigger is not None and recharge is not None and "hours_to_recharge_after_trigger" in rec:
-            hours_params = by_name.get("hours_to_recharge_after_trigger", {}).get("params") or {}
-            precision = int(hours_params.get("precision", 2) or 2)
-            lo_hours = _to_finite_float(hours_params.get("min", hours_params.get("lo")), 0.0) or 0.0
-            hi_hours = _to_finite_float(hours_params.get("max", hours_params.get("hi")), None)
-            try:
-                requested_hours = float(rec.get("hours_to_recharge_after_trigger"))
-            except (TypeError, ValueError):
-                requested_hours = 1.0
-            if hi_hours is not None:
-                requested_hours = min(requested_hours, hi_hours)
-            requested_hours = max(lo_hours, requested_hours)
-
-            elapsed_hours = max(0.0, (recharge - trigger).total_seconds() / 3600.0)
-            # The timestamp pair and duration are one contract. Choose a timestamp consistent with
-            # the bounded duration, rather than clamping the duration after the fact.
-            if abs(elapsed_hours - requested_hours) > (0.5 / (10 ** max(0, precision))):
-                repaired_recharge = trigger + timedelta(hours=requested_hours)
-                params = by_name.get("recharge_timestamp", {}).get("params") or {}
-                set_value("recharge_timestamp", _format_datetime(repaired_recharge, params),
-                          "recharge_timestamp aligned to hours_to_recharge_after_trigger")
-                recharge = repaired_recharge
-                elapsed_hours = requested_hours
-            set_value("hours_to_recharge_after_trigger", round(elapsed_hours, precision),
-                      "hours_to_recharge_after_trigger recalculated from timestamps")
-        elif trigger is not None and recharge is not None and recharge < trigger:
-            params = by_name.get("recharge_timestamp", {}).get("params") or {}
-            repaired_recharge = trigger + timedelta(hours=1)
-            set_value("recharge_timestamp", _format_datetime(repaired_recharge, params),
-                      "recharge_timestamp moved after low_balance_trigger_timestamp")
-            recharge = repaired_recharge
-
-        if "pre_trigger_core_balance_inr" in rec and "threshold_breach_limit_inr" in rec:
-            pre = rec.get("pre_trigger_core_balance_inr")
-            threshold = rec.get("threshold_breach_limit_inr")
-            if isinstance(pre, (int, float)) and isinstance(threshold, (int, float)) and pre > threshold:
-                set_value("threshold_breach_limit_inr", round(float(pre), 2),
-                          "threshold_breach_limit_inr raised to contain pre-trigger balance")
-
-        if "zero_balance_outage_duration_hours" in rec and "hours_to_recharge_after_trigger" in rec:
-            outage = rec.get("zero_balance_outage_duration_hours")
-            elapsed = rec.get("hours_to_recharge_after_trigger")
-            if isinstance(outage, (int, float)) and isinstance(elapsed, (int, float)) and outage > elapsed:
-                max_outage = max(0, int(math.floor(float(elapsed))))
-                set_value("zero_balance_outage_duration_hours", max_outage,
-                          "zero_balance_outage_duration_hours capped by recharge delay")
-
-        if all(k in rec for k in ("pre_trigger_core_balance_inr", "credited_monetary_amount_inr", "emergency_credit_deducted_inr", "post_recharge_core_balance_inr")):
-            pre = rec.get("pre_trigger_core_balance_inr")
-            credited = rec.get("credited_monetary_amount_inr")
-            emergency = rec.get("emergency_credit_deducted_inr")
-            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (pre, credited, emergency)):
-                target_params = by_name.get("post_recharge_core_balance_inr", {}).get("params") or {}
-                post_lo = _to_finite_float(target_params.get("min", target_params.get("lo")), 0.0) or 0.0
-                post_hi = _to_finite_float(target_params.get("max", target_params.get("hi")), 100.0)
-                raw_expected = float(pre) + float(credited) - float(emergency)
-                if post_hi is not None and raw_expected > post_hi:
-                    adjusted_credited = max(0.0, min(float(credited), float(post_hi) - float(pre) + float(emergency)))
-                    set_value("credited_monetary_amount_inr", round(adjusted_credited, 2),
-                              "credited_monetary_amount_inr adjusted to preserve post-balance bounds")
-                    credited = adjusted_credited
-                    raw_expected = float(pre) + float(credited) - float(emergency)
-                elif raw_expected < post_lo:
-                    adjusted_emergency = max(0.0, min(float(emergency), float(pre) + float(credited) - float(post_lo)))
-                    set_value("emergency_credit_deducted_inr", round(adjusted_emergency, 2),
-                              "emergency_credit_deducted_inr adjusted to preserve post-balance bounds")
-                    emergency = adjusted_emergency
-                    raw_expected = float(pre) + float(credited) - float(emergency)
-                expected = round(max(post_lo, min(post_hi if post_hi is not None else raw_expected, raw_expected)), 2)
-                set_value("post_recharge_core_balance_inr", expected,
-                          "post_recharge_core_balance_inr recalculated from balance movement")
-
-    # Intervention fields: a conversion cannot occur without an intervention being sent.
-    if rec.get("proactive_nudge_sent_flag") is False:
-        for name in ("nudge_channel", "nudge_offer_type"):
-            if name in rec and by_name.get(name, {}).get("nullable", True):
-                set_value(name, None, f"{name} cleared because proactive nudge was not sent")
-        if "intervention_conversion_flag" in rec:
-            set_value("intervention_conversion_flag", False,
-                      "intervention_conversion_flag forced false because proactive nudge was not sent")
 
     # Obvious lifecycle ordering for commonly named datetime pairs. Iterate because repairing
     # one edge can legitimately move a shared timestamp and therefore require a second pass.
@@ -4948,7 +3159,7 @@ def _validate_record(
 
             def resolve_bound(raw):
                 # CSV bounds may be literal numbers (min=0) or references to
-                # another generated field (min=recharge_count_30d). Never call
+                # another generated field (min=event_count_30d). Never call
                 # float() directly on a field name; resolve it from the record.
                 if raw is None:
                     return None
@@ -5048,25 +3259,10 @@ def _validate_record(
     rec, final_contract_issues = _enforce_csv_contract(rec, variables, rules=rules)
     issues.extend(final_contract_issues)
 
-    timestamp_field = next((name for name in ("record_timestamp", "transaction_timestamp", "timestamp", "created_at", "updated_at") if name in rec), None)
-    base_ts = _qa_parse_dt(rec.get(timestamp_field)) if timestamp_field else None
-    dispatch_ts = _qa_parse_dt(rec.get("notification_dispatch_ts"))
-    response_ts = _qa_parse_dt(rec.get("customer_response_ts"))
-    if base_ts and dispatch_ts and dispatch_ts < base_ts:
-        dispatch_var = next((v for v in variables if str(v.get("name")) == "notification_dispatch_ts"), {})
-        rec["notification_dispatch_ts"] = _format_datetime(base_ts, dispatch_var.get("params") or {})
-        issues.append("notification_dispatch_ts corrected")
-    if dispatch_ts and response_ts and response_ts < dispatch_ts:
-        response_var = next((v for v in variables if str(v.get("name")) == "customer_response_ts"), {})
-        rec["customer_response_ts"] = _format_datetime(dispatch_ts, response_var.get("params") or {})
-        issues.append("customer_response_ts corrected")
-
     rec, generic_issues = _enforce_generic_business_consistency(rec, variables, rules=rules)
     issues.extend(generic_issues)
     rec, semantic_issues = _enforce_obvious_semantic_consistency(rec, variables, rules=rules)
     issues.extend(semantic_issues)
-    rec, topup_issues = _enforce_low_balance_topup_consistency(rec, variables, rules=rules)
-    issues.extend(topup_issues)
     # Domain semantics can move timestamps/amounts/statuses, so authoritative formulas must
     # be recalculated once more before the final contract/strict validation boundary.
     rec, post_domain_formula_issues = _enforce_authoritative_formulas(rec, variables, rules=rules)
@@ -5084,7 +3280,6 @@ def _validate_record(
     # Fail closed after every repair/constraint pass. This prevents a future change to
     # one repair stage from silently reintroducing a contradiction into final_records.
     _assert_temporal_consistency(rec, variables, relations=temporal_relations)
-    _assert_low_balance_topup_consistency(rec, variables, rules=rules)
 
     bad_placeholders = []
     for var in variables:
@@ -5098,23 +3293,6 @@ def _validate_record(
     # Formatting preserves the parsed instant and therefore does not require another
     # temporal-consistency scan after serialization.
     rec = _format_datetime_fields(rec, variables)
-
-    # Recalculate displayed-duration fields after timestamp serialization. The public format is
-    # minute-based by default, so computing the duration before formatting can differ by a
-    # fraction of a minute from the timestamps the client actually receives.
-    final_trigger = _qa_parse_dt(rec.get("low_balance_trigger_timestamp"))
-    final_recharge = _qa_parse_dt(rec.get("recharge_timestamp"))
-    if final_trigger is not None and final_recharge is not None and "hours_to_recharge_after_trigger" in rec:
-        hour_params = next((v.get("params") or {} for v in variables if v.get("name") == "hours_to_recharge_after_trigger"), {})
-        hour_precision = int(hour_params.get("precision", 2) or 2)
-        final_hours = round(max(0.0, (final_recharge - final_trigger).total_seconds() / 3600.0), hour_precision)
-        lo = _to_finite_float(hour_params.get("min", hour_params.get("lo")), 0.0) or 0.0
-        hi = _to_finite_float(hour_params.get("max", hour_params.get("hi")), None)
-        if final_hours < lo:
-            final_hours = lo
-        if hi is not None and final_hours > hi:
-            final_hours = hi
-        rec["hours_to_recharge_after_trigger"] = final_hours
 
     rec, final_formula_issues = _enforce_authoritative_formulas(rec, variables, rules=rules)
     issues.extend(final_formula_issues)
@@ -5138,6 +3316,8 @@ def run_deterministic_agentic_generation(
     type_of_data: str,
     scenario_context: dict[str, Any],
     records_per_user: int = 10,
+    seed: int | None = None,
+    as_of: Any = None,
 ) -> WorkflowState:
     """Fast path for confirmed agentic scenarios.
 
@@ -5168,6 +3348,33 @@ def run_deterministic_agentic_generation(
         state.errors.append(f"Unknown scenario '{scenario}'")
         return state
     variables, field_order = dyn
+
+    # Behaviour-pack path: a scenario confirmed against a behaviour pack is generated by a causal journey
+    # simulation and scored on its delivered rows. Scenarios without a pack keep the legacy generator below.
+    from synth.service import generate as pack_generate, resolve_pack
+
+    pack = resolve_pack(scenario_context)
+    if pack is not None:
+        if type_of_data != "transactional":
+            raise ValueError(f"Behaviour pack '{pack.pack_id}' generates transactional data only.")
+        from core.scenario_semantics import classify_outcome_mode
+
+        mode = classify_outcome_mode(
+            scenario_type=str(state.scenario_type or ""),
+            expected_outcome=str(state.expected_outcome or ""),
+            business_response=str(state.business_response or ""),
+            business_scenario=str(state.business_scenario or ""),
+        )
+        result = pack_generate(
+            pack, variables, count=state.count, per_entity=state.records_per_user,
+            seed=seed, as_of=as_of, mode=mode,
+        )
+        state.raw_records = list(result.records)
+        state.final_records = list(result.records)
+        state.field_order = list(result.fields)
+        state.validation_report = result.validation_report
+        return state
+
     state.field_order = list(field_order)
     state.rules = build_deterministic_rules(state, variables)
 

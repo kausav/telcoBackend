@@ -1,4 +1,4 @@
-"""Agentic telecom scenario proposal and HITL validation.
+"""Agentic scenario proposal and HITL validation.
 
 Public API design: scenario/propose creates a normal draft; scenario/confirm is the
 HITL approval/edit action; scenario/generate executes only confirmed scenarios.
@@ -15,18 +15,18 @@ import re
 from core.agentic_models import ScenarioImportResponse, ScenarioProposeRequest, ScenarioSchema, ScenarioIntent, GeneratedSchemaField
 from core.conversation_store import append_message, ensure_conversation
 from core.dynamic_scenarios import new_draft_id, save_draft
-from core.errors import LLMUpstreamError
 from core.runtime_cache import get_proposal, set_proposal
-from core.scenario_variable_store import get_recommended, get_user_variables, save_proposal
-from core.json_domain_policy import is_json_grounded_domain, source_manifest
-from core.low_balance_variable_policy import validate_db_definition
+from core.scenario_variable_store import get_recommended, get_selection_lock, get_user_variables, lock_selection, save_proposal
+from core.json_domain_policy import source_manifest
+from core.variable_contract import validate_db_definition
 
 logger = logging.getLogger(__name__)
 from agents.intent_agent import GeminiIntentAgent
 from agents.schema_compiler import SchemaCompiler
-from core.industry_source_store import normalize_industry_key, semantic_exclusion_aliases, catalog_for_request
+from config.runtime import PROPOSE_LLM_ADVISOR, SCHEMA_MAX_VARIABLES
+from core.variable_semantics import variable_semantic_aliases
+from core.industry_source_store import normalize_domain_key, normalize_industry_key, normalize_lookup_key, semantic_exclusion_aliases, catalog_for_request
 from core.output_equivalence import output_equivalence_signature
-from core.scenario_planner import _context_tokens, select_source_rows, select_db_variables_for_scenario, add_derived_offer_presentation, add_derived_scenario_fields
 
 
 class AgenticSchemaWorkflow:
@@ -58,7 +58,7 @@ class AgenticSchemaWorkflow:
             match = next((name for name in names if name.lower() == requested.lower()), None)
             if match:
                 return match
-        preferred = ("subscriber_id", "customer_id", "account_id", "prepaid_account_id", "user_id", "entity_id", "id")
+        preferred = ("customer_id", "account_id", "user_id", "entity_id", "id")
         return next((name for name in preferred if name in names), next(iter(field_names), None))
 
     @staticmethod
@@ -217,6 +217,20 @@ class AgenticSchemaWorkflow:
         return ordered
 
     @classmethod
+    def _lock_key(
+        cls,
+        req: ScenarioProposeRequest,
+        db_variables: list[dict[str, Any]],
+        source_sources: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Stable identity of everything the model's selection may depend on."""
+        material = json.dumps(
+            ["selection_lock_v1", req.requested_scenario_id.strip(), cls._cache_key(req, db_variables, source_sources)],
+            sort_keys=True, separators=(",", ":"), default=str,
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @classmethod
     def _cache_key(
         cls,
         req: ScenarioProposeRequest,
@@ -286,7 +300,11 @@ class AgenticSchemaWorkflow:
             for field in ordered:
                 key = field.name.strip().casefold()
                 generated_from = str(field.provenance.get("generated_from") or "").strip().lower()
-                source_by_name.setdefault(key, "MONGODB_JSON" if generated_from == "mongodb_json_source" else "LLM_GENERATED")
+                source_by_name.setdefault(key, {
+                    "mongodb_json_source": "MONGODB_JSON",
+                    "scenario_derived": "DERIVED",
+                    "behavior_pack": "DERIVED",
+                }.get(generated_from, "LLM_GENERATED"))
 
         def add_persisted(items: list[dict[str, Any]], source: str) -> None:
             for raw in items or []:
@@ -559,7 +577,6 @@ class AgenticSchemaWorkflow:
                     continue
                 winner = min(indices, key=source_priority)
                 winner_name = current_fields[winner].name
-                winner_key = winner_name.strip().casefold()
                 winner_deps = {
                     str(dep).strip().casefold()
                     for dep in (current_fields[winner].depends_on or [])
@@ -623,27 +640,11 @@ class AgenticSchemaWorkflow:
             if req.user_id and req.user_id.strip()
             else []
         )
-        # Persisted variables are an authoritative catalog, not an instruction to emit every field.
-        # Keep explicit user selections; select DB recommendations only when their semantics support
-        # the current request or a source model selected for that request. Dependencies are closed.
-        context_words = _context_tokens(req)
-        model_rows = [x for x in (source_catalog.get("models") or []) if isinstance(x, dict)]
-        # Use the same deterministic source relevance planner as the compiler. This prevents the DB
-        # selector from receiving a different, broader model set and then re-opening unrelated DB
-        # concepts that the compiler will never select from the source contract.
-        _source_preview, source_selection_report = select_source_rows(
-            model_rows,
-            context=context_words,
-            max_fields=max(1, len(model_rows)),
-        )
-        preliminary_models = set(source_selection_report.get("relevant_models") or [])
-        preliminary_models.update(source_selection_report.get("related_models") or [])
-        preliminary_models = sorted(preliminary_models)[:20]
-        recommended = select_db_variables_for_scenario(
-            recommended_all,
-            context=context_words,
-            selected_source_models=preliminary_models,
-            user_selected_names=[str(v.get("name") or "") for v in user_selected if isinstance(v, dict)],
+        # Every enabled MongoDB variable of the scenario is human-curated, so all of them are kept: they
+        # have first claim on the variable budget and are never re-scored or dropped by a relevance heuristic.
+        recommended = sorted(
+            (dict(v) for v in recommended_all if isinstance(v, dict) and str(v.get("name") or "").strip()),
+            key=lambda v: str(v["name"]).strip().casefold(),
         )
         db_variables = self._merge_db_variable_sources(recommended, user_selected)
         if not json_grounded and not db_variables:
@@ -682,7 +683,59 @@ class AgenticSchemaWorkflow:
             "and generation behavior. Return only complementary source-backed variables from the supplied catalog; persisted MongoDB variables are supplied separately and must never be recreated or renamed."
         )
 
-        cache_key = self._cache_key(req, db_variables, source_sources)
+        # A behaviour pack collapses candidates onto business concepts itself, so it must see the whole
+        # candidate pool (DB + complete source catalog); the variable budget applies to unpacked proposals.
+        candidate_pack = None
+        pack_pulled: list[str] = []
+        if json_grounded or db_variables:
+            from synth.service import propose_pack
+
+            candidate_pack = propose_pack(
+                normalize_industry_key(req.industry_type), normalize_domain_key(req.domain),
+                req.requested_scenario_id, req.use_case, req.country, req.type_of_data,
+            )
+        if candidate_pack is not None and json_grounded:
+            from synth.concepts import pull_names
+
+            pack_pulled = pull_names(
+                candidate_pack, [r for r in source_catalog.get("models") or [] if isinstance(r, dict)], covered_by=db_variables)
+        pool_cap = max(SCHEMA_MAX_VARIABLES, len(source_catalog.get("models") or []) + len(db_variables)) if candidate_pack else SCHEMA_MAX_VARIABLES
+
+        # A DB variable that depends on a source column needs that column, whatever its ranking.
+        catalog_index: dict[str, str] = {}
+        for row in sorted((r for r in source_catalog.get("models") or [] if isinstance(r, dict)), key=lambda r: str(r.get("name"))):
+            for alias in variable_semantic_aliases(row.get("name")):
+                catalog_index.setdefault(alias, str(row.get("name")))
+        db_dependencies = sorted({
+            catalog_index[alias]
+            for v in db_variables
+            for dep in (v.get("depends_on") or [])
+            for alias in sorted(variable_semantic_aliases(dep))
+            if alias in catalog_index and normalize_lookup_key(dep) not in protected_name_set
+        })
+        forced = set(pack_pulled) | set(db_dependencies)
+
+        def compile_schema(cap: int) -> ScenarioSchema:
+            return self.compiler.compile(
+                intent,
+                max_variables=cap,
+                domain_query=req.domain,
+                entity_key=req.entity_key,
+                industry_type=req.industry_type,
+                scenario_type=req.scenario_type,
+                type_of_data=req.type_of_data,
+                use_case=req.use_case,
+                business_scenario=req.business_scenario,
+                business_response="",
+                expected_outcome="",
+                country=req.country,
+                excluded_field_names=list(protected_names),
+                external_variable_names=set(protected_name_set),
+                external_variable_definitions=db_variables,
+                forced_names=forced,
+            )
+
+        cache_key = self._cache_key(req, db_variables, source_sources) + (pool_cap,)
         cached = get_proposal(cache_key)
         if cached is not None:
             intent = ScenarioIntent.model_validate(cached["intent"])
@@ -692,15 +745,28 @@ class AgenticSchemaWorkflow:
         else:
             cid = ensure_conversation(requested_scenario_id, req.user_id, requested_scenario_id)
             append_message(cid, "user", agent_prompt, requested_scenario_id=requested_scenario_id)
-            intent = self._get_intent_agent().run(
-                agent_prompt,
-                country=req.country,
-                industry_type=industry_key,
-                domain_query=req.domain,
-                excluded_variable_names=list(protected_names),
-                persisted_variables=db_variables,
-                source_catalog=source_catalog,
-            )
+            if PROPOSE_LLM_ADVISOR:
+                # The model's choice is locked the first time it is made, per distinct input (request, DB
+                # variables, source documents). Every later run of the same scenario reuses it and skips the
+                # model, so the proposal is identical until one of those inputs changes.
+                lock_key = self._lock_key(req, db_variables, source_sources)
+                stored = get_selection_lock(lock_key)
+                if stored is None:
+                    fresh = self._get_intent_agent().run(
+                        agent_prompt,
+                        country=req.country,
+                        industry_type=industry_key,
+                        domain_query=req.domain,
+                        excluded_variable_names=list(protected_names),
+                        persisted_variables=db_variables,
+                        source_catalog=source_catalog,
+                    )
+                    stored = lock_selection(lock_key, requested_scenario_id, fresh.model_dump())
+                intent = ScenarioIntent.model_validate(stored)
+            else:
+                # The variable set is a pure function of the request, the DB variables and the source
+                # catalog: no model call, so the same scenario always yields the same proposal.
+                intent = ScenarioIntent()
             intent.industry_type = industry_key
             intent.domain = req.domain
             intent.subdomain = "unknown"
@@ -723,23 +789,7 @@ class AgenticSchemaWorkflow:
                 ]
 
             if json_grounded:
-                schema = self.compiler.compile(
-                    intent,
-                    max_variables=None,
-                    domain_query=req.domain,
-                    entity_key=req.entity_key,
-                    industry_type=req.industry_type,
-                    scenario_type=req.scenario_type,
-                    type_of_data=req.type_of_data,
-                    use_case=req.use_case,
-                    business_scenario=req.business_scenario,
-                    business_response="",
-                    expected_outcome="",
-                    country=req.country,
-                    excluded_field_names=list(protected_names),
-                    external_variable_names=set(protected_name_set),
-                    external_variable_definitions=db_variables,
-                )
+                schema = compile_schema(pool_cap)
             else:
                 # No JSON source exists for this pair. The only executable definitions allowed
                 # are the persisted MongoDB scenario variables; build the schema directly from
@@ -761,18 +811,40 @@ class AgenticSchemaWorkflow:
                     unresolved_items=[] if db_fields else ["No persisted MongoDB scenario variables are available."],
                     warnings=["No industry-standard JSON source is registered for this industry/domain pair; MongoDB scenario variables are the complete executable source."],
                 )
-            # Business-stage enrichment is deterministic and happens after source/DB selection,
-            # never by copying a source catalog into the executable schema.
-            schema = schema.model_copy(update={"fields": add_derived_scenario_fields(add_derived_offer_presentation(list(schema.fields)), scenario_type=req.scenario_type, domain=req.domain, business_scenario=req.business_scenario)})
             set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
 
-        schema = schema.model_copy(update={"fields": add_derived_scenario_fields(add_derived_offer_presentation(list(schema.fields)), scenario_type=req.scenario_type, domain=req.domain, business_scenario=req.business_scenario)})
         schema, variable_sources, raw_persisted_by_name = self._merge_persisted_variables(
             schema,
             recommended,
             user_selected,
             entity_key=req.entity_key,
         )
+
+        # Behaviour pack (if one applies): collapse every candidate column onto business concepts so the
+        # dataset has exactly one column per business fact. Without a matching pack the legacy flow is unchanged.
+        pack = None
+        concept_report: dict[str, Any] | None = None
+        if candidate_pack is not None:
+            from synth.integration import apply_pack_to_schema
+
+            applied = apply_pack_to_schema(schema, candidate_pack, variable_sources, raw_persisted_by_name)
+            concept_report = applied.report
+            if applied.applied:
+                pack = candidate_pack
+                schema, variable_sources, raw_persisted_by_name = (
+                    applied.schema, applied.variable_sources, applied.raw_persisted_by_name)
+                logger.info(
+                    "[AgenticSchemaWorkflow] behaviour pack %s v%s applied: %s -> %s columns",
+                    pack.pack_id, pack.version, concept_report["input_columns"], concept_report["output_columns"],
+                )
+            else:
+                logger.info("[AgenticSchemaWorkflow] behaviour pack %s v%s skipped: %s",
+                            candidate_pack.pack_id, candidate_pack.version, concept_report["reason"])
+                if json_grounded:
+                    # Unpacked proposal: rebuild from the source under the variable budget.
+                    schema = compile_schema(SCHEMA_MAX_VARIABLES)
+                    schema, variable_sources, raw_persisted_by_name = self._merge_persisted_variables(
+                        schema, recommended, user_selected, entity_key=req.entity_key)
 
         behavioral_rules = self._canonicalize_behavioral_rules(
             list(getattr(intent, "behavioral_rules", []) or []),
@@ -836,6 +908,9 @@ class AgenticSchemaWorkflow:
             "db_variable_names": sorted(raw_persisted_by_name.keys()),
             "db_variable_definitions": raw_persisted_by_name,
             "behavioral_rules": behavioral_rules,
+            "behavior_pack_id": pack.pack_id if pack else None,
+            "behavior_pack_version": pack.version if pack else None,
+            "concept_report": concept_report,
         }
         save_draft(draft_id, draft)
         save_proposal(
@@ -866,6 +941,8 @@ class AgenticSchemaWorkflow:
             typeOfData=type_of_data,
             entityKey=entity_key,
             variableSources=variable_sources,
+            behaviorPackId=pack.pack_id if pack else None,
+            conceptReport=concept_report,
         )
 
     @staticmethod
@@ -897,10 +974,6 @@ class AgenticSchemaWorkflow:
             for name in (draft.get("db_variable_definitions") or {}).keys()
             if str(name).strip()
         )
-
-        # The proposal is already canonicalized against its source catalog and DB overlays. Do not
-        # run the legacy Low Balance reconciliation layer here; it would reintroduce telecom-specific
-        # naming and could discard legitimate source-backed fields from other scenarios.
 
         # Concept labels are soft hints. Only genuinely executable unresolved requirements block confirmation.
         # Reconcile compiler-stage diagnostics against the already merged executable variable set

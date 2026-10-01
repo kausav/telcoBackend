@@ -2,18 +2,28 @@
 from __future__ import annotations
 
 import logging
-import hashlib
 from typing import Any
 
-from core.agentic_models import GeneratedSchemaField, ResolvedConcept, ScenarioIntent, ScenarioSchema, SchemaRelationship, VariableIdea
+from core.agentic_models import (
+    GeneratedSchemaField,
+    ResolvedConcept,
+    ScenarioIntent,
+    ScenarioSchema,
+)
 import math
 import re
-from difflib import SequenceMatcher
-from core.scenario_semantics import classify_outcome_mode
-from core.json_domain_policy import is_json_grounded_domain, is_low_balance_domain
-from core.industry_source_store import catalog_for_request, normalize_lookup_key, canonical_variable_semantic_key, semantic_exclusion_aliases, _catalog_role
+from core.json_domain_policy import is_json_grounded_domain
+from core import lexicon
+from core.industry_source_store import (
+    _canonical_context_tokens,
+    catalog_for_request,
+    normalize_industry_key,
+    normalize_lookup_key,
+    semantic_exclusion_aliases,
+    _catalog_role,
+)
 from core.variable_quality import VariableQualityEngine
-from core.scenario_planner import select_source_rows
+from core.scenario_planner import owning_models, select_source_rows
 from core.temporal_contract import is_supported_temporal_rule
 from config.runtime import SCHEMA_MAX_VARIABLES, SCHEMA_MIN_VARIABLE_SCORE
 
@@ -30,7 +40,6 @@ def _is_entity_catalog_row(spec: dict[str, Any]) -> bool:
     return any(token in text for token in ("customer", "account", "party", "subscriber", "member", "patient", "policyholder", "user", "profile")) and not any(
         token in text for token in ("transaction", "event", "order", "payment", "claim", "encounter", "visit")
     )
-
 
 
 class SchemaCompiler:
@@ -77,90 +86,6 @@ class SchemaCompiler:
         "visible", "shared", "enabled", "active", "available", "valid",
     }
     _SOURCE_BOOLEAN_PREFIXES = {"is", "has", "can", "should"}
-
-    @staticmethod
-    def _source_semantic_segments(field: GeneratedSchemaField) -> list[str]:
-        """Return normalized semantic-path segments recorded by the JSON source."""
-        provenance = field.provenance or {}
-        semantic_key = str(provenance.get("source_json_semantic_key") or "").strip()
-        if semantic_key:
-            segments: list[str] = []
-            for raw_segment in semantic_key.split("."):
-                normalized = SchemaCompiler._normalize_variable_key(raw_segment)
-                if normalized:
-                    segments.append(normalized)
-            if segments:
-                return segments
-        fallback = SchemaCompiler._normalize_variable_key(field.name)
-        return [fallback] if fallback else ["scenario_attribute"]
-
-    @classmethod
-    def _source_candidate_tokens(cls, segments: list[str]) -> list[str]:
-        """Flatten the source path while removing only redundant structural repetition."""
-        output: list[str] = []
-        for segment in segments:
-            tokens = [token for token in str(segment or "").split("_") if token]
-            if not tokens:
-                continue
-            max_overlap = min(len(output), len(tokens) - 1)
-            overlap = 0
-            for size in range(max_overlap, 0, -1):
-                if output[-size:] == tokens[:size]:
-                    overlap = size
-                    break
-            output.extend(tokens[overlap:])
-
-        collapsed: list[str] = []
-        for token in output:
-            if collapsed and collapsed[-1] == token:
-                continue
-            collapsed.append(token)
-
-        # Flattened Money/Quantity wrappers frequently end with ``amount.value``. The leaf ``value``
-        # does not add a second business concept, so keep the source meaning as ``amount``.
-        if len(collapsed) >= 2 and collapsed[-1] == "value" and collapsed[-2] == "amount":
-            collapsed.pop()
-        if len(collapsed) >= 2 and collapsed[-1] == "amount" and collapsed[-2] == "amount":
-            collapsed.pop()
-        return collapsed
-
-    @classmethod
-    def _source_candidate_forms(cls, segments: list[str]) -> list[str]:
-        """Build compact whole-word names from the leaf side of the source semantic path."""
-        tokens = cls._source_candidate_tokens(segments)
-        if not tokens:
-            return []
-
-        leaf_is_generic = tokens[-1] in cls._GENERIC_SOURCE_LEAF_TOKENS
-        has_boolean_prefix = any(token in cls._SOURCE_BOOLEAN_PREFIXES for token in tokens[-3:])
-        if has_boolean_prefix:
-            minimum_tokens = min(3, len(tokens))
-        elif tokens[-1] in {"amount", "value", "quantity", "count"} and len(tokens) > 2:
-            minimum_tokens = 3
-        elif leaf_is_generic and len(tokens) > 2:
-            # Generic identifiers/statuses/names are too ambiguous on their own. Keep at least
-            # three semantic words for oversized source paths whenever the source provides them.
-            minimum_tokens = 3
-        elif leaf_is_generic and len(tokens) > 1:
-            minimum_tokens = 2
-        else:
-            minimum_tokens = 1
-        forms: list[str] = []
-        seen: set[str] = set()
-
-        # Prefer 2-4 semantic words. Larger context is considered only when needed for uniqueness.
-        max_window = min(len(tokens), 6)
-        preferred_sizes = list(range(minimum_tokens, max_window + 1))
-        preferred_sizes.sort(key=lambda size: (0 if 2 <= size <= 4 else 1, size))
-        for size in preferred_sizes:
-            candidate = cls._normalize_variable_key("_".join(tokens[-size:]))
-            if not candidate or candidate in seen:
-                continue
-            if len(candidate) <= cls.SOURCE_RUNTIME_NAME_MAX_LENGTH:
-                forms.append(candidate)
-                seen.add(candidate)
-
-        return forms
 
 
     @classmethod
@@ -259,9 +184,6 @@ class SchemaCompiler:
             result.append(rewritten)
         return result
 
-    @staticmethod
-    def _idea_tokens(idea: dict[str, object]) -> set[str]:
-        return set(_tokens(" ".join(str(idea.get(k, "")) for k in ("name", "description", "role", "grain"))))
 
     def _fresh_name(
         self,
@@ -320,136 +242,6 @@ class SchemaCompiler:
                 return list(dict.fromkeys(parts))
         return []
 
-    @classmethod
-    def _normalize_semantic_dtype(cls, name: str, description: str, role: str, dtype: str) -> str:
-        """Correct obvious LLM type mistakes from the variable's own semantics."""
-        n = cls._normalize_variable_name(name)
-        text = f"{name} {description}".lower()
-        role = str(role or "").lower()
-        dtype = str(dtype or "string").lower()
-
-        if n.endswith(("_timestamp", "_time", "_date")) or role == "timing":
-            return "date" if n.endswith("_date") and not n.endswith("_datetime") else "datetime"
-        if (
-            any(token in n for token in ("flag", "is_", "has_", "enabled", "active"))
-            or bool(re.match(r"^(?:is|has)[a-z]", n))
-        ):
-            return "boolean"
-        # Unit/currency-unit fields describe denominations, not numeric amounts.
-        # Check them before the broad ``_amount`` heuristic so names such as
-        # ``topup_amount_currency_unit`` remain strings.
-        if n.endswith(("_unit", "_units")) or "currency_unit" in n or "usage_unit" in n:
-            return "string"
-        if any(token in n for token in ("_amount", "_balance", "_quota", "_score", "_rate", "_percentage", "_percent")):
-            return "float"
-        if any(token in n for token in ("_count", "_days", "_months", "_hours", "_minutes", "number_of", "num_")):
-            return "integer"
-        # Preserve explicit boolean declarations before role-based categorical coercion.
-        if dtype in {"boolean", "bool"}:
-            return "boolean"
-        if any(token in n for token in ("_channel", "_method", "_type", "_status", "_state", "_reason", "_category", "_segment", "_capability", "circle")):
-            return "categorical"
-        if "categorical" in role or role in {"status", "decision", "configuration"}:
-            return "categorical"
-        return dtype
-
-    def _generic_contract_for_idea(
-        self,
-        idea: dict[str, object],
-        country: str | None,
-        scenario_mode: str,
-    ) -> tuple[str, str, dict[str, object]] | None:
-        """Build a deterministic contract only when the semantic idea is safely executable."""
-        name = str(idea.get("name") or "scenario_attribute")
-        desc = str(idea.get("description") or "")
-        role = str(idea.get("role") or "other").lower()
-        dtype = self._normalize_semantic_dtype(
-            name, desc, role, str(idea.get("dtype") or "string").lower()
-        )
-        lower = f"{name} {desc}".lower()
-        country_code = str(country or "IN").upper()
-
-        if name.strip().lower() == "msisdn":
-            dial_codes = {
-                "IN": "+91", "US": "+1", "CA": "+1", "GB": "+44", "AU": "+61",
-                "AE": "+971", "SG": "+65", "DE": "+49", "FR": "+33", "IT": "+39",
-            }
-            dial = dial_codes.get(country_code, country_code if country_code.startswith("+") else "+" + country_code)
-            return "e164_phone", "string", {"country_codes": [dial], "country": country_code}
-
-        if name.strip().lower() in {"subscriber_id", "account_id"}:
-            prefix = "SUB-" if name.strip().lower() == "subscriber_id" else "ACC-"
-            if name.strip().lower() == "account_id":
-                return "id_mirror", "string", {
-                    "prefix": prefix, "source_field": "subscriber_id", "source_prefix": "SUB-"
-                }
-            return "prefixed_int", "string", {"prefix": prefix, "digits": 10}
-
-        if role == "identity" or name.lower().endswith(("_id", "_key")) or name.lower() == "id":
-            prefix = f"{name[:-3].upper()}-" if name.lower().endswith("_id") else "ID-"
-            return "prefixed_int", "string", {"prefix": prefix, "digits": 10}
-
-        if dtype in self.UNSUPPORTED_NESTED_DTYPES:
-            return None
-
-        if dtype in {"datetime", "timestamp"} or role == "timing":
-            return "recent_datetime", "datetime", {
-                "timezone": "Asia/Kolkata" if country_code == "IN" else "UTC",
-                "days_back": 365,
-            }
-        if dtype == "date":
-            return "recent_date", "date", {
-                "timezone": "Asia/Kolkata" if country_code == "IN" else "UTC",
-                "days_back": 365,
-            }
-        # Preserve an explicit boolean declaration even when the semantic role is
-        # ``decision`` or ``status``. A boolean eligibility/flag must not be coerced into
-        # an open-ended categorical field merely because its business role is a decision.
-        if dtype in {"boolean", "bool"}:
-            return "weighted_choice", "boolean", {"choices": [False, True], "weights": [0.5, 0.5]}
-
-        if name.strip().lower() == "recharge_plan_validity_days":
-            return "uniform_int", "integer", {"min": 1, "max": 84, "precision": 0}
-        if dtype in {"integer", "int"} or role == "metric":
-            return "uniform_int", "integer", {"min": 0, "max": 100, "precision": 0}
-        if dtype in {"float", "decimal", "number", "numeric"} or role == "measurement":
-            return "uniform", "float", {"min": 0.0, "max": 1000.0, "precision": 2}
-        if dtype == "categorical" or role in {"status", "decision", "configuration", "categorical"}:
-            explicit = self._description_choices(desc)
-            if explicit:
-                return "weighted_choice", "categorical", {"choices": explicit, "weights": [1.0] * len(explicit)}
-
-            if "network" in lower and "capability" in lower:
-                choices = ["2G", "3G", "4G", "5G"]
-            elif "channel" in lower:
-                choices = ["APP", "SMS", "WEB", "USSD", "WHATSAPP", "IVR", "RETAIL"]
-            elif "payment" in lower and ("instrument" in lower or "method" in lower):
-                choices = ["UPI", "CREDIT_CARD", "DEBIT_CARD", "WALLET", "CASH", "AUTO_DEBIT"]
-            elif "recharge_plan_code" in name.lower() or ("plan" in lower and "code" in lower):
-                choices = ["PREPAID_1D", "PREPAID_7D", "PREPAID_14D", "PREPAID_28D", "PREPAID_30D", "PREPAID_56D", "PREPAID_84D"]
-            elif "offer" in lower:
-                choices = ["EXTRA_DATA", "CASH_BACK", "VALIDITY_BOOSTER", "DISCOUNT_VOUCHER"]
-            elif "segment" in lower:
-                choices = ["ULTRA_LOW", "MASS", "MID_TIER", "HIGH_VALUE"]
-            elif "reason" in lower:
-                choices = ["LOW_BALANCE", "DATA_EXHAUSTED", "VALIDITY_EXPIRY", "CUSTOMER_REQUEST"]
-            elif role == "status" or any(token in lower for token in (" status", "_status", " state")):
-                mode_values = {
-                    "positive": ["COMPLETED", "SUCCESS", "APPROVED"],
-                    "negative": ["FAILED", "ERROR", "REJECTED"],
-                    "suppression": ["SUPPRESSED", "HELD", "SKIPPED"],
-                    "decline_or_no_response": ["DECLINED", "NO_RESPONSE", "REJECTED"],
-                    "concurrent": ["NO_CLEAR_PRIORITY", "CONFLICT", "PENDING_PRIORITY"],
-                    "mixed": ["COMPLETED", "FAILED", "PENDING"],
-                }
-                choices = mode_values.get(scenario_mode or "mixed", mode_values["mixed"])
-            else:
-                return None
-            return "weighted_choice", "categorical", {"choices": choices, "weights": [1.0] * len(choices)}
-
-        # Do not manufacture a meaningless generic string contract. The field must either
-        # be grounded in a concrete registry generator or have a recognized semantic contract.
-        return None
 
     @staticmethod
     def _json_source_contract(
@@ -480,7 +272,7 @@ class SchemaCompiler:
             }
 
         # Honor standard-defined string formats before generic semantic name heuristics. This is
-        # important for non-telecom sources where a field named ``id`` may legally be a UUID/URI.
+        # important for other sources where a field named ``id`` may legally be a UUID/URI.
         if dtype in {"string", "str", "text"}:
             string_params: dict[str, object] = {}
             if fmt:
@@ -507,7 +299,7 @@ class SchemaCompiler:
             if source_examples:
                 string_params["source_examples"] = source_examples
             # Every MongoDB-backed JSON string is source-contract-bound. There is no
-            # filesystem/telecom fallback for an industry source field.
+            # filesystem/vocabulary fallback for an industry source field.
             string_params["source_contract"] = True
             if fmt in {"uuid", "uuid4"}:
                 return "uuid_string", "string", string_params
@@ -524,7 +316,7 @@ class SchemaCompiler:
             return "semantic_string", "string", string_params
 
         # Some official Swagger string definitions encode a constrained vocabulary only
-        # in their descriptions (for example RelatedTopupBalance.role = parent/child).
+        # in their descriptions (for example RelatedOrder.role = parent/child).
         # Materialize those explicit source-described choices instead of falling back to
         # generic semantic strings.
         description = str(spec.get("description") or "")
@@ -646,12 +438,6 @@ class SchemaCompiler:
         candidate_variables_override: list[dict[str, object]] | None = None,
         all_source_specs: list[dict[str, Any]] | None = None,
     ) -> list[GeneratedSchemaField]:
-        normalized_type = str(type_of_data or intent.type_of_data or "transactional").strip().lower()
-        excluded_keys = {
-            self._normalize_variable_key(name)
-            for name in (excluded_field_names or [])
-            if self._normalize_variable_key(name)
-        }
         raw_ideas = (
             [dict(idea) for idea in candidate_variables_override]
             if candidate_variables_override is not None
@@ -684,7 +470,7 @@ class SchemaCompiler:
         # Keep LLM-proposed scenario variables even when their names are similar to official
         # attributes. The official scalar catalog is already de-duplicated by exact field name,
         # while scenario-derived analytics such as ``balance_remaining_amount`` and
-        # ``topup_recharge_amount`` can intentionally coexist with their source-backed fields.
+        # ``extra_charge_amount`` can intentionally coexist with their source-backed fields.
         # Fuzzy suppression previously removed legitimate scenario variables and narrowed the
         # generated schema below the requested business scope.
         for idea in raw_ideas:
@@ -692,7 +478,7 @@ class SchemaCompiler:
         if entity_key:
             add_idea({
                 "name": entity_key,
-                "description": f"Stable identifier for the requested {intent.use_case or 'telecom'} entity.",
+                "description": f"Stable identifier for the requested {intent.use_case or intent.domain or 'business'} entity.",
                 "role": "identity",
                 "grain": "entity",
                 "dtype": "string",
@@ -891,8 +677,9 @@ class SchemaCompiler:
         external_variable_names: set[str] | None = None,
         external_variable_definitions: list[dict[str, Any]] | None = None,
         max_variables: int | None = None,
+        forced_names: set[str] | None = None,
     ) -> ScenarioSchema:
-        """Compile any MongoDB-backed standards domain without assuming telecom semantics."""
+        """Compile any MongoDB-backed standards domain without assuming any industry's semantics."""
         catalog_payload = catalog_for_request(industry_type, domain)
         catalog_rows = [dict(row) for row in (catalog_payload.get("models") or []) if isinstance(row, dict)]
         if not catalog_rows:
@@ -978,11 +765,16 @@ class SchemaCompiler:
         candidate_pool_budget = min(len(catalog_rows), max(variable_budget, 1)) if variable_budget else 0
         selected_rows, source_selection_report = select_source_rows(
             catalog_rows,
-            context=set(re.findall(r"[a-z0-9]+", business_context.casefold())) - {"and", "the", "of", "to", "in", "for", "with", "a", "an", "is", "are"},
+            context=_canonical_context_tokens(
+                set(re.findall(r"[a-z0-9]+", business_context.casefold())) - {"and", "the", "of", "to", "in", "for", "with", "a", "an", "is", "are"},
+                lexicon.load(normalize_industry_key(industry_type) if industry_type else None),
+            ),
             preferred_names=preferred_names,
             preferred_models={str(value) for value in (intent.requested_entities or []) if str(value).strip()},
             excluded_names=excluded,
             excluded_semantic_keys=external_semantic_aliases,
+            forced_names=forced_names,
+            owner_models=owning_models(external_variable_definitions, catalog_rows),
             max_fields=candidate_pool_budget,
         )
 
@@ -1017,7 +809,7 @@ class SchemaCompiler:
                 "_source_model": f"{spec.get('source_id','')}__{spec.get('model','')}",
                 "_source_required": bool(spec.get("required")),
                 "_source_nullable": not bool(spec.get("required")),
-                "_force_include": bool(spec.get("required")) or (
+                "_force_include": bool(spec.get("required")) or normalize_lookup_key(spec.get("name")) in {normalize_lookup_key(n) for n in (forced_names or ())} or (
                     normalized_type == "transactional"
                     and resolved_entity_key
                     and self._normalize_variable_key(str(spec.get("name") or "")) == self._normalize_variable_key(resolved_entity_key)
@@ -1159,6 +951,7 @@ class SchemaCompiler:
         excluded_field_names: list[str] | None = None,
         external_variable_names: set[str] | None = None,
         external_variable_definitions: list[dict[str, Any]] | None = None,
+        forced_names: set[str] | None = None,
     ) -> ScenarioSchema:
         """Compile only from active MongoDB industry/domain JSON sources."""
         normalized_industry = (industry_type or intent.industry_type or "").strip()
@@ -1182,6 +975,7 @@ class SchemaCompiler:
             external_variable_names=external_variable_names,
             external_variable_definitions=external_variable_definitions,
             max_variables=max_variables,
+            forced_names=forced_names,
         )
 
     def approval_questions(self, intent: ScenarioIntent, schema: ScenarioSchema) -> list[str]:
@@ -1190,6 +984,4 @@ class SchemaCompiler:
             questions.append("How many records/entities should be generated?")
         if intent.country is None:
             questions.append("Which country/market should be modeled?")
-        if "recharge" in {e.canonical_id for e in schema.entities} and "usage_event" in {e.canonical_id for e in schema.entities}:
-            questions.append("Should recharge and usage histories be generated as a causal timeline with balance impact enabled?")
         return questions

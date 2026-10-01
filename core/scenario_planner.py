@@ -12,7 +12,6 @@ from typing import Any, Iterable
 from core.industry_source_store import (
     _catalog_role,
     _normalize_model_name,
-    _source_owner_family,
     canonical_variable_semantic_key,
     normalize_lookup_key,
 )
@@ -29,8 +28,8 @@ _GENERIC_ROLE_WORDS = {
     "records", "resource", "entity", "object", "data", "model", "detail", "details", "profile", "balance",
 }
 _ENTITY_WORDS = {
-    "customer", "subscriber", "user", "member", "patient", "account", "policyholder", "client",
-    "tenant", "person", "organization", "company", "party", "msisdn", "phone", "mobile",
+    "customer", "user", "member", "patient", "account", "policyholder", "client",
+    "tenant", "person", "organization", "company", "party", "phone", "mobile",
 }
 
 
@@ -38,20 +37,9 @@ def _tokens(value: Any) -> set[str]:
     text = str(value or "").casefold()
     raw = re.findall(r"[a-z0-9]+", text)
     out: set[str] = set()
-    # Treat common hyphen/space punctuation variants as one semantic term (for example
-    # ``top-up`` and ``top up``). This is normalization, not an industry-specific field list.
-    if re.search(r"\btop[\s_-]+up\b", text):
-        raw.append("topup")
     for token in raw:
         if token in _STOP:
             continue
-        # Keep compound source names usable without a telecom-specific dictionary.
-        if token.endswith("balance") and len(token) > len("balance") + 2:
-            out.add(token[:-len("balance")])
-            out.add("balance")
-        if token.endswith("topup") and len(token) > len("topup") + 2:
-            out.add(token[:-len("topup")])
-            out.add("topup")
         out.add(token)
         if token.endswith("ies") and len(token) > 4:
             out.add(token[:-3] + "y")
@@ -131,8 +119,25 @@ def _model_evidence(rows: list[dict[str, Any]], context: set[str], preferred_mod
     return result
 
 
-def _same_owner(row: dict[str, Any], model: str) -> bool:
-    return _source_owner_family(row.get("source_owner_model") or row.get("model")) == _source_owner_family(model)
+def _definition_key(row: dict[str, Any]) -> tuple:
+    """Identity of what a source leaf *is*, independent of the resource that carries it.
+
+    Sibling resources of a standard repeat the same leaf (``product[].name``, ``usageType``, ``status`` ...) with
+    the same type, allowed values and meaning. Those copies are one business concept, not several variables.
+    """
+    path = str(row.get("path") or "")
+    leaf = path.split(".", 1)[1] if "." in path else path
+    return (leaf, str(row.get("dtype") or ""), tuple(row.get("enum_values") or ()), " ".join(str(row.get("description") or "").split()))
+
+
+def owning_models(variables: Iterable[dict[str, Any]] | None, rows: list[dict[str, Any]]) -> set[str]:
+    """Source models that own at least one of the given (curated) variables, matched on the flattened name prefix."""
+    def compact(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+    names = [compact(v.get("name")) for v in variables or [] if isinstance(v, dict) and v.get("name")]
+    models = {_normalize_model_name(r.get("business_model") or r.get("model")) for r in rows}
+    return {m for m in models if m and any(n.startswith(compact(m)) for n in names)}
 
 
 def select_source_rows(
@@ -143,6 +148,8 @@ def select_source_rows(
     preferred_models: set[str] | None = None,
     excluded_names: set[str] | None = None,
     excluded_semantic_keys: set[str] | None = None,
+    forced_names: set[str] | None = None,
+    owner_models: set[str] | None = None,
     max_fields: int = 500,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Select scenario-relevant source leaves without whole-model expansion."""
@@ -150,6 +157,8 @@ def select_source_rows(
     preferred = {normalize_lookup_key(x) for x in preferred_names or set() if normalize_lookup_key(x)}
     excluded = {normalize_lookup_key(x) for x in excluded_names or set() if normalize_lookup_key(x)}
     excluded_sem = {normalize_lookup_key(x) for x in excluded_semantic_keys or set() if normalize_lookup_key(x)}
+    # Fields a behaviour pack cannot run without: they open their model and are selected unconditionally.
+    forced = {normalize_lookup_key(x) for x in forced_names or set() if normalize_lookup_key(x)}
 
     canonical: list[dict[str, Any]] = []
     seen_semantics: set[str] = set()
@@ -166,7 +175,7 @@ def select_source_rows(
         if semantic:
             seen_semantics.add(semantic)
         kind = str(row.get("model_kind") or "resource")
-        if kind in {"support", "support_reference", "abstract", "auxiliary", "crud_wrapper"}:
+        if kind in {"support", "support_reference", "abstract", "auxiliary", "crud_wrapper", "event_wrapper"}:
             continue
         canonical.append(row)
 
@@ -184,6 +193,11 @@ def select_source_rows(
         direct = bool(_source_direct_signal(row, context))
         if direct or _relevance_score(row, context) >= 28:
             models.add(model)
+    for row in canonical:
+        if normalize_lookup_key(row.get("name")) in forced:
+            model = _normalize_model_name(row.get("business_model") or row.get("model"))
+            if model:
+                models.add(model)
     anchor_models: set[str] = set()
 
     # Entity/resource anchors are selected without allowing generic "id" or "account" words to
@@ -199,6 +213,17 @@ def select_source_rows(
             models.add(model)
             anchor_models.add(model)
             break
+
+    # The resources the curated DB variables belong to are the scenario's primary resources. Sibling
+    # resources that merely share vocabulary with the request (other operations on the same balance,
+    # say) would only add look-alike reference columns, so they are not opened.
+    # That only holds when the curated variables describe resources beyond the entity itself. A scenario whose
+    # curated variables are just the entity's identifiers has no resource of its own yet, so the scenario
+    # context alone decides which source models are relevant.
+    requested_models = {_normalize_model_name(v) for v in (preferred_models or ()) if _normalize_model_name(v)}
+    resource_owners = {m for m in (owner_models or set()) if not (_tokens(m) & _ENTITY_WORDS)}
+    if resource_owners or requested_models:
+        models = {m for m in models if m in resource_owners or m in requested_models or m in anchor_models}
 
     # Add source-defined related models only one hop from an already relevant model.  This is a
     # structural relation, not a broad resource expansion.
@@ -222,8 +247,20 @@ def select_source_rows(
             if target not in models:
                 related.add(target)
 
+    def reference_leaf(row: dict[str, Any], model: str) -> bool:
+        """An identifier that points at another resource, rather than naming this one or the entity."""
+        if _catalog_role(row) != "identity":
+            return False
+        rest = _tokens(row.get("name")) - _tokens(model)
+        rest -= {"id", "identifier", "key"}
+        if not rest:
+            return False                                        # the model's own identifier
+        return not (model in anchor_models and rest <= _ENTITY_WORDS)
+
     def admissible(row: dict[str, Any], model: str, *, direct: bool, related_model: bool = False) -> bool:
         role = _catalog_role(row)
+        if normalize_lookup_key(row.get("name")) not in forced and reference_leaf(row, model):
+            return False
         if direct or row.get("required"):
             return True
         # Entity anchor models are opened only to provide identity/relationship anchors unless the
@@ -255,6 +292,9 @@ def select_source_rows(
         if name in preferred:
             score += 100.0
             direct = True
+        if name in forced:
+            score += 1000.0
+            direct = True
         role = _catalog_role(row)
         if model in related:
             score -= 10.0
@@ -271,32 +311,46 @@ def select_source_rows(
     # Keep a small amount of structural coverage per relevant model, then the strongest direct fields.
     selected: list[dict[str, Any]] = []
     selected_sem: set[str] = set()
-    for model in sorted(models):
+    selected_defs: set[tuple] = set()
+
+    def repeated(row: dict[str, Any]) -> bool:
+        name = normalize_lookup_key(row.get("name"))
+        return name not in preferred and name not in forced and _definition_key(row) in selected_defs
+
+    # Models whose own name matches the scenario come first (then by their best field), and every opened model
+    # gets a fair share of the budget, so the order of names in the catalog never decides what is selected.
+    name_evidence = context - _GENERIC_ROLE_WORDS - _ENTITY_WORDS
+    best_score: dict[str, float] = {}
+    for score, _row, model in scored:
+        best_score[model] = max(best_score.get(model, float("-inf")), score)
+    ranked_models = sorted(models, key=lambda m: (-len((_tokens(m) - _GENERIC_ROLE_WORDS - _ENTITY_WORDS) & name_evidence), -best_score.get(m, 0.0), m))
+    share = max(3, min(12, limit // max(1, len(ranked_models))))
+    for model in ranked_models:
         candidates = sorted(
             [item for item in scored if item[2] == model],
             key=lambda item: (-item[0], item[1].get("depth", 0), normalize_lookup_key(item[1].get("name"))),
         )
-        for score, row, _ in candidates[:12]:
+        for score, row, _ in candidates[:share]:
             sem = canonical_variable_semantic_key(row) or normalize_lookup_key(row.get("name"))
-            if sem in selected_sem:
+            if sem in selected_sem or repeated(row):
                 continue
             direct = bool(_source_direct_signal(row, context))
             if not admissible(row, model, direct=direct, related_model=False):
                 continue
-            selected.append(dict(row)); selected_sem.add(sem)
+            selected.append(dict(row)); selected_sem.add(sem); selected_defs.add(_definition_key(row))
 
     for score, row, model in sorted(scored, key=lambda x: (-x[0], x[2], normalize_lookup_key(x[1].get("name")))):
         if len(selected) >= limit:
             break
         sem = canonical_variable_semantic_key(row) or normalize_lookup_key(row.get("name"))
-        if sem in selected_sem:
+        if sem in selected_sem or repeated(row):
             continue
         direct = bool(_source_direct_signal(row, context))
         if not admissible(row, model, direct=direct, related_model=(model in related)):
             continue
         if model in related and score < 18 and normalize_lookup_key(row.get("name")) not in preferred:
             continue
-        selected.append(dict(row)); selected_sem.add(sem)
+        selected.append(dict(row)); selected_sem.add(sem); selected_defs.add(_definition_key(row))
 
     # Resolve explicit preferred fields last only when their owning model is scenario-relevant. This
     # protects against one noisy LLM field opening a sibling operation model.
@@ -310,7 +364,11 @@ def select_source_rows(
             continue
         selected.append(dict(row)); selected_sem.add(sem)
 
-    selected = selected[:limit]
+    # Forced fields come first so a budget can never squeeze them out.
+    forced_rows = [dict(r) for r in canonical if normalize_lookup_key(r.get("name")) in forced]
+    forced_keys = {canonical_variable_semantic_key(r) or normalize_lookup_key(r.get("name")) for r in forced_rows}
+    selected = forced_rows + [r for r in selected if (canonical_variable_semantic_key(r) or normalize_lookup_key(r.get("name"))) not in forced_keys]
+    selected = selected[:max(limit, len(forced_rows))]
     report = {
         "candidate_count": len(canonical),
         "canonical_candidate_count": len(canonical),
@@ -360,12 +418,12 @@ def select_db_variables_for_scenario(
             "party", "requestor", "owner", "receiver", "related", "payment", "method",
             "channel", "product", "logical", "resource", "voucher", "reference", "href", "role",
         }
-        explicit_entity_name = bool(field_name_tokens & {"msisdn", "phone", "mobile"}) or normalize_lookup_key(item.get("name")) in {
-            "customer_id", "subscriber_id", "user_id", "member_id", "patient_id", "account_id"
+        explicit_entity_name = bool(field_name_tokens & {"phone", "mobile"}) or normalize_lookup_key(item.get("name")) in {
+            "customer_id", "user_id", "member_id", "patient_id", "account_id"
         }
         entity_identity = explicit_entity_name or (
             role == "identity"
-            and bool(field_name_tokens & {"customer", "subscriber", "user", "member", "patient"})
+            and bool(field_name_tokens & {"customer", "user", "member", "patient"})
             and not (field_name_tokens & relationship_markers)
         )
         resource_identity = bool(role == "identity" and model_overlap and not (field_name_tokens & relationship_markers))
@@ -384,13 +442,13 @@ def select_db_variables_for_scenario(
         entity_model = bool(matched_model and _tokens(matched_model) & _ENTITY_WORDS)
         decision_context = context_set & {
             "offer", "accepted", "accept", "acceptance", "response", "decision",
-            "intervention", "communication", "contact", "recharge", "topup", "upsell",
+            "intervention", "communication", "contact",
         }
         score = 14.0 * len(direct) + 8.0 * len(model_overlap)
-        # A low-balance/recharge-style scenario has an implicit decision point when the persisted
+        # An intervention/offer-style scenario has an implicit decision point when the persisted
         # catalog exposes a concrete offer/acceptance concept. This is semantic evidence from the
         # request terms, not a field-name allowlist for one industry.
-        if (field_name_tokens & {"offer", "accepted", "accept", "acceptance", "recommend", "recommended"}) and (context_set & {"topup", "recharge", "intervention", "upsell", "offer"}):
+        if (field_name_tokens & {"offer", "accepted", "accept", "acceptance", "recommend", "recommended"}) and (context_set & {"intervention", "offer"}):
             score += 18
             direct = True
         # Entity identity is structurally useful even if no model is explicitly named in the request.
@@ -476,119 +534,3 @@ def select_db_variables_for_scenario(
                     selected.append(dict(dep_item)); selected_names.add(key); changed = True
 
     return selected
-
-
-def add_derived_offer_presentation(fields: list[Any]) -> list[Any]:
-    """Add a derived presentation flag only when an acceptance decision exists without one."""
-    names = {str(getattr(f, "name", "") or "").casefold() for f in fields}
-    accepted = next((str(getattr(f, "name", "")) for f in fields if "offer" in str(getattr(f, "name", "")).casefold() and "accept" in str(getattr(f, "name", "")).casefold()), None)
-    presented = next((str(getattr(f, "name", "")) for f in fields if "offer" in str(getattr(f, "name", "")).casefold() and ("present" in str(getattr(f, "name", "")).casefold() or "presentation" in str(getattr(f, "name", "")).casefold())), None)
-    if not accepted or presented or "offer_presented_flag" in names:
-        return fields
-
-    from core.agentic_models import GeneratedSchemaField
-    support = [
-        str(getattr(f, "name", "")) for f in fields
-        if "intervention" in str(getattr(f, "name", "")).casefold() or "recommend" in str(getattr(f, "name", "")).casefold()
-    ]
-    if not support:
-        return fields
-    dependencies = support[:2]
-    fields.append(GeneratedSchemaField(
-        name="offer_presented_flag",
-        dtype="boolean",
-        description="Derived flag indicating that a decisionable offer or recommendation was presented to the customer.",
-        gen="formula",
-        params={},
-        depends_on=dependencies,
-        nullable=False,
-        required=False,
-        formula=" and ".join(f"{dep} != None" for dep in dependencies),
-        scope="transaction",
-        provenance={"generated_from": "scenario_derived", "role": "decision", "derived_from": dependencies},
-    ))
-    return fields
-
-
-def add_derived_scenario_fields(
-    fields: list[Any],
-    *,
-    scenario_type: str = "",
-    domain: str = "",
-    business_scenario: str = "",
-) -> list[Any]:
-    """Add only high-confidence missing decision/derived concepts required by the scenario.
-
-    These are executable derived concepts, not copied source fields. The additions are
-    domain-neutral and depend on semantic evidence already present in the selected contract.
-    """
-    from core.agentic_models import GeneratedSchemaField
-
-    out = list(fields)
-    existing = {str(getattr(f, "name", "") or "").casefold() for f in out}
-    context = _tokens(" ".join((scenario_type, domain, business_scenario)))
-
-    # Suppression scenarios need an explicit observable decision, even when the source schema
-    # exposes only the communication inputs. This makes scenarioType semantically testable.
-    suppression = "suppression" in context or "suppressed" in context or "do_not_contact" in context
-    if suppression:
-        if "suppression_flag" not in existing:
-            out.append(GeneratedSchemaField(
-                name="suppression_flag",
-                dtype="boolean",
-                description="Derived flag indicating that the applicable communication or intervention was suppressed for this scenario event.",
-                gen="formula",
-                params={},
-                depends_on=[],
-                nullable=False,
-                required=False,
-                formula="True",
-                scope="transaction",
-                provenance={"generated_from": "scenario_derived", "role": "decision", "scenario_semantics": "suppression"},
-            ))
-            existing.add("suppression_flag")
-        if "communication_allowed" not in existing:
-            out.append(GeneratedSchemaField(
-                name="communication_allowed",
-                dtype="boolean",
-                description="Derived flag indicating whether the communication or intervention is allowed for the scenario event.",
-                gen="formula",
-                params={},
-                depends_on=["suppression_flag"],
-                nullable=False,
-                required=False,
-                formula="not suppression_flag",
-                scope="transaction",
-                provenance={"generated_from": "scenario_derived", "role": "eligibility", "derived_from": ["suppression_flag"]},
-            ))
-            existing.add("communication_allowed")
-
-    # A depletion journey benefits from a machine-computable depletion horizon when the selected
-    # contract already exposes compatible remaining quantity and consumption velocity concepts.
-    depletion_context = bool({"depletion", "exhaustion", "depleted"} & context)
-    data_context = bool({"data", "consumption"} & context)
-    if depletion_context and data_context and "days_to_depletion" not in existing:
-        remaining = [f for f in out if str(getattr(f, "dtype", "") or "").casefold() in {"int", "integer", "float", "decimal", "number", "numeric"} and "remaining" in str(getattr(f, "name", "") or "").casefold()]
-        velocity = [f for f in out if str(getattr(f, "dtype", "") or "").casefold() in {"int", "integer", "float", "decimal", "number", "numeric"} and any(t in str(getattr(f, "name", "") or "").casefold() for t in ("velocity", "consumption_rate", "usage_rate", "per_day"))]
-        if remaining and velocity:
-            rem = remaining[0]
-            vel = velocity[0]
-            rem_text = f"{getattr(rem, 'name', '')} {getattr(rem, 'description', '')}".casefold()
-            vel_text = f"{getattr(vel, 'name', '')} {getattr(vel, 'description', '')}".casefold()
-            compatible_unit = any(unit in rem_text and unit in vel_text for unit in ("mb", "gb", "byte", "bytes"))
-            if compatible_unit:
-                formula = f"max(0, {rem.name} / {vel.name})"
-                out.append(GeneratedSchemaField(
-                    name="days_to_depletion",
-                    dtype="float",
-                    description="Derived number of days until the remaining resource is depleted at the current consumption velocity.",
-                    gen="formula",
-                    params={"min": 0, "precision": 2},
-                    depends_on=[rem.name, vel.name],
-                    nullable=False,
-                    required=False,
-                    formula=formula,
-                    scope="transaction",
-                    provenance={"generated_from": "scenario_derived", "role": "derived", "derived_from": [rem.name, vel.name]},
-                ))
-    return out

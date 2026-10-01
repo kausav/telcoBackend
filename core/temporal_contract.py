@@ -37,9 +37,8 @@ _TEMPORAL_SUFFIXES = (
 def normalize_temporal_family(name: Any) -> str:
     """Return a canonical resource family for a temporal field name.
 
-    Underscore/casing variants are normalized so e.g. ``topupbalance_*`` and
-    ``topup_balance_*`` can match, while genuinely different resources such as
-    ``adjust_balance_*`` and ``topup_balance_*`` remain separate.
+    Underscore/casing variants are normalized so e.g. ``resourcex_*`` and
+    ``resource_x_*`` can match, while genuinely different resources remain separate.
     """
     text = re.sub(r"[^a-z0-9]+", "_", str(name or "").casefold()).strip("_")
     for suffix in _TEMPORAL_SUFFIXES:
@@ -73,23 +72,11 @@ def _source_identity(var: dict[str, Any]) -> str:
     return model or source_id
 
 
-def same_source_model(parent: dict[str, Any], child: dict[str, Any]) -> bool:
-    left = _source_model(parent)
-    right = _source_model(child)
-    return bool(left and right and left == right)
-
-
 def same_source_resource(parent: dict[str, Any], child: dict[str, Any]) -> bool:
     """Return whether two fields share the same preserved source resource identity."""
     left = _source_identity(parent)
     right = _source_identity(child)
     return bool(left and right and left == right)
-
-
-def is_temporal_name(name: Any) -> bool:
-    """Whether a field name explicitly carries a temporal lifecycle suffix."""
-    text = re.sub(r"[^a-z0-9]+", "_", str(name or "").casefold()).strip("_")
-    return any(text.endswith(suffix) for suffix in _TEMPORAL_SUFFIXES)
 
 
 def explicit_datetime_dependency(parent_name: str, child: dict[str, Any]) -> bool:
@@ -174,7 +161,3 @@ def source_declared_max_delay_seconds(parent: dict[str, Any], child: dict[str, A
     return None
 
 
-def temporal_relationship_reason(parent: dict[str, Any], child: dict[str, Any]) -> str:
-    if explicit_datetime_dependency(str(parent.get("name") or ""), child):
-        return "Confirmed datetime dependency implies chronological causality."
-    return "Same canonical resource family implies lifecycle ordering."

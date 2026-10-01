@@ -48,7 +48,12 @@ JSON_SOURCE_LLM_FIELDS_PER_MODEL = max(3, int(os.getenv("JSON_SOURCE_LLM_FIELDS_
 # Process-local cache for immutable active source catalogs. Admin mutations invalidate the cache.
 SOURCE_CATALOG_CACHE_TTL_SECONDS = max(5, int(os.getenv("SOURCE_CATALOG_CACHE_TTL_SECONDS", "60")))
 
-SCHEMA_MAX_VARIABLES = int(os.getenv("SCHEMA_MAX_VARIABLES", "500"))
+# Total variables per proposal, DB variables included (they are always kept first; JSON variables fill the rest).
+SCHEMA_MAX_VARIABLES = max(1, int(os.getenv("SCHEMA_MAX_VARIABLES", "60")))
+# When true, the LLM names the relevant source resources/variables once per distinct input and that choice is
+# locked in MongoDB, so later runs of the same scenario reuse it. When false no model is called at all and the
+# JSON variables come only from the resources the DB variables belong to.
+PROPOSE_LLM_ADVISOR = os.getenv("PROPOSE_LLM_ADVISOR", "true").strip().lower() in {"1", "true", "yes", "on"}
 SCHEMA_MIN_VARIABLE_SCORE = float(os.getenv("SCHEMA_MIN_VARIABLE_SCORE", "42"))
 
 GENERATION_MAX_ATTEMPTS_PER_RECORD = max(1, min(20, int(os.getenv("GENERATION_MAX_ATTEMPTS_PER_RECORD", "8"))))

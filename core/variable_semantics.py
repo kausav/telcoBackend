@@ -23,8 +23,6 @@ _SYNONYMS = (
     ("valid_for_end_date_time", "valid_to"),
     ("shared_flag", "shared"),
     ("is_shared_flag", "is_shared"),
-    ("recharge", "topup"),
-    ("top_up", "topup"),
     ("automatic", "auto"),
 )
 
@@ -75,7 +73,7 @@ def variable_semantic_aliases(value: Any) -> set[str]:
     aliases = {canonical, re.sub(r"[^a-z0-9]", "", canonical)}
 
     # A second normalization pass protects against mixed producer orderings such as
-    # top_up_top_up_balance vs recharge_balance without introducing broad suffix aliases.
+    # order_order_total vs purchase_total without introducing broad suffix aliases.
     compact_canonical = aliases.copy()
     for alias in compact_canonical:
         if alias:

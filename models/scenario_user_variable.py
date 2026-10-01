@@ -23,7 +23,7 @@ class ScenarioUserVariableModel:
                     variables: list[dict[str, Any]], state: str = "SELECTED") -> int:
         from core.agentic_models import GeneratedSchemaField
         from core.variable_semantics import variable_semantic_identities
-        from core.low_balance_variable_policy import validate_db_definition
+        from core.variable_contract import validate_db_definition
         requested = str(requested_scenario_id or "").strip()
         if not requested:
             raise ValueError("requested_scenario_id is required")
