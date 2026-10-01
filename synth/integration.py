@@ -7,7 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from synth.concepts import canonicalize
+from synth.concepts import Canonicalization, canonicalize
+from synth.fill import fill_rates
 from synth.pack import BehaviorPack
 
 
@@ -26,6 +27,9 @@ def apply_pack_to_schema(
     pack: BehaviorPack,
     variable_sources: dict[str, str],
     raw_persisted_by_name: dict[str, dict[str, Any]],
+    *,
+    mode: str = "mixed",
+    min_fill: float = 0.0,
 ) -> PackApplication:
     """Collapse a merged ``ScenarioSchema`` onto the pack's concepts - or leave it untouched.
 
@@ -33,6 +37,10 @@ def apply_pack_to_schema(
     has a column for every concept it cannot run without. Otherwise the schema is returned unchanged
     (legacy flow) with a report saying exactly why, so a pack never silently removes variables somebody
     curated. DB-owned variable definitions are returned exactly as stored, plus a ``concept`` tag.
+
+    A column that would be empty on nearly every row for this scenario ``mode`` (a value on fewer than ``min_fill``
+    of the rows) is left out, because a variable that is null all the time is noise. Only a variable the person
+    explicitly selected (USER_SELECTED) is always kept.
     """
     from core.agentic_models import GeneratedSchemaField
 
@@ -46,6 +54,7 @@ def apply_pack_to_schema(
              "uncovered_curated": result.uncovered, "missing_required_concepts": result.missing_required},
         )
 
+    _drop_sparse(result, pack, variable_sources, mode, min_fill)
     kept = [GeneratedSchemaField.model_validate(f) for f in result.fields]
     kept_keys = {f.name.strip().casefold() for f in kept}
 
@@ -74,7 +83,34 @@ def apply_pack_to_schema(
         "warnings": list(schema.warnings) + result.warnings + [
             f"Behaviour pack '{pack.pack_id}' reduced {result.input_count} candidate columns to {len(kept)} "
             f"({dropped.get('excluded', 0)} out of scope, {dropped.get('duplicate', 0)} duplicates of the same fact, "
-            f"{dropped.get('unmapped', 0)} unmapped)."
+            f"{dropped.get('unmapped', 0)} unmapped, {dropped.get('sparse', 0)} empty on nearly every row for this scenario)."
         ],
     })
     return PackApplication(True, schema, sources, raw, {**base, "applied": True, **report})
+
+
+def _drop_sparse(result: Canonicalization, pack: BehaviorPack, variable_sources: dict[str, str],
+                 mode: str, min_fill: float) -> None:
+    """Remove columns whose concept is practically always empty in ``mode`` (in place)."""
+    if min_fill <= 0:
+        return
+    fills = fill_rates(pack, mode)
+    sources = {str(k).casefold(): str(v).upper() for k, v in variable_sources.items()}
+    kept: list[dict[str, Any]] = []
+    for column in result.fields:
+        cid = str(column.get("concept") or "")
+        name = str(column.get("name") or "")
+        source = sources.get(name.casefold()) or str(column.get("source") or "").upper()
+        concept = pack.concepts.get(cid)
+        share = fills.get(cid, 1.0)
+        if concept is not None and not concept.required and cid != pack.entity_concept \
+                and source != "USER_SELECTED" and share < min_fill:
+            result.concept_columns.pop(cid, None)
+            result.dropped.append({
+                "name": name, "kind": "sparse", "concept": cid, "source": source,
+                "reason": f"Carries a value on only {share:.0%} of rows for this scenario type, so it is not "
+                          "offered as a variable (select it explicitly if you need it).",
+            })
+            continue
+        kept.append(column)
+    result.fields = kept

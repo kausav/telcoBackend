@@ -99,6 +99,7 @@ class EventRows:
         return {
             **pack.reference,
             "currency": pack.currency,
+            "model": params,                 # the mode's model parameters (what ``P`` is in emit expressions)
             "as_of": ctx.as_of,
             "tz_offset_min": (offset.total_seconds() / 60.0) if offset else 0.0,
             "min_gap_seconds": _need(params, "timeline", "min_gap_minutes") * 60,

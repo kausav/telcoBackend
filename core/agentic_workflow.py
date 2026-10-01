@@ -24,7 +24,7 @@ from core.variable_contract import validate_db_definition
 logger = logging.getLogger(__name__)
 from agents.intent_agent import GeminiIntentAgent
 from agents.schema_compiler import SchemaCompiler
-from config.runtime import PROPOSE_LLM_ADVISOR, SCHEMA_MAX_VARIABLES
+from config.runtime import PACK_MIN_FILL, PROPOSE_LLM_ADVISOR, SCHEMA_MAX_VARIABLES
 from core.variable_semantics import variable_semantic_aliases
 from core.industry_source_store import normalize_domain_key, normalize_industry_key, normalize_lookup_key, semantic_exclusion_aliases, catalog_for_request
 from core.output_equivalence import output_equivalence_signature
@@ -828,7 +828,13 @@ class AgenticSchemaWorkflow:
         if candidate_pack is not None:
             from synth.integration import apply_pack_to_schema
 
-            applied = apply_pack_to_schema(schema, candidate_pack, variable_sources, raw_persisted_by_name)
+            from core.scenario_semantics import classify_outcome_mode
+
+            mode = classify_outcome_mode(
+                scenario_type=str(req.scenario_type or ""), expected_outcome="", business_response="",
+                business_scenario=str(req.business_scenario or ""))
+            applied = apply_pack_to_schema(
+                schema, candidate_pack, variable_sources, raw_persisted_by_name, mode=mode, min_fill=PACK_MIN_FILL)
             concept_report = applied.report
             if applied.applied:
                 pack = candidate_pack

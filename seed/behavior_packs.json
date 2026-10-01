@@ -16242,7 +16242,6 @@
     "Data Add-on 12GB 28-Day": 0.09,
     "Data Add-on 25GB 28-Day": 0.04
    },
-   "trigger_ratio": 0.2,
    "poq_validity_days": 1,
    "poq_pending_states": {
     "inProgress": 0.6,
@@ -16261,6 +16260,7 @@
     "margin_minutes": 20,
     "hour_weights_ref": "diurnal_weights_local_hour"
    },
+   "trigger_ratio": 0.2,
    "report_error_p": 0.02,
    "report_pending_p": 0.04,
    "suspended_p": 0.02,
@@ -16273,8 +16273,9 @@
    "mixed": {},
    "negative": {
     "model": {
+     "trigger_ratio": 0.55,
      "report_error_p": 0.12,
-     "poq_error_p": 0.4,
+     "poq_error_p": 0.5,
      "poq_red_p": 0.3,
      "poq_yellow_p": 0.2
     },
@@ -16402,7 +16403,7 @@
     "id": "qualification_only_for_a_nearly_depleted_bucket",
     "level": "record",
     "severity": "error",
-    "expr": "(poq_id is not None) == (usage_report_state == 'done' and bucket_remaining_mb <= REF['trigger_ratio'] * REF['buckets'][bucket_name]['quota_mb'])",
+    "expr": "(poq_id is not None) == (usage_report_state == 'done' and bucket_remaining_mb <= REF['model']['trigger_ratio'] * REF['buckets'][bucket_name]['quota_mb'])",
     "message": "An offer qualification is requested exactly when a completed report shows the bucket nearly depleted.",
     "requires": [
      "poq_id",
@@ -16781,7 +16782,7 @@
     "concept": "qualify",
     "scope": "event",
     "when": null,
-    "expr": "usage_report_state == 'done' and bucket_remaining_mb <= REF['trigger_ratio'] * REF['buckets'][bucket_name]['quota_mb']",
+    "expr": "usage_report_state == 'done' and bucket_remaining_mb <= P['trigger_ratio'] * REF['buckets'][bucket_name]['quota_mb']",
     "sample": null
    },
    {

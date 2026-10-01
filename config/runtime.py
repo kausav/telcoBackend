@@ -56,6 +56,11 @@ SCHEMA_MAX_VARIABLES = max(1, int(os.getenv("SCHEMA_MAX_VARIABLES", "60")))
 PROPOSE_LLM_ADVISOR = os.getenv("PROPOSE_LLM_ADVISOR", "true").strip().lower() in {"1", "true", "yes", "on"}
 SCHEMA_MIN_VARIABLE_SCORE = float(os.getenv("SCHEMA_MIN_VARIABLE_SCORE", "42"))
 
+# A behaviour-pack variable is only proposed when it carries a value on at least this share of rows for the requested
+# scenario type (a column that is null nearly all the time is noise). Variables the user selected explicitly are always
+# kept. 0 disables the check.
+PACK_MIN_FILL = min(1.0, max(0.0, float(os.getenv("PACK_MIN_FILL", "0.2"))))
+
 # Span used when a curated numeric range declares a lower bound but no upper bound (counts / amounts).
 OPEN_BOUND_SPAN_INT = max(1, int(os.getenv("OPEN_BOUND_SPAN_INT", "30")))
 OPEN_BOUND_SPAN_FLOAT = max(1.0, float(os.getenv("OPEN_BOUND_SPAN_FLOAT", "500")))
