@@ -101,6 +101,12 @@ def classify_outcome_mode(
     return "mixed"
 
 
+_POSITIVE_FLAG_WORDS = ("success", "complet", "approved", "accepted", "converted", "delivered", "fulfilled", "retained", "eligible", "activated")
+_NEGATIVE_FLAG_WORDS = ("fail", "declin", "reject", "denied", "blocked", "cancel", "abandon", "error", "refus")
+_STATED_VALUE = re.compile(r"expected\s+(?:value\s+)?(?:is|=|:)\s*(true|false)\b", re.IGNORECASE)
+_TEMPORAL_DTYPES = {"datetime", "date", "timestamp", "time"}
+
+
 def derive_scenario_semantics(state, variables: list[dict]) -> dict:
     """Derive generic, deterministic semantic guardrails from the full scenario context.
 
@@ -214,15 +220,23 @@ def derive_scenario_semantics(state, variables: list[dict]) -> dict:
         }
 
         if dtype in {"boolean", "bool"}:
-            positive_bool = success_like or any(x in field_text for x in ("accepted", "approved", "converted", "retained", "eligible"))
-            negative_bool = failure_like or any(x in field_text for x in ("declined", "failed", "rejected", "suppressed", "denied", "blocked", "ineligible", "cancelled", "abandoned"))
-            if outcome_mode == "positive" and positive_bool and not negative_bool:
-                force_true.append(name)
-            elif outcome_mode == "suppression" and any(x in field_text for x in ("send", "sent", "contact", "notification", "message", "offer", "present", "recommend", "eligible")):
+            # Polarity comes from the field NAME only. A description such as "True when no further
+            # intervention occurs after decline" mentions an outcome word without the flag meaning it.
+            name_text = norm(name.replace("_", " "))
+            positive_bool = any(x in name_text for x in _POSITIVE_FLAG_WORDS)
+            negative_bool = any(x in name_text for x in _NEGATIVE_FLAG_WORDS)
+            stated = _STATED_VALUE.search(clean(var.get("description")))
+            if stated:                                    # the definition itself states the expected value
+                (force_true if stated.group(1).lower() == "true" else force_false).append(name)
+            elif outcome_mode == "positive" and positive_bool != negative_bool:
+                (force_true if positive_bool else force_false).append(name)
+            elif outcome_mode == "suppression" and any(x in name_text for x in ("send", "sent", "contact", "notification", "message", "offer", "present", "recommend", "eligible")):
                 force_false.append(name)
-            elif outcome_mode in {"negative", "decline_or_no_response"} and (positive_bool or negative_bool):
-                force_false.append(name)
-            elif outcome_mode == "concurrent" and any(x in field_text for x in ("conflict", "competing", "clear priority", "selected", "resolved")):
+            elif outcome_mode == "negative" and positive_bool != negative_bool:
+                (force_false if positive_bool else force_true).append(name)
+            elif outcome_mode == "decline_or_no_response" and positive_bool != negative_bool:
+                (force_false if positive_bool else force_true).append(name)
+            elif outcome_mode == "concurrent" and any(x in name_text for x in ("conflict", "competing", "clear priority", "selected", "resolved")):
                 force_true.append(name)
         elif dtype in {"categorical", "string"} and choices:
             if outcome_mode == "positive":
@@ -250,7 +264,13 @@ def derive_scenario_semantics(state, variables: list[dict]) -> dict:
     # domain, industry, or scenario ID.
     absent_temporal_roles = []
     if outcome_mode == "decline_or_no_response":
-        absent_temporal_roles.append("response")
+        # A decline IS a response, so its timestamp exists. A response event is absent only when the scenario
+        # is purely about silence (it neither mentions a decline nor leaves room for one).
+        outcome_text = norm(" ".join(pieces[k] for k in ("scenario_type", "expected_outcome", "business_response")))
+        silent = any(t in outcome_text for t in ("no response", "no-response", "ignored", "unanswered", "silence"))
+        explicit = any(t in outcome_text for t in ("declin", "reject", "refus"))
+        if silent and not explicit:
+            absent_temporal_roles.append("response")
     elif outcome_mode == "suppression":
         absent_temporal_roles.extend(["presentation", "dispatch", "response"])
 
@@ -266,6 +286,9 @@ def derive_scenario_semantics(state, variables: list[dict]) -> dict:
 
 
 def temporal_role(var: dict) -> str:
+    dtype = str(var.get("dtype") or "").strip().lower()
+    if dtype and dtype not in _TEMPORAL_DTYPES:
+        return "generic"                      # a flag, count or name is not a point in time
     text = f"{var.get('name', '')} {var.get('description', '')}".lower()
     if any(k in text for k in ("decision", "response", "reply", "decline", "acceptance")):
         return "response"

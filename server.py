@@ -14,6 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Literal
 
+from core.seed import ensure_seeded
 from core.dynamic_scenarios import (
     add_feedback,
     confirm_scenario,
@@ -82,6 +83,7 @@ async def lifespan(_app: FastAPI):
     try:
         ping_mongodb()
         ensure_model_indexes()
+        ensure_seeded()
         logger.info("Industry source registry ready: source_of_truth=mongodb")
     except Exception:
         logger.exception("Application startup validation failed")

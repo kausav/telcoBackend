@@ -275,9 +275,11 @@ def _query(filter_: dict[str, Any]) -> list[BehaviorPack]:
         return hit[1]
     out: list[BehaviorPack] = []
     try:
+        from core.seed import ensure_seeded
         from models._helpers import collection_name
         from models.database import get_database
 
+        ensure_seeded()
         rows = get_database()[collection_name("MONGODB_BEHAVIOR_PACKS_COLLECTION", "behavior_packs")].find(
             filter_, {"_id": 0}
         )

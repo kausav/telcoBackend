@@ -1,0 +1,116 @@
+[
+  {
+    "industry_key": "*",
+    "industry_labels": {
+      "telecommunication": "telecom",
+      "telecommunications": "telecom"
+    }
+  },
+  {
+    "industry_key": "telecom",
+    "aliases": {
+      "top_up": "topup",
+      "recharge": "topup",
+      "subscriber": "customer",
+      "client": "customer",
+      "member": "customer",
+      "mobile": "subscriber",
+      "depletion": "usage",
+      "consumption": "usage",
+      "usage": "usage",
+      "upsell": "product",
+      "offer": "product",
+      "offering": "product",
+      "retention": "intervention"
+    },
+    "expansions": {
+      "depletion": [
+        "consumption",
+        "remaining",
+        "usage"
+      ],
+      "consumption": [
+        "depletion",
+        "remaining",
+        "usage"
+      ],
+      "recharge": [
+        "topup"
+      ],
+      "top_up": [
+        "topup"
+      ],
+      "upsell": [
+        "offer",
+        "offering",
+        "product",
+        "product_offering",
+        "qualification"
+      ],
+      "offer": [
+        "offering",
+        "product",
+        "product_offering",
+        "qualification"
+      ],
+      "offering": [
+        "offer",
+        "product",
+        "product_offering",
+        "qualification"
+      ],
+      "retention": [
+        "intervention",
+        "nudge",
+        "offer"
+      ]
+    },
+    "branch_expansions": {
+      "upsell": [
+        "offer",
+        "offering",
+        "product",
+        "product_offering",
+        "qualification"
+      ],
+      "offer": [
+        "product",
+        "product_offering",
+        "qualification"
+      ],
+      "offering": [
+        "offer",
+        "product",
+        "product_offering",
+        "qualification"
+      ],
+      "recharge": [
+        "topup"
+      ],
+      "top_up": [
+        "topup"
+      ],
+      "consumption": [
+        "depletion",
+        "remaining",
+        "usage"
+      ],
+      "depletion": [
+        "consumption",
+        "remaining",
+        "usage"
+      ],
+      "retention": [
+        "intervention",
+        "nudge",
+        "offer"
+      ]
+    },
+    "stopwords": [
+      "telecommunications",
+      "telecommunication",
+      "telecom",
+      "india"
+    ]
+  }
+]

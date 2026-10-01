@@ -43,9 +43,11 @@ def _documents(industry_key: str) -> list[dict[str, Any]]:
         return hit[1]
     rows: list[dict[str, Any]] = []
     try:
+        from core.seed import ensure_seeded
         from models._helpers import collection_name
         from models.database import get_database
 
+        ensure_seeded()
         wanted = ["*"] if industry_key == "*" else ["*", industry_key]
         cursor = get_database()[collection_name("MONGODB_DOMAIN_LEXICON_COLLECTION", "domain_lexicon")].find(
             {"industry_key": {"$in": wanted}}, {"_id": 0}

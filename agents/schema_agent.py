@@ -288,6 +288,7 @@ class SchemaAgent:
             if not isinstance(current, dict):
                 current = {}
             current.setdefault("description", str(var.get("description") or ""))
+            current.setdefault("dtype", str(var.get("dtype") or ""))
             current.setdefault("nullable", bool(var.get("nullable", False)))
             field_constraints[field] = current
         rules["field_constraints"] = field_constraints

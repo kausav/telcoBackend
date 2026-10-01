@@ -13,6 +13,7 @@ import logging
 import re
 
 from core.agentic_models import ScenarioImportResponse, ScenarioProposeRequest, ScenarioSchema, ScenarioIntent, GeneratedSchemaField
+from core.definition_audit import incomplete_definitions
 from core.conversation_store import append_message, ensure_conversation
 from core.dynamic_scenarios import new_draft_id, save_draft
 from core.runtime_cache import get_proposal, set_proposal
@@ -852,6 +853,10 @@ class AgenticSchemaWorkflow:
         )
         unresolved_questions = self.compiler.approval_questions(intent, schema)
         variables, field_order = self._schema_to_variables(schema, raw_persisted_by_name)
+        if pack is None:
+            incomplete = incomplete_definitions(variables)
+            if incomplete:
+                concept_report = {**(concept_report or {}), "applied": False, "incomplete_definitions": incomplete}
         for variable in variables:
             key = str(variable.get("name") or "").strip().lower()
             persisted_source = variable_sources.get(key)

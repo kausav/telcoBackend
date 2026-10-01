@@ -225,7 +225,7 @@ def _score_target(t: Target, rows: list[dict[str, Any]], present: set[str], conc
         # lies outside [min, max] - small datasets must not fail on sampling noise.
         lo, hi = _wilson(observed, min(population, entities * 3))
         interval = [round(lo, 4), round(hi, 4)]
-        ok = hi >= t.min and lo <= t.max
+        ok = hi >= t.min - 1e-9 and lo <= t.max + 1e-9      # tolerance: an exact 0 or 1 sits on the interval's float edge
         return {**base, "status": "pass" if ok else "fail", "observed": round(observed, 4), "n": population,
                 "interval99": interval}
     else:

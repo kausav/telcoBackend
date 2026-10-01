@@ -34,7 +34,10 @@ from core.temporal_contract import (
     source_declared_max_delay_seconds,
     source_declared_min_delay_seconds,
 )
-from config.runtime import AGENTIC_REQUIRE_CLEAN_RECORDS, AGENTIC_REQUIRE_EXACT_RECORD_COUNT, GENERATION_MAX_ATTEMPTS_PER_RECORD
+from config.runtime import (
+    AGENTIC_REQUIRE_CLEAN_RECORDS, AGENTIC_REQUIRE_EXACT_RECORD_COUNT, GENERATION_MAX_ATTEMPTS_PER_RECORD,
+    OPEN_BOUND_SPAN_FLOAT, OPEN_BOUND_SPAN_INT,
+)
 from config.country_metadata import COUNTRY_BASE
 
 logger = logging.getLogger(__name__)
@@ -293,7 +296,7 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
         prefix = re.sub(r"[^A-Z0-9]+", "_", prefix_source.upper()).strip("_") or "REF"
         return _prefixed_int({"prefix": f"{prefix}-", "digits": 10}, rec)
 
-    if "phone" in n or "mobile" in n:
+    if "phone" in n or "mobile" in n or "msisdn" in n or ("number" in d and ("mobile" in d or "phone" in d)):
         # Country is request-scoped. The generator receives it through the internal execution
         # context so a US/GB/etc. request never silently falls back to India's +91 prefix.
         country = str(p.get("country") or rec.get("__country__") or "").strip().upper()
@@ -534,11 +537,11 @@ def _multiple_of_tick_bounds(lo: float, hi: float, multiple_of: float, scale: in
 def _uniform(params: dict, _rec: dict) -> float:
     precision = int(params.get("precision", 2) or 2)
     lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
-    hi = _to_finite_float(params.get("max", params.get("hi")), lo)
+    hi = _to_finite_float(params.get("max", params.get("hi")), None)
     if lo is None:
         lo = 0.0
     if hi is None:
-        hi = lo
+        hi = lo + OPEN_BOUND_SPAN_FLOAT      # no declared upper bound: never collapse to a constant
     hi = max(lo, hi)
     if precision > 0:
         scale = 10 ** precision
@@ -563,9 +566,9 @@ def _uniform(params: dict, _rec: dict) -> float:
 
 def _uniform_int(params: dict, _rec: dict) -> int:
     lo = _to_finite_float(params.get("min", params.get("lo")), 0.0)
-    hi = _to_finite_float(params.get("max", params.get("hi")), lo)
+    hi = _to_finite_float(params.get("max", params.get("hi")), None)
     lo_int = int(math.ceil(lo if lo is not None else 0.0))
-    hi_int = int(math.floor(hi if hi is not None else lo_int))
+    hi_int = int(math.floor(hi)) if hi is not None else lo_int + OPEN_BOUND_SPAN_INT
     if hi_int < lo_int:
         hi_int = lo_int
     multiple = params.get("multiple_of")
@@ -1215,7 +1218,7 @@ def _apply_scenario_semantics(rec: dict, rules: dict | None) -> dict:
     for name, constraint in field_constraints.items():
         if not isinstance(constraint, dict):
             continue
-        var = {"name": name, "description": constraint.get("description", "")}
+        var = {"name": name, "description": constraint.get("description", ""), "dtype": constraint.get("dtype", "")}
         if _temporal_field_is_absent_by_scenario(var, rules) and name in rec and bool(constraint.get("nullable", True)):
             rec[name] = None
     return rec

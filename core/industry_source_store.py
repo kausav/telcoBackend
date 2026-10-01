@@ -51,13 +51,42 @@ def normalize_lookup_key(value: str | None) -> str:
     return re.sub(r"_+", "_", text)
 
 
+_STORED_KEYS_TTL_SECONDS = 60.0
+_stored_keys_cache: dict[str, Any] = {"at": float("-inf"), "keys": ()}
+
+
+def _stored_industry_keys() -> tuple[str, ...]:
+    """Industry keys of the active source documents (cached briefly; empty when the database is unreachable)."""
+    now = monotonic()
+    if now - _stored_keys_cache["at"] < _STORED_KEYS_TTL_SECONDS:
+        return _stored_keys_cache["keys"]
+    try:
+        keys = tuple(sorted(str(k) for k in _collection().distinct("industry_key", {"active": True}) if k))
+    except Exception:
+        return ()
+    _stored_keys_cache.update(at=now, keys=keys)
+    return keys
+
+
 def normalize_industry_key(value: str | None) -> str:
-    """Normalize industry labels without consulting any static industry/standards registry."""
+    """Resolve an industry label to the key the source documents are stored under.
+
+    A label the vocabulary knows maps to its key; otherwise the label is matched against the stored industry
+    keys (equal, or one is the start of the other: ``telecommunications`` -> ``telecom``), so a request does
+    not have to spell the industry exactly the way it was registered.
+    """
     raw = str(value or "").strip()
     if not raw:
         return "generic"
     compact = normalize_lookup_key(raw)
-    return lexicon.load().industry_labels.get(compact, compact) or "generic"
+    known = lexicon.load().industry_labels.get(compact)
+    if known:
+        return known
+    stored = _stored_industry_keys()
+    if compact in stored:
+        return compact
+    close = [k for k in stored if len(k) >= 4 and len(compact) >= 4 and (compact.startswith(k) or k.startswith(compact))]
+    return min(close, key=lambda k: (-len(k), k)) if close else (compact or "generic")
 
 
 def normalize_domain_key(value: str | None) -> str:
