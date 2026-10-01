@@ -105,10 +105,10 @@ def generate(
     if not concept_columns:
         raise ValueError("None of the confirmed variables map to the behaviour pack; nothing to generate.")
     engine = get_engine(pack.engine)
-    ctx = RunContext(seed=seed, as_of=as_of, tz_name=pack.timezone)
     params = pack.mode_params(mode)
-    concept_rows = engine.simulate(pack, params, ctx, entities=count, per_entity=per_entity,
-                                   hints=_hints(pack, variables, concept_columns))
+    ctx, concept_rows = _simulate_with_coverage(
+        engine, pack, params, set(concept_columns), seed=seed, as_of=as_of, count=count, per_entity=per_entity,
+        hints=_hints(pack, variables, concept_columns))
     records = project(concept_rows, pack, concept_columns)
 
     # Score what is actually delivered: parse the projected columns back, so formatting bugs are visible too.
@@ -121,6 +121,46 @@ def generate(
     entity_key = concept_columns.get(pack.entity_concept)
     return PackGeneration(records=records, fields=list(records[0]) if records else [],
                           entity_key=entity_key, validation_report=report, concept_columns=concept_columns)
+
+
+# Rows a coverage search may simulate in total: small requests (where chance can leave a conditional fact
+# unrepresented) get many attempts, large ones (where it cannot) get one.
+_COVERAGE_ROW_BUDGET = 20_000
+_COVERAGE_MAX_ATTEMPTS = 40
+
+
+def _attempt_seed(seed: int | None, attempt: int) -> int | None:
+    if attempt == 0 or seed is None:
+        return seed
+    return (int(seed) * 1_000_003 + attempt) % 2_147_483_647
+
+
+def _empty_columns(rows: list[dict[str, Any]], concepts: set[str]) -> set[str]:
+    return {c for c in concepts if all(row.get(c) is None for row in rows)}
+
+
+def _simulate_with_coverage(engine, pack: BehaviorPack, params: dict[str, Any], concepts: set[str], *, seed: int | None,
+                            as_of: Any, count: int, per_entity: int, hints: dict[str, Any]):
+    """Simulate, preferring a dataset in which every delivered column carries at least one value.
+
+    A conditional fact (a recurring-top-up period, a suspension reason) is empty on the rows it does not apply
+    to, but in a small dataset chance alone can leave it empty everywhere, which reads as a broken column. The
+    attempts are a deterministic sequence derived from the seed (the first is the seed itself), so the same
+    request always yields the same dataset; the first attempt that represents every column wins, otherwise the
+    one with the fewest empty columns.
+    """
+    base_as_of = RunContext(seed=0, as_of=as_of, tz_name=pack.timezone).as_of
+    attempts = max(1, min(_COVERAGE_MAX_ATTEMPTS, _COVERAGE_ROW_BUDGET // max(1, count * per_entity)))
+    best = None
+    for attempt in range(attempts):
+        ctx = RunContext(seed=_attempt_seed(seed, attempt), as_of=base_as_of, tz_name=pack.timezone)
+        rows = engine.simulate(pack, params, ctx, entities=count, per_entity=per_entity, hints=hints)
+        empty = len(_empty_columns(rows, concepts))
+        if best is None or empty < best[0]:
+            best = (empty, ctx, rows)
+        if empty == 0:
+            break
+    return best[1], best[2]
 
 
 def _legacy_keys(report: dict[str, Any], count: int, per_entity: int, produced: int) -> dict[str, Any]:

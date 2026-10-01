@@ -274,15 +274,15 @@ def _query(filter_: dict[str, Any]) -> list[BehaviorPack]:
     if hit is not None and now - hit[0] < ttl:
         return hit[1]
     out: list[BehaviorPack] = []
+    present: set[str] | None = None
     try:
         from core.seed import ensure_seeded
         from models._helpers import collection_name
         from models.database import get_database
 
         ensure_seeded()
-        rows = get_database()[collection_name("MONGODB_BEHAVIOR_PACKS_COLLECTION", "behavior_packs")].find(
-            filter_, {"_id": 0}
-        )
+        collection = get_database()[collection_name("MONGODB_BEHAVIOR_PACKS_COLLECTION", "behavior_packs")]
+        rows = collection.find(filter_, {"_id": 0})
         for row in itertools.islice(rows, _MAX_PACKS):
             if not isinstance(row, dict):
                 continue
@@ -290,11 +290,43 @@ def _query(filter_: dict[str, Any]) -> list[BehaviorPack]:
                 out.append(BehaviorPack.model_validate(row))
             except Exception:
                 logger.exception("Ignoring invalid behaviour pack %s in MongoDB", row.get("pack_id"))
+        present = {str(p) for p in collection.distinct("pack_id")}
     except Exception as exc:
         logger.warning("behaviour packs not loaded from MongoDB: %s", exc)
-        return out                      # do not cache a failure
-    _CACHE[key] = (now, out)
+    out.extend(_bundled_packs(filter_, present))
+    if present is not None:
+        _CACHE[key] = (now, out)          # a database failure is not cached: it is retried on the next call
     return out
+
+
+def _bundled_packs(filter_: dict[str, Any], present: set[str] | None) -> list[BehaviorPack]:
+    """The packs the application ships, for pack ids MongoDB holds no document of.
+
+    MongoDB stays authoritative: a pack id it holds (in any version or status) is never taken from the bundle, so
+    editing or retiring a pack there is always honoured. The bundle only covers what MongoDB lacks, for example when
+    the database is unreachable or does not accept the first-start insert.
+    """
+    from core.seed import bundled
+
+    def wanted(row: dict[str, Any]) -> bool:
+        for field, expected in filter_.items():
+            value = row.get(field)
+            if isinstance(expected, dict) and "$in" in expected:
+                if value not in expected["$in"]:
+                    return False
+            elif value != expected:
+                return False
+        return True
+
+    found: list[BehaviorPack] = []
+    for row in bundled("behavior_packs"):
+        if (present is not None and row.get("pack_id") in present) or not wanted(row):
+            continue
+        try:
+            found.append(BehaviorPack.model_validate(row))
+        except Exception:
+            logger.exception("Ignoring invalid bundled behaviour pack %s", row.get("pack_id"))
+    return found
 
 
 def clear_cache() -> None:

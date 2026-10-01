@@ -42,22 +42,28 @@ def _documents(industry_key: str) -> list[dict[str, Any]]:
     if hit is not None and now - hit[0] < ttl:
         return hit[1]
     rows: list[dict[str, Any]] = []
+    wanted = ["*"] if industry_key == "*" else ["*", industry_key]
+    reachable = False
     try:
         from core.seed import ensure_seeded
         from models._helpers import collection_name
         from models.database import get_database
 
         ensure_seeded()
-        wanted = ["*"] if industry_key == "*" else ["*", industry_key]
         cursor = get_database()[collection_name("MONGODB_DOMAIN_LEXICON_COLLECTION", "domain_lexicon")].find(
             {"industry_key": {"$in": wanted}}, {"_id": 0}
         )
         rows = [row for row in cursor if isinstance(row, dict)]
+        reachable = True
     except Exception as exc:
         logger.warning("domain lexicon not loaded from MongoDB: %s", exc)
-        _CACHE[industry_key] = (now - max(ttl - 5.0, 0.0), rows)   # a failure is retried after ~5 s
-        return rows
-    _CACHE[industry_key] = (now, rows)
+    # MongoDB stays authoritative; the bundled vocabulary only covers industry keys it holds no document for.
+    from core.seed import bundled
+
+    held = {row.get("industry_key") for row in rows}
+    rows = rows + [dict(doc) for doc in bundled("domain_lexicon") if doc.get("industry_key") in wanted and doc.get("industry_key") not in held]
+    # a failure is retried after ~5 s
+    _CACHE[industry_key] = (now if reachable else now - max(ttl - 5.0, 0.0), rows)
     return rows
 
 

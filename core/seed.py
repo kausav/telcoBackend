@@ -27,7 +27,24 @@ _SETS = (
 )
 _RETRY_SECONDS = 30.0
 _LOCK = threading.Lock()
-_state: dict[str, Any] = {"done": False, "next_try": 0.0}
+_state: dict[str, Any] = {"done": False, "next_try": 0.0, "error": None}
+_BUNDLED: dict[str, list[dict[str, Any]]] = {}
+
+
+def bundled(collection: str) -> list[dict[str, Any]]:
+    """Documents the application ships for ``collection`` (the defaults MongoDB falls back to when it has none)."""
+    if collection not in _BUNDLED:
+        documents: list[dict[str, Any]] = []
+        for filename, _env, default, _identity in _SETS:
+            if default == collection and (SEED_DIR / filename).is_file():
+                documents = json.loads((SEED_DIR / filename).read_text(encoding="utf-8"))
+        _BUNDLED[collection] = documents
+    return _BUNDLED[collection]
+
+
+def status() -> dict[str, Any]:
+    """Whether the bundled reference data reached MongoDB, and the last reason it did not."""
+    return {"seeded": bool(_state["done"]), "last_error": _state["error"]}
 
 
 def ensure_seeded() -> None:
@@ -41,7 +58,8 @@ def ensure_seeded() -> None:
             inserted = _seed()
         except Exception as exc:                       # the database is unreachable: try again shortly
             _state["next_try"] = time.monotonic() + _RETRY_SECONDS
-            logger.warning("reference data not seeded: %s", exc)
+            _state["error"] = f"{type(exc).__name__}: {exc}"[:300]
+            logger.warning("reference data not seeded: %s", _state["error"])
             return
         _state["done"] = True
         if inserted:
@@ -54,6 +72,7 @@ def _seed() -> dict[str, int]:
 
     database = get_database()
     inserted: dict[str, int] = {}
+    failures: list[str] = []
     for filename, env_name, default, identity in _SETS:
         path = SEED_DIR / filename
         if not path.is_file():
@@ -62,8 +81,13 @@ def _seed() -> dict[str, int]:
         count = 0
         for document in json.loads(path.read_text(encoding="utf-8")):
             key = {field: document[field] for field in identity}
-            if collection.update_one(key, {"$setOnInsert": document}, upsert=True).upserted_id is not None:
-                count += 1
+            try:
+                if collection.update_one(key, {"$setOnInsert": {k: v for k, v in document.items() if k not in key}}, upsert=True).upserted_id is not None:
+                    count += 1
+            except Exception as exc:                   # one rejected document must not block the others
+                failures.append(f"{default} {key}: {type(exc).__name__}: {exc}"[:200])
         inserted[default] = count
+    if failures:
+        raise RuntimeError("; ".join(failures[:3]) + (f" (+{len(failures) - 3} more)" if len(failures) > 3 else ""))
     return {name: count for name, count in inserted.items() if count}
 
