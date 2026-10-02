@@ -47,28 +47,28 @@ def infer_history_field_sets(variables: list[dict[str, Any]], entity_key: str | 
         # Identity fields can arrive from persisted DB definitions with a legacy transaction scope.
         # Their business identity is still entity-stable, so keep the value across a user's history.
         identity_tokens = {"customer", "account", "user", "member", "patient", "policyholder"}
+        identity_names = {"msisdn", "msisdn_number", "mobile_number", "phone_number", "subscriber_number"}
         for name, var in by_name.items():
             if name in governed:
                 continue
             low = str(name).casefold()
             desc = str(var.get("description") or "").casefold()
             looks_like_identity = (
-                any(low.endswith(f"_{token}_id") or low == f"{token}_id" for token in identity_tokens)
+                low in identity_names
+                or any(low.endswith(f"_{token}_id") or low == f"{token}_id" for token in identity_tokens)
                 or (low.endswith("_id") and any(token in low for token in identity_tokens) and "payment" not in low and "transaction" not in low and "order" not in low)
                 or ("unique identifier" in desc and any(token in low for token in identity_tokens))
             )
             if looks_like_identity:
                 stable.add(name)
 
-        # Stateful resource identifiers (for example a balance bucket, entitlement, inventory
-        # balance, or subscription resource) are often declared transaction-scoped in source
-        # schemas even though the same resource persists across an entity's history. Promote an ID
-        # to stable context only when its owner also exposes lifecycle/state-like fields such as
-        # remaining quantity, validity, balance, status, or state. Transaction IDs expose request/
-        # amount/status but do not satisfy this resource-state fingerprint.
+        # Infer stable scope only for legacy IDs that omit scope; explicit entity/event/transaction
+        # grain remains authoritative for resource identifiers.
         for name, var in by_name.items():
             low = str(name).casefold()
             if not low.endswith("_id") or name in stable or name in governed:
+                continue
+            if scoped.get(name) in {"entity", "transaction", "event", "derived"}:
                 continue
             owner = low[:-3].rstrip("_")
             if not owner:

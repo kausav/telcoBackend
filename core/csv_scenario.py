@@ -1243,7 +1243,7 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
                     formula = ""
                 elif pairs:
                     raise ValueError(
-                        f"Row {row_number} ('{name}'): percentage weights must cover all choices and sum to 100% (±0.1%)"
+                        f"Row {row_number} ('{name}'): percentage weights must cover all choices and sum to 100% ( 0.1%)"
                     )
         # ``gen`` is optional for generic CSV producers. Infer a safe default
         # from dtype/params instead of forcing every producer to know our internal

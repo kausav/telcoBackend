@@ -68,8 +68,26 @@ def _validated_behavioral_rules(state: Any, variables: list[dict]) -> list[dict[
             continue
         if any(isinstance(v, list) and any(isinstance(item, (dict, tuple, set)) for item in v) for v in then.values()):
             continue
+        assignments_match_contract = True
         for field, value in then.items():
+            variable = by_name[str(field)]
+            params = variable.get("params") if isinstance(variable.get("params"), dict) else {}
+            declared_values = params.get("choices")
+            if isinstance(declared_values, list) and declared_values:
+                assigned_values = value if isinstance(value, list) else [value]
+                declared_norm = {
+                    str(item).strip().lower().replace("-", "_").replace(" ", "_")
+                    for item in declared_values
+                }
+                if any(
+                    str(item).strip().lower().replace("-", "_").replace(" ", "_") not in declared_norm
+                    for item in assigned_values
+                ):
+                    assignments_match_contract = False
+                    break
             safe_then[str(field)] = value
+        if not assignments_match_contract:
+            continue
         signature = repr((sorted((str(k), repr(v)) for k, v in safe_when.items()), sorted((str(k), repr(v)) for k, v in safe_then.items())))
         if signature in seen:
             continue

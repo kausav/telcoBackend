@@ -24,7 +24,7 @@ from core.variable_contract import validate_db_definition
 logger = logging.getLogger(__name__)
 from agents.intent_agent import GeminiIntentAgent
 from agents.schema_compiler import SchemaCompiler
-from config.runtime import PACK_MIN_FILL, PROPOSE_LLM_ADVISOR, SCHEMA_MAX_VARIABLES
+from config.runtime import ENABLE_BEHAVIOR_PACKS, PACK_MIN_FILL, PROPOSE_LLM_ADVISOR, SCHEMA_MAX_VARIABLES
 from core.variable_semantics import variable_semantic_aliases
 from core.industry_source_store import normalize_domain_key, normalize_industry_key, normalize_lookup_key, semantic_exclusion_aliases, catalog_for_request
 from core.output_equivalence import output_equivalence_signature
@@ -688,7 +688,7 @@ class AgenticSchemaWorkflow:
         # candidate pool (DB + complete source catalog); the variable budget applies to unpacked proposals.
         candidate_pack = None
         pack_pulled: list[str] = []
-        if json_grounded or db_variables:
+        if ENABLE_BEHAVIOR_PACKS and (json_grounded or db_variables):
             from synth.service import propose_pack
 
             candidate_pack = propose_pack(

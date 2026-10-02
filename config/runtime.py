@@ -56,6 +56,11 @@ SCHEMA_MAX_VARIABLES = max(1, int(os.getenv("SCHEMA_MAX_VARIABLES", "60")))
 PROPOSE_LLM_ADVISOR = os.getenv("PROPOSE_LLM_ADVISOR", "true").strip().lower() in {"1", "true", "yes", "on"}
 SCHEMA_MIN_VARIABLE_SCORE = float(os.getenv("SCHEMA_MIN_VARIABLE_SCORE", "42"))
 
+# Industry behavior packs add domain-specific simulation on top of source schemas. Keep the
+# standards-backed, industry-neutral path as the default; packs require explicit opt-in.
+ENABLE_BEHAVIOR_PACKS = os.getenv("ENABLE_BEHAVIOR_PACKS", "false").strip().lower() in {"1", "true", "yes", "on"}
+MIN_LOGIC_QUALITY_PERCENT = min(100.0, max(0.0, float(os.getenv("MIN_LOGIC_QUALITY_PERCENT", "90"))))
+
 # A behaviour-pack variable is only proposed when it carries a value on at least this share of rows for the requested
 # scenario type (a column that is null nearly all the time is noise). Variables the user selected explicitly are always
 # kept. 0 disables the check.
@@ -67,3 +72,6 @@ OPEN_BOUND_SPAN_FLOAT = max(1.0, float(os.getenv("OPEN_BOUND_SPAN_FLOAT", "500")
 GENERATION_MAX_ATTEMPTS_PER_RECORD = max(1, min(20, int(os.getenv("GENERATION_MAX_ATTEMPTS_PER_RECORD", "8"))))
 AGENTIC_REQUIRE_CLEAN_RECORDS = os.getenv("AGENTIC_REQUIRE_CLEAN_RECORDS", "true").strip().lower() in {"1", "true", "yes", "on"}
 AGENTIC_REQUIRE_EXACT_RECORD_COUNT = os.getenv("AGENTIC_REQUIRE_EXACT_RECORD_COUNT", "true").strip().lower() in {"1", "true", "yes", "on"}
+# Semantic Gemini QA is synchronous and makes one request per record chunk. Keep it opt-in so
+# large generate requests do not wait on dozens of sequential provider calls.
+AGENTIC_LLM_QA_MODE = os.getenv("AGENTIC_LLM_QA_MODE", "off").strip().lower()

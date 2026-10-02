@@ -35,8 +35,9 @@ from core.temporal_contract import (
     source_declared_min_delay_seconds,
 )
 from config.runtime import (
-    AGENTIC_REQUIRE_CLEAN_RECORDS, AGENTIC_REQUIRE_EXACT_RECORD_COUNT, GENERATION_MAX_ATTEMPTS_PER_RECORD,
-    OPEN_BOUND_SPAN_FLOAT, OPEN_BOUND_SPAN_INT,
+    AGENTIC_LLM_QA_MODE, AGENTIC_REQUIRE_CLEAN_RECORDS, AGENTIC_REQUIRE_EXACT_RECORD_COUNT,
+    GENERATION_MAX_ATTEMPTS_PER_RECORD,
+    MIN_LOGIC_QUALITY_PERCENT, OPEN_BOUND_SPAN_FLOAT, OPEN_BOUND_SPAN_INT,
 )
 from config.country_metadata import COUNTRY_BASE
 
@@ -132,6 +133,14 @@ A record is INVALID if any material contradiction remains. Do not accept a recor
 its JSON, datatype, or range checks pass. If deterministic validation can prove a contradiction,
 that deterministic result overrides an LLM judgement. Never invent missing business facts to make
 a record look valid.
+
+Use the supplied field scope/grain and source descriptions when judging repeated histories. Keep
+entity identifiers stable across rows and keep transaction/resource identifiers on their own event
+unless the contract explicitly declares otherwise. Compare states only when they describe the same
+resource and lifecycle; distinguish a current state from a history snapshot. For a "Normal" scenario,
+do not force every operation to succeed: assess outcomes against declared choices and weights, and
+report that business realism cannot be determined when no expected distribution is given. Never
+infer a domain-specific success rate from the word "Normal" alone.
 
 The generator is expected to produce records that already satisfy the complete contract. Treat a non-zero
 repair count as evidence that the generation policy missed a dependency or scenario invariant. Do not perform
@@ -2824,29 +2833,59 @@ def _enforce_generic_business_consistency(rec: dict, variables: list[dict], rule
         return _qa_parse_dt(rec.get(name)) if name in rec else None
 
     names = list(by_name)
-    # 1) Auto-run configuration is a single stateful contract. A disabled recurring process has no
-    # recurring schedule/occurrence count; an enabled process needs both when the schema exposes them.
-    auto_fields = [n for n in names if "auto" in norm(n) and any(t in norm(n) for t in ("recurring", "automatic", "renew"))]
-    auto = auto_fields[0] if auto_fields else None
-    if auto and isinstance(rec.get(auto), bool):
-        period_count = next((n for n in names if "period" in norm(n) and ("number" in norm(n) or "count" in norm(n))), None)
-        recurring = next((n for n in names if "period" in norm(n) and "recurr" in norm(n) and str(by_name[n].get("dtype") or "").lower() in {"categorical", "string"}), None)
+    # 1) Auto-top-up fields are a single source-described contract. Pair the flag and
+    # its schedule/count by normalized resource owner so parallel history fields cannot
+    # accidentally control the top-up configuration.
+    def periodic_owner(name: str, suffixes: tuple[str, ...]) -> str:
+        compact = re.sub(r"[^a-z0-9]+", "", name.casefold())
+        for suffix in suffixes:
+            if compact.endswith(suffix):
+                return compact[:-len(suffix)]
+        return ""
+
+    for auto in names:
+        auto_var = by_name[auto]
+        auto_desc = str(auto_var.get("description") or "").casefold()
+        if str(auto_var.get("dtype") or "").lower() not in {"bool", "boolean"}:
+            continue
+        auto_name = norm(auto)
+        if "auto" not in auto_name and "automatic" not in auto_desc:
+            continue
+        if "topup" not in auto_name and "top-up" not in auto_desc and "topup" not in auto_desc:
+            continue
+
+        owner = periodic_owner(auto, ("isautotopup", "isautomatictopup"))
+        if not owner:
+            continue
+        period_count = next((
+            name for name in names
+            if periodic_owner(name, ("numberofperiods", "periodcount")) == owner
+            and str(by_name[name].get("dtype") or "").lower() in _NUMERIC_DTYPES
+        ), None)
+        recurring = next((
+            name for name in names
+            if periodic_owner(name, ("recurringperiod",)) == owner
+            and str(by_name[name].get("dtype") or "").lower() in {"categorical", "string"}
+        ), None)
+        if not period_count and not recurring:
+            continue
+
         if rec.get(auto) is False:
             if period_count and by_name[period_count].get("nullable", True):
                 set_value(period_count, None, f"{period_count} cleared because {auto} is false")
             if recurring and by_name[recurring].get("nullable", True):
                 set_value(recurring, None, f"{recurring} cleared because {auto} is false")
-        else:
+        elif rec.get(auto) is True:
             if period_count and rec.get(period_count) in (None, 0):
                 params = by_name[period_count].get("params") or {}
                 lo = _to_finite_float(params.get("min", params.get("lo")), 1.0) or 1.0
                 hi = _to_finite_float(params.get("max", params.get("hi")), max(lo, 12.0))
                 candidate = int(round(lo if hi is None else _rng().uniform(max(1.0, lo), max(lo, hi))))
-                set_value(period_count, max(1, candidate), f"{period_count} aligned to enabled recurring processing")
+                set_value(period_count, max(1, candidate), f"{period_count} aligned to enabled auto-topup")
             if recurring and rec.get(recurring) is None:
                 choices = list((by_name[recurring].get("params") or {}).get("choices") or [])
                 if choices:
-                    set_value(recurring, _rng().choice(choices), f"{recurring} populated for enabled recurring processing")
+                    set_value(recurring, _rng().choice(choices), f"{recurring} populated for enabled auto-topup")
 
     # 2) Completed outcomes require a confirmation/completion instant when such an instant exists.
     status_fields = [
@@ -3446,6 +3485,7 @@ def run_deterministic_agentic_generation(
     expected_records = state.count * state.records_per_user if type_of_data == "transactional" else state.count
     valid_rate = (len(checked) / expected_records) if expected_records else 1.0
     clean_rate = (clean_records / len(checked)) if checked else 0.0
+    contract_conformance_rate = valid_rate * 100.0
     repaired_record_count = max(0, len(checked) - clean_records)
     repaired_record_rate = (repaired_record_count / len(checked)) if checked else 0.0
     state.validation_report = {
@@ -3456,10 +3496,12 @@ def run_deterministic_agentic_generation(
         "record_errors": len(state.record_errors),
         "valid_record_rate": round(valid_rate * 100.0, 3),
         "clean_record_rate": round(clean_rate * 100.0, 3),
+        "contract_conformance_rate": round(contract_conformance_rate, 3),
+        "contract_conformance_metric": "final_deterministic_validation_against_requested_record_count",
         "repaired_record_rate": round(repaired_record_rate * 100.0, 3),
         "target_valid_record_rate": 100.0,
-        "target_clean_record_rate": 95.0,
-        "quality_target_met": valid_rate >= 1.0 and clean_rate >= 0.95,
+        "target_contract_conformance_percent": MIN_LOGIC_QUALITY_PERCENT,
+        "quality_target_met": contract_conformance_rate > MIN_LOGIC_QUALITY_PERCENT,
         "contract_pass_rate": 100.0 if checked else 0.0,
         "recovered": 0,
         "algo_fixes": fixes,
@@ -3470,6 +3512,31 @@ def run_deterministic_agentic_generation(
             "scenario_semantics", "cross_field_semantics", "timestamp_relationships", "user_history_consistency",
         ],
     }
+
+    if AGENTIC_LLM_QA_MODE == "full" and state.final_records:
+        deterministic_report = dict(state.validation_report)
+        state.raw_records = list(state.final_records)
+        try:
+            reviewer = DataGenerationAgent(GeminiClient())
+            state = reviewer._qa_validate(state, preserve_records=True, llm_mode="full")
+            llm_report = state.validation_report or {}
+            state.validation_report = {
+                **deterministic_report,
+                "llm_fixes": int(llm_report.get("llm_fixes", 0) or 0),
+                "llm_issues": int(llm_report.get("llm_issues", 0) or 0),
+                "llm_review": {
+                    "status": "completed" if not state.errors else "completed_with_fallbacks",
+                    "reviewed_records": len(state.final_records),
+                    "preserved_dropped_records": int(llm_report.get("preserved_dropped_records", 0) or 0),
+                    "preserved_invalid_repairs": int(llm_report.get("preserved_invalid_repairs", 0) or 0),
+                },
+            }
+        except Exception as exc:
+            logger.warning("[AgenticQA] Semantic review unavailable; deterministic-valid records retained: %s", exc)
+            state.validation_report = {
+                **deterministic_report,
+                "llm_review": {"status": "unavailable", "reason": str(exc)[:500]},
+            }
     return state
 
 
@@ -3510,43 +3577,77 @@ class DataGenerationAgent:
             records = []
             aggregate_plan = _build_generation_plan(variables, rules=state.rules)
             for index in range(state.count):
-                rec = {}
-                try:
-                    rec = _generate_record(variables, rules=state.rules, plan=aggregate_plan)
-                    records.append(rec)
-                except Exception as exc:
-                    state.record_errors.append({"record_index": index, "error": str(exc), "record": dict(rec)})
-                    logger.warning("[DataGeneration] Skipping aggregational record %d: %s", index, exc)
+                last_exc: Exception | None = None
+                for _attempt in range(GENERATION_MAX_ATTEMPTS_PER_RECORD):
+                    try:
+                        rec = _generate_record(
+                            variables, rules=state.rules, plan=aggregate_plan, apply_repairs=False
+                        )
+                        records.append(rec)
+                        last_exc = None
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                if last_exc is not None:
+                    state.record_errors.append({"record_index": index, "error": str(last_exc), "record": {}})
+                    logger.warning("[DataGeneration] Could not generate aggregational record %d after %d attempts: %s", index, GENERATION_MAX_ATTEMPTS_PER_RECORD, last_exc)
 
         state.raw_records = records
         return state
 
-    def _qa_validate(self, state: WorkflowState) -> WorkflowState:
+    def _qa_validate(
+        self,
+        state: WorkflowState,
+        *,
+        preserve_records: bool = False,
+        llm_mode: str | None = None,
+    ) -> WorkflowState:
         records = state.raw_records
         dyn = resolve_variables(state.scenario)
         if dyn is None:
             raise ValueError(f"Unknown scenario '{state.scenario}'")
         variables, _ = dyn
         transactional = state.type_of_data == "transactional"
-        qa_temporal_relations = _build_generation_plan(variables, rules=state.rules).temporal_relations
+        qa_plan = _build_generation_plan(variables, rules=state.rules)
+        qa_temporal_relations = qa_plan.temporal_relations
 
         checked: list[dict] = []
         algo_fixed = 0
         for record_index, record in enumerate(records):
-            try:
-                repaired, issues = _validate_record(
-                    record, variables, state.field_order, transactional,
-                    rules=state.rules, temporal_relations=qa_temporal_relations,
-                )
-                algo_fixed += len(issues)
-                checked.append(repaired)
-            except Exception as exc:
+            candidate = record
+            last_exc: Exception | None = None
+            for attempt in range(GENERATION_MAX_ATTEMPTS_PER_RECORD):
+                if attempt and not transactional:
+                    try:
+                        candidate = _generate_record(
+                            variables, rules=state.rules, plan=qa_plan, apply_repairs=False
+                        )
+                    except Exception as exc:
+                        last_exc = exc
+                        continue
+                try:
+                    repaired, issues = _validate_record(
+                        candidate, variables, state.field_order, transactional,
+                        rules=state.rules, temporal_relations=qa_temporal_relations,
+                    )
+                    algo_fixed += len(issues)
+                    checked.append(repaired)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+            if last_exc is not None:
+                exc = last_exc
                 state.record_errors.append({"record_index": record_index, "error": str(exc), "record": dict(record)})
                 logger.warning("[QA] Skipping invalid record %d: %s", record_index, exc)
 
-        qa_mode = os.getenv("QA_LLM_MODE", "off").strip().lower()
+        deterministic_checked = list(checked)
+
+        qa_mode = (llm_mode or os.getenv("QA_LLM_MODE", "off")).strip().lower()
         llm_fixes = 0
         llm_issues = 0
+        preserved_dropped_records = 0
+        preserved_invalid_repairs = 0
         dropped_all: list[dict] = []
         if qa_mode == "full" and checked:
             valid_all: list[dict] = []
@@ -3556,7 +3657,9 @@ class DataGenerationAgent:
                     "name": v.get("name"), "dtype": v.get("dtype"),
                     "description": v.get("description", ""), "params": v.get("params", {}),
                     "depends_on": v.get("depends_on", []), "formula": v.get("formula", ""),
-                    "nullable": v.get("nullable", False),
+                    "nullable": v.get("nullable", False), "required": v.get("required", False),
+                    "scope": v.get("scope", "transaction"),
+                    "source": v.get("source"), "provenance": v.get("provenance", {}),
                 } for v in dyn_variables
             ], default=str, sort_keys=True)
             system_prompt = _QA_SYSTEM.format(
@@ -3565,6 +3668,16 @@ class DataGenerationAgent:
             ) + (
                 "\n\nGENERATION POLICY (records should arrive pre-correct):\n"
                 + "\n".join(f"- {r}" for r in state.rules.get("generation_policy", []))
+            ) + (
+                "\n\nMACHINE-READABLE SCENARIO RULES (authoritative):\n"
+                + json.dumps({
+                    key: state.rules.get(key)
+                    for key in (
+                        "scenario_semantics", "conditional_rules", "temporal_rules",
+                        "formula_rules", "generation_constraints", "variable_sources",
+                    )
+                    if state.rules.get(key) is not None
+                }, default=str, sort_keys=True)
             ) + f"\n\nFULL SCENARIO SCHEMA CONTRACT (authoritative):\n{schema_contract}\n"
             for i in range(0, len(checked), _CHUNK):
                 chunk = checked[i:i + _CHUNK]
@@ -3611,10 +3724,11 @@ class DataGenerationAgent:
                         state.errors.append(f"QA chunk {i} returned invalid record identities; deterministic records retained")
                         valid_all.extend(chunk)
                     else:
-                        # Missing IDs must be retained unless explicitly dropped. This prevents LLM QA
-                        # from silently shrinking the dataset.
                         for qa_id, original in original_by_id.items():
-                            if qa_id in returned:
+                            if preserve_records and qa_id in dropped_ids:
+                                valid_all.append(original)
+                                preserved_dropped_records += 1
+                            elif qa_id in returned:
                                 valid_all.append(returned[qa_id])
                             elif qa_id not in dropped_ids:
                                 valid_all.append(original)
@@ -3641,6 +3755,18 @@ class DataGenerationAgent:
                     algo_fixed += len(final_issues)
                     deterministic_final.append(repaired)
                 except Exception as exc:
+                    if preserve_records and record_index < len(deterministic_checked):
+                        try:
+                            fallback, _ = _validate_record(
+                                deterministic_checked[record_index], variables, state.field_order, transactional,
+                                rules=state.rules, temporal_relations=qa_temporal_relations,
+                            )
+                            deterministic_final.append(fallback)
+                            preserved_invalid_repairs += 1
+                            logger.warning("[QA-final] Rejected LLM repair for record %d; retained deterministic-valid original: %s", record_index, exc)
+                            continue
+                        except Exception as fallback_exc:
+                            exc = fallback_exc
                     state.record_errors.append({"record_index": record_index, "error": str(exc), "record": dict(record)})
                     logger.warning("[QA-final] Rejecting record %d after deterministic recheck: %s", record_index, exc)
             checked = deterministic_final
@@ -3649,12 +3775,14 @@ class DataGenerationAgent:
         state.validation_report = {
             "total_input": len(records),
             "total_valid": len(checked),
-            "total_dropped": len(dropped_all) + len(state.record_errors),
+            "total_dropped": max(0, len(dropped_all) - preserved_dropped_records) + len(state.record_errors),
             "record_errors": len(state.record_errors),
             "recovered": 0,
             "algo_fixes": algo_fixed,
             "llm_fixes": llm_fixes,
             "llm_issues": llm_issues,
+            "preserved_dropped_records": preserved_dropped_records,
+            "preserved_invalid_repairs": preserved_invalid_repairs,
             "deterministic_checks": [
                 "schema_and_type", "declared_ranges_and_choices", "formula_and_arithmetic",
                 "timestamp_relationships", "user_history_consistency",

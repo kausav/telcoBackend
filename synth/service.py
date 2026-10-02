@@ -15,6 +15,7 @@ from synth.engines import get_engine
 from synth.pack import BehaviorPack, find_pack, get_pack
 from synth.projection import parse_columns, project
 from synth.scorer import score_rows
+from config.runtime import ENABLE_BEHAVIOR_PACKS
 
 
 @dataclass
@@ -35,6 +36,12 @@ def resolve_pack(scenario_context: dict[str, Any]) -> BehaviorPack | None:
     pack_id = str(scenario_context.get("behavior_pack_id") or "").strip()
     if not pack_id:
         return None
+    if not ENABLE_BEHAVIOR_PACKS:
+        raise ValueError(
+            f"Confirmed scenario is pinned to domain-specific behaviour pack '{pack_id}'. "
+            "Set ENABLE_BEHAVIOR_PACKS=true to run it, or propose and confirm the scenario again "
+            "with behaviour packs disabled to use the industry-standard source schema."
+        )
     version = scenario_context.get("behavior_pack_version")
     pack = get_pack(pack_id, int(version) if version not in (None, "") else None)
     if pack is None:
