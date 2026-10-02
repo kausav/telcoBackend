@@ -1,8 +1,8 @@
 """Optional domain vocabulary, stored in MongoDB (collection ``domain_lexicon``), never in code.
 
 Business wording rarely matches source-model wording ("top up" vs ``TopupBalance``, "claim" vs
-``Loss``). Those bridges are data about an industry, so they live next to the source documents and
-behaviour packs and the application ships with none. Every document looks like::
+``Loss``). Those bridges are data about an industry, so they live next to the source documents
+and the application ships with none. Every document looks like::
 
     {"industry_key": "telecom" | "*",            # "*" applies to every industry
      "aliases":          {"top_up": "topup"},     # token -> canonical token

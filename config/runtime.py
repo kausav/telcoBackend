@@ -56,15 +56,17 @@ SCHEMA_MAX_VARIABLES = max(1, int(os.getenv("SCHEMA_MAX_VARIABLES", "60")))
 PROPOSE_LLM_ADVISOR = os.getenv("PROPOSE_LLM_ADVISOR", "true").strip().lower() in {"1", "true", "yes", "on"}
 SCHEMA_MIN_VARIABLE_SCORE = float(os.getenv("SCHEMA_MIN_VARIABLE_SCORE", "42"))
 
-# Industry behavior packs add domain-specific simulation on top of source schemas. Keep the
-# standards-backed, industry-neutral path as the default; packs require explicit opt-in.
-ENABLE_BEHAVIOR_PACKS = os.getenv("ENABLE_BEHAVIOR_PACKS", "false").strip().lower() in {"1", "true", "yes", "on"}
+# A decision threshold for the logic quality of generated data (percent of records that satisfy every scenario rule).
 MIN_LOGIC_QUALITY_PERCENT = min(100.0, max(0.0, float(os.getenv("MIN_LOGIC_QUALITY_PERCENT", "90"))))
-
-# A behaviour-pack variable is only proposed when it carries a value on at least this share of rows for the requested
-# scenario type (a column that is null nearly all the time is noise). Variables the user selected explicitly are always
-# kept. 0 disables the check.
-PACK_MIN_FILL = min(1.0, max(0.0, float(os.getenv("PACK_MIN_FILL", "0.2"))))
+# Time allowed for one model call that designs a scenario's generation spec (the spec is long, so this is generous).
+SPEC_LLM_TIMEOUT_MS = max(10000, int(os.getenv("SPEC_LLM_TIMEOUT_MS", "240000")))
+# A second model reviews a sample of the data a designed spec produces and sends what a person would call wrong back to the
+# designer. Turn off to design with the deterministic checks only.
+SPEC_REVIEW = os.getenv("SPEC_REVIEW", "true").strip().lower() in {"1", "true", "yes", "on"}
+# Total time one design may take across its repair rounds; once spent, the spec so far is rejected rather than waiting on.
+SPEC_COMPILE_BUDGET_SECONDS = max(30, int(os.getenv("SPEC_COMPILE_BUDGET_SECONDS", "600")))
+# Start designing a proposal's spec in the background as soon as it is proposed (the person reviews it meanwhile).
+SPEC_WARM_ON_PROPOSE = os.getenv("SPEC_WARM_ON_PROPOSE", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 # Span used when a curated numeric range declares a lower bound but no upper bound (counts / amounts).
 OPEN_BOUND_SPAN_INT = max(1, int(os.getenv("OPEN_BOUND_SPAN_INT", "30")))

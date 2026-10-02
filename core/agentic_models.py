@@ -93,10 +93,6 @@ class GeneratedSchemaField(BaseModel):
     scope: Literal["entity", "transaction", "event", "derived"] = "transaction"
     useCase: str | None = Field(default=None, max_length=300)
     provenance: dict[str, Any] = Field(default_factory=dict)
-    # Business concept from the behaviour pack this column represents (one column per concept).
-    concept: str | None = None
-    # The column a behaviour pack uses as the chronological clock of an entity's history.
-    primary_timestamp: bool = False
 
 
 class ScenarioSchema(BaseModel):
@@ -148,5 +144,10 @@ class ScenarioImportResponse(BaseModel):
     typeOfData: Literal["transactional", "aggregational"]
     entityKey: str | None = None
     variableSources: dict[str, str] = Field(default_factory=dict, description="Internal provenance for source-backed scenario variables")
-    behaviorPackId: str | None = Field(default=None, description="Behaviour pack that governs generation for this scenario, if one applies")
-    conceptReport: dict | None = Field(default=None, description="What canonicalisation kept/dropped and why (audit trail)")
+    conceptReport: dict | None = Field(default=None, description="Audit trail of the proposal, for example curated numeric ranges that declare no upper bound")
+
+
+class CsvImportResponse(ScenarioImportResponse):
+    """CSV import: the draft plus how the scenario's generation spec was obtained."""
+    generationSpecKey: str | None = Field(default=None, description="Key of the verified generation spec pinned to this scenario, if one could be designed")
+    specReport: dict | None = Field(default=None, description="How the generation spec was obtained, what it assumes, and any problem")

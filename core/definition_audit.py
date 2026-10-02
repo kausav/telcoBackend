@@ -9,8 +9,8 @@ _RANGE_GENERATORS = {"uniform", "uniform_int"}
 def incomplete_definitions(variables: list[dict[str, Any]]) -> list[dict[str, str]]:
     """Curated numeric ranges that declare no upper bound.
 
-    Without a behaviour pack such a column can only be drawn from a neutral open-ended span, so the proposal says
-    so and the owner can complete the definition (or author a behaviour pack) for realistic values.
+    Such a column can only be drawn from a neutral open-ended span unless the generation spec (or the definition) gives
+    it a realistic scale, so the proposal says so and the owner can complete the definition.
     """
     found = []
     for var in variables:
@@ -22,6 +22,6 @@ def incomplete_definitions(variables: list[dict[str, Any]]) -> list[dict[str, st
             found.append({
                 "name": str(var.get("name") or ""),
                 "reason": "The numeric range declares no upper bound, so its values are drawn from a neutral open-ended span "
-                          "(add `max` to the definition or a behaviour pack for realistic values).",
+                          "(add `max` to the definition for realistic values).",
             })
     return found

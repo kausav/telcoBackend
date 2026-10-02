@@ -41,16 +41,11 @@ def infer_history_field_sets(variables: list[dict[str, Any]], entity_key: str | 
     }
     if scoped:
         stable = {name for name, scope in scoped.items() if scope == "entity"}
-        # A behaviour pack states for every column whether it belongs to the entity or to each event; that
-        # declaration is final, so the naming heuristics below only apply to columns no pack governs.
-        governed = {name for name, var in by_name.items() if var.get("concept")}
         # Identity fields can arrive from persisted DB definitions with a legacy transaction scope.
         # Their business identity is still entity-stable, so keep the value across a user's history.
         identity_tokens = {"customer", "account", "user", "member", "patient", "policyholder"}
         identity_names = {"msisdn", "msisdn_number", "mobile_number", "phone_number", "subscriber_number"}
         for name, var in by_name.items():
-            if name in governed:
-                continue
             low = str(name).casefold()
             desc = str(var.get("description") or "").casefold()
             looks_like_identity = (
@@ -66,7 +61,7 @@ def infer_history_field_sets(variables: list[dict[str, Any]], entity_key: str | 
         # grain remains authoritative for resource identifiers.
         for name, var in by_name.items():
             low = str(name).casefold()
-            if not low.endswith("_id") or name in stable or name in governed:
+            if not low.endswith("_id") or name in stable:
                 continue
             if scoped.get(name) in {"entity", "transaction", "event", "derived"}:
                 continue

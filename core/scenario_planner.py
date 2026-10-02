@@ -157,7 +157,7 @@ def select_source_rows(
     preferred = {normalize_lookup_key(x) for x in preferred_names or set() if normalize_lookup_key(x)}
     excluded = {normalize_lookup_key(x) for x in excluded_names or set() if normalize_lookup_key(x)}
     excluded_sem = {normalize_lookup_key(x) for x in excluded_semantic_keys or set() if normalize_lookup_key(x)}
-    # Fields a behaviour pack cannot run without: they open their model and are selected unconditionally.
+    # Fields the caller requires (for example what a DB variable depends on): selected unconditionally.
     forced = {normalize_lookup_key(x) for x in forced_names or set() if normalize_lookup_key(x)}
 
     canonical: list[dict[str, Any]] = []

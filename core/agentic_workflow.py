@@ -24,9 +24,9 @@ from core.variable_contract import validate_db_definition
 logger = logging.getLogger(__name__)
 from agents.intent_agent import GeminiIntentAgent
 from agents.schema_compiler import SchemaCompiler
-from config.runtime import ENABLE_BEHAVIOR_PACKS, PACK_MIN_FILL, PROPOSE_LLM_ADVISOR, SCHEMA_MAX_VARIABLES
+from config.runtime import PROPOSE_LLM_ADVISOR, SCHEMA_MAX_VARIABLES, SPEC_WARM_ON_PROPOSE
 from core.variable_semantics import variable_semantic_aliases
-from core.industry_source_store import normalize_domain_key, normalize_industry_key, normalize_lookup_key, semantic_exclusion_aliases, catalog_for_request
+from core.industry_source_store import normalize_industry_key, normalize_lookup_key, semantic_exclusion_aliases, catalog_for_request
 from core.output_equivalence import output_equivalence_signature
 
 
@@ -304,7 +304,6 @@ class AgenticSchemaWorkflow:
                 source_by_name.setdefault(key, {
                     "mongodb_json_source": "MONGODB_JSON",
                     "scenario_derived": "DERIVED",
-                    "behavior_pack": "DERIVED",
                 }.get(generated_from, "LLM_GENERATED"))
 
         def add_persisted(items: list[dict[str, Any]], source: str) -> None:
@@ -684,23 +683,7 @@ class AgenticSchemaWorkflow:
             "and generation behavior. Return only complementary source-backed variables from the supplied catalog; persisted MongoDB variables are supplied separately and must never be recreated or renamed."
         )
 
-        # A behaviour pack collapses candidates onto business concepts itself, so it must see the whole
-        # candidate pool (DB + complete source catalog); the variable budget applies to unpacked proposals.
-        candidate_pack = None
-        pack_pulled: list[str] = []
-        if ENABLE_BEHAVIOR_PACKS and (json_grounded or db_variables):
-            from synth.service import propose_pack
-
-            candidate_pack = propose_pack(
-                normalize_industry_key(req.industry_type), normalize_domain_key(req.domain),
-                req.requested_scenario_id, req.use_case, req.country, req.type_of_data,
-            )
-        if candidate_pack is not None and json_grounded:
-            from synth.concepts import pull_names
-
-            pack_pulled = pull_names(
-                candidate_pack, [r for r in source_catalog.get("models") or [] if isinstance(r, dict)], covered_by=db_variables)
-        pool_cap = max(SCHEMA_MAX_VARIABLES, len(source_catalog.get("models") or []) + len(db_variables)) if candidate_pack else SCHEMA_MAX_VARIABLES
+        pool_cap = SCHEMA_MAX_VARIABLES
 
         # A DB variable that depends on a source column needs that column, whatever its ranking.
         catalog_index: dict[str, str] = {}
@@ -714,7 +697,7 @@ class AgenticSchemaWorkflow:
             for alias in sorted(variable_semantic_aliases(dep))
             if alias in catalog_index and normalize_lookup_key(dep) not in protected_name_set
         })
-        forced = set(pack_pulled) | set(db_dependencies)
+        forced = set(db_dependencies)
 
         def compile_schema(cap: int) -> ScenarioSchema:
             return self.compiler.compile(
@@ -821,48 +804,16 @@ class AgenticSchemaWorkflow:
             entity_key=req.entity_key,
         )
 
-        # Behaviour pack (if one applies): collapse every candidate column onto business concepts so the
-        # dataset has exactly one column per business fact. Without a matching pack the legacy flow is unchanged.
-        pack = None
-        concept_report: dict[str, Any] | None = None
-        if candidate_pack is not None:
-            from synth.integration import apply_pack_to_schema
-
-            from core.scenario_semantics import classify_outcome_mode
-
-            mode = classify_outcome_mode(
-                scenario_type=str(req.scenario_type or ""), expected_outcome="", business_response="",
-                business_scenario=str(req.business_scenario or ""))
-            applied = apply_pack_to_schema(
-                schema, candidate_pack, variable_sources, raw_persisted_by_name, mode=mode, min_fill=PACK_MIN_FILL)
-            concept_report = applied.report
-            if applied.applied:
-                pack = candidate_pack
-                schema, variable_sources, raw_persisted_by_name = (
-                    applied.schema, applied.variable_sources, applied.raw_persisted_by_name)
-                logger.info(
-                    "[AgenticSchemaWorkflow] behaviour pack %s v%s applied: %s -> %s columns",
-                    pack.pack_id, pack.version, concept_report["input_columns"], concept_report["output_columns"],
-                )
-            else:
-                logger.info("[AgenticSchemaWorkflow] behaviour pack %s v%s skipped: %s",
-                            candidate_pack.pack_id, candidate_pack.version, concept_report["reason"])
-                if json_grounded:
-                    # Unpacked proposal: rebuild from the source under the variable budget.
-                    schema = compile_schema(SCHEMA_MAX_VARIABLES)
-                    schema, variable_sources, raw_persisted_by_name = self._merge_persisted_variables(
-                        schema, recommended, user_selected, entity_key=req.entity_key)
-
         behavioral_rules = self._canonicalize_behavioral_rules(
             list(getattr(intent, "behavioral_rules", []) or []),
             schema,
         )
         unresolved_questions = self.compiler.approval_questions(intent, schema)
         variables, field_order = self._schema_to_variables(schema, raw_persisted_by_name)
-        if pack is None:
-            incomplete = incomplete_definitions(variables)
-            if incomplete:
-                concept_report = {**(concept_report or {}), "applied": False, "incomplete_definitions": incomplete}
+        concept_report: dict[str, Any] | None = None
+        incomplete = incomplete_definitions(variables)
+        if incomplete:
+            concept_report = {"incomplete_definitions": incomplete}
         for variable in variables:
             key = str(variable.get("name") or "").strip().lower()
             persisted_source = variable_sources.get(key)
@@ -919,10 +870,9 @@ class AgenticSchemaWorkflow:
             "db_variable_names": sorted(raw_persisted_by_name.keys()),
             "db_variable_definitions": raw_persisted_by_name,
             "behavioral_rules": behavioral_rules,
-            "behavior_pack_id": pack.pack_id if pack else None,
-            "behavior_pack_version": pack.version if pack else None,
             "concept_report": concept_report,
         }
+        draft["generation_spec_key"] = self._warm_generation_spec(draft, variables)
         save_draft(draft_id, draft)
         save_proposal(
             request_id=draft_id,
@@ -952,9 +902,25 @@ class AgenticSchemaWorkflow:
             typeOfData=type_of_data,
             entityKey=entity_key,
             variableSources=variable_sources,
-            behaviorPackId=pack.pack_id if pack else None,
             conceptReport=concept_report,
         )
+
+    @staticmethod
+    def _warm_generation_spec(draft: dict[str, Any], variables: list[dict[str, Any]]) -> str | None:
+        """Start designing the generation spec of this proposal in the background and return its key.
+
+        The user reviews the proposal while the design runs, so by the time the scenario is confirmed and generated the
+        spec usually exists. The proposal's own response is not affected; nothing here waits for a model or can fail it.
+        """
+        if not SPEC_WARM_ON_PROPOSE:
+            return None
+        try:
+            from synth.service import make_brief, warm_spec
+
+            return warm_spec(variables, make_brief({**draft, "industry": draft.get("industry_type")}))
+        except Exception:
+            logger.exception("generation spec warm-up could not be started")
+            return None
 
     @staticmethod
     def validate_hitl_changes(

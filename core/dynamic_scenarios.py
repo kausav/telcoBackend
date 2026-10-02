@@ -118,8 +118,7 @@ def resolve_scenario_context(requested_scenario_id: str) -> dict[str, Any]:
         "db_variable_names": sorted(set(meta.get("db_variable_names") or []) | set((meta.get("db_variable_definitions") or {}).keys())),
         "db_variable_definitions": dict(meta.get("db_variable_definitions") or {}),
         "behavioral_rules": list(meta.get("behavioral_rules") or []),
-        "behavior_pack_id": meta.get("behavior_pack_id"),
-        "behavior_pack_version": meta.get("behavior_pack_version"),
+        "generation_spec_key": meta.get("generation_spec_key"),
     }
 
 

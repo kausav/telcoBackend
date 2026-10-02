@@ -27,7 +27,7 @@ from core.dynamic_scenarios import (
 )
 from core.compiled_schema import invalidate_scenario
 from core.runtime_cache import clear_scenario
-from core.agentic_models import ScenarioProposeRequest, ScenarioImportResponse
+from core.agentic_models import CsvImportResponse, ScenarioImportResponse, ScenarioProposeRequest
 from core.csv_scenario import infer_type_of_data, parse_definition_csv
 from config.country_metadata import COUNTRY_BASE
 from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES, INDUSTRY_SOURCE_MAX_JSON_BYTES
@@ -194,7 +194,7 @@ class GenerateRequest(BaseModel):
     count: int = Field(35, ge=1, le=5000, description="Number of users/entities to generate for a transactional scenario")
     recordsPerUser: int = Field(10, ge=1, le=10, description="Number of most-recent historical records returned per user for a transactional scenario")
     seed: int | None = Field(None, ge=0, le=2_147_483_647, description="Optional deterministic generation seed for reproducible synthetic-data runs")
-    as_of: str | None = Field(None, alias="asOf", max_length=40, description="Optional ISO-8601 reference time (\"now\") for behaviour-pack generation; with a seed it makes a run exactly reproducible")
+    as_of: str | None = Field(None, alias="asOf", max_length=40, description="Optional ISO-8601 reference time (\"now\") for generation; with a seed it makes a run exactly reproducible")
 
 
 class GenerateResponse(BaseModel):
@@ -268,6 +268,8 @@ class ConfirmResponse(BaseModel):
     typeOfData: Literal["transactional", "aggregational"]
     entityKey: str | None = None
     variableSources: dict[str, str] = Field(default_factory=dict, description="Internal provenance for source-backed scenario variables")
+    generationSpecKey: str | None = Field(default=None, description="Key of the verified generation spec pinned to this scenario, if one could be designed")
+    specReport: dict | None = Field(default=None, description="How the generation spec was obtained, what it assumes, and any problem")
 
 
 class IndustrySourceStatusRequest(BaseModel):
@@ -602,7 +604,7 @@ def remove_industry_source(source_id: str):
     return {"success": True, "sourceId": source_id, "deleted": True}
 
 
-@app.post("/scenario/import-csv", response_model=ScenarioImportResponse)
+@app.post("/scenario/import-csv", response_model=CsvImportResponse)
 def import_scenario_csv(
     file: UploadFile = File(..., description="CSV scenario definition containing variables"),
     requestedScenarioId: str = Form(...),
@@ -684,9 +686,15 @@ def import_scenario_csv(
         "agentic": False,
         "source": "csv_import",
     }
+    # A CSV definition is as much a source of truth as an industry document: the model designs how its columns behave
+    # together for this scenario (verified against the CSV's own allowed values, ranges and patterns), once, here.
+    spec_report = _prepare_generation_spec(
+        variables, {**draft, "industry": industryType, "scenario_type": scenarioType})
+    draft["generation_spec_key"] = spec_report.get("spec_key")
+    draft["spec_report"] = spec_report
     save_draft(draft_id, draft)
 
-    return ScenarioImportResponse(
+    return CsvImportResponse(
         success=True,
         draft_id=draft_id,
         scenario_id=requestedScenarioId,
@@ -697,6 +705,8 @@ def import_scenario_csv(
         field_order=field_order,
         typeOfData=detected_type,
         entityKey=entityKey,
+        generationSpecKey=draft["generation_spec_key"],
+        specReport=spec_report,
     )
 
 
@@ -716,6 +726,12 @@ def confirm_scenario_route(req: ConfirmRequest):
             )
         except (ValueError, KeyError) as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        # Confirmed definitions keep the source label the proposal gave them, so the scenario is described to the
+        # generation design exactly as it was proposed.
+        for variable in variables:
+            label = variable_sources.get(str(variable.get("name") or "").strip().casefold())
+            if label and not variable.get("source"):
+                variable["source"] = label
     else:
         variables=[dict(v) for v in draft.get("variables",[]) if isinstance(v,dict)]
         by_name={str(v.get("name")):v for v in variables if v.get("name")}
@@ -756,9 +772,6 @@ def confirm_scenario_route(req: ConfirmRequest):
         "source_policy": draft.get("source_policy", "scenario_variables"),
         "source_documents": list(draft.get("source_documents") or []),
         "behavioral_rules": [dict(rule) for rule in (draft.get("behavioral_rules") or []) if isinstance(rule, dict)],
-        # The behaviour pack pinned at proposal time; generation must use exactly this pack.
-        "behavior_pack_id": draft.get("behavior_pack_id"),
-        "behavior_pack_version": draft.get("behavior_pack_version"),
         # Preserve the immutable JSON source provenance through HITL confirmation.
         # Generation must rely on the confirmed contract rather than querying live source
         # document IDs on every request; source IDs remain useful for audit/debugging.
@@ -768,6 +781,11 @@ def confirm_scenario_route(req: ConfirmRequest):
             if str(name).strip() and str(source_id).strip()
         },
     }
+    # Pin the verified generation spec for exactly these variables: the proposal's own spec when nothing changed, that
+    # spec narrowed when columns were removed, a fresh design when columns were added. If none can be designed the
+    # scenario is still confirmed and generation says so in its report.
+    spec_report = _prepare_generation_spec(variables, meta, hint_key=draft.get("generation_spec_key"))
+    meta["generation_spec_key"] = spec_report.get("spec_key")
     try:
         scenario_id, scenario_id_reassigned = confirm_scenario(
             requested_scenario_id, meta, variables, field_order, draft_id=req.draft_id
@@ -793,6 +811,8 @@ def confirm_scenario_route(req: ConfirmRequest):
         typeOfData=type_of_data,
         entityKey=entity_key,
         variableSources=meta.get("variable_sources") or {},
+        generationSpecKey=meta["generation_spec_key"],
+        specReport=spec_report,
     )
 
 
@@ -815,6 +835,21 @@ async def propose_scenario(req: ScenarioProposeRequest):
         # runtime bugs must continue to reach the global 500 handler instead of being
         # mislabeled as a provider outage.
         raise HTTPException(status_code=503, detail={"error": str(exc)}) from exc
+
+
+def _prepare_generation_spec(variables: list[dict], meta: dict, *, hint_key: str | None = None) -> dict:
+    """Name the generation spec for ``variables`` and make sure its design is under way (never waits, never raises).
+
+    The report's ``spec_key`` is what the scenario pins; ``status`` is ``ready`` when the verified spec already exists and
+    ``designing`` when it is being designed in the background (generation waits for it if it is still running).
+    """
+    try:
+        from synth.service import make_brief, pin_spec
+
+        return dict(pin_spec(variables, make_brief(meta), hint_key=hint_key))
+    except Exception as exc:
+        logger.exception("generation spec could not be prepared")
+        return {"status": "unavailable", "spec_key": None, "problems": [f"{type(exc).__name__}: {exc}"[:300]]}
 
 
 def _timestamp_sort_key(value):

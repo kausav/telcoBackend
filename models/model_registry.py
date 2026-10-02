@@ -9,6 +9,7 @@ from models.conversation import ConversationModel
 from models.chat_message import ChatMessageModel
 from models.industry_source import IndustrySourceModel
 from models.selection_lock import SelectionLockModel
+from models.generation_spec import GenerationSpecModel
 
 ALL_MODELS = (
     ScenarioModel,
@@ -21,6 +22,7 @@ ALL_MODELS = (
     ChatMessageModel,
     IndustrySourceModel,
     SelectionLockModel,
+    GenerationSpecModel,
 )
 
 

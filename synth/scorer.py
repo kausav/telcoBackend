@@ -5,16 +5,18 @@ What the old ``validation_report`` did: it reported ``contract_pass_rate`` from 
 
 What this does: it evaluates, on the *final rows*,
 
-* **invariants** - the pack's logical rules (record-, entity- and dataset-level), each written as a
-  small expression in the pack, i.e. independently of the engine that produced the rows;
+* **invariants** - the spec's logical rules (record-, entity- and dataset-level), each written as a
+  small expression in the spec, i.e. independently of the engine that produced the rows;
 * **targets** - distribution expectations (shares, medians) with acceptance ranges;
-* **structure** - required columns present, parseable types, *duplicate columns that output the
-  same value on every row* (the "duplicate variables" problem, measured directly on the data), and the
-  output contract of the curated DB definitions (allowed choices, numeric ranges, nullability).
+* **structure** - parseable types, *duplicate columns that output the same value on every row* (the
+  "duplicate variables" problem, measured directly on the data), and the output contract of the variable
+  definitions (allowed choices, numeric ranges, patterns, nullability) - which comes from the definitions and
+  the industry source documents, not from the spec.
 
-What it does NOT do: prove the data matches the real world. It measures conformance to the pack, so a
-score is only as meaningful as the pack's rules and ranges. Calibrate the pack with real aggregates
-before quoting a score as "accuracy against reality".
+What it does NOT do: prove the data matches the real world. The spec's rules and targets are written from the
+scenario's description, so they measure internal consistency and conformance to the definitions, not
+calibration against a real population. Calibrate the parameters with real aggregates before quoting a score
+as "accuracy against reality".
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ from typing import Any
 
 from synth.contract import check_contract
 from synth.expr import Expr
-from synth.pack import BehaviorPack, Target
+from synth.spec import GenerationSpec, Target
 
 MAX_EXAMPLES = 3
 WEIGHTS = {"consistency": 0.4, "clean_rows": 0.3, "realism": 0.3}
@@ -41,34 +43,33 @@ def _evaluate(expr: Expr, env: dict[str, Any]) -> tuple[bool, str | None]:
 
 
 def score_rows(
-    pack: BehaviorPack,
+    spec: GenerationSpec,
     rows: list[dict[str, Any]],
     ref: dict[str, Any],
     *,
-    mode: str = "mixed",
     columns: set[str] | None = None,
     parse_errors: list[dict[str, Any]] | None = None,
     contract: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Score ``rows`` (``concept -> value`` dicts, datetimes aware UTC) against ``pack``."""
+    """Score ``rows`` (``column id -> value`` dicts, datetimes aware UTC) against ``spec``."""
     n = len(rows)
     present = set(columns) if columns is not None else (set(rows[0]) if rows else set())
-    concept_names = set(pack.concepts)
-    report: dict[str, Any] = {"rows": n, "mode": mode, "pack_id": pack.pack_id, "pack_version": pack.version}
+    column_names = set(spec.columns)
+    report: dict[str, Any] = {"rows": n, "spec_source": spec.source}
     if n == 0:
         report.update(overall=0.0, verdict="fail", note="no rows")
         return report
 
     def env_row(r: dict[str, Any]) -> dict[str, Any]:
         env = {c: r.get(c) for c in present}
-        env["REF"] = ref
+        env["REF"], env["as_of"], env["P"] = ref, ref.get("as_of"), ref.get("model")
         return env
 
     # ---- invariants ----------------------------------------------------------------------------
-    entity_c = pack.entity_concept
-    order_c = next((c for c, spec in pack.concepts.items() if spec.required and spec.dtype == "datetime"), None)
+    entity_c = spec.entity_column
+    order_c = spec.clock
     by_entity: dict[Any, list[dict[str, Any]]] = defaultdict(list)
-    if entity_c in present:
+    if entity_c is not None and entity_c in present:
         for r in rows:
             by_entity[r.get(entity_c)].append(r)
         if order_c in present:
@@ -77,12 +78,12 @@ def score_rows(
 
     results: list[dict[str, Any]] = []
     row_fail = [False] * n
-    for inv in pack.invariants:
+    for inv in spec.invariants:
         expr = Expr(inv.expr)
-        needed = set(inv.requires) | (expr.names & concept_names)
+        needed = set(inv.requires) | (expr.names & column_names)
         absent = needed - present
-        if inv.level == "entity" and entity_c not in present:
-            absent = absent | {entity_c}
+        if inv.level == "entity" and (entity_c is None or entity_c not in present):
+            absent = absent | {entity_c or "<entity column>"}
         if absent:
             results.append({"id": inv.id, "level": inv.level, "severity": inv.severity, "status": "skipped",
                             "reason": "columns absent: " + ", ".join(sorted(absent))})
@@ -103,7 +104,7 @@ def score_rows(
             failed = 0
             for key, grp in by_entity.items():
                 env = {c: [g.get(c) for g in grp] for c in present}
-                env["REF"] = ref
+                env["REF"], env["as_of"], env["P"] = ref, ref.get("as_of"), ref.get("model")
                 ok, err = _evaluate(expr, env)
                 if not ok:
                     failed += 1
@@ -112,7 +113,7 @@ def score_rows(
             total, passed = len(by_entity), len(by_entity) - failed
         else:  # dataset
             env = {c: [r.get(c) for r in rows] for c in present}
-            env["REF"] = ref
+            env["REF"], env["as_of"], env["P"] = ref, ref.get("as_of"), ref.get("model")
             ok, err = _evaluate(expr, env)
             total, passed, failed = 1, int(ok), int(not ok)
             if not ok:
@@ -128,23 +129,23 @@ def score_rows(
     clean_rows = 1.0 - (sum(row_fail) / n)
 
     # ---- targets -------------------------------------------------------------------------------
-    target_results = [_score_target(t, rows, present, concept_names, ref, len(by_entity) or n) for t in pack.mode_targets(mode)]
+    target_results = [_score_target(t, rows, present, column_names, ref, len(by_entity) or n) for t in spec.targets]
     scored_t = [t for t in target_results if t["status"] in ("pass", "fail")]
     realism = (sum(1 for t in scored_t if t["status"] == "pass") / len(scored_t)) if scored_t else None
 
     # ---- structure -----------------------------------------------------------------------------
-    missing_required = sorted(c for c, spec in pack.concepts.items() if spec.required and c not in present)
-    dup = _duplicate_columns(rows, present, pack)
-    contract_violations = check_contract(rows, contract or [])
+    dup = _duplicate_columns(rows, present, spec)
+    contract_bad: set[int] = set()
+    contract_violations = check_contract(rows, contract or [], contract_bad)
     structure = {
         "contract_checks": len(contract or []),
         "contract_violations": contract_violations,
-        "missing_required_concepts": missing_required,
+        "contract_rows_failed": len(contract_bad),
         "parse_errors": (parse_errors or [])[:10],
         "parse_error_count": len(parse_errors or []),
         "duplicate_columns": dup,
     }
-    structure_ok = not missing_required and not dup and not parse_errors and not contract_violations
+    structure_ok = not dup and not parse_errors and not contract_violations
 
     parts = {"consistency": consistency, "clean_rows": clean_rows}
     if realism is not None:
@@ -157,6 +158,7 @@ def score_rows(
 
     report.update(
         overall=round(overall, 4),
+        rows_failed=sum(1 for i in range(n) if row_fail[i] or i in contract_bad),
         components={k: round(v, 4) for k, v in parts.items()},
         weights={k: WEIGHTS[k] for k in parts},
         verdict=verdict,
@@ -167,8 +169,9 @@ def score_rows(
         },
         targets={"scored": len(scored_t), "skipped": len(target_results) - len(scored_t), "results": target_results},
         structure=structure,
-        note=("Scores measure conformance to the behaviour pack (logic + plausible ranges), not truth about a real "
-              "population. Calibrate the pack with real aggregates to turn it into an accuracy claim."),
+        note=("Scores measure consistency with the spec's own rules and conformance to the variable definitions (allowed "
+              "values, ranges, patterns, nullability), not truth about a real population. Calibrate the spec's "
+              "parameters with real aggregates to turn it into an accuracy claim."),
     )
     return report
 
@@ -183,12 +186,12 @@ def _wilson(p: float, n: float, z: float = 2.576) -> tuple[float, float]:
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
-def _score_target(t: Target, rows: list[dict[str, Any]], present: set[str], concepts: set[str],
+def _score_target(t: Target, rows: list[dict[str, Any]], present: set[str], columns: set[str],
                   ref: dict[str, Any], entities: int) -> dict[str, Any]:
     exprs = [Expr(s) for s in (t.where, t.condition) if s]
-    needed = set().union(*(e.names & concepts for e in exprs)) if exprs else set()
-    if t.concept:
-        needed.add(t.concept)
+    needed = set().union(*(e.names & columns for e in exprs)) if exprs else set()
+    if t.column:
+        needed.add(t.column)
     base = {"id": t.id, "stat": t.stat, "min": t.min, "max": t.max, "description": t.description}
     if not needed <= present:
         return {**base, "status": "skipped", "reason": "columns absent: " + ", ".join(sorted(needed - present))}
@@ -199,14 +202,14 @@ def _score_target(t: Target, rows: list[dict[str, Any]], present: set[str], conc
     values: list[float] = []
     for r in rows:
         env = {c: r.get(c) for c in present}
-        env["REF"] = ref
+        env["REF"], env["as_of"], env["P"] = ref, ref.get("as_of"), ref.get("model")
         try:
             if where is not None and not where(env):
                 continue
             if t.stat == "share":
                 hit = bool(cond(env))
             else:
-                v = r.get(t.concept)
+                v = r.get(t.column)
                 if v is None:
                     continue
                 values.append(float(v))
@@ -237,32 +240,32 @@ def _score_target(t: Target, rows: list[dict[str, Any]], present: set[str], conc
     return {**base, "status": "pass" if ok else "fail", "observed": round(observed, 4), "n": population}
 
 
-def _reads(pack: BehaviorPack) -> dict[str, set[str]]:
-    """concept -> concepts its emit reads (how the pack says one fact is derived from another)."""
+def _reads(spec: GenerationSpec) -> dict[str, set[str]]:
+    """column -> columns its emit reads (how the spec says one fact is derived from another)."""
     from synth.samplers import sampler_names
 
     reads: dict[str, set[str]] = {}
-    for emit in pack.emit:
+    for emit in spec.emit:
         names: set[str] = set()
         for src in (emit.when, emit.expr):
             if src:
                 names |= Expr(src).names
         if emit.sample is not None:
             names |= sampler_names(emit.sample)
-        reads[emit.concept] = names
+        reads[emit.column] = names
     return reads
 
 
-def _duplicate_columns(rows: list[dict[str, Any]], present: set[str], pack: BehaviorPack) -> list[dict[str, Any]]:
+def _duplicate_columns(rows: list[dict[str, Any]], present: set[str], spec: GenerationSpec) -> list[dict[str, Any]]:
     """Pairs of non-entity columns that carry the same varying value on *every* row (same output).
 
     Not reported: constant columns (two columns that never vary are not the same variable), columns one of which
-    the pack derives from the other (they may coincide on a small sample), and groups the pack declares in
-    ``output.identical_concepts`` - columns the business defined as two names for one fact.
+    the spec derives from the other (they may coincide on a small sample), and groups the spec declares in
+    ``output.identical_columns`` - columns the business defined as two names for one fact.
     """
-    declared = [set(group) for group in pack.output.get("identical_concepts", [])]
-    reads = _reads(pack)
-    cols = [c for c in sorted(present) if c in pack.concepts and pack.concepts[c].kind != "entity"]
+    declared = [set(group) for group in spec.output.get("identical_columns", [])]
+    reads = _reads(spec)
+    cols = [c for c in sorted(present) if c in spec.columns and spec.columns[c].kind == "event"]
     sigs: dict[tuple, list[str]] = defaultdict(list)
     for c in cols:
         values = tuple(str(_short(r.get(c))) for r in rows)

@@ -21,6 +21,7 @@ from core.dynamic_scenarios import (
 )
 from agents.data_generation_agent import _pick_timestamp_field, generation_seed, run_deterministic_agentic_generation
 from core.pipeline import run_pipeline
+from core.state import WorkflowState
 from core.industry_source_store import list_source_documents
 from core.scenario_variable_store import get_recommended
 
@@ -111,9 +112,9 @@ def _require_generation_source(
             # source label or the preserved source document id. DB overlays remain allowed.
             if source in {"MONGODB_JSON", "DB_RECOMMENDED", "USER_SELECTED"} or source_id:
                 continue
-            # Derived columns are computed by the application itself (a behaviour pack's opt-in facts, or a
-            # scenario-semantics decision such as a suppression flag), so they are not LLM output.
-            if source == "DERIVED" and str(row.get("gen") or "") in {"behavior_pack", "formula"}:
+            # Derived columns are computed by the application itself (a scenario-semantics decision such as a
+            # suppression flag), so they are not LLM output.
+            if source == "DERIVED" and str(row.get("gen") or "") == "formula":
                 continue
             # Legacy confirmed agentic rows may predate source metadata preservation. They are
             # still inside an approved mongodb source-policy contract and were schema-validated
@@ -187,6 +188,42 @@ def _require_generation_source(
                 + ", ".join(sorted(set(unknown))[:25])
             )
 
+LEGACY_ENGINE = "definitions_legacy"
+
+
+def _generate_from_spec(requested_scenario_id: str, scenario_context: dict[str, Any], *, count: int, records_per_user: int,
+                        seed: int | None, as_of: Any):
+    """Generate from the scenario's verified generation spec.
+
+    Returns ``(state, generated, report)``: ``state`` is None when no verified spec exists for the scenario (the model
+    could not be reached, or rejected its own spec after repairs), in which case the caller falls back to the
+    definition-driven generator and says so in the validation report.
+    """
+    from synth.service import generate, resolve_spec
+
+    variables, field_order = resolve_variables(requested_scenario_id) or ([], [])
+    type_of_data = str(scenario_context.get("type_of_data") or resolve_data_type(requested_scenario_id))
+    resolution = resolve_spec(scenario_context, variables)
+    if resolution.spec is None:
+        return None, None, resolution.report
+    generated = generate(resolution.spec, variables, count=max(1, count), per_entity=max(1, min(50, records_per_user)),
+                         seed=seed, as_of=as_of)
+    state = WorkflowState(
+        scenario=requested_scenario_id, count=max(1, count), industry=scenario_context.get("industry", "generic"),
+        country=scenario_context.get("country"), type_of_data=type_of_data,
+        records_per_user=max(1, min(50, records_per_user)), domain=str(scenario_context.get("domain") or ""),
+        business_scenario=str(scenario_context.get("business_scenario") or ""),
+        business_response=scenario_context.get("business_response"), expected_outcome=scenario_context.get("expected_outcome"),
+        scenario_type=scenario_context.get("scenario_type"), use_case=scenario_context.get("use_case"),
+        entity_key=scenario_context.get("entity_key"), scenario_context=dict(scenario_context))
+    state.raw_records = list(generated.records)
+    state.final_records = list(generated.records)
+    state.field_order = [name for name in field_order if name in generated.fields] or list(generated.fields)
+    generated.validation_report["generation_spec"] = resolution.report
+    state.validation_report = generated.validation_report
+    return state, generated, resolution.report
+
+
 def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
     """Run the full generation + QA pipeline and build the API response payload."""
     requested_scenario_id = req_payload.get("requested_scenario_id")
@@ -212,7 +249,11 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
     scenario_context = resolve_scenario_context(requested_scenario_id)
     _require_generation_source(requested_scenario_id, scenario_context)
     with generation_seed(seed):
-        if scenario_context.get("agentic"):
+        spec_state, spec_generated, spec_report = _generate_from_spec(
+            requested_scenario_id, scenario_context, count=count, records_per_user=records_per_user, seed=seed, as_of=as_of)
+        if spec_state is not None:
+            state = spec_state
+        elif scenario_context.get("agentic"):
             state = run_deterministic_agentic_generation(
                 scenario=requested_scenario_id,
                 count=count,
@@ -235,6 +276,12 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
                 records_per_user=records_per_user,
             )
 
+    if spec_state is None:
+        # No verified spec: the definition-driven generator ran. Say so, never let it pass for the spec-driven path.
+        state.validation_report = {**(state.validation_report or {}), "generation_engine": LEGACY_ENGINE,
+                                   "generation_spec": spec_report,
+                                   "generation_warning": "No verified generation spec was available for this scenario, so every "
+                                   "column was generated from its own definition without scenario-level behaviour modelling."}
     if state.errors and not state.final_records and not state.record_errors:
         raise RuntimeError("; ".join(state.errors))
     if state.record_errors and not state.final_records:
@@ -287,11 +334,15 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
                 continue
             grouped.setdefault(str(value), []).append(row)
         entity_records: list[dict[str, Any]] = []
-        compiled = compile_scenario(requested_scenario_id)
-        user_fields = compiled.user_fields
+        if spec_generated is not None:
+            user_fields = list(spec_generated.entity_columns)
+            history_timestamp_field = spec_generated.clock_column
+        else:
+            compiled = compile_scenario(requested_scenario_id)
+            user_fields = compiled.user_fields
+            history_timestamp_field = _pick_timestamp_field(compiled.variables)
         user_field_names = set(user_fields)
         user_field_names.add(entity_key)
-        history_timestamp_field = _pick_timestamp_field(compiled.variables)
         for entity_value, rows in grouped.items():
             timestamp_field = history_timestamp_field
             if timestamp_field:

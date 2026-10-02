@@ -1,49 +1,58 @@
-"""The output contract implied by the variable definitions a person curated in the DB.
+"""The output contract implied by the variable definitions themselves.
 
-A curated variable definition says more than its name: ``choices`` are the only values allowed,
-``min``/``max`` bound a number, ``nullable: false`` forbids gaps. The behaviour pack decides *how*
-values are produced (distributions, causality); this module checks that what it produced still stays
-inside what the definitions allow, and reports every breach. Nothing is silently "repaired".
+Wherever a variable comes from - a person's curated definition, a field of an industry source document, a row of
+an uploaded CSV definition - its definition says more than its name: ``choices`` are the only values allowed,
+``min``/``max`` bound a number, ``pattern`` and ``min_length``/``max_length`` shape a string, ``nullable: false``
+forbids gaps. The generation spec decides *how* values are produced (distributions, causality, a language
+model's judgement); this module checks that what it produced still stays inside what the definitions allow, and
+reports every breach. Nothing is silently "repaired", and nothing a model wrote can widen the contract: this is
+how the industry source documents stay authoritative for what a valid value is.
 
-Deliberately not contractual: ``weights`` and ``days_back``. They are sampling hints of the generic
-generators (equal weights and a fixed ``days_back`` are what an unconfigured variable carries), so the
-pack's own distributions and history window replace them.
+Deliberately not contractual: ``weights``, ``days_back`` and ``source_examples``. They are sampling hints of the
+generic generators, so the spec's own distributions and history window replace them.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from synth.concepts import CURATED
-
 MAX_EXAMPLES = 3
-_NUMERIC = {"integer", "int", "float", "decimal", "number"}
+_NUMERIC = {"integer", "int", "float", "decimal", "number", "numeric"}
 
 
 def _definition_params(variable: dict[str, Any]) -> dict[str, Any]:
-    params = variable.get("params") if isinstance(variable.get("params"), dict) else {}
-    if str(variable.get("gen") or "") == "behavior_pack":
-        prov = variable.get("provenance") if isinstance(variable.get("provenance"), dict) else {}
-        legacy = prov.get("legacy_params")
-        params = legacy if isinstance(legacy, dict) else {}
-    return params
+    return variable.get("params") if isinstance(variable.get("params"), dict) else {}
 
 
-def build_contract(variables: list[dict[str, Any]], concept_columns: dict[str, str]) -> list[dict[str, Any]]:
-    """One entry per curated column that constrains its values."""
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def build_contract(variables: list[dict[str, Any]], columns: dict[str, str]) -> list[dict[str, Any]]:
+    """One entry per delivered column that its definition constrains. ``columns``: spec column id -> column name."""
     by_column = {str(v.get("name")): v for v in variables}
     contract: list[dict[str, Any]] = []
-    for concept, column in concept_columns.items():
+    for cid, column in columns.items():
         v = by_column.get(column)
-        if not v or str(v.get("source") or "").upper() not in CURATED:
+        if not v:
             continue
         params = _definition_params(v)
-        entry: dict[str, Any] = {"concept": concept, "column": column}
-        if isinstance(params.get("choices"), list) and params["choices"]:
+        entry: dict[str, Any] = {"column": cid, "name": column}
+        if isinstance(params.get("choices"), list) and params["choices"] and str(v.get("gen") or "") != "dependent_choice":
             entry["choices"] = list(params["choices"])
         if str(v.get("dtype") or "").lower() in _NUMERIC:
             for key in ("min", "max"):
-                if isinstance(params.get(key), (int, float)) and not isinstance(params.get(key), bool):
+                if _number(params.get(key)):
                     entry[key] = params[key]
+        if isinstance(params.get("pattern"), str) and params["pattern"]:
+            try:
+                re.compile(params["pattern"])
+                entry["pattern"] = params["pattern"]
+            except re.error:
+                pass
+        for key in ("min_length", "max_length"):
+            if _number(params.get(key)):
+                entry[key] = int(params[key])
         if v.get("nullable") is False:
             entry["not_null"] = True
         if len(entry) > 2:
@@ -57,15 +66,18 @@ def _allowed(value: Any, choices: list[Any]) -> bool:
     return str(value).casefold() in {str(c).casefold() for c in choices if not isinstance(c, bool)}
 
 
-def check_contract(rows: list[dict[str, Any]], contract: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Violations of ``contract`` over ``rows`` (``concept -> value`` dicts)."""
+def check_contract(rows: list[dict[str, Any]], contract: list[dict[str, Any]],
+                   bad_rows: set[int] | None = None) -> list[dict[str, Any]]:
+    """Violations of ``contract`` over ``rows`` (``column id -> value`` dicts); ``bad_rows`` collects the offending row indexes."""
     violations: list[dict[str, Any]] = []
     for entry in contract:
-        concept = entry["concept"]
-        bad: dict[str, list[Any]] = {"not_null": [], "choices": [], "min": [], "max": []}
-        counts = dict.fromkeys(bad, 0)
+        cid = entry["column"]
+        pattern = re.compile(entry["pattern"]) if "pattern" in entry else None
+        rules = ("not_null", "choices", "min", "max", "pattern", "min_length", "max_length")
+        bad: dict[str, list[Any]] = {r: [] for r in rules}
+        counts = dict.fromkeys(rules, 0)
         for i, row in enumerate(rows):
-            value = row.get(concept)
+            value = row.get(cid)
             problems: list[str] = []
             if value is None:
                 if entry.get("not_null"):
@@ -73,17 +85,25 @@ def check_contract(rows: list[dict[str, Any]], contract: list[dict[str, Any]]) -
             else:
                 if "choices" in entry and not _allowed(value, entry["choices"]):
                     problems.append("choices")
-                if "min" in entry and isinstance(value, (int, float)) and value < entry["min"]:
+                if "min" in entry and _number(value) and value < entry["min"]:
                     problems.append("min")
-                if "max" in entry and isinstance(value, (int, float)) and value > entry["max"]:
+                if "max" in entry and _number(value) and value > entry["max"]:
                     problems.append("max")
+                if isinstance(value, str):
+                    if pattern is not None and pattern.fullmatch(value) is None:
+                        problems.append("pattern")
+                    if "min_length" in entry and len(value) < entry["min_length"]:
+                        problems.append("min_length")
+                    if "max_length" in entry and len(value) > entry["max_length"]:
+                        problems.append("max_length")
+            if problems and bad_rows is not None:
+                bad_rows.add(i)
             for p in problems:
                 counts[p] += 1
                 if len(bad[p]) < MAX_EXAMPLES:
                     bad[p].append({"row": i, "value": value.isoformat() if hasattr(value, "isoformat") else value})
         for rule, n in counts.items():
             if n:
-                violations.append({"column": entry["column"], "concept": concept, "rule": rule,
-                                   "allowed": entry.get(rule if rule != "not_null" else "not_null"),
-                                   "violations": n, "examples": bad[rule]})
+                violations.append({"column": entry.get("name", cid), "id": cid, "rule": rule,
+                                   "allowed": entry.get(rule), "violations": n, "examples": bad[rule]})
     return violations

@@ -1,8 +1,8 @@
-"""A tiny, safe expression language for pack invariants and targets.
+"""A tiny, safe expression language for the rules and formulas of a generation spec.
 
 Only a whitelist of AST nodes is evaluated (no attribute access, no imports, no comprehension),
-so packs can live in a database without being a code-execution vector. Short-circuit semantics of
-``and`` / ``or`` / ``if-else`` are preserved, which lets pack authors guard ``None`` values:
+so a spec - which a language model writes and a database stores - is never a code-execution vector.
+Short-circuit semantics of ``and`` / ``or`` / ``if-else`` are preserved, which lets an author guard ``None`` values:
 
     status != 'completed' or confirmed_at is not None
 """

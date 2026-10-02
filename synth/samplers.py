@@ -1,8 +1,8 @@
-"""Declarative value samplers for behaviour packs.
+"""Declarative value samplers for generation specs.
 
 Any sampler may carry ``"cast": "int" | "float"`` (``int`` rounds to the nearest integer).
 
-A pack says *how a column is produced* in data, never in code. Each ``emit`` entry is either an
+A spec says *how a column is produced* in data, never in code. Each ``emit`` entry is either an
 expression over engine variables / earlier columns, or a sampler from the small, closed catalogue below.
 This module holds mechanism only: there are no vocabularies, prefixes, numbers or formats in it.
 
@@ -26,6 +26,9 @@ This module holds mechanism only: there are no vocabularies, prefixes, numbers o
                            "days": {lognormal spec} | "minutes": {lognormal spec} |
                            "seconds": [lo, hi], "extra_seconds": [lo, hi]}    # bounds may be expressions
     {"type": "switch",    "by": "<expression>", "cases": {key: <sampler>}}
+    {"type": "after_parents", "parents": [{"var": "<variable>", "min_secs": 0, "max_secs": null}]}   # at/after every parent
+    {"type": "definition", "gen": "<generator>", "params": {...}, "dtype": "..", "formula": "..", "name": "<column>",
+                           "reads": ["<variable>", ..]}                      # the column's own definition (see synth.definitions)
 """
 from __future__ import annotations
 
@@ -35,7 +38,7 @@ from typing import Any
 from synth.expr import Expr
 
 TYPES = {"const", "expr", "choice", "id", "template", "lognormal", "beta_scaled", "uniform_int", "uniform", "bernoulli",
-         "time_shift", "switch"}
+         "time_shift", "switch", "definition", "after_parents"}
 _EXPR_KEYS = {"expr", "by", "filter", "scale", "round", "stable_by"}
 _CASTS = {"int": lambda v: int(round(float(v))), "float": float}
 _NUMERIC_KEYS = {"uniform_int": ("low", "high"), "uniform": ("low", "high", "round"), "bernoulli": ("p",)}
@@ -48,6 +51,10 @@ def sampler_names(spec: dict[str, Any]) -> set[str]:
     for key in _EXPR_KEYS | set(_NUMERIC_KEYS.get(kind, ())):
         if isinstance(spec.get(key), str):
             names |= Expr(spec[key]).names
+    if kind == "definition":
+        names |= {str(n) for n in spec.get("reads") or ()}
+    if kind == "after_parents":
+        names |= {str(p["var"]) for p in spec.get("parents") or ()}
     if kind == "time_shift":
         names.add(spec["anchor"])
         for key in ("seconds", "extra_seconds"):
@@ -67,7 +74,7 @@ class SamplerError(ValueError):
 
 
 def validate(spec: Any, where: str) -> None:
-    """Fail fast (at pack load) on unknown types, bad expressions and missing keys."""
+    """Fail fast (when a spec is loaded) on unknown types, bad expressions and missing keys."""
     if not isinstance(spec, dict) or spec.get("type") not in TYPES:
         raise SamplerError(f"{where}: sampler needs a 'type' in {sorted(TYPES)}")
     kind = spec["type"]
@@ -75,7 +82,7 @@ def validate(spec: Any, where: str) -> None:
         "const": ["value"], "expr": ["expr"], "id": ["digits"], "template": ["parts"], "lognormal": ["median", "sigma"],
         "beta_scaled": ["alpha", "beta", "scale"], "uniform_int": ["low", "high"], "uniform": ["low", "high"],
         "bernoulli": ["p"], "time_shift": ["anchor", "direction"],
-        "switch": ["by", "cases"], "choice": [],
+        "switch": ["by", "cases"], "choice": [], "definition": ["gen"], "after_parents": ["parents"],
     }[kind]
     for key in need:
         if key not in spec:
@@ -160,9 +167,21 @@ class Sampler:
             return ctx.bernoulli(float(self._num(spec["p"], env)))
         if kind == "time_shift":
             return self._shift(spec, env, rt)
+        if kind == "definition":
+            from synth import definitions
+
+            if spec.get("unique"):
+                return ctx.unique(spec.get("registry") or concept, lambda: definitions.draw(spec, env, rt))
+            return definitions.draw(spec, env, rt)
+        if kind == "after_parents":
+            return self._after(spec, env, rt)
         if kind == "switch":
             case = spec["cases"].get(str(self._expr(spec["by"])(env)))
-            return None if case is None else self._draw(case, env, rt, concept)
+            if case is None:
+                return None
+            value = self._draw(case, env, rt, concept)
+            cast = _CASTS.get(case.get("cast"))          # a case is a sampler in its own right: its cast applies too
+            return value if cast is None or value is None else cast(value)
         raise SamplerError(f"unknown sampler type {kind!r}")
 
     # ------------------------------------------------------------------------------------------
@@ -218,6 +237,25 @@ class Sampler:
             n = int(part["digits"])
             return f"{rt.ctx.rng.randrange(0, 10 ** n):0{n}d}"
         raise SamplerError(f"bad template part {part!r}")
+
+    def _after(self, spec: dict[str, Any], env: dict[str, Any], rt: "Runtime") -> Any:
+        """A time at or after every parent that has one (within each parent's optional ceiling), else None."""
+        lowers, uppers = [], []
+        for parent in spec["parents"]:
+            at = env.get(parent["var"])
+            if at is None:
+                continue
+            lowers.append(at + timedelta(seconds=float(parent.get("min_secs") or 0)))
+            if parent.get("max_secs") is not None:
+                uppers.append(at + timedelta(seconds=float(parent["max_secs"])))
+        if not lowers:
+            return None
+        lower = max(lowers)
+        upper = min(uppers) if uppers else None
+        if upper is None:
+            return lower + timedelta(seconds=rt.ctx.rng.randint(1, 3600))
+        span = int((upper - lower).total_seconds())
+        return lower if span <= 0 else lower + timedelta(seconds=rt.ctx.rng.randint(0, span))
 
     def _shift(self, spec: dict[str, Any], env: dict[str, Any], rt: "Runtime") -> Any:
         anchor = env.get(spec["anchor"])

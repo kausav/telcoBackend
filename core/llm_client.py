@@ -44,7 +44,7 @@ def _extract_status_code(exc: Exception) -> int | None:
 class GeminiClient:
     """Thin, synchronous wrapper around the supported ``google-genai`` SDK."""
 
-    def __init__(self, api_key: str | None = None) -> None:
+    def __init__(self, api_key: str | None = None, timeout_ms: int | None = None) -> None:
         try:
             from google import genai
             from google.genai import types
@@ -56,7 +56,7 @@ class GeminiClient:
             raise EnvironmentError("Set GEMINI_API_KEY or GOOGLE_API_KEY before starting the service.")
 
         self.model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-        timeout_ms = max(1000, int(os.getenv("GEMINI_TIMEOUT_MS", "60000")))
+        timeout_ms = max(1000, int(timeout_ms if timeout_ms else os.getenv("GEMINI_TIMEOUT_MS", "60000")))
         retry_attempts = max(1, min(6, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "1"))))
         retry_options = types.HttpRetryOptions(
             attempts=retry_attempts,
