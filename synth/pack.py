@@ -274,7 +274,7 @@ def _query(filter_: dict[str, Any]) -> list[BehaviorPack]:
     if hit is not None and now - hit[0] < ttl:
         return hit[1]
     out: list[BehaviorPack] = []
-    present: set[str] | None = None
+    held: set[tuple[str, int]] | None = None
     try:
         from core.seed import ensure_seeded
         from models._helpers import collection_name
@@ -290,21 +290,24 @@ def _query(filter_: dict[str, Any]) -> list[BehaviorPack]:
                 out.append(BehaviorPack.model_validate(row))
             except Exception:
                 logger.exception("Ignoring invalid behaviour pack %s in MongoDB", row.get("pack_id"))
-        present = {str(p) for p in collection.distinct("pack_id")}
+        held = {(str(r.get("pack_id")), int(r.get("version") or 0))
+                for r in itertools.islice(collection.find({}, {"_id": 0, "pack_id": 1, "version": 1}), _MAX_PACKS)
+                if isinstance(r, dict)}
     except Exception as exc:
         logger.warning("behaviour packs not loaded from MongoDB: %s", exc)
-    out.extend(_bundled_packs(filter_, present))
-    if present is not None:
+    out.extend(_bundled_packs(filter_, held))
+    if held is not None:
         _CACHE[key] = (now, out)          # a database failure is not cached: it is retried on the next call
     return out
 
 
-def _bundled_packs(filter_: dict[str, Any], present: set[str] | None) -> list[BehaviorPack]:
-    """The packs the application ships, for pack ids MongoDB holds no document of.
+def _bundled_packs(filter_: dict[str, Any], held: set[tuple[str, int]] | None) -> list[BehaviorPack]:
+    """The packs the application ships, for (pack id, version) pairs MongoDB holds no document of.
 
-    MongoDB stays authoritative: a pack id it holds (in any version or status) is never taken from the bundle, so
-    editing or retiring a pack there is always honoured. The bundle only covers what MongoDB lacks, for example when
-    the database is unreachable or does not accept the first-start insert.
+    MongoDB stays authoritative for what it holds: a pack version it has (in any status) is never taken from the
+    bundle, so editing or retiring it there is always honoured. The bundle covers what MongoDB lacks - a pack
+    version shipped after the database was seeded, or everything when the database is unreachable or rejects the
+    insert - so a newer bundled version is used instead of an older stored one.
     """
     from core.seed import bundled
 
@@ -320,7 +323,7 @@ def _bundled_packs(filter_: dict[str, Any], present: set[str] | None) -> list[Be
 
     found: list[BehaviorPack] = []
     for row in bundled("behavior_packs"):
-        if (present is not None and row.get("pack_id") in present) or not wanted(row):
+        if (held is not None and (str(row.get("pack_id")), int(row.get("version") or 0)) in held) or not wanted(row):
             continue
         try:
             found.append(BehaviorPack.model_validate(row))

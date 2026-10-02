@@ -1,7 +1,7 @@
 [
  {
   "pack_id": "telecom.prepaid.low_balance_topup.IN",
-  "version": 6,
+  "version": 7,
   "status": "active",
   "title": "Prepaid low-balance & top-up journey (India)",
   "engine": "renewal_journey/v1",
@@ -445,6 +445,17 @@
     "default_on": false,
     "column_name": null,
     "null_token": null
+   },
+   "bucket_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the bucket's validity (opened with the customer relationship).",
+    "bind": [
+     {
+      "name": "^bucket_valid_for_start_date_time$"
+     }
+    ],
+    "required": false
    }
   },
   "exclusions": [
@@ -2009,6 +2020,17 @@
      "customer_valid_to",
      "customer_valid_from"
     ]
+   },
+   {
+    "id": "bucket_valid_from_is_activation",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_valid_from == customer_valid_from",
+    "message": "The balance bucket is opened with the customer relationship.",
+    "requires": [
+     "bucket_valid_from",
+     "customer_valid_from"
+    ]
    }
   ],
   "targets": [
@@ -2256,6 +2278,13 @@
       86400
      ]
     }
+   },
+   {
+    "concept": "bucket_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
    },
    {
     "concept": "topup_id",
@@ -2564,7 +2593,7 @@
  },
  {
   "pack_id": "telecom.prepaid.low_balance.suppression.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Low balance - communication suppression (prepaid, India)",
   "engine": "event_rows/v1",
@@ -2592,7 +2621,8 @@
    "Vocabularies, probabilities and windows in this pack are ILLUSTRATIVE defaults chosen from public knowledge of Indian prepaid operations; calibrate them with the operator's aggregates (they are plain data in this pack).",
    "A row is one low-balance communication decision. It is suppressed when the customer recharged within the cooldown window or already received `frequency_cap` low-balance messages in the last 24 hours.",
    "cooldown_duration is in hours (the variable definition carries no unit).",
-   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it."
+   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it.",
+   "Related top-up and bucket variables from the source documents (usage type, product, bucket) are generated alongside the top-up attempt."
   ],
   "concepts": {
    "customer_id": {
@@ -2858,6 +2888,98 @@
     "bind": [
      {
       "name": "^topup_?balance_reason$"
+     }
+    ],
+    "required": false
+   },
+   "topup_usage_type": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Kind of balance the top-up credits.",
+    "bind": [
+     {
+      "name": "^topup_?balance_usage_type$"
+     }
+    ],
+    "required": false
+   },
+   "topup_product_name": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Product bought with the top-up.",
+    "bind": [
+     {
+      "name": "^topup_?balance_product_name$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_id": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Balance bucket identifier (one per subscriber).",
+    "bind": [
+     {
+      "name": "^bucket_id$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_status": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Status of the balance bucket.",
+    "bind": [
+     {
+      "name": "^bucket_status$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_remaining_value": {
+    "kind": "event",
+    "dtype": "float",
+    "description": "Balance in the bucket (INR).",
+    "bind": [
+     {
+      "name": "^bucket_remaining_value_amount$"
+     }
+    ],
+    "required": false,
+    "precision": 2
+   },
+   "party_account_status": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Operational state of the subscriber account.",
+    "bind": [
+     {
+      "name": "^topup_?balance_party_account_status$"
+     }
+    ],
+    "required": false
+   },
+   "topup_auto_flag": {
+    "kind": "event",
+    "dtype": "boolean",
+    "description": "The top-up was an automatic (recurring) recharge.",
+    "bind": [
+     {
+      "name": "^balance_action_history_is_auto_topup$"
+     },
+     {
+      "name": "^topup_?balance_is_auto_topup$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the bucket's validity (opened with the customer relationship).",
+    "bind": [
+     {
+      "name": "^bucket_valid_for_start_date_time$"
      }
     ],
     "required": false
@@ -3155,7 +3277,7 @@
     "id": "customer_valid_from_before_topup",
     "level": "record",
     "severity": "error",
-    "expr": "customer_valid_from < topup_requested_at",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
     "message": "The customer relationship starts before any top-up it made.",
     "requires": [
      "customer_valid_from",
@@ -3212,6 +3334,28 @@
     "message": "A customer's last top-up never moves back in time.",
     "requires": [
      "topup_confirmed_at"
+    ]
+   },
+   {
+    "id": "auto_flag_matches_reason",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_auto_flag is None or topup_auto_flag == (topup_reason == 'AUTO_RECHARGE')",
+    "message": "A top-up is automatic exactly when its reason is AUTO_RECHARGE.",
+    "requires": [
+     "topup_auto_flag",
+     "topup_reason"
+    ]
+   },
+   {
+    "id": "bucket_valid_from_is_activation",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_valid_from == customer_valid_from",
+    "message": "The balance bucket is opened with the customer relationship.",
+    "requires": [
+     "bucket_valid_from",
+     "customer_valid_from"
     ]
    }
   ],
@@ -3315,6 +3459,27 @@
       86400
      ]
     }
+   },
+   {
+    "concept": "party_account_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.95,
+      "restricted": 0.03,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "bucket_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
    },
    {
     "concept": "suppress_intent",
@@ -3540,6 +3705,110 @@
      "type": "choice",
      "from_ref": "topup_reasons"
     }
+   },
+   {
+    "concept": "topup_usage_type",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "monetary"
+    }
+   },
+   {
+    "concept": "topup_product_name",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "switch",
+     "by": "text(int(topup_amount))",
+     "cases": {
+      "10": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 10"
+      },
+      "20": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 20"
+      },
+      "50": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 50"
+      },
+      "100": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 100"
+      },
+      "149": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 149 (14 days)"
+      },
+      "199": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 199 (28 days)"
+      },
+      "239": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 239 (28 days)"
+      },
+      "299": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 299 (28 days)"
+      },
+      "399": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 399 (28 days)"
+      }
+     }
+    }
+   },
+   {
+    "concept": "bucket_id",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "BKT-",
+     "digits": 10,
+     "registry": "bucket_id",
+     "stable_by": "'bucket'"
+    }
+   },
+   {
+    "concept": "bucket_status",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.93,
+      "expired": 0.05,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "bucket_remaining_value",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "uniform",
+     "low": 0.5,
+     "high": 49.5,
+     "round": 2
+    }
+   },
+   {
+    "concept": "topup_auto_flag",
+    "scope": "event",
+    "when": "topup_reason is not None",
+    "expr": "topup_reason == 'AUTO_RECHARGE'",
+    "sample": null
    }
   ],
   "output": {
@@ -3550,7 +3819,7 @@
  },
  {
   "pack_id": "telecom.prepaid.low_balance.customer_declines.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Low balance - customer declines the offer (prepaid, India)",
   "engine": "event_rows/v1",
@@ -3577,7 +3846,8 @@
   "assumptions": [
    "Vocabularies, probabilities and windows in this pack are ILLUSTRATIVE defaults chosen from public knowledge of Indian prepaid operations; calibrate them with the operator's aggregates (they are plain data in this pack).",
    "A row is one explicit decline of a low-balance top-up offer. The business response is to stop contacting the customer for the suppression window, so the expected follow-up rate is 0 (model.followup_violation_p can be raised to simulate non-compliance).",
-   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it."
+   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it.",
+   "Related top-up and bucket variables from the source documents (usage type, product, bucket) are generated alongside the top-up attempt."
   ],
   "concepts": {
    "customer_id": {
@@ -3813,6 +4083,98 @@
     "dtype": "datetime",
     "description": "Drawn credit time before the customer's history is applied (latent).",
     "bind": [],
+    "required": false
+   },
+   "topup_usage_type": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Kind of balance the top-up credits.",
+    "bind": [
+     {
+      "name": "^topup_?balance_usage_type$"
+     }
+    ],
+    "required": false
+   },
+   "topup_product_name": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Product bought with the top-up.",
+    "bind": [
+     {
+      "name": "^topup_?balance_product_name$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_id": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Balance bucket identifier (one per subscriber).",
+    "bind": [
+     {
+      "name": "^bucket_id$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_status": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Status of the balance bucket.",
+    "bind": [
+     {
+      "name": "^bucket_status$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_remaining_value": {
+    "kind": "event",
+    "dtype": "float",
+    "description": "Balance in the bucket (INR).",
+    "bind": [
+     {
+      "name": "^bucket_remaining_value_amount$"
+     }
+    ],
+    "required": false,
+    "precision": 2
+   },
+   "party_account_status": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Operational state of the subscriber account.",
+    "bind": [
+     {
+      "name": "^topup_?balance_party_account_status$"
+     }
+    ],
+    "required": false
+   },
+   "topup_auto_flag": {
+    "kind": "event",
+    "dtype": "boolean",
+    "description": "The top-up was an automatic (recurring) recharge.",
+    "bind": [
+     {
+      "name": "^balance_action_history_is_auto_topup$"
+     },
+     {
+      "name": "^topup_?balance_is_auto_topup$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the bucket's validity (opened with the customer relationship).",
+    "bind": [
+     {
+      "name": "^bucket_valid_for_start_date_time$"
+     }
+    ],
     "required": false
    }
   },
@@ -4092,7 +4454,7 @@
     "id": "customer_valid_from_before_topup",
     "level": "record",
     "severity": "error",
-    "expr": "customer_valid_from < topup_requested_at",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
     "message": "The customer relationship starts before any top-up it made.",
     "requires": [
      "customer_valid_from",
@@ -4149,6 +4511,28 @@
     "message": "A customer's last top-up never moves back in time.",
     "requires": [
      "topup_confirmed_at"
+    ]
+   },
+   {
+    "id": "auto_flag_matches_reason",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_auto_flag is None or topup_auto_flag == (topup_reason == 'AUTO_RECHARGE')",
+    "message": "A top-up is automatic exactly when its reason is AUTO_RECHARGE.",
+    "requires": [
+     "topup_auto_flag",
+     "topup_reason"
+    ]
+   },
+   {
+    "id": "bucket_valid_from_is_activation",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_valid_from == customer_valid_from",
+    "message": "The balance bucket is opened with the customer relationship.",
+    "requires": [
+     "bucket_valid_from",
+     "customer_valid_from"
     ]
    }
   ],
@@ -4262,6 +4646,27 @@
       86400
      ]
     }
+   },
+   {
+    "concept": "party_account_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.95,
+      "restricted": 0.03,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "bucket_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
    },
    {
     "concept": "offer_name",
@@ -4412,6 +4817,110 @@
      "type": "choice",
      "from_ref": "topup_reasons"
     }
+   },
+   {
+    "concept": "topup_usage_type",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "monetary"
+    }
+   },
+   {
+    "concept": "topup_product_name",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "switch",
+     "by": "text(int(topup_amount))",
+     "cases": {
+      "10": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 10"
+      },
+      "20": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 20"
+      },
+      "50": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 50"
+      },
+      "100": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 100"
+      },
+      "149": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 149 (14 days)"
+      },
+      "199": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 199 (28 days)"
+      },
+      "239": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 239 (28 days)"
+      },
+      "299": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 299 (28 days)"
+      },
+      "399": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 399 (28 days)"
+      }
+     }
+    }
+   },
+   {
+    "concept": "bucket_id",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "BKT-",
+     "digits": 10,
+     "registry": "bucket_id",
+     "stable_by": "'bucket'"
+    }
+   },
+   {
+    "concept": "bucket_status",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.93,
+      "expired": 0.05,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "bucket_remaining_value",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "uniform",
+     "low": 0.5,
+     "high": 49.5,
+     "round": 2
+    }
+   },
+   {
+    "concept": "topup_auto_flag",
+    "scope": "event",
+    "when": "topup_reason is not None",
+    "expr": "topup_reason == 'AUTO_RECHARGE'",
+    "sample": null
    }
   ],
   "output": {
@@ -4422,7 +4931,7 @@
  },
  {
   "pack_id": "telecom.prepaid.low_balance.cooldown.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Low balance - engagement cooldown (prepaid, India)",
   "engine": "event_rows/v1",
@@ -4449,7 +4958,8 @@
   "assumptions": [
    "Vocabularies, probabilities and windows in this pack are ILLUSTRATIVE defaults chosen from public knowledge of Indian prepaid operations; calibrate them with the operator's aggregates (they are plain data in this pack).",
    "A row is one cooldown that starts after an engagement; the customer's response arrives inside the window and a repeat engagement is blocked while the cooldown runs (more often after a negative response).",
-   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it."
+   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it.",
+   "Related top-up and bucket variables from the source documents (usage type, product, bucket) are generated alongside the top-up attempt."
   ],
   "concepts": {
    "customer_id": {
@@ -4675,6 +5185,98 @@
     "dtype": "datetime",
     "description": "Drawn credit time before the customer's history is applied (latent).",
     "bind": [],
+    "required": false
+   },
+   "topup_usage_type": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Kind of balance the top-up credits.",
+    "bind": [
+     {
+      "name": "^topup_?balance_usage_type$"
+     }
+    ],
+    "required": false
+   },
+   "topup_product_name": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Product bought with the top-up.",
+    "bind": [
+     {
+      "name": "^topup_?balance_product_name$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_id": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Balance bucket identifier (one per subscriber).",
+    "bind": [
+     {
+      "name": "^bucket_id$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_status": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Status of the balance bucket.",
+    "bind": [
+     {
+      "name": "^bucket_status$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_remaining_value": {
+    "kind": "event",
+    "dtype": "float",
+    "description": "Balance in the bucket (INR).",
+    "bind": [
+     {
+      "name": "^bucket_remaining_value_amount$"
+     }
+    ],
+    "required": false,
+    "precision": 2
+   },
+   "party_account_status": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Operational state of the subscriber account.",
+    "bind": [
+     {
+      "name": "^topup_?balance_party_account_status$"
+     }
+    ],
+    "required": false
+   },
+   "topup_auto_flag": {
+    "kind": "event",
+    "dtype": "boolean",
+    "description": "The top-up was an automatic (recurring) recharge.",
+    "bind": [
+     {
+      "name": "^balance_action_history_is_auto_topup$"
+     },
+     {
+      "name": "^topup_?balance_is_auto_topup$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the bucket's validity (opened with the customer relationship).",
+    "bind": [
+     {
+      "name": "^bucket_valid_for_start_date_time$"
+     }
+    ],
     "required": false
    }
   },
@@ -4935,7 +5537,7 @@
     "id": "customer_valid_from_before_topup",
     "level": "record",
     "severity": "error",
-    "expr": "customer_valid_from < topup_requested_at",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
     "message": "The customer relationship starts before any top-up it made.",
     "requires": [
      "customer_valid_from",
@@ -4992,6 +5594,28 @@
     "message": "A customer's last top-up never moves back in time.",
     "requires": [
      "topup_confirmed_at"
+    ]
+   },
+   {
+    "id": "auto_flag_matches_reason",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_auto_flag is None or topup_auto_flag == (topup_reason == 'AUTO_RECHARGE')",
+    "message": "A top-up is automatic exactly when its reason is AUTO_RECHARGE.",
+    "requires": [
+     "topup_auto_flag",
+     "topup_reason"
+    ]
+   },
+   {
+    "id": "bucket_valid_from_is_activation",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_valid_from == customer_valid_from",
+    "message": "The balance bucket is opened with the customer relationship.",
+    "requires": [
+     "bucket_valid_from",
+     "customer_valid_from"
     ]
    }
   ],
@@ -5107,6 +5731,27 @@
     }
    },
    {
+    "concept": "party_account_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.95,
+      "restricted": 0.03,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "bucket_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
+   },
+   {
     "concept": "cooldown_start_timestamp",
     "scope": "event",
     "when": null,
@@ -5152,7 +5797,7 @@
      "direction": "after",
      "seconds": [
       60,
-      "cooldown_period_hours * 3600 * 0.5"
+      "min(cooldown_period_hours * 3600 * 0.5, secs(as_of, cooldown_start_timestamp))"
      ]
     }
    },
@@ -5253,6 +5898,110 @@
      "type": "choice",
      "from_ref": "topup_reasons"
     }
+   },
+   {
+    "concept": "topup_usage_type",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "monetary"
+    }
+   },
+   {
+    "concept": "topup_product_name",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "switch",
+     "by": "text(int(topup_amount))",
+     "cases": {
+      "10": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 10"
+      },
+      "20": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 20"
+      },
+      "50": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 50"
+      },
+      "100": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 100"
+      },
+      "149": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 149 (14 days)"
+      },
+      "199": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 199 (28 days)"
+      },
+      "239": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 239 (28 days)"
+      },
+      "299": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 299 (28 days)"
+      },
+      "399": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 399 (28 days)"
+      }
+     }
+    }
+   },
+   {
+    "concept": "bucket_id",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "BKT-",
+     "digits": 10,
+     "registry": "bucket_id",
+     "stable_by": "'bucket'"
+    }
+   },
+   {
+    "concept": "bucket_status",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.93,
+      "expired": 0.05,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "bucket_remaining_value",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "uniform",
+     "low": 0.5,
+     "high": 49.5,
+     "round": 2
+    }
+   },
+   {
+    "concept": "topup_auto_flag",
+    "scope": "event",
+    "when": "topup_reason is not None",
+    "expr": "topup_reason == 'AUTO_RECHARGE'",
+    "sample": null
    }
   ],
   "output": {
@@ -5263,7 +6012,7 @@
  },
  {
   "pack_id": "telecom.prepaid.low_balance.support_path.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Low balance - assisted top-up support path (prepaid, India)",
   "engine": "event_rows/v1",
@@ -5290,7 +6039,8 @@
   "assumptions": [
    "Vocabularies, probabilities and windows in this pack are ILLUSTRATIVE defaults chosen from public knowledge of Indian prepaid operations; calibrate them with the operator's aggregates (they are plain data in this pack).",
    "A row is one support contact raised because a low-balance top-up did not go smoothly. Every contact is logged under a case id (the DB makes it non-null; it is mandatory on escalation); only resolved requests have a resolution time. Every row is a support contact (the DB defines the request time as mandatory), so assistance_required_flag is true unless model.assistance_required_p is lowered.",
-   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it."
+   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it.",
+   "Related top-up and bucket variables from the source documents (usage type, product, bucket) are generated alongside the top-up attempt."
   ],
   "concepts": {
    "customer_id": {
@@ -5548,6 +6298,98 @@
     "dtype": "datetime",
     "description": "Drawn credit time before the customer's history is applied (latent).",
     "bind": [],
+    "required": false
+   },
+   "topup_usage_type": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Kind of balance the top-up credits.",
+    "bind": [
+     {
+      "name": "^topup_?balance_usage_type$"
+     }
+    ],
+    "required": false
+   },
+   "topup_product_name": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Product bought with the top-up.",
+    "bind": [
+     {
+      "name": "^topup_?balance_product_name$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_id": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Balance bucket identifier (one per subscriber).",
+    "bind": [
+     {
+      "name": "^bucket_id$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_status": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Status of the balance bucket.",
+    "bind": [
+     {
+      "name": "^bucket_status$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_remaining_value": {
+    "kind": "event",
+    "dtype": "float",
+    "description": "Balance in the bucket (INR).",
+    "bind": [
+     {
+      "name": "^bucket_remaining_value_amount$"
+     }
+    ],
+    "required": false,
+    "precision": 2
+   },
+   "party_account_status": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Operational state of the subscriber account.",
+    "bind": [
+     {
+      "name": "^topup_?balance_party_account_status$"
+     }
+    ],
+    "required": false
+   },
+   "topup_auto_flag": {
+    "kind": "event",
+    "dtype": "boolean",
+    "description": "The top-up was an automatic (recurring) recharge.",
+    "bind": [
+     {
+      "name": "^balance_action_history_is_auto_topup$"
+     },
+     {
+      "name": "^topup_?balance_is_auto_topup$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the bucket's validity (opened with the customer relationship).",
+    "bind": [
+     {
+      "name": "^bucket_valid_for_start_date_time$"
+     }
+    ],
     "required": false
    }
   },
@@ -5885,7 +6727,7 @@
     "id": "customer_valid_from_before_topup",
     "level": "record",
     "severity": "error",
-    "expr": "customer_valid_from < topup_requested_at",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
     "message": "The customer relationship starts before any top-up it made.",
     "requires": [
      "customer_valid_from",
@@ -5942,6 +6784,28 @@
     "message": "A customer's last top-up never moves back in time.",
     "requires": [
      "topup_confirmed_at"
+    ]
+   },
+   {
+    "id": "auto_flag_matches_reason",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_auto_flag is None or topup_auto_flag == (topup_reason == 'AUTO_RECHARGE')",
+    "message": "A top-up is automatic exactly when its reason is AUTO_RECHARGE.",
+    "requires": [
+     "topup_auto_flag",
+     "topup_reason"
+    ]
+   },
+   {
+    "id": "bucket_valid_from_is_activation",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_valid_from == customer_valid_from",
+    "message": "The balance bucket is opened with the customer relationship.",
+    "requires": [
+     "bucket_valid_from",
+     "customer_valid_from"
     ]
    }
   ],
@@ -6065,6 +6929,27 @@
       86400
      ]
     }
+   },
+   {
+    "concept": "party_account_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.95,
+      "restricted": 0.03,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "bucket_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
    },
    {
     "concept": "assistance_required_flag",
@@ -6247,6 +7132,110 @@
      "type": "choice",
      "from_ref": "topup_reasons"
     }
+   },
+   {
+    "concept": "topup_usage_type",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "monetary"
+    }
+   },
+   {
+    "concept": "topup_product_name",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "switch",
+     "by": "text(int(topup_amount))",
+     "cases": {
+      "10": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 10"
+      },
+      "20": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 20"
+      },
+      "50": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 50"
+      },
+      "100": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 100"
+      },
+      "149": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 149 (14 days)"
+      },
+      "199": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 199 (28 days)"
+      },
+      "239": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 239 (28 days)"
+      },
+      "299": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 299 (28 days)"
+      },
+      "399": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 399 (28 days)"
+      }
+     }
+    }
+   },
+   {
+    "concept": "bucket_id",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "BKT-",
+     "digits": 10,
+     "registry": "bucket_id",
+     "stable_by": "'bucket'"
+    }
+   },
+   {
+    "concept": "bucket_status",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.93,
+      "expired": 0.05,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "bucket_remaining_value",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "uniform",
+     "low": 0.5,
+     "high": 49.5,
+     "round": 2
+    }
+   },
+   {
+    "concept": "topup_auto_flag",
+    "scope": "event",
+    "when": "topup_reason is not None",
+    "expr": "topup_reason == 'AUTO_RECHARGE'",
+    "sample": null
    }
   ],
   "output": {
@@ -6257,7 +7246,7 @@
  },
  {
   "pack_id": "telecom.prepaid.low_balance.topup_failure.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Low balance - top-up failure and recovery (prepaid, India)",
   "engine": "event_rows/v1",
@@ -6283,7 +7272,9 @@
   "entity_concept": "customer_id",
   "assumptions": [
    "Vocabularies, probabilities and windows in this pack are ILLUSTRATIVE defaults chosen from public knowledge of Indian prepaid operations; calibrate them with the operator's aggregates (they are plain data in this pack).",
-   "A row is one top-up attempt. Failed attempts carry a failure code, whether an immediate retry is permitted (by failure code) and the recovery action; in-flight states (INITIALIZED/IN_PROGRESS) only occur for attempts made in the last two hours before the reference time."
+   "A row is one top-up attempt. Failed attempts carry a failure code, whether an immediate retry is permitted (by failure code) and the recovery action; in-flight states (INITIALIZED/IN_PROGRESS) only occur for attempts made in the last two hours before the reference time.",
+   "Related customer variables from the source documents (state, status, start of the relationship) are generated per subscriber and the relationship always starts before the journey.",
+   "Related top-up and bucket variables from the source documents (usage type, product, bucket) are generated alongside the top-up attempt."
   ],
   "concepts": {
    "customer_id": {
@@ -6509,6 +7500,130 @@
      }
     ],
     "required": false
+   },
+   "state": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Indian state / union territory of the subscriber.",
+    "bind": [
+     {
+      "name": "^customer_contact_medium_characteristic_state_or_province$"
+     },
+     {
+      "name": "^state(_or_province)?$"
+     }
+    ],
+    "required": false
+   },
+   "customer_status": {
+    "kind": "entity",
+    "dtype": "categorical",
+    "description": "Lifecycle status of the customer relationship.",
+    "bind": [
+     {
+      "name": "^customer_status$"
+     }
+    ],
+    "required": false
+   },
+   "customer_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the customer relationship (activation).",
+    "bind": [
+     {
+      "name": "^customer_valid_for_start_(date_time|datetime|date)$"
+     }
+    ],
+    "required": false
+   },
+   "topup_usage_type": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Kind of balance the top-up credits.",
+    "bind": [
+     {
+      "name": "^topup_?balance_usage_type$"
+     }
+    ],
+    "required": false
+   },
+   "topup_product_name": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Product bought with the top-up.",
+    "bind": [
+     {
+      "name": "^topup_?balance_product_name$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_id": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Balance bucket identifier (one per subscriber).",
+    "bind": [
+     {
+      "name": "^bucket_id$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_status": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Status of the balance bucket.",
+    "bind": [
+     {
+      "name": "^bucket_status$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_remaining_value": {
+    "kind": "event",
+    "dtype": "float",
+    "description": "Balance in the bucket (INR).",
+    "bind": [
+     {
+      "name": "^bucket_remaining_value_amount$"
+     }
+    ],
+    "required": false,
+    "precision": 2
+   },
+   "bucket_balance_before": {
+    "kind": "derived",
+    "dtype": "float",
+    "description": "Balance before the top-up attempt (latent).",
+    "bind": [],
+    "required": false
+   },
+   "topup_auto_flag": {
+    "kind": "event",
+    "dtype": "boolean",
+    "description": "The top-up was an automatic (recurring) recharge.",
+    "bind": [
+     {
+      "name": "^balance_action_history_is_auto_topup$"
+     },
+     {
+      "name": "^topup_?balance_is_auto_topup$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the bucket's validity (opened with the customer relationship).",
+    "bind": [
+     {
+      "name": "^bucket_valid_for_start_date_time$"
+     }
+    ],
+    "required": false
    }
   },
   "exclusions": [],
@@ -6663,6 +7778,41 @@
     "INITIALIZED": {
      "0": 1.0
     }
+   },
+   "states": {
+    "Uttar Pradesh": 14.5,
+    "Maharashtra": 8.6,
+    "Bihar": 6.4,
+    "Tamil Nadu": 6.3,
+    "Madhya Pradesh": 5.5,
+    "West Bengal": 5.3,
+    "Rajasthan": 5.3,
+    "Karnataka": 5.0,
+    "Gujarat": 4.6,
+    "Andhra Pradesh": 4.4,
+    "Telangana": 3.6,
+    "Kerala": 3.0,
+    "Odisha": 2.6,
+    "Punjab": 2.5,
+    "Delhi": 2.4,
+    "Haryana": 2.2,
+    "Jharkhand": 2.0,
+    "Chhattisgarh": 1.9,
+    "Assam": 1.8,
+    "Uttarakhand": 0.9,
+    "Jammu and Kashmir": 0.9,
+    "Himachal Pradesh": 0.6,
+    "Goa": 0.3,
+    "Tripura": 0.3,
+    "Meghalaya": 0.3,
+    "Manipur": 0.2,
+    "Nagaland": 0.2,
+    "Arunachal Pradesh": 0.2,
+    "Mizoram": 0.2,
+    "Sikkim": 0.1
+   },
+   "customer_status": {
+    "active": 1.0
    }
   },
   "model": {
@@ -6808,6 +7958,112 @@
     "requires": [
      "topup_amount"
     ]
+   },
+   {
+    "id": "state_known",
+    "level": "record",
+    "severity": "error",
+    "expr": "state in REF['states']",
+    "message": "State must be an Indian state / UT.",
+    "requires": [
+     "state"
+    ]
+   },
+   {
+    "id": "state_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(state) == 1",
+    "message": "state must not change within a subscriber's history.",
+    "requires": [
+     "state"
+    ]
+   },
+   {
+    "id": "customer_status_known",
+    "level": "record",
+    "severity": "error",
+    "expr": "customer_status in REF['customer_status']",
+    "message": "Customer status comes from the status vocabulary.",
+    "requires": [
+     "customer_status"
+    ]
+   },
+   {
+    "id": "customer_status_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(customer_status) == 1",
+    "message": "customer_status is a property of the subscriber.",
+    "requires": [
+     "customer_status"
+    ]
+   },
+   {
+    "id": "customer_valid_from_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(customer_valid_from) == 1",
+    "message": "customer_valid_from is a property of the subscriber.",
+    "requires": [
+     "customer_valid_from"
+    ]
+   },
+   {
+    "id": "customer_valid_from_before_event",
+    "level": "record",
+    "severity": "error",
+    "expr": "customer_valid_from < topup_requested_at",
+    "message": "The customer relationship starts before the event.",
+    "requires": [
+     "customer_valid_from",
+     "topup_requested_at"
+    ]
+   },
+   {
+    "id": "customer_valid_from_before_topup",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
+    "message": "The customer relationship starts before any top-up it made.",
+    "requires": [
+     "customer_valid_from",
+     "topup_requested_at"
+    ]
+   },
+   {
+    "id": "credited_only_when_completed",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_remaining_value >= (topup_amount if topup_confirmed_at is not None else 0)",
+    "message": "A completed top-up is credited to the bucket; a failed one is not.",
+    "requires": [
+     "bucket_remaining_value",
+     "topup_amount",
+     "topup_confirmed_at"
+    ]
+   },
+   {
+    "id": "auto_flag_matches_reason",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_auto_flag is None or topup_auto_flag == (topup_reason == 'AUTO_RECHARGE')",
+    "message": "A top-up is automatic exactly when its reason is AUTO_RECHARGE.",
+    "requires": [
+     "topup_auto_flag",
+     "topup_reason"
+    ]
+   },
+   {
+    "id": "bucket_valid_from_is_activation",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_valid_from == customer_valid_from",
+    "message": "The balance bucket is opened with the customer relationship.",
+    "requires": [
+     "bucket_valid_from",
+     "customer_valid_from"
+    ]
    }
   ],
   "targets": [
@@ -6889,6 +8145,54 @@
      "type": "choice",
      "from_ref": "party_account_status"
     }
+   },
+   {
+    "concept": "state",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "from_ref": "states"
+    }
+   },
+   {
+    "concept": "customer_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "from_ref": "customer_status"
+    }
+   },
+   {
+    "concept": "customer_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "time_shift",
+     "anchor": "first_event_at",
+     "direction": "before",
+     "days": {
+      "median": 420,
+      "sigma": 0.7,
+      "min": 60,
+      "max": 3650
+     },
+     "extra_seconds": [
+      0,
+      86400
+     ]
+    }
+   },
+   {
+    "concept": "bucket_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
    },
    {
     "concept": "topup_status",
@@ -7067,6 +8371,117 @@
      "tables_ref": "retry_counts",
      "cast": "int"
     }
+   },
+   {
+    "concept": "topup_usage_type",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "monetary"
+    }
+   },
+   {
+    "concept": "topup_product_name",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "switch",
+     "by": "text(int(topup_amount))",
+     "cases": {
+      "10": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 10"
+      },
+      "20": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 20"
+      },
+      "50": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 50"
+      },
+      "100": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 100"
+      },
+      "149": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 149 (14 days)"
+      },
+      "199": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 199 (28 days)"
+      },
+      "239": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 239 (28 days)"
+      },
+      "299": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 299 (28 days)"
+      },
+      "399": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 399 (28 days)"
+      }
+     }
+    }
+   },
+   {
+    "concept": "bucket_id",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "BKT-",
+     "digits": 10,
+     "registry": "bucket_id",
+     "stable_by": "'bucket'"
+    }
+   },
+   {
+    "concept": "bucket_status",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.93,
+      "expired": 0.05,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "bucket_balance_before",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "uniform",
+     "low": 0.5,
+     "high": 49.5,
+     "round": 2
+    }
+   },
+   {
+    "concept": "bucket_remaining_value",
+    "scope": "event",
+    "when": null,
+    "expr": "round(bucket_balance_before + (topup_amount if topup_confirmed_at is not None else 0), 2)",
+    "sample": null
+   },
+   {
+    "concept": "topup_auto_flag",
+    "scope": "event",
+    "when": "topup_reason is not None",
+    "expr": "topup_reason == 'AUTO_RECHARGE'",
+    "sample": null
    }
   ],
   "output": {
@@ -7077,7 +8492,7 @@
  },
  {
   "pack_id": "telecom.prepaid.low_balance.balance_discrepancy.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Low balance - balance update discrepancy verification (prepaid, India)",
   "engine": "event_rows/v1",
@@ -7104,7 +8519,9 @@
   "assumptions": [
    "Vocabularies, probabilities and windows in this pack are ILLUSTRATIVE defaults chosen from public knowledge of Indian prepaid operations; calibrate them with the operator's aggregates (they are plain data in this pack).",
    "A row is one credited top-up whose balance was reconciled. The DB statuses allow only completed_discrepancy and pending_verification, so VERIFIED_MATCH (a clean reconciliation) is never generated.",
-   "Pending verifications have no verdict yet, hence no fault reason, verification time or discrepancy."
+   "Pending verifications have no verdict yet, hence no fault reason, verification time or discrepancy.",
+   "Related customer variables from the source documents (state, status, start of the relationship) are generated per subscriber and the relationship always starts before the journey.",
+   "Related top-up and bucket variables from the source documents (usage type, product, bucket) are generated alongside the top-up attempt."
   ],
   "concepts": {
    "customer_id": {
@@ -7378,6 +8795,100 @@
      }
     ],
     "required": false
+   },
+   "state": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Indian state / union territory of the subscriber.",
+    "bind": [
+     {
+      "name": "^customer_contact_medium_characteristic_state_or_province$"
+     },
+     {
+      "name": "^state(_or_province)?$"
+     }
+    ],
+    "required": false
+   },
+   "customer_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the customer relationship (activation).",
+    "bind": [
+     {
+      "name": "^customer_valid_for_start_(date_time|datetime|date)$"
+     }
+    ],
+    "required": false
+   },
+   "topup_usage_type": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Kind of balance the top-up credits.",
+    "bind": [
+     {
+      "name": "^topup_?balance_usage_type$"
+     }
+    ],
+    "required": false
+   },
+   "topup_product_name": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Product bought with the top-up.",
+    "bind": [
+     {
+      "name": "^topup_?balance_product_name$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_id": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Balance bucket identifier (one per subscriber).",
+    "bind": [
+     {
+      "name": "^bucket_id$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_status": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Status of the balance bucket.",
+    "bind": [
+     {
+      "name": "^bucket_status$"
+     }
+    ],
+    "required": false
+   },
+   "topup_auto_flag": {
+    "kind": "event",
+    "dtype": "boolean",
+    "description": "The top-up was an automatic (recurring) recharge.",
+    "bind": [
+     {
+      "name": "^balance_action_history_is_auto_topup$"
+     },
+     {
+      "name": "^topup_?balance_is_auto_topup$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the bucket's validity (opened with the customer relationship).",
+    "bind": [
+     {
+      "name": "^bucket_valid_for_start_date_time$"
+     }
+    ],
+    "required": false
    }
   },
   "exclusions": [],
@@ -7507,6 +9018,38 @@
     "OCS_SYNC_DELAY": 0.25,
     "DUPLICATE_TRANSACTION_REJECTED": 0.1,
     "MESSAGE_QUEUE_LAG": 0.1
+   },
+   "states": {
+    "Uttar Pradesh": 14.5,
+    "Maharashtra": 8.6,
+    "Bihar": 6.4,
+    "Tamil Nadu": 6.3,
+    "Madhya Pradesh": 5.5,
+    "West Bengal": 5.3,
+    "Rajasthan": 5.3,
+    "Karnataka": 5.0,
+    "Gujarat": 4.6,
+    "Andhra Pradesh": 4.4,
+    "Telangana": 3.6,
+    "Kerala": 3.0,
+    "Odisha": 2.6,
+    "Punjab": 2.5,
+    "Delhi": 2.4,
+    "Haryana": 2.2,
+    "Jharkhand": 2.0,
+    "Chhattisgarh": 1.9,
+    "Assam": 1.8,
+    "Uttarakhand": 0.9,
+    "Jammu and Kashmir": 0.9,
+    "Himachal Pradesh": 0.6,
+    "Goa": 0.3,
+    "Tripura": 0.3,
+    "Meghalaya": 0.3,
+    "Manipur": 0.2,
+    "Nagaland": 0.2,
+    "Arunachal Pradesh": 0.2,
+    "Mizoram": 0.2,
+    "Sikkim": 0.1
    }
   },
   "model": {
@@ -7667,6 +9210,100 @@
     "requires": [
      "topup_amount"
     ]
+   },
+   {
+    "id": "state_known",
+    "level": "record",
+    "severity": "error",
+    "expr": "state in REF['states']",
+    "message": "State must be an Indian state / UT.",
+    "requires": [
+     "state"
+    ]
+   },
+   {
+    "id": "state_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(state) == 1",
+    "message": "state must not change within a subscriber's history.",
+    "requires": [
+     "state"
+    ]
+   },
+   {
+    "id": "customer_status_known",
+    "level": "record",
+    "severity": "error",
+    "expr": "customer_status in REF['customer_status']",
+    "message": "Customer status comes from the status vocabulary.",
+    "requires": [
+     "customer_status"
+    ]
+   },
+   {
+    "id": "customer_status_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(customer_status) == 1",
+    "message": "customer_status is a property of the subscriber.",
+    "requires": [
+     "customer_status"
+    ]
+   },
+   {
+    "id": "customer_valid_from_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(customer_valid_from) == 1",
+    "message": "customer_valid_from is a property of the subscriber.",
+    "requires": [
+     "customer_valid_from"
+    ]
+   },
+   {
+    "id": "customer_valid_from_before_event",
+    "level": "record",
+    "severity": "error",
+    "expr": "customer_valid_from < topup_requested_at",
+    "message": "The customer relationship starts before the event.",
+    "requires": [
+     "customer_valid_from",
+     "topup_requested_at"
+    ]
+   },
+   {
+    "id": "customer_valid_from_before_topup",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
+    "message": "The customer relationship starts before any top-up it made.",
+    "requires": [
+     "customer_valid_from",
+     "topup_requested_at"
+    ]
+   },
+   {
+    "id": "auto_flag_matches_reason",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_auto_flag is None or topup_auto_flag == (topup_reason == 'AUTO_RECHARGE')",
+    "message": "A top-up is automatic exactly when its reason is AUTO_RECHARGE.",
+    "requires": [
+     "topup_auto_flag",
+     "topup_reason"
+    ]
+   },
+   {
+    "id": "bucket_valid_from_is_activation",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_valid_from == customer_valid_from",
+    "message": "The balance bucket is opened with the customer relationship.",
+    "requires": [
+     "bucket_valid_from",
+     "customer_valid_from"
+    ]
    }
   ],
   "targets": [
@@ -7749,6 +9386,44 @@
      "by": "customer_status",
      "tables_ref": "account_status_by_customer_status"
     }
+   },
+   {
+    "concept": "state",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "from_ref": "states"
+    }
+   },
+   {
+    "concept": "customer_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "time_shift",
+     "anchor": "first_event_at",
+     "direction": "before",
+     "days": {
+      "median": 420,
+      "sigma": 0.7,
+      "min": 60,
+      "max": 3650
+     },
+     "extra_seconds": [
+      0,
+      86400
+     ]
+    }
+   },
+   {
+    "concept": "bucket_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
    },
    {
     "concept": "verification_status",
@@ -7974,6 +9649,98 @@
       "max": 720
      }
     }
+   },
+   {
+    "concept": "topup_usage_type",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "monetary"
+    }
+   },
+   {
+    "concept": "topup_product_name",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "switch",
+     "by": "text(int(topup_amount))",
+     "cases": {
+      "10": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 10"
+      },
+      "20": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 20"
+      },
+      "50": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 50"
+      },
+      "100": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 100"
+      },
+      "149": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 149 (14 days)"
+      },
+      "199": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 199 (28 days)"
+      },
+      "239": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 239 (28 days)"
+      },
+      "299": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 299 (28 days)"
+      },
+      "399": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 399 (28 days)"
+      }
+     }
+    }
+   },
+   {
+    "concept": "bucket_id",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "BKT-",
+     "digits": 10,
+     "registry": "bucket_id",
+     "stable_by": "'bucket'"
+    }
+   },
+   {
+    "concept": "bucket_status",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.93,
+      "expired": 0.05,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "topup_auto_flag",
+    "scope": "event",
+    "when": "topup_reason is not None",
+    "expr": "topup_reason == 'AUTO_RECHARGE'",
+    "sample": null
    }
   ],
   "output": {
@@ -7984,7 +9751,7 @@
  },
  {
   "pack_id": "telecom.prepaid.low_balance.dedup.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Low balance - duplicate trigger de-duplication (prepaid, India)",
   "engine": "event_rows/v1",
@@ -8010,7 +9777,9 @@
   "entity_concept": "customer_id",
   "assumptions": [
    "Vocabularies, probabilities and windows in this pack are ILLUSTRATIVE defaults chosen from public knowledge of Indian prepaid operations; calibrate them with the operator's aggregates (they are plain data in this pack).",
-   "A row is one low-balance trigger evaluation. It is a duplicate when it follows the previous trigger within the de-duplication window (seconds); duplicates are suppressed, debounced (auto top-ups only), logged or passed through, and a suppressed or debounced trigger creates no top-up."
+   "A row is one low-balance trigger evaluation. It is a duplicate when it follows the previous trigger within the de-duplication window (seconds); duplicates are suppressed, debounced (auto top-ups only), logged or passed through, and a suppressed or debounced trigger creates no top-up.",
+   "Related customer variables from the source documents (state, status, start of the relationship) are generated per subscriber and the relationship always starts before the journey.",
+   "Related top-up and bucket variables from the source documents (usage type, product, bucket) are generated alongside the top-up attempt."
   ],
   "concepts": {
    "customer_id": {
@@ -8298,6 +10067,123 @@
      }
     ],
     "required": false
+   },
+   "state": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Indian state / union territory of the subscriber.",
+    "bind": [
+     {
+      "name": "^customer_contact_medium_characteristic_state_or_province$"
+     },
+     {
+      "name": "^state(_or_province)?$"
+     }
+    ],
+    "required": false
+   },
+   "customer_status": {
+    "kind": "entity",
+    "dtype": "categorical",
+    "description": "Lifecycle status of the customer relationship.",
+    "bind": [
+     {
+      "name": "^customer_status$"
+     }
+    ],
+    "required": false
+   },
+   "customer_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the customer relationship (activation).",
+    "bind": [
+     {
+      "name": "^customer_valid_for_start_(date_time|datetime|date)$"
+     }
+    ],
+    "required": false
+   },
+   "topup_usage_type": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Kind of balance the top-up credits.",
+    "bind": [
+     {
+      "name": "^topup_?balance_usage_type$"
+     }
+    ],
+    "required": false
+   },
+   "topup_product_name": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Product bought with the top-up.",
+    "bind": [
+     {
+      "name": "^topup_?balance_product_name$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_id": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Balance bucket identifier (one per subscriber).",
+    "bind": [
+     {
+      "name": "^bucket_id$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_status": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Status of the balance bucket.",
+    "bind": [
+     {
+      "name": "^bucket_status$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_remaining_value": {
+    "kind": "event",
+    "dtype": "float",
+    "description": "Balance in the bucket (INR).",
+    "bind": [
+     {
+      "name": "^bucket_remaining_value_amount$"
+     }
+    ],
+    "required": false,
+    "precision": 2
+   },
+   "topup_auto_flag": {
+    "kind": "event",
+    "dtype": "boolean",
+    "description": "The top-up was an automatic (recurring) recharge.",
+    "bind": [
+     {
+      "name": "^balance_action_history_is_auto_topup$"
+     },
+     {
+      "name": "^topup_?balance_is_auto_topup$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the bucket's validity (opened with the customer relationship).",
+    "bind": [
+     {
+      "name": "^bucket_valid_for_start_date_time$"
+     }
+    ],
+    "required": false
    }
   },
   "exclusions": [],
@@ -8421,6 +10307,41 @@
     "10": 0.35,
     "20": 0.3,
     "50": 0.2
+   },
+   "states": {
+    "Uttar Pradesh": 14.5,
+    "Maharashtra": 8.6,
+    "Bihar": 6.4,
+    "Tamil Nadu": 6.3,
+    "Madhya Pradesh": 5.5,
+    "West Bengal": 5.3,
+    "Rajasthan": 5.3,
+    "Karnataka": 5.0,
+    "Gujarat": 4.6,
+    "Andhra Pradesh": 4.4,
+    "Telangana": 3.6,
+    "Kerala": 3.0,
+    "Odisha": 2.6,
+    "Punjab": 2.5,
+    "Delhi": 2.4,
+    "Haryana": 2.2,
+    "Jharkhand": 2.0,
+    "Chhattisgarh": 1.9,
+    "Assam": 1.8,
+    "Uttarakhand": 0.9,
+    "Jammu and Kashmir": 0.9,
+    "Himachal Pradesh": 0.6,
+    "Goa": 0.3,
+    "Tripura": 0.3,
+    "Meghalaya": 0.3,
+    "Manipur": 0.2,
+    "Nagaland": 0.2,
+    "Arunachal Pradesh": 0.2,
+    "Mizoram": 0.2,
+    "Sikkim": 0.1
+   },
+   "customer_status": {
+    "active": 1.0
    }
   },
   "model": {
@@ -8632,6 +10553,111 @@
     "requires": [
      "topup_amount"
     ]
+   },
+   {
+    "id": "state_known",
+    "level": "record",
+    "severity": "error",
+    "expr": "state in REF['states']",
+    "message": "State must be an Indian state / UT.",
+    "requires": [
+     "state"
+    ]
+   },
+   {
+    "id": "state_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(state) == 1",
+    "message": "state must not change within a subscriber's history.",
+    "requires": [
+     "state"
+    ]
+   },
+   {
+    "id": "customer_status_known",
+    "level": "record",
+    "severity": "error",
+    "expr": "customer_status in REF['customer_status']",
+    "message": "Customer status comes from the status vocabulary.",
+    "requires": [
+     "customer_status"
+    ]
+   },
+   {
+    "id": "customer_status_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(customer_status) == 1",
+    "message": "customer_status is a property of the subscriber.",
+    "requires": [
+     "customer_status"
+    ]
+   },
+   {
+    "id": "customer_valid_from_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(customer_valid_from) == 1",
+    "message": "customer_valid_from is a property of the subscriber.",
+    "requires": [
+     "customer_valid_from"
+    ]
+   },
+   {
+    "id": "customer_valid_from_before_event",
+    "level": "record",
+    "severity": "error",
+    "expr": "customer_valid_from < low_balance_trigger_timestamp",
+    "message": "The customer relationship starts before the event.",
+    "requires": [
+     "customer_valid_from",
+     "low_balance_trigger_timestamp"
+    ]
+   },
+   {
+    "id": "customer_valid_from_before_topup",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
+    "message": "The customer relationship starts before any top-up it made.",
+    "requires": [
+     "customer_valid_from",
+     "topup_requested_at"
+    ]
+   },
+   {
+    "id": "balance_below_trigger",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_remaining_value <= low_balance_threshold_amount",
+    "message": "A low-balance trigger fires only while the balance is below the threshold.",
+    "requires": [
+     "bucket_remaining_value",
+     "low_balance_threshold_amount"
+    ]
+   },
+   {
+    "id": "auto_flag_matches_reason",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_auto_flag is None or topup_auto_flag == (topup_reason == 'AUTO_RECHARGE')",
+    "message": "A top-up is automatic exactly when its reason is AUTO_RECHARGE.",
+    "requires": [
+     "topup_auto_flag",
+     "topup_reason"
+    ]
+   },
+   {
+    "id": "bucket_valid_from_is_activation",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_valid_from == customer_valid_from",
+    "message": "The balance bucket is opened with the customer relationship.",
+    "requires": [
+     "bucket_valid_from",
+     "customer_valid_from"
+    ]
    }
   ],
   "targets": [
@@ -8713,6 +10739,54 @@
      "type": "choice",
      "from_ref": "party_account_status"
     }
+   },
+   {
+    "concept": "state",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "from_ref": "states"
+    }
+   },
+   {
+    "concept": "customer_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "from_ref": "customer_status"
+    }
+   },
+   {
+    "concept": "customer_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "time_shift",
+     "anchor": "first_event_at",
+     "direction": "before",
+     "days": {
+      "median": 420,
+      "sigma": 0.7,
+      "min": 60,
+      "max": 3650
+     },
+     "extra_seconds": [
+      0,
+      86400
+     ]
+    }
+   },
+   {
+    "concept": "bucket_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
    },
    {
     "concept": "low_balance_trigger_timestamp",
@@ -9002,6 +11076,110 @@
     "when": "(topup_status not in ['suppressed', 'debounced']) and (topup_status == 'completed') and REF['validity_days'][text(int(topup_amount))] > 0",
     "expr": "add_days(topup_valid_from, REF['validity_days'][text(int(topup_amount))])",
     "sample": null
+   },
+   {
+    "concept": "topup_usage_type",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "monetary"
+    }
+   },
+   {
+    "concept": "topup_product_name",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "switch",
+     "by": "text(int(topup_amount))",
+     "cases": {
+      "10": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 10"
+      },
+      "20": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 20"
+      },
+      "50": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 50"
+      },
+      "100": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 100"
+      },
+      "149": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 149 (14 days)"
+      },
+      "199": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 199 (28 days)"
+      },
+      "239": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 239 (28 days)"
+      },
+      "299": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 299 (28 days)"
+      },
+      "399": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 399 (28 days)"
+      }
+     }
+    }
+   },
+   {
+    "concept": "bucket_id",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "BKT-",
+     "digits": 10,
+     "registry": "bucket_id",
+     "stable_by": "'bucket'"
+    }
+   },
+   {
+    "concept": "bucket_status",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.93,
+      "expired": 0.05,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "bucket_remaining_value",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "uniform",
+     "low": 0.5,
+     "high": "low_balance_threshold_amount",
+     "round": 2
+    }
+   },
+   {
+    "concept": "topup_auto_flag",
+    "scope": "event",
+    "when": "topup_reason is not None",
+    "expr": "topup_reason == 'AUTO_RECHARGE'",
+    "sample": null
    }
   ],
   "output": {
@@ -9012,7 +11190,7 @@
  },
  {
   "pack_id": "telecom.prepaid.low_balance.concurrent_journeys.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Low balance - concurrent journey arbitration (prepaid, India)",
   "engine": "event_rows/v1",
@@ -9039,7 +11217,9 @@
   "assumptions": [
    "Vocabularies, probabilities and windows in this pack are ILLUSTRATIVE defaults chosen from public knowledge of Indian prepaid operations; calibrate them with the operator's aggregates (they are plain data in this pack).",
    "A row is one arbitration between the low-balance journey and a concurrent journey: the higher priority score wins its treatment and the other journey is suppressed, so suppressed_journey_id always references one of the two journey ids (the DB's per-column id prefixes for suppressed_journey_id are not used, because the value must equal an existing journey id).",
-   "When the low-balance journey wins, trigger de-duplication still applies to it."
+   "When the low-balance journey wins, trigger de-duplication still applies to it.",
+   "Related customer variables from the source documents (state, status, start of the relationship) are generated per subscriber and the relationship always starts before the journey.",
+   "Related top-up and bucket variables from the source documents (usage type, product, bucket) are generated alongside the top-up attempt."
   ],
   "concepts": {
    "customer_id": {
@@ -9417,6 +11597,123 @@
      }
     ],
     "required": false
+   },
+   "state": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Indian state / union territory of the subscriber.",
+    "bind": [
+     {
+      "name": "^customer_contact_medium_characteristic_state_or_province$"
+     },
+     {
+      "name": "^state(_or_province)?$"
+     }
+    ],
+    "required": false
+   },
+   "customer_status": {
+    "kind": "entity",
+    "dtype": "categorical",
+    "description": "Lifecycle status of the customer relationship.",
+    "bind": [
+     {
+      "name": "^customer_status$"
+     }
+    ],
+    "required": false
+   },
+   "customer_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the customer relationship (activation).",
+    "bind": [
+     {
+      "name": "^customer_valid_for_start_(date_time|datetime|date)$"
+     }
+    ],
+    "required": false
+   },
+   "topup_usage_type": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Kind of balance the top-up credits.",
+    "bind": [
+     {
+      "name": "^topup_?balance_usage_type$"
+     }
+    ],
+    "required": false
+   },
+   "topup_product_name": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Product bought with the top-up.",
+    "bind": [
+     {
+      "name": "^topup_?balance_product_name$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_id": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Balance bucket identifier (one per subscriber).",
+    "bind": [
+     {
+      "name": "^bucket_id$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_status": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Status of the balance bucket.",
+    "bind": [
+     {
+      "name": "^bucket_status$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_remaining_value": {
+    "kind": "event",
+    "dtype": "float",
+    "description": "Balance in the bucket (INR).",
+    "bind": [
+     {
+      "name": "^bucket_remaining_value_amount$"
+     }
+    ],
+    "required": false,
+    "precision": 2
+   },
+   "topup_auto_flag": {
+    "kind": "event",
+    "dtype": "boolean",
+    "description": "The top-up was an automatic (recurring) recharge.",
+    "bind": [
+     {
+      "name": "^balance_action_history_is_auto_topup$"
+     },
+     {
+      "name": "^topup_?balance_is_auto_topup$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the bucket's validity (opened with the customer relationship).",
+    "bind": [
+     {
+      "name": "^bucket_valid_for_start_date_time$"
+     }
+    ],
+    "required": false
    }
   },
   "exclusions": [],
@@ -9545,6 +11842,41 @@
     "Retention": 0.4,
     "Upsell": 0.35,
     "Suspended": 0.25
+   },
+   "states": {
+    "Uttar Pradesh": 14.5,
+    "Maharashtra": 8.6,
+    "Bihar": 6.4,
+    "Tamil Nadu": 6.3,
+    "Madhya Pradesh": 5.5,
+    "West Bengal": 5.3,
+    "Rajasthan": 5.3,
+    "Karnataka": 5.0,
+    "Gujarat": 4.6,
+    "Andhra Pradesh": 4.4,
+    "Telangana": 3.6,
+    "Kerala": 3.0,
+    "Odisha": 2.6,
+    "Punjab": 2.5,
+    "Delhi": 2.4,
+    "Haryana": 2.2,
+    "Jharkhand": 2.0,
+    "Chhattisgarh": 1.9,
+    "Assam": 1.8,
+    "Uttarakhand": 0.9,
+    "Jammu and Kashmir": 0.9,
+    "Himachal Pradesh": 0.6,
+    "Goa": 0.3,
+    "Tripura": 0.3,
+    "Meghalaya": 0.3,
+    "Manipur": 0.2,
+    "Nagaland": 0.2,
+    "Arunachal Pradesh": 0.2,
+    "Mizoram": 0.2,
+    "Sikkim": 0.1
+   },
+   "customer_status": {
+    "active": 1.0
    }
   },
   "model": {
@@ -9804,6 +12136,111 @@
      "journey_id",
      "concurrent_journey_id"
     ]
+   },
+   {
+    "id": "state_known",
+    "level": "record",
+    "severity": "error",
+    "expr": "state in REF['states']",
+    "message": "State must be an Indian state / UT.",
+    "requires": [
+     "state"
+    ]
+   },
+   {
+    "id": "state_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(state) == 1",
+    "message": "state must not change within a subscriber's history.",
+    "requires": [
+     "state"
+    ]
+   },
+   {
+    "id": "customer_status_known",
+    "level": "record",
+    "severity": "error",
+    "expr": "customer_status in REF['customer_status']",
+    "message": "Customer status comes from the status vocabulary.",
+    "requires": [
+     "customer_status"
+    ]
+   },
+   {
+    "id": "customer_status_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(customer_status) == 1",
+    "message": "customer_status is a property of the subscriber.",
+    "requires": [
+     "customer_status"
+    ]
+   },
+   {
+    "id": "customer_valid_from_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(customer_valid_from) == 1",
+    "message": "customer_valid_from is a property of the subscriber.",
+    "requires": [
+     "customer_valid_from"
+    ]
+   },
+   {
+    "id": "customer_valid_from_before_event",
+    "level": "record",
+    "severity": "error",
+    "expr": "customer_valid_from < low_balance_trigger_timestamp",
+    "message": "The customer relationship starts before the event.",
+    "requires": [
+     "customer_valid_from",
+     "low_balance_trigger_timestamp"
+    ]
+   },
+   {
+    "id": "customer_valid_from_before_topup",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
+    "message": "The customer relationship starts before any top-up it made.",
+    "requires": [
+     "customer_valid_from",
+     "topup_requested_at"
+    ]
+   },
+   {
+    "id": "balance_below_trigger",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_remaining_value <= low_balance_threshold_amount",
+    "message": "A low-balance trigger fires only while the balance is below the threshold.",
+    "requires": [
+     "bucket_remaining_value",
+     "low_balance_threshold_amount"
+    ]
+   },
+   {
+    "id": "auto_flag_matches_reason",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_auto_flag is None or topup_auto_flag == (topup_reason == 'AUTO_RECHARGE')",
+    "message": "A top-up is automatic exactly when its reason is AUTO_RECHARGE.",
+    "requires": [
+     "topup_auto_flag",
+     "topup_reason"
+    ]
+   },
+   {
+    "id": "bucket_valid_from_is_activation",
+    "level": "record",
+    "severity": "error",
+    "expr": "bucket_valid_from == customer_valid_from",
+    "message": "The balance bucket is opened with the customer relationship.",
+    "requires": [
+     "bucket_valid_from",
+     "customer_valid_from"
+    ]
    }
   ],
   "targets": [
@@ -9885,6 +12322,54 @@
      "type": "choice",
      "from_ref": "party_account_status"
     }
+   },
+   {
+    "concept": "state",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "from_ref": "states"
+    }
+   },
+   {
+    "concept": "customer_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "from_ref": "customer_status"
+    }
+   },
+   {
+    "concept": "customer_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "time_shift",
+     "anchor": "first_event_at",
+     "direction": "before",
+     "days": {
+      "median": 420,
+      "sigma": 0.7,
+      "min": 60,
+      "max": 3650
+     },
+     "extra_seconds": [
+      0,
+      86400
+     ]
+    }
+   },
+   {
+    "concept": "bucket_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
    },
    {
     "concept": "low_balance_trigger_timestamp",
@@ -10305,6 +12790,110 @@
     "when": "(topup_status not in ['suppressed', 'debounced']) and (topup_status == 'completed') and REF['validity_days'][text(int(topup_amount))] > 0",
     "expr": "add_days(topup_valid_from, REF['validity_days'][text(int(topup_amount))])",
     "sample": null
+   },
+   {
+    "concept": "topup_usage_type",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "monetary"
+    }
+   },
+   {
+    "concept": "topup_product_name",
+    "scope": "event",
+    "when": "topup_amount is not None",
+    "expr": null,
+    "sample": {
+     "type": "switch",
+     "by": "text(int(topup_amount))",
+     "cases": {
+      "10": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 10"
+      },
+      "20": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 20"
+      },
+      "50": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 50"
+      },
+      "100": {
+       "type": "const",
+       "value": "Talktime Top-up Rs 100"
+      },
+      "149": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 149 (14 days)"
+      },
+      "199": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 199 (28 days)"
+      },
+      "239": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 239 (28 days)"
+      },
+      "299": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 299 (28 days)"
+      },
+      "399": {
+       "type": "const",
+       "value": "Unlimited Pack Rs 399 (28 days)"
+      }
+     }
+    }
+   },
+   {
+    "concept": "bucket_id",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "BKT-",
+     "digits": 10,
+     "registry": "bucket_id",
+     "stable_by": "'bucket'"
+    }
+   },
+   {
+    "concept": "bucket_status",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.93,
+      "expired": 0.05,
+      "suspended": 0.02
+     }
+    }
+   },
+   {
+    "concept": "bucket_remaining_value",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "uniform",
+     "low": 0.5,
+     "high": "low_balance_threshold_amount",
+     "round": 2
+    }
+   },
+   {
+    "concept": "topup_auto_flag",
+    "scope": "event",
+    "when": "topup_reason is not None",
+    "expr": "topup_reason == 'AUTO_RECHARGE'",
+    "sample": null
    }
   ],
   "output": {
@@ -10315,7 +12904,7 @@
  },
  {
   "pack_id": "telecom.prepaid.data_depletion.upsell.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Data depletion - upsell offer and response (prepaid, India)",
   "engine": "event_rows/v1",
@@ -10346,7 +12935,8 @@
    "A row is one data-depletion notification for a customer on a prepaid plan, with the booster offer recommended for it and the customer's response.",
    "The customer's typical daily use follows from the plan allowance and a depletion-frequency band; every count, average and velocity in the row is derived from that, so they agree with each other.",
    "Columns that a scenario does not list (for example the affinity scores in DU-01) still drive the simulation as latent facts but are not delivered.",
-   "Related source-document variables (customer, last completed top-up, data bucket) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it."
+   "Related source-document variables (customer, last completed top-up, data bucket) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it.",
+   "The subscriber's current product (identifier, name, offering, order and start dates, status) is a source-document variable generated once per subscriber; it is ordered when the customer relationship starts."
   ],
   "concepts": {
    "customer_id": {
@@ -10983,6 +13573,72 @@
     "bind": [
      {
       "name": "^topup_?balance_usage_type$"
+     }
+    ],
+    "required": false
+   },
+   "product_id": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Identifier of the subscriber's current product.",
+    "bind": [
+     {
+      "name": "^product_id$"
+     }
+    ],
+    "required": false
+   },
+   "product_name": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Name of the subscriber's current prepaid product.",
+    "bind": [
+     {
+      "name": "^product_name$"
+     }
+    ],
+    "required": false
+   },
+   "product_offering_name": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Catalogue offering the product was sold under.",
+    "bind": [
+     {
+      "name": "^product_product_offering_name$"
+     }
+    ],
+    "required": false
+   },
+   "product_order_date": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "When the product was ordered.",
+    "bind": [
+     {
+      "name": "^product_order_date$"
+     }
+    ],
+    "required": false
+   },
+   "product_start_date": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "When the product started.",
+    "bind": [
+     {
+      "name": "^product_product_start_date$"
+     }
+    ],
+    "required": false
+   },
+   "product_status": {
+    "kind": "entity",
+    "dtype": "categorical",
+    "description": "Lifecycle status of the product.",
+    "bind": [
+     {
+      "name": "^product_product_status$"
      }
     ],
     "required": false
@@ -11681,7 +14337,7 @@
     "id": "customer_valid_from_before_topup",
     "level": "record",
     "severity": "error",
-    "expr": "customer_valid_from < topup_requested_at",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
     "message": "The customer relationship starts before any top-up it made.",
     "requires": [
      "customer_valid_from",
@@ -11738,6 +14394,48 @@
     "message": "A customer's last top-up never moves back in time.",
     "requires": [
      "topup_confirmed_at"
+    ]
+   },
+   {
+    "id": "product_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(product_name) == 1",
+    "message": "A subscriber's product is a property of the subscriber.",
+    "requires": [
+     "product_name"
+    ]
+   },
+   {
+    "id": "product_status_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(product_status) == 1",
+    "message": "Product status is a property of the subscriber.",
+    "requires": [
+     "product_status"
+    ]
+   },
+   {
+    "id": "product_starts_after_order",
+    "level": "record",
+    "severity": "error",
+    "expr": "product_start_date > product_order_date",
+    "message": "A product starts after it was ordered.",
+    "requires": [
+     "product_start_date",
+     "product_order_date"
+    ]
+   },
+   {
+    "id": "product_ordered_when_relationship_starts",
+    "level": "record",
+    "severity": "error",
+    "expr": "product_order_date == customer_valid_from",
+    "message": "The product is ordered when the customer relationship starts.",
+    "requires": [
+     "product_order_date",
+     "customer_valid_from"
     ]
    }
   ],
@@ -12076,6 +14774,62 @@
       0,
       86400
      ]
+    }
+   },
+   {
+    "concept": "product_id",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "PRD-",
+     "digits": 10,
+     "registry": "product_id"
+    }
+   },
+   {
+    "concept": "product_name",
+    "scope": "entity",
+    "when": null,
+    "expr": "current_plan_name",
+    "sample": null
+   },
+   {
+    "concept": "product_offering_name",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "Prepaid Data Plan"
+    }
+   },
+   {
+    "concept": "product_order_date",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
+   },
+   {
+    "concept": "product_start_date",
+    "scope": "entity",
+    "when": null,
+    "expr": "add_secs(product_order_date, 90)",
+    "sample": null
+   },
+   {
+    "concept": "product_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.95,
+      "pendingTerminate": 0.05
+     }
     }
    },
    {
@@ -12456,7 +15210,7 @@
  },
  {
   "pack_id": "telecom.prepaid.data_depletion.offer_suppression.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Data depletion - suppress redundant offers after a purchase (prepaid, India)",
   "engine": "event_rows/v1",
@@ -12484,7 +15238,8 @@
    "Vocabularies, probabilities and windows in this pack are ILLUSTRATIVE defaults chosen from public knowledge of Indian prepaid operations; calibrate them with the operator's aggregates (they are plain data in this pack).",
    "A row is one upsell trigger for a customer who recently bought a data product. The trigger is suppressed when the purchase is still inside the cooldown or the offer is equivalent to the purchased product; `suppression_flag` is that policy decision, `communication_suppressed_flag` is what actually happened (a small leak rate models process failures, and `suppression_success_flag` says whether the two agree).",
    "last_data_purchase_product_name and purchased_product_name are defined as two names for the same purchase and therefore carry the same value.",
-   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it."
+   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it.",
+   "The subscriber's current product (identifier, name, offering, order and start dates, status) is a source-document variable generated once per subscriber; it is ordered when the customer relationship starts."
   ],
   "concepts": {
    "customer_id": {
@@ -12990,6 +15745,72 @@
      }
     ],
     "required": false
+   },
+   "product_id": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Identifier of the subscriber's current product.",
+    "bind": [
+     {
+      "name": "^product_id$"
+     }
+    ],
+    "required": false
+   },
+   "product_name": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Name of the subscriber's current prepaid product.",
+    "bind": [
+     {
+      "name": "^product_name$"
+     }
+    ],
+    "required": false
+   },
+   "product_offering_name": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Catalogue offering the product was sold under.",
+    "bind": [
+     {
+      "name": "^product_product_offering_name$"
+     }
+    ],
+    "required": false
+   },
+   "product_order_date": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "When the product was ordered.",
+    "bind": [
+     {
+      "name": "^product_order_date$"
+     }
+    ],
+    "required": false
+   },
+   "product_start_date": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "When the product started.",
+    "bind": [
+     {
+      "name": "^product_product_start_date$"
+     }
+    ],
+    "required": false
+   },
+   "product_status": {
+    "kind": "entity",
+    "dtype": "categorical",
+    "description": "Lifecycle status of the product.",
+    "bind": [
+     {
+      "name": "^product_product_status$"
+     }
+    ],
+    "required": false
    }
   },
   "exclusions": [],
@@ -13156,6 +15977,22 @@
    },
    "customer_status": {
     "active": 1.0
+   },
+   "product_plan_weights": {
+    "Rs 249 1GB/day 28-Day": 0.14,
+    "Rs 299 1.5GB/day 28-Day": 0.3,
+    "Rs 349 2GB/day 28-Day": 0.22,
+    "Rs 399 2.5GB/day 28-Day": 0.12,
+    "Rs 479 1.5GB/day 56-Day": 0.1,
+    "Rs 719 1.5GB/day 84-Day": 0.12
+   },
+   "product_offerings": {
+    "Rs 249 1GB/day 28-Day": "Prepaid Data Plan",
+    "Rs 299 1.5GB/day 28-Day": "Prepaid Data Plan",
+    "Rs 349 2GB/day 28-Day": "Prepaid Data Plan",
+    "Rs 399 2.5GB/day 28-Day": "Prepaid Data Plan",
+    "Rs 479 1.5GB/day 56-Day": "Prepaid Data Plan",
+    "Rs 719 1.5GB/day 84-Day": "Prepaid Data Plan"
    }
   },
   "model": {
@@ -13456,7 +16293,7 @@
     "id": "customer_valid_from_before_topup",
     "level": "record",
     "severity": "error",
-    "expr": "customer_valid_from < topup_requested_at",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
     "message": "The customer relationship starts before any top-up it made.",
     "requires": [
      "customer_valid_from",
@@ -13513,6 +16350,48 @@
     "message": "A customer's last top-up never moves back in time.",
     "requires": [
      "topup_confirmed_at"
+    ]
+   },
+   {
+    "id": "product_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(product_name) == 1",
+    "message": "A subscriber's product is a property of the subscriber.",
+    "requires": [
+     "product_name"
+    ]
+   },
+   {
+    "id": "product_status_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(product_status) == 1",
+    "message": "Product status is a property of the subscriber.",
+    "requires": [
+     "product_status"
+    ]
+   },
+   {
+    "id": "product_starts_after_order",
+    "level": "record",
+    "severity": "error",
+    "expr": "product_start_date > product_order_date",
+    "message": "A product starts after it was ordered.",
+    "requires": [
+     "product_start_date",
+     "product_order_date"
+    ]
+   },
+   {
+    "id": "product_ordered_when_relationship_starts",
+    "level": "record",
+    "severity": "error",
+    "expr": "product_order_date == customer_valid_from",
+    "message": "The product is ordered when the customer relationship starts.",
+    "requires": [
+     "product_order_date",
+     "customer_valid_from"
     ]
    }
   ],
@@ -13635,6 +16514,62 @@
       0,
       86400
      ]
+    }
+   },
+   {
+    "concept": "product_id",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "PRD-",
+     "digits": 10,
+     "registry": "product_id"
+    }
+   },
+   {
+    "concept": "product_name",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "from_ref": "product_plan_weights"
+    }
+   },
+   {
+    "concept": "product_offering_name",
+    "scope": "entity",
+    "when": null,
+    "expr": "REF['product_offerings'][product_name]",
+    "sample": null
+   },
+   {
+    "concept": "product_order_date",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
+   },
+   {
+    "concept": "product_start_date",
+    "scope": "entity",
+    "when": null,
+    "expr": "add_secs(product_order_date, 90)",
+    "sample": null
+   },
+   {
+    "concept": "product_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.95,
+      "pendingTerminate": 0.05
+     }
     }
    },
    {
@@ -14006,7 +16941,7 @@
  },
  {
   "pack_id": "telecom.prepaid.data_depletion.decline_followup.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Data depletion - declined / ignored offer follow-up (prepaid, India)",
   "engine": "event_rows/v1",
@@ -14034,7 +16969,8 @@
    "Vocabularies, probabilities and windows in this pack are ILLUSTRATIVE defaults chosen from public knowledge of Indian prepaid operations; calibrate them with the operator's aggregates (they are plain data in this pack).",
    "A row is one data-upsell offer and how the follow-up rules treated the outcome. After a decline or silence the customer is not offered anything until the suppression ends; consent or DND means the offer is not presented and the decision is respected.",
    "REENGAGEMENT_ELIGIBLE is not produced as a journey_outcome (eligibility is carried by reengagement_eligible_flag, which depends on the reference time).",
-   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it."
+   "Related source-document variables (customer, last completed top-up) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it.",
+   "The subscriber's current product (identifier, name, offering, order and start dates, status) is a source-document variable generated once per subscriber; it is ordered when the customer relationship starts."
   ],
   "concepts": {
    "customer_id": {
@@ -14565,6 +17501,72 @@
      }
     ],
     "required": false
+   },
+   "product_id": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Identifier of the subscriber's current product.",
+    "bind": [
+     {
+      "name": "^product_id$"
+     }
+    ],
+    "required": false
+   },
+   "product_name": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Name of the subscriber's current prepaid product.",
+    "bind": [
+     {
+      "name": "^product_name$"
+     }
+    ],
+    "required": false
+   },
+   "product_offering_name": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Catalogue offering the product was sold under.",
+    "bind": [
+     {
+      "name": "^product_product_offering_name$"
+     }
+    ],
+    "required": false
+   },
+   "product_order_date": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "When the product was ordered.",
+    "bind": [
+     {
+      "name": "^product_order_date$"
+     }
+    ],
+    "required": false
+   },
+   "product_start_date": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "When the product started.",
+    "bind": [
+     {
+      "name": "^product_product_start_date$"
+     }
+    ],
+    "required": false
+   },
+   "product_status": {
+    "kind": "entity",
+    "dtype": "categorical",
+    "description": "Lifecycle status of the product.",
+    "bind": [
+     {
+      "name": "^product_product_status$"
+     }
+    ],
+    "required": false
    }
   },
   "exclusions": [],
@@ -14791,7 +17793,7 @@
    "timeline": {
     "history_days": 240,
     "min_gap_minutes": 180,
-    "margin_minutes": 20,
+    "margin_minutes": 4340,
     "hour_weights_ref": "diurnal_weights_local_hour",
     "earliest_next": "prev['suppression_end_timestamp']"
    },
@@ -15097,7 +18099,7 @@
     "id": "customer_valid_from_before_topup",
     "level": "record",
     "severity": "error",
-    "expr": "customer_valid_from < topup_requested_at",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
     "message": "The customer relationship starts before any top-up it made.",
     "requires": [
      "customer_valid_from",
@@ -15154,6 +18156,48 @@
     "message": "A customer's last top-up never moves back in time.",
     "requires": [
      "topup_confirmed_at"
+    ]
+   },
+   {
+    "id": "product_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(product_name) == 1",
+    "message": "A subscriber's product is a property of the subscriber.",
+    "requires": [
+     "product_name"
+    ]
+   },
+   {
+    "id": "product_status_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(product_status) == 1",
+    "message": "Product status is a property of the subscriber.",
+    "requires": [
+     "product_status"
+    ]
+   },
+   {
+    "id": "product_starts_after_order",
+    "level": "record",
+    "severity": "error",
+    "expr": "product_start_date > product_order_date",
+    "message": "A product starts after it was ordered.",
+    "requires": [
+     "product_start_date",
+     "product_order_date"
+    ]
+   },
+   {
+    "id": "product_ordered_when_relationship_starts",
+    "level": "record",
+    "severity": "error",
+    "expr": "product_order_date == customer_valid_from",
+    "message": "The product is ordered when the customer relationship starts.",
+    "requires": [
+     "product_order_date",
+     "customer_valid_from"
     ]
    }
   ],
@@ -15346,6 +18390,62 @@
       0,
       86400
      ]
+    }
+   },
+   {
+    "concept": "product_id",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "PRD-",
+     "digits": 10,
+     "registry": "product_id"
+    }
+   },
+   {
+    "concept": "product_name",
+    "scope": "entity",
+    "when": null,
+    "expr": "topup_plan",
+    "sample": null
+   },
+   {
+    "concept": "product_offering_name",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "Prepaid Data Plan"
+    }
+   },
+   {
+    "concept": "product_order_date",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
+   },
+   {
+    "concept": "product_start_date",
+    "scope": "entity",
+    "when": null,
+    "expr": "add_secs(product_order_date, 90)",
+    "sample": null
+   },
+   {
+    "concept": "product_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.95,
+      "pendingTerminate": 0.05
+     }
     }
    },
    {
@@ -15736,7 +18836,7 @@
  },
  {
   "pack_id": "telecom.prepaid.data_depletion.usage_offer_qualification.IN",
-  "version": 2,
+  "version": 5,
   "status": "active",
   "title": "Data depletion - usage report and offer qualification (prepaid, India)",
   "engine": "event_rows/v1",
@@ -15769,7 +18869,9 @@
    "The curated variables of these scenarios are only the subscriber identifiers, so the journey is taken from the registered source documents (UsageConsumption, Bucket, ProductOfferingQualification): a row is one usage report for the subscriber's data bucket; when a completed report shows the bucket nearly depleted (<= trigger_ratio of the allowance left) an offer qualification is requested.",
    "Consumption accumulates inside a plan cycle and never decreases within it; consumed + remaining equals the plan allowance.",
    "scenarioType 'Failure' selects the negative mode (more report and qualification errors, more red results); other types use the mixed mode.",
-   "Which journey DU-06..DU-10 stand for was not specified; they share this pack until a scenario needs its own."
+   "Which journey DU-06..DU-10 stand for was not specified; they share this pack until a scenario needs its own.",
+   "Related source-document variables (customer, last completed top-up, data bucket) are generated consistently with the journey: the top-up is the customer's most recent completed one before the event, and the customer relationship starts before it.",
+   "The subscriber's current product (identifier, name, offering, order and start dates, status) is a source-document variable generated once per subscriber; it is ordered when the customer relationship starts."
   ],
   "concepts": {
    "customer_id": {
@@ -15935,6 +19037,20 @@
     "bind": [
      {
       "name": "^usage_consumption_bucket_ref_or_value_status$"
+     },
+     {
+      "name": "^bucket_status$"
+     }
+    ],
+    "required": false
+   },
+   "bucket_id": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Data bucket identifier (one per subscriber).",
+    "bind": [
+     {
+      "name": "^bucket_id$"
      }
     ],
     "required": false
@@ -15990,6 +19106,9 @@
     "bind": [
      {
       "name": "^usage_consumption_bucket_ref_or_value_remaining_value_amount$"
+     },
+     {
+      "name": "^bucket_remaining_value_amount$"
      }
     ],
     "required": false,
@@ -16135,6 +19254,197 @@
      }
     ],
     "required": false
+   },
+   "state": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Indian state / union territory of the subscriber.",
+    "bind": [
+     {
+      "name": "^customer_contact_medium_characteristic_state_or_province$"
+     },
+     {
+      "name": "^state(_or_province)?$"
+     }
+    ],
+    "required": false
+   },
+   "customer_status": {
+    "kind": "entity",
+    "dtype": "categorical",
+    "description": "Lifecycle status of the customer relationship.",
+    "bind": [
+     {
+      "name": "^customer_status$"
+     }
+    ],
+    "required": false
+   },
+   "customer_valid_from": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "Start of the customer relationship (activation).",
+    "bind": [
+     {
+      "name": "^customer_valid_for_start_(date_time|datetime|date)$"
+     }
+    ],
+    "required": false
+   },
+   "topup_id": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Top-up transaction identifier.",
+    "bind": [
+     {
+      "name": "^topup_?balance_(id|balance_topup_id)$"
+     }
+    ],
+    "required": false
+   },
+   "topup_status": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "State of the top-up (the latest completed top-up).",
+    "bind": [
+     {
+      "name": "^topup_?balance_status$"
+     }
+    ],
+    "required": false
+   },
+   "topup_amount": {
+    "kind": "event",
+    "dtype": "float",
+    "description": "Top-up amount in INR.",
+    "bind": [
+     {
+      "name": "^topup_?balance_amount(_amount)?$"
+     }
+    ],
+    "required": false,
+    "precision": 2
+   },
+   "topup_requested_at": {
+    "kind": "event",
+    "dtype": "datetime",
+    "description": "When the top-up was requested.",
+    "bind": [
+     {
+      "name": "^topup_?balance_requested_date$"
+     }
+    ],
+    "required": false
+   },
+   "topup_confirmed_at": {
+    "kind": "event",
+    "dtype": "datetime",
+    "description": "When the top-up was credited.",
+    "bind": [
+     {
+      "name": "^topup_?balance_confirmation_date$"
+     }
+    ],
+    "required": false
+   },
+   "topup_reason": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Why the top-up was made.",
+    "bind": [
+     {
+      "name": "^topup_?balance_reason$"
+     }
+    ],
+    "required": false
+   },
+   "topup_product_name": {
+    "kind": "event",
+    "dtype": "string",
+    "description": "Product bought with the top-up.",
+    "bind": [
+     {
+      "name": "^topup_?balance_product_name$"
+     }
+    ],
+    "required": false
+   },
+   "topup_usage_type": {
+    "kind": "event",
+    "dtype": "categorical",
+    "description": "Kind of balance the top-up credited.",
+    "bind": [
+     {
+      "name": "^topup_?balance_usage_type$"
+     }
+    ],
+    "required": false
+   },
+   "product_id": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Identifier of the subscriber's current product.",
+    "bind": [
+     {
+      "name": "^product_id$"
+     }
+    ],
+    "required": false
+   },
+   "product_name": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Name of the subscriber's current prepaid product.",
+    "bind": [
+     {
+      "name": "^product_name$"
+     }
+    ],
+    "required": false
+   },
+   "product_offering_name": {
+    "kind": "entity",
+    "dtype": "string",
+    "description": "Catalogue offering the product was sold under.",
+    "bind": [
+     {
+      "name": "^product_product_offering_name$"
+     }
+    ],
+    "required": false
+   },
+   "product_order_date": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "When the product was ordered.",
+    "bind": [
+     {
+      "name": "^product_order_date$"
+     }
+    ],
+    "required": false
+   },
+   "product_start_date": {
+    "kind": "entity",
+    "dtype": "datetime",
+    "description": "When the product started.",
+    "bind": [
+     {
+      "name": "^product_product_start_date$"
+     }
+    ],
+    "required": false
+   },
+   "product_status": {
+    "kind": "entity",
+    "dtype": "categorical",
+    "description": "Lifecycle status of the product.",
+    "bind": [
+     {
+      "name": "^product_product_status$"
+     }
+    ],
+    "required": false
    }
   },
   "exclusions": [],
@@ -16202,27 +19512,33 @@
    "buckets": {
     "Rs 249 1GB/day 28-Day": {
      "quota_mb": 28672.0,
-     "validity_days": 28
+     "validity_days": 28,
+     "price": 249
     },
     "Rs 299 1.5GB/day 28-Day": {
      "quota_mb": 43008.0,
-     "validity_days": 28
+     "validity_days": 28,
+     "price": 299
     },
     "Rs 349 2GB/day 28-Day": {
      "quota_mb": 57344.0,
-     "validity_days": 28
+     "validity_days": 28,
+     "price": 349
     },
     "Rs 399 2.5GB/day 28-Day": {
      "quota_mb": 71680.0,
-     "validity_days": 28
+     "validity_days": 28,
+     "price": 399
     },
     "Rs 479 1.5GB/day 56-Day": {
      "quota_mb": 86016.0,
-     "validity_days": 56
+     "validity_days": 56,
+     "price": 479
     },
     "Rs 719 1.5GB/day 84-Day": {
      "quota_mb": 129024.0,
-     "validity_days": 84
+     "validity_days": 84,
+     "price": 719
     }
    },
    "bucket_weights": {
@@ -16251,6 +19567,41 @@
     "OFFER_CATALOG_UNAVAILABLE": 0.35,
     "CUSTOMER_NOT_ELIGIBLE": 0.3,
     "BSS_TIMEOUT": 0.35
+   },
+   "states": {
+    "Uttar Pradesh": 14.5,
+    "Maharashtra": 8.6,
+    "Bihar": 6.4,
+    "Tamil Nadu": 6.3,
+    "Madhya Pradesh": 5.5,
+    "West Bengal": 5.3,
+    "Rajasthan": 5.3,
+    "Karnataka": 5.0,
+    "Gujarat": 4.6,
+    "Andhra Pradesh": 4.4,
+    "Telangana": 3.6,
+    "Kerala": 3.0,
+    "Odisha": 2.6,
+    "Punjab": 2.5,
+    "Delhi": 2.4,
+    "Haryana": 2.2,
+    "Jharkhand": 2.0,
+    "Chhattisgarh": 1.9,
+    "Assam": 1.8,
+    "Uttarakhand": 0.9,
+    "Jammu and Kashmir": 0.9,
+    "Himachal Pradesh": 0.6,
+    "Goa": 0.3,
+    "Tripura": 0.3,
+    "Meghalaya": 0.3,
+    "Manipur": 0.2,
+    "Nagaland": 0.2,
+    "Arunachal Pradesh": 0.2,
+    "Mizoram": 0.2,
+    "Sikkim": 0.1
+   },
+   "customer_status": {
+    "active": 1.0
    }
   },
   "model": {
@@ -16500,6 +19851,172 @@
     "requires": [
      "bucket_name"
     ]
+   },
+   {
+    "id": "state_known",
+    "level": "record",
+    "severity": "error",
+    "expr": "state in REF['states']",
+    "message": "State must be an Indian state / UT.",
+    "requires": [
+     "state"
+    ]
+   },
+   {
+    "id": "state_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(state) == 1",
+    "message": "state must not change within a subscriber's history.",
+    "requires": [
+     "state"
+    ]
+   },
+   {
+    "id": "customer_status_known",
+    "level": "record",
+    "severity": "error",
+    "expr": "customer_status in REF['customer_status']",
+    "message": "Customer status comes from the status vocabulary.",
+    "requires": [
+     "customer_status"
+    ]
+   },
+   {
+    "id": "customer_status_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(customer_status) == 1",
+    "message": "customer_status is a property of the subscriber.",
+    "requires": [
+     "customer_status"
+    ]
+   },
+   {
+    "id": "customer_valid_from_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(customer_valid_from) == 1",
+    "message": "customer_valid_from is a property of the subscriber.",
+    "requires": [
+     "customer_valid_from"
+    ]
+   },
+   {
+    "id": "customer_valid_from_before_event",
+    "level": "record",
+    "severity": "error",
+    "expr": "customer_valid_from < usage_report_created_at",
+    "message": "The customer relationship starts before the event.",
+    "requires": [
+     "customer_valid_from",
+     "usage_report_created_at"
+    ]
+   },
+   {
+    "id": "customer_valid_from_before_topup",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_requested_at is None or customer_valid_from < topup_requested_at",
+    "message": "The customer relationship starts before any top-up it made.",
+    "requires": [
+     "customer_valid_from",
+     "topup_requested_at"
+    ]
+   },
+   {
+    "id": "topup_credited_after_request",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_confirmed_at > topup_requested_at",
+    "message": "A top-up is credited after it was requested.",
+    "requires": [
+     "topup_confirmed_at",
+     "topup_requested_at"
+    ]
+   },
+   {
+    "id": "topup_before_event",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_confirmed_at < usage_report_created_at",
+    "message": "The last top-up precedes the event.",
+    "requires": [
+     "topup_confirmed_at",
+     "usage_report_created_at"
+    ]
+   },
+   {
+    "id": "topup_is_completed",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_status == 'completed'",
+    "message": "The context top-up is a completed one.",
+    "requires": [
+     "topup_status"
+    ]
+   },
+   {
+    "id": "topup_amount_positive",
+    "level": "record",
+    "severity": "error",
+    "expr": "topup_amount > 0",
+    "message": "A top-up amount is positive.",
+    "requires": [
+     "topup_amount"
+    ]
+   },
+   {
+    "id": "topup_never_moves_back",
+    "level": "entity",
+    "severity": "error",
+    "expr": "non_decreasing(topup_confirmed_at)",
+    "message": "A customer's last top-up never moves back in time.",
+    "requires": [
+     "topup_confirmed_at"
+    ]
+   },
+   {
+    "id": "product_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(product_name) == 1",
+    "message": "A subscriber's product is a property of the subscriber.",
+    "requires": [
+     "product_name"
+    ]
+   },
+   {
+    "id": "product_status_stable",
+    "level": "entity",
+    "severity": "error",
+    "expr": "distinct(product_status) == 1",
+    "message": "Product status is a property of the subscriber.",
+    "requires": [
+     "product_status"
+    ]
+   },
+   {
+    "id": "product_starts_after_order",
+    "level": "record",
+    "severity": "error",
+    "expr": "product_start_date > product_order_date",
+    "message": "A product starts after it was ordered.",
+    "requires": [
+     "product_start_date",
+     "product_order_date"
+    ]
+   },
+   {
+    "id": "product_ordered_when_relationship_starts",
+    "level": "record",
+    "severity": "error",
+    "expr": "product_order_date == customer_valid_from",
+    "message": "The product is ordered when the customer relationship starts.",
+    "requires": [
+     "product_order_date",
+     "customer_valid_from"
+    ]
    }
   ],
   "targets": [
@@ -16625,6 +20142,103 @@
     "sample": null
    },
    {
+    "concept": "state",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "from_ref": "states"
+    }
+   },
+   {
+    "concept": "customer_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "from_ref": "customer_status"
+    }
+   },
+   {
+    "concept": "customer_valid_from",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "time_shift",
+     "anchor": "first_event_at",
+     "direction": "before",
+     "days": {
+      "median": 420,
+      "sigma": 0.7,
+      "min": 120,
+      "max": 3650
+     },
+     "extra_seconds": [
+      0,
+      86400
+     ]
+    }
+   },
+   {
+    "concept": "product_id",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "PRD-",
+     "digits": 10,
+     "registry": "product_id"
+    }
+   },
+   {
+    "concept": "product_name",
+    "scope": "entity",
+    "when": null,
+    "expr": "bucket_name",
+    "sample": null
+   },
+   {
+    "concept": "product_offering_name",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "Prepaid Data Plan"
+    }
+   },
+   {
+    "concept": "product_order_date",
+    "scope": "entity",
+    "when": null,
+    "expr": "customer_valid_from",
+    "sample": null
+   },
+   {
+    "concept": "product_start_date",
+    "scope": "entity",
+    "when": null,
+    "expr": "add_secs(product_order_date, 90)",
+    "sample": null
+   },
+   {
+    "concept": "product_status",
+    "scope": "entity",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "choice",
+     "weights": {
+      "active": 0.95,
+      "pendingTerminate": 0.05
+     }
+    }
+   },
+   {
     "concept": "usage_report_id",
     "scope": "event",
     "when": null,
@@ -16706,6 +20320,19 @@
     "sample": {
      "type": "bernoulli",
      "p": "P['suspended_p']"
+    }
+   },
+   {
+    "concept": "bucket_id",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "id",
+     "prefix": "BKT-",
+     "digits": 10,
+     "registry": "bucket_id",
+     "stable_by": "'bucket'"
     }
    },
    {
@@ -16908,6 +20535,87 @@
     "when": "poq_state == 'done'",
     "expr": "add_days(poq_date, REF['poq_validity_days'])",
     "sample": null
+   },
+   {
+    "concept": "topup_confirmed_at",
+    "scope": "event",
+    "when": null,
+    "expr": "bucket_valid_from",
+    "sample": null
+   },
+   {
+    "concept": "topup_requested_at",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "time_shift",
+     "anchor": "topup_confirmed_at",
+     "direction": "before",
+     "seconds": [
+      8,
+      150
+     ]
+    }
+   },
+   {
+    "concept": "topup_id",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "template",
+     "registry": "topup_id",
+     "parts": [
+      {
+       "const": "TUP-"
+      },
+      {
+       "digits": 10
+      }
+     ]
+    }
+   },
+   {
+    "concept": "topup_status",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "completed"
+    }
+   },
+   {
+    "concept": "topup_amount",
+    "scope": "event",
+    "when": null,
+    "expr": "float(REF['buckets'][bucket_name]['price'])",
+    "sample": null
+   },
+   {
+    "concept": "topup_reason",
+    "scope": "event",
+    "when": null,
+    "expr": "'PLAN_RECHARGE'",
+    "sample": null
+   },
+   {
+    "concept": "topup_product_name",
+    "scope": "event",
+    "when": null,
+    "expr": "bucket_name",
+    "sample": null
+   },
+   {
+    "concept": "topup_usage_type",
+    "scope": "event",
+    "when": null,
+    "expr": null,
+    "sample": {
+     "type": "const",
+     "value": "data"
+    }
    }
   ],
   "output": {
