@@ -116,7 +116,11 @@ WHAT YOU DECIDE
    it: nothing is activated, allocated or finished for a transaction that failed, was cancelled or is still in flight. Facts
    about an entity stay the same across its rows; a fact that carries over from the previous row uses prev. A status that
    means "still in flight" (created, pending, initialised, in progress) is only possible for an event recent enough that it
-   could still be in flight; older events have reached a final state.
+   could still be in flight; older events have reached a final state. A boolean that says a step happened (presented, sent,
+   viewed, accepted, converted, resolved) agrees with everything that records that step: its timestamp, amount and status exist
+   exactly when the flag is true, and a later step (accepted, converted) is never true when the step before it (presented,
+   offered) is false. An automatic, scheduled or system-initiated flag agrees with who initiates the row (its requestor, role
+   and channel): an automatic action is requested by the system, a customer-initiated one is not.
 6. Realistic values. Where a definition lists no values (marked needs_values), derive realistic values for the scenario's
    industry, country and currency from the column's description and the other columns (names, reasons, plan or product
    names, channels, categories, amounts in local currency and realistic magnitudes) and put them in "reference". Identifiers and contact values follow the real format of the scenario's country
@@ -691,7 +695,8 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
     report["empty_columns"] = empty_ids
     report["failed_targets"] = [t["id"] for t in report["targets"]["results"] if t["status"] == "fail"]
     if not problems:
-        report["advice"] = cadence_advice(spec, rows) + constant_advice(spec, rows, variables) + sparse_advice(spec, rows)
+        report["advice"] = (cadence_advice(spec, rows) + constant_advice(spec, rows, variables) + sparse_advice(spec, rows)
+                              + bound_advice(spec, rows))
         report["facts"] = shape_facts(spec, rows)
     return problems, report
 
@@ -748,9 +753,13 @@ def cadence_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dic
             window = _median(spans)
             if seen >= 20 and share > 0.25 and window > 0.5 * median_gap:
                 names = [spec.columns[a].column, spec.columns[b].column]
+                ordered = sorted(spans)
+                at_clock = [abs((r[b] - r[spec.clock]).total_seconds()) <= 86400.0 for r in rows if r.get(b) is not None and r.get(spec.clock) is not None]
                 found.append((share, {
                     "id": "window_overlap", "severity": "warn", "columns": names, "ids": [a, b], "share": round(share, 3),
                     "window_days_mean": round(statistics.fmean(x for x in spans if x >= 0) / 86400.0, 1),
+                    "window_days_p95": round(ordered[int(0.95 * (len(ordered) - 1))] / 86400.0, 1),
+                    "ends_at_clock": bool(at_clock) and sum(at_clock) >= 0.95 * len(at_clock),
                     "problem": f"The window {names[0]} -> {names[1]} (typically {window / 86400:.0f} days) is still open at the same entity's next event "
                                f"in {share:.0%} of consecutive events, because events are only {median_gap / 86400:.1f} days apart on average.",
                     "evidence": f"history {spec.timeline.get('history_days')} days for {spec.timeline.get('events')} events per entity; "
@@ -785,6 +794,40 @@ def constant_advice(spec: GenerationSpec, rows: list[dict[str, Any]], variables:
                         "fix": "A numeric fact varies from entity to entity (and from event to event when it is measured per event): draw it from a "
                                "distribution, or compute it from the columns it is defined by with matching units so its magnitude is realistic."})
     return out[:3]
+
+
+_BOUND_WORDS = {"total", "limit", "quota", "capacity", "maximum", "max", "cap", "allowance", "ceiling", "entitlement"}
+_PART_WORDS = {"remaining", "used", "consumed", "consumption", "spent", "available", "outstanding", "paid", "left"}
+
+
+def bound_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for a numeric part (remaining, used, consumed...) that exceeds the bound it is part of (total, limit, quota...) on most rows."""
+    n = len(rows)
+    if n < 100:
+        return []
+    numeric = {cid: name for cid, name in spec.delivered.items() if spec.columns[cid].dtype in ("integer", "float")}
+    found: list[tuple[float, dict[str, Any]]] = []
+    for bid, bname in numeric.items():
+        if not (_tokens(bname) & _BOUND_WORDS):
+            continue
+        for xid, xname in numeric.items():
+            if xid == bid or (_tokens(xname) & _BOUND_WORDS) or not (_tokens(xname) & _PART_WORDS):
+                continue
+            pairs = [(r[xid], r[bid]) for r in rows if isinstance(r.get(xid), (int, float)) and isinstance(r.get(bid), (int, float))]
+            if len(pairs) < 100:
+                continue
+            share = sum(1 for x, bound in pairs if x > bound) / len(pairs)
+            median_x, median_bound = _median([float(x) for x, _ in pairs]), _median([float(b) for _, b in pairs])
+            comparable = median_x > 0 and median_bound > 0 and 0.1 <= median_x / median_bound <= 10.0     # same unit and scale
+            if share > 0.5 and comparable:
+                found.append((share, {
+                    "id": "part_exceeds_bound", "severity": "warn", "columns": [xname, bname],
+                    "problem": f"{xname} is larger than {bname} on {share:.0%} of rows.",
+                    "evidence": f"{len(pairs)} simulated rows",
+                    "fix": f"Unless {xname} is an overage of {bname}, a part of something cannot exceed its total, limit or allowance: "
+                           "draw the bound first and derive the part from it (same unit), or derive the bound from its parts."}))
+    found.sort(key=lambda t: -t[0])
+    return [f for _, f in found[:2]]
 
 
 def sparse_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -890,7 +933,9 @@ exceeds what the other columns allow). Judge each against what the column means:
 only exists once something succeeded must be empty for every state that is not a success; a fact that applies must not be
 empty; windows (validity, term, cooldown) should not still be open when the same entity's next event of that kind starts
 unless the scenario renews them early; items (name, price, size, validity of one product or plan) must agree with each other;
-the actor's role, identifier and channel must agree; statuses of one subject must not contradict each other.
+the actor's role, identifier and channel must agree (and with an automatic/scheduled flag: automatic means requested by the system);
+a flag that says a step happened (presented, viewed, accepted, converted, resolved) agrees with that step's timestamp, amount and status,
+and a later step is never true while the step before it is false; statuses of one subject must not contradict each other.
 Timestamp layouts ("timestamp_layouts") are fixed by the platform, are written in the scenario's local time and are rounded to the
 layout's unit: never report a layout, a missing UTC offset or a rounding effect. Report only what the sample demonstrates,
 citing the entity/event and the values. Do not report style, wording, or anything you cannot show. Do not report that a column is "random" unless random values contradict something. At most 8 issues,
@@ -1159,12 +1204,23 @@ class SpecCompiler:
             return rnd
         _, end_id = issue["ids"]
         events = int(rnd.spec.timeline.get("events") or events_per_entity(brief))
-        days = min(float(MAX_HISTORY_DAYS), max(float(history.get("days") or 0.0), math.ceil(events * issue["window_days_mean"] * 1.25)))
+        if issue.get("ends_at_clock") and rnd.spec.clock:
+            # The window ends when its own event happens, so nothing "after the previous end" can be asked of the next
+            # event; the next event has to come a whole window later than the previous one.
+            clock = rnd.spec.clock
+            gap = float(math.ceil(issue.get("window_days_p95") or issue["window_days_mean"]))
+            rule = f"add_days(prev['{clock}'], {gap:g}) if prev['{clock}'] is not None else None"
+            span = gap
+            what = f"at least {gap:g} days after the previous event (the window that ends at each event)"
+        else:
+            rule = f"prev['{end_id}'] if prev['{end_id}'] is not None else None"
+            span = issue["window_days_mean"]
+            what = f"after the previous {issue['columns'][1]}"
+        days = min(float(MAX_HISTORY_DAYS), max(float(history.get("days") or 0.0), math.ceil(events * span * 1.25)))
         overlay = copy.deepcopy(rnd.overlay)
-        overlay["history"] = {**history, "days": days,
-                              "earliest_next": f"prev['{end_id}'] if prev['{end_id}'] is not None else None"}
+        overlay["history"] = {**history, "days": days, "earliest_next": rule}
         assumptions = list(overlay.get("assumptions") or [])
-        assumptions.append(f"An entity's next event starts after the previous {issue['columns'][1]} (spacing rule added because the "
+        assumptions.append(f"An entity's next event starts {what} (spacing rule added because the "
                            f"measured windows overlapped in {issue['share']:.0%} of consecutive events).")
         overlay["assumptions"] = assumptions[-40:]
         candidate = self._verified(base, brief, overlay)

@@ -775,6 +775,7 @@ class SchemaCompiler:
             excluded_semantic_keys=external_semantic_aliases,
             forced_names=forced_names,
             owner_models=owning_models(external_variable_definitions, catalog_rows),
+            db_definitions=external_variable_definitions,
             max_fields=candidate_pool_budget,
         )
 

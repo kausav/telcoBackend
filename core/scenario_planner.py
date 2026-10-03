@@ -10,6 +10,7 @@ import re
 from typing import Any, Iterable
 
 from core.industry_source_store import (
+    _canonical_catalog_dtype,
     _catalog_role,
     _normalize_model_name,
     canonical_variable_semantic_key,
@@ -130,6 +131,128 @@ def _definition_key(row: dict[str, Any]) -> tuple:
     return (leaf, str(row.get("dtype") or ""), tuple(row.get("enum_values") or ()), " ".join(str(row.get("description") or "").split()))
 
 
+_REFERENCE_NOISE = {"related", "ref", "refs", "reference", "or", "value", "link", "linked"}
+_HIERARCHY_WORDS = {"parent", "child", "hierarchy", "hierarchical", "linked", "chain", "predecessor", "successor", "previous"}
+
+
+def _reference_target(row: dict[str, Any]) -> str:
+    """The resource a reference leaf points at (``related_topup_balance`` -> ``topup_balance``), else ``""``.
+
+    The source marks scalar leaves that sit inside a reference wrapper (``X.relatedY.id``) with the wrapper's
+    kind; the wrapper's own name says which resource it refers to.
+    """
+    kinds = {str(row.get("source_owner_kind") or "")} | {str(k) for k in row.get("source_owner_kinds") or ()}
+    if "support_reference" not in kinds:
+        return ""
+    parts = [p for p in str(row.get("source_owner_model") or "").split("_") if p and p not in _REFERENCE_NOISE]
+    return "_".join(parts)
+
+
+def _description_text(value: Any) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
+
+
+def _same_meaning(a: Any, b: Any) -> bool:
+    """Equal descriptions, or one is a sentence of the other (at least three words, so ``Unit`` never matches)."""
+    a, b = _description_text(a), _description_text(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long_ = sorted((a, b), key=len)
+    return len(short.split()) >= 3 and short in long_
+
+
+def _leaf_path(row: dict[str, Any]) -> str:
+    path = str(row.get("path") or "")
+    return path.split(".", 1)[1] if "." in path else path
+
+
+def _row_dtype(row: dict[str, Any]) -> str:
+    fmt = str(row.get("format") or "").strip().lower()
+    if fmt in {"date-time", "datetime"}:
+        return "datetime"
+    if fmt == "date":
+        return "date"
+    return _canonical_catalog_dtype(row.get("dtype"), bool(row.get("enum_values")))
+
+
+def _restating_rows(
+    selected: list[dict[str, Any]],
+    *,
+    protected: set[str],
+    candidates: Iterable[dict[str, Any]],
+    db_definitions: Iterable[dict[str, Any]] | None,
+    owner_models: set[str] | None,
+) -> set[str]:
+    """Names of selected rows that only restate a fact another selected variable already carries.
+
+    * A resource that points at another resource (a history or log row that references the balance it records)
+      repeats that resource's own leaves: same property, type, allowed values and meaning. When the referenced
+      resource's leaf is present - as a source row or as a persisted variable - the referencing copy is redundant.
+      The resource's own identifier is never a copy (each resource has one).
+    * ``<entity>_<x>`` beside an existing ``<x>`` variable is that variable seen through the entity.
+    """
+    def compact(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+    def model_of(row: dict[str, Any]) -> str:
+        return _normalize_model_name(row.get("business_model") or row.get("model"))
+
+    by_model: dict[str, list[dict[str, Any]]] = {}
+    links: dict[str, set[str]] = {}
+    for row in selected:
+        by_model.setdefault(model_of(row), []).append(row)
+    for row in candidates:                                    # every candidate, also the reference leaves that were not selected
+        target = _reference_target(row)
+        if target and target != model_of(row):
+            links.setdefault(model_of(row), set()).add(target)
+
+    held: list[tuple[str, str, str, str]] = []              # (model, leaf-agnostic dtype, description, name)
+    db_names: set[str] = set()
+    for item in db_definitions or ():
+        if not isinstance(item, dict) or not str(item.get("name") or "").strip():
+            continue
+        name = normalize_lookup_key(item.get("name"))
+        db_names.add(name)
+        for model in owner_models or ():
+            if compact(name).startswith(compact(model)):
+                held.append((model, str(item.get("dtype") or "").strip().lower(), str(item.get("description") or ""), name))
+
+    removed: set[str] = set()
+    for row in selected:
+        name = normalize_lookup_key(row.get("name"))
+        if not name or name in protected:
+            continue
+        model = model_of(row)
+        if _catalog_role(row) != "identity":
+            for target in links.get(model, ()):
+                same_source = any(
+                    other is not row
+                    and normalize_lookup_key(other.get("name")) not in removed
+                    and _leaf_path(other) == _leaf_path(row)
+                    and _row_dtype(other) == _row_dtype(row)
+                    and tuple(other.get("enum_values") or ()) == tuple(row.get("enum_values") or ())
+                    and _same_meaning(other.get("description"), row.get("description"))
+                    for other in by_model.get(target, ())
+                )
+                same_db = any(
+                    owner == target and dtype == _row_dtype(row) and _same_meaning(description, row.get("description"))
+                    for owner, dtype, description, _ in held
+                )
+                if same_source or same_db:
+                    removed.add(name)
+                    break
+        if name in removed:
+            continue
+        # <entity>_<x> next to a persisted <x>: the same fact reached through the entity.
+        model_tokens = _tokens(row.get("business_model") or row.get("model"))
+        head, _, rest = name.partition("_")
+        if head in _ENTITY_WORDS and head in model_tokens and rest in db_names and rest != name:
+            removed.add(name)
+    return removed
+
+
 def owning_models(variables: Iterable[dict[str, Any]] | None, rows: list[dict[str, Any]]) -> set[str]:
     """Source models that own at least one of the given (curated) variables, matched on the flattened name prefix."""
     def compact(value: Any) -> str:
@@ -150,6 +273,7 @@ def select_source_rows(
     excluded_semantic_keys: set[str] | None = None,
     forced_names: set[str] | None = None,
     owner_models: set[str] | None = None,
+    db_definitions: Iterable[dict[str, Any]] | None = None,
     max_fields: int = 500,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Select scenario-relevant source leaves without whole-model expansion."""
@@ -281,10 +405,28 @@ def select_source_rows(
                 return False
         return True
 
+    # A leaf inside a reference to a resource that is already part of the dataset (a top-up that points at a related
+    # top-up, a history row that points at the top-up it records) restates that resource: its id is the id already
+    # present, its name and role describe the resource's own columns. Only a request that is about the link itself
+    # (parent/child, hierarchy, chains) keeps such leaves.
+    hierarchy_asked = bool(context & _HIERARCHY_WORDS)
+    entity_only = _ENTITY_WORDS | {"id", "identifier", "key"}
+
+    def points_at_present_resource(row: dict[str, Any], model: str) -> bool:
+        target = _reference_target(row)
+        if not target or hierarchy_asked:
+            return False
+        name = normalize_lookup_key(row.get("name"))
+        if name in forced or (name in preferred and _tokens(name) <= entity_only):
+            return False
+        return target == model or target in models
+
     scored: list[tuple[float, dict[str, Any], str]] = []
     for row in canonical:
         model = _normalize_model_name(row.get("business_model") or row.get("model"))
         if model not in models and model not in related:
+            continue
+        if points_at_present_resource(row, model):
             continue
         score = _relevance_score(row, context)
         name = normalize_lookup_key(row.get("name"))
@@ -360,9 +502,15 @@ def select_source_rows(
         name = normalize_lookup_key(row.get("name"))
         model = _normalize_model_name(row.get("business_model") or row.get("model"))
         sem = canonical_variable_semantic_key(row) or name
-        if name not in preferred or sem in selected_sem or model not in models:
+        if name not in preferred or sem in selected_sem or model not in models or points_at_present_resource(row, model):
             continue
         selected.append(dict(row)); selected_sem.add(sem)
+
+    # Copies of a fact another selected variable already carries (see _restating_rows) are dropped last, so which
+    # of two look-alike resources keeps the fact never depends on the order candidates were visited in.
+    restating = _restating_rows(selected, protected=forced, candidates=canonical, db_definitions=db_definitions, owner_models=owner_models)
+    if restating:
+        selected = [r for r in selected if normalize_lookup_key(r.get("name")) not in restating]
 
     # Forced fields come first so a budget can never squeeze them out.
     forced_rows = [dict(r) for r in canonical if normalize_lookup_key(r.get("name")) in forced]
@@ -385,6 +533,7 @@ def select_source_rows(
         "preferred_names_used": sorted(set(normalize_lookup_key(r.get("name")) for r in selected) & preferred),
         "excluded_names": sorted(excluded),
         "excluded_semantic_keys": sorted(excluded_sem),
+        "restating_removed": sorted(restating),
     }
     return selected, report
 
