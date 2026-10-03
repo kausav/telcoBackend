@@ -37,6 +37,7 @@ from core.scenario_variable_store import upsert_recommended, get_recommended, se
 from models.database import ping as ping_mongodb
 from models.model_registry import ensure_indexes as ensure_model_indexes
 from core.generation_service import build_generation_response
+from synth.service import SpecNotReady
 from core.industry_source_store import (
     delete_source_document,
     get_source_document,
@@ -927,6 +928,10 @@ async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
             (perf_counter() - started) * 1000.0,
         )
         return payload
+    except SpecNotReady as exc:
+        # The scenario's behaviour design is still running in the background: answer at once instead of holding the request.
+        raise HTTPException(503, detail={"error": str(exc), "retryAfterSeconds": exc.retry_after},
+                            headers={"Retry-After": str(exc.retry_after)}) from exc
     except ValueError as exc:
         raise HTTPException(400, detail={"error": str(exc)}) from exc
 

@@ -29,6 +29,8 @@ This module holds mechanism only: there are no vocabularies, prefixes, numbers o
     {"type": "after_parents", "parents": [{"var": "<variable>", "min_secs": 0, "max_secs": null}]}   # at/after every parent
     {"type": "definition", "gen": "<generator>", "params": {...}, "dtype": "..", "formula": "..", "name": "<column>",
                            "reads": ["<variable>", ..]}                      # the column's own definition (see synth.definitions)
+    {"type": "rollup",    "fn": "first|last|min|max|sum|mean|count|any|all|distinct", "of": "<expression per row>",
+                          "where": "<expression per row>"}                  # a fact about the ENTITY computed from its own events
 """
 from __future__ import annotations
 
@@ -38,8 +40,14 @@ from typing import Any
 from synth.expr import Expr
 
 TYPES = {"const", "expr", "choice", "id", "template", "lognormal", "beta_scaled", "uniform_int", "uniform", "bernoulli",
-         "time_shift", "switch", "definition", "after_parents"}
-_EXPR_KEYS = {"expr", "by", "filter", "scale", "round", "stable_by"}
+         "time_shift", "switch", "definition", "after_parents", "rollup"}
+ROLLUP_FNS = ("first", "last", "min", "max", "sum", "mean", "count", "any", "all", "distinct")
+_EXPR_KEYS = {"expr", "by", "filter", "scale", "round", "stable_by", "of", "where"}
+
+
+def is_rollup(sample: Any) -> bool:
+    """True for a sampler that summarises the entity's own events (computed after them, never drawn)."""
+    return isinstance(sample, dict) and sample.get("type") == "rollup"
 _CASTS = {"int": lambda v: int(round(float(v))), "float": float}
 _NUMERIC_KEYS = {"uniform_int": ("low", "high"), "uniform": ("low", "high", "round"), "bernoulli": ("p",)}
 
@@ -82,7 +90,7 @@ def validate(spec: Any, where: str) -> None:
         "const": ["value"], "expr": ["expr"], "id": ["digits"], "template": ["parts"], "lognormal": ["median", "sigma"],
         "beta_scaled": ["alpha", "beta", "scale"], "uniform_int": ["low", "high"], "uniform": ["low", "high"],
         "bernoulli": ["p"], "time_shift": ["anchor", "direction"],
-        "switch": ["by", "cases"], "choice": [], "definition": ["gen"], "after_parents": ["parents"],
+        "switch": ["by", "cases"], "choice": [], "definition": ["gen"], "after_parents": ["parents"], "rollup": ["fn"],
     }[kind]
     for key in need:
         if key not in spec:
@@ -93,6 +101,11 @@ def validate(spec: Any, where: str) -> None:
     for key in _NUMERIC_KEYS.get(kind, ()):
         if isinstance(spec.get(key), str):
             Expr(spec[key])
+    if kind == "rollup":
+        if spec["fn"] not in ROLLUP_FNS:
+            raise SamplerError(f"{where}: rollup fn must be one of {list(ROLLUP_FNS)}")
+        if spec["fn"] != "count" and not spec.get("of"):
+            raise SamplerError(f"{where}: rollup '{spec['fn']}' needs 'of' (an expression evaluated on each event)")
     if spec.get("cast") is not None and spec["cast"] not in _CASTS:
         raise SamplerError(f"{where}: cast must be one of {sorted(_CASTS)}")
     if kind == "choice":
@@ -182,6 +195,8 @@ class Sampler:
             value = self._draw(case, env, rt, concept)
             cast = _CASTS.get(case.get("cast"))          # a case is a sampler in its own right: its cast applies too
             return value if cast is None or value is None else cast(value)
+        if kind == "rollup":
+            raise SamplerError("a rollup is computed from the entity's events by the engine; it is never drawn")
         raise SamplerError(f"unknown sampler type {kind!r}")
 
     # ------------------------------------------------------------------------------------------

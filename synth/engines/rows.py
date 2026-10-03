@@ -12,11 +12,18 @@ The engine owns only the time axis; everything else is declared by the generatio
   (optionally shaped by a ``timeline.hour_weights`` curve over the local hour of day);
 * ``timeline.earliest_next`` (optional expression over ``prev``) pushes an event later when the previous event
   of the same entity forbids another one yet - for example while a cooldown or suppression window is running.
+  The event then happens a little after that time (a natural delay of up to a quarter of the usual spacing).
   An entity whose events no longer fit before ``as_of`` is simulated again, so rows never break the rule;
 * ``scope: entity`` columns are drawn once per entity, in declaration order;
 * ``scope: event`` columns are drawn per row, in declaration order, and may read every column declared
   before them (latent columns, which are never delivered, are how a spec expresses the hidden decisions that
-  make the visible columns agree with each other).
+  make the visible columns agree with each other);
+* a ``rollup`` (an entity-scope fact such as "when did this customer last accept an offer" or "how many top-ups
+  did it make") is computed after the entity's events from those events, so a fact about the entity can never
+  contradict the events it summarises; the same value is on every row of the entity.
+* the timeline is designed for ``timeline.events`` events per entity (the history length that spaces them
+  realistically); asking for more or fewer events per entity stretches or shrinks the history in proportion, so the
+  spacing between consecutive events - and everything that depends on it, such as overlapping windows - stays as designed.
 
 Variables available to expressions and samplers (engine vocabulary, domain-neutral):
 
@@ -36,11 +43,12 @@ from synth.clock import RunContext
 from synth.expr import Expr
 from synth.projection import time_resolution
 from synth.spec import GenerationSpec
-from synth.samplers import Runtime, Sampler, sampler_names
+from synth.samplers import Runtime, Sampler, is_rollup, sampler_names
 
 ENTITY_VARS = frozenset({"first_event_at", "as_of"})
 EVENT_VARS = frozenset({"event_at", "event_index", "prev"})
 _MAX_ATTEMPTS = 40
+MAX_HISTORY_DAYS = 730.0
 _NAMESPACES = frozenset({"REF", "P"})
 
 
@@ -66,13 +74,19 @@ class EventRows:
         """Fail at load when an emit reads something that is not defined at that point."""
         seen_event = False
         for emit in spec.emit:
+            if is_rollup(emit.sample):
+                continue
             if emit.scope == "event":
                 seen_event = True
             elif seen_event:
                 raise ValueError(f"emit '{emit.column}': entity-scope columns must be declared before event-scope ones")
         known = set(ENTITY_VARS)
+        rolled: set[str] = set()
         for emit in spec.emit:
-            available = known | (EVENT_VARS if emit.scope == "event" else set())
+            rollup = is_rollup(emit.sample)
+            if not rollup and rolled:
+                raise ValueError(f"emit '{emit.column}' is declared after a rollup; rollups come last")
+            available = known | (EVENT_VARS if emit.scope == "event" and not rollup else set())
             used: set[str] = set()
             for src in (emit.when, emit.expr):
                 if src:
@@ -85,6 +99,10 @@ class EventRows:
                     f"emit '{emit.column}' reads {sorted(unknown)}, which are not defined before it "
                     f"(available: engine variables and earlier columns)"
                 )
+            if rollup:
+                if emit.scope != "entity":
+                    raise ValueError(f"emit '{emit.column}': a rollup describes the entity and must be entity-scoped")
+                rolled.add(emit.column)
             known.add(emit.column)
         timeline = spec.timeline or {}
         if "history_days" not in timeline:
@@ -121,7 +139,8 @@ class _Run:
         self.ctx, self.P, self.view = ctx, spec.model, view
         self.rt = Runtime(ctx, view, hints)
         timeline = spec.timeline
-        self.history = timedelta(days=float(timeline["history_days"]))
+        self.history_days = float(timeline["history_days"])
+        self.events_ref = max(1.0, float(timeline.get("events") or 0)) if timeline.get("events") else None
         self.gap = float(timeline.get("min_gap_minutes", 0)) * 60.0
         self.margin = timedelta(minutes=float(timeline.get("margin_minutes", 0)))
         self.earliest = Expr(timeline["earliest_next"]) if timeline.get("earliest_next") else None
@@ -129,14 +148,20 @@ class _Run:
         self.hour_weights = _hour_weights(curve) if curve else None
         self.offset_min = view["tz_offset_min"]
         resolution = time_resolution(spec)
-        self.entity_emits = [_Step(e, resolution) for e in spec.emit if e.scope == "entity"]
+        self.entity_emits = [_Step(e, resolution) for e in spec.emit if e.scope == "entity" and not is_rollup(e.sample)]
         self.event_emits = [_Step(e, resolution) for e in spec.emit if e.scope == "event"]
+        self.rollups = [_Rollup(e, resolution) for e in spec.emit if is_rollup(e.sample)]
         self.resolution = resolution
 
     # ---- time axis ---------------------------------------------------------------------------
+    def window_days(self, n: int) -> float:
+        """Days of history for ``n`` events: the designed length, scaled with the number of events asked for."""
+        days = self.history_days * (n / self.events_ref) if self.events_ref else self.history_days
+        return min(MAX_HISTORY_DAYS, max(1.0, days))
+
     def _anchors(self, n: int) -> list[datetime]:
         end = self.ctx.as_of - self.margin
-        window = self.history.total_seconds()
+        window = self.window_days(n) * 86400.0
         slot = window / n
         # Events are at least ``gap`` apart, but never so far apart that ``n`` of them cannot fit the history.
         pad = min(self.gap / 2.0, slot * 0.45)
@@ -163,13 +188,13 @@ class _Run:
                 return rows
         raise ValueError(
             f"recordsPerUser={n} cannot be simulated: the spec's spacing rule (timeline.earliest_next) pushes the events "
-            f"past the reference time within the {self.history.days}-day history. Lower recordsPerUser or widen timeline.history_days."
+            f"past the reference time within the {self.window_days(n):.0f}-day history. Lower recordsPerUser or widen timeline.history_days."
         )
 
     def _simulate_entity(self, n: int) -> list[dict[str, Any]] | None:
         anchors = self._anchors(n)
         end = self.ctx.as_of - self.margin
-        gap = min(self.gap, self.history.total_seconds() / n * 0.9)
+        gap = min(self.gap, self.window_days(n) * 86400.0 / n * 0.9)
         env: dict[str, Any] = {"REF": self.view, "P": self.P, "as_of": self.ctx.as_of, "first_event_at": anchors[0]}
         for step in self.entity_emits:
             env[step.column] = step.draw(env, self.rt)
@@ -182,8 +207,10 @@ class _Run:
                 earliest = max(earliest, at + timedelta(seconds=gap))
             if self.earliest is not None and prev is not None:
                 floor = self.earliest({"prev": prev, "as_of": self.ctx.as_of, "REF": self.view, "P": self.P})
-                if floor is not None:
-                    earliest = max(earliest, floor)
+                if floor is not None and floor > earliest:
+                    # pushed by the rule: the next event follows the end of what the previous one opened after some natural
+                    # delay (up to a quarter of the usual spacing), not at the very instant it becomes possible
+                    earliest = floor + timedelta(seconds=self.ctx.rng.uniform(0.0, 0.25 * self.window_days(n) * 86400.0 / n))
             if earliest > end:
                 return None
             at = earliest
@@ -193,6 +220,11 @@ class _Run:
                 row_env[step.column] = step.draw(row_env, self.rt)
             prev = {s.column: row_env[s.column] for s in (*self.entity_emits, *self.event_emits)}
             rows.append(prev)
+        for rollup in self.rollups:
+            value = rollup.compute(rows, env, self.rt)
+            env[rollup.column] = value
+            for row in rows:
+                row[rollup.column] = value
         return rows
 
 
@@ -218,3 +250,67 @@ class _Step:
         if isinstance(value, datetime):
             return value.replace(second=0, microsecond=0) if self.resolution >= 60 else value.replace(microsecond=0)
         return value
+
+
+class _Rollup:
+    """An entity fact computed from the entity's own events (oldest first): first/last/min/max/sum/mean/count/any/all/distinct."""
+
+    def __init__(self, emit: Any, resolution: int = 1):
+        spec = emit.sample
+        self.column, self.fn, self.resolution = emit.column, spec["fn"], resolution
+        self.of = Expr(spec["of"]) if spec.get("of") else None
+        self.where = Expr(spec["where"]) if spec.get("where") else None
+        self.when = Expr(emit.when) if emit.when else None
+        self.cast = spec.get("cast")
+
+    def compute(self, rows: list[dict[str, Any]], entity_env: dict[str, Any], rt: Runtime) -> Any:
+        try:
+            if self.when is not None and not self.when(entity_env):
+                return None
+            values: list[Any] = []
+            hits = 0
+            for row in rows:
+                env = {**entity_env, **row}
+                if self.where is not None and not self.where(env):
+                    continue
+                hits += 1
+                if self.of is not None:
+                    values.append(self.of(env))
+            return self._finish(values, hits)
+        except SpecRuntimeError:
+            raise
+        except Exception as exc:
+            raise SpecRuntimeError(self.column, exc) from exc
+
+    def _finish(self, values: list[Any], hits: int) -> Any:
+        fn = self.fn
+        if fn == "count":
+            return hits if self.of is None else sum(1 for v in values if v is not None and v is not False)
+        if fn == "any":
+            return any(bool(v) for v in values) if self.of is not None else hits > 0
+        if fn == "all":
+            return all(bool(v) for v in values) if self.of is not None else True
+        present = [v for v in values if v is not None]
+        if not present:
+            return 0 if fn == "sum" else None
+        if fn == "first":
+            out: Any = present[0]
+        elif fn == "last":
+            out = present[-1]
+        elif fn == "min":
+            out = min(present)
+        elif fn == "max":
+            out = max(present)
+        elif fn == "sum":
+            out = sum(present)
+        elif fn == "mean":
+            out = sum(present) / len(present)
+        else:                                                   # distinct
+            out = len({str(v) for v in present})
+        if isinstance(out, datetime):
+            return out.replace(second=0, microsecond=0) if self.resolution >= 60 else out.replace(microsecond=0)
+        if self.cast == "int" and isinstance(out, (int, float)):
+            return int(round(out))
+        if self.cast == "float" and isinstance(out, (int, float)):
+            return float(out)
+        return out

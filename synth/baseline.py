@@ -22,7 +22,7 @@ from typing import Any
 
 from synth import definitions
 from synth.expr import Expr
-from synth.samplers import sampler_names
+from synth.samplers import is_rollup, sampler_names
 from synth.spec import GenerationSpec, SpecColumn, safe_identifier
 
 _DTYPE = {
@@ -48,15 +48,19 @@ def spec_dtype(dtype: Any) -> str:
 
 
 def order_entries(entries: list[dict[str, Any]], *, soft: bool = False) -> list[dict[str, Any]]:
-    """Order emit entries so every entry comes after what it reads, entity-scope ones first.
+    """Order emit entries so every entry comes after what it reads: entity-scope ones first, then event-scope ones, then rollups.
 
     ``entries`` are dicts with ``column``, ``scope``, ``when``, ``expr``, ``sample``. Entries are sorted by
     dependency and, among independent ones, kept in their given order, so the result is stable. An entity-scope
     entry may not read an event-scope column, and a cycle is an error - unless ``soft``, where the edge that closes
     a cycle is dropped (its ``reads`` entry too) and the entry simply sees no value for that column.
+
+    A rollup (an entity fact computed from the entity's own events) is the one entity-scope entry that reads event
+    columns. It is computed after the events, so nothing but another rollup may read it.
     """
     by_col = {e["column"]: e for e in entries}
     position = {e["column"]: i for i, e in enumerate(entries)}
+    rollups = {c for c, e in by_col.items() if is_rollup(e.get("sample"))}
 
     def reads(e: dict[str, Any]) -> set[str]:
         names: set[str] = set()
@@ -69,7 +73,13 @@ def order_entries(entries: list[dict[str, Any]], *, soft: bool = False) -> list[
 
     deps = {c: reads(e) for c, e in by_col.items()}
     for c, e in by_col.items():
-        if e["scope"] == "entity":
+        if c not in rollups:
+            summary = sorted(d for d in deps[c] if d in rollups)
+            if summary and not soft:
+                raise SpecBuildError(f"column '{c}' reads rollup column(s) {summary}; a rollup summarises the entity's events and is "
+                                     "computed after them, so only another rollup may read it")
+            deps[c] -= set(summary)
+        if e["scope"] == "entity" and c not in rollups:
             bad = sorted(d for d in deps[c] if by_col[d]["scope"] == "event")
             if bad:
                 if not soft:
@@ -78,7 +88,11 @@ def order_entries(entries: list[dict[str, Any]], *, soft: bool = False) -> list[
                 _drop_reads(e, set(bad))
     ordered: list[str] = []
     placed: set[str] = set()
-    remaining = sorted(by_col, key=lambda c: (by_col[c]["scope"] != "entity", position[c]))
+
+    def rank(c: str) -> int:
+        return 2 if c in rollups else (0 if by_col[c]["scope"] == "entity" else 1)
+
+    remaining = sorted(by_col, key=lambda c: (rank(c), position[c]))
     while remaining:
         progress = False
         for c in list(remaining):
@@ -95,8 +109,8 @@ def order_entries(entries: list[dict[str, Any]], *, soft: bool = False) -> list[
             cut = deps[c] - placed
             deps[c] -= cut
             _drop_reads(by_col[c], cut)
-    # entity-scope entries first (a stable sort keeps dependency order inside each scope)
-    ordered.sort(key=lambda c: by_col[c]["scope"] != "entity")
+    # entity-scope entries first, event-scope next, rollups last (a stable sort keeps dependency order inside each group)
+    ordered.sort(key=rank)
     return [by_col[c] for c in ordered]
 
 

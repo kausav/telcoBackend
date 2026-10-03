@@ -58,7 +58,7 @@ def _non_decreasing(values: Any) -> bool:
 
 def _all_after(starts: Any, ends: Any, applies: Any = None) -> bool:
     """Entity-level: every event starts after the previous event's ``end`` (only where ``applies`` holds for that previous event)."""
-    flags = applies if applies is not None else [True] * len(ends)
+    flags = applies if isinstance(applies, (list, tuple)) else [True if applies is None else bool(applies)] * len(ends)
     return all(nxt >= end for nxt, end, on in zip(starts[1:], ends, flags) if on and end is not None and nxt is not None)
 
 

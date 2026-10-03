@@ -22,9 +22,23 @@ class GenerationSpecModel:
     @classmethod
     def put_if_absent(cls, spec_key: str, spec: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
         """Store a spec once; returns the stored document (an existing one wins, so a key never changes meaning)."""
-        document = {"spec_key": spec_key, "spec": spec, "meta": meta, "created_at": time.time()}
+        document = {"spec_key": spec_key, "spec": spec, "meta": meta, "revision": 0, "created_at": time.time()}
         cls.collection.update_one({"spec_key": spec_key}, {"$setOnInsert": document}, upsert=True)
         return cls.get(spec_key) or document
+
+    @classmethod
+    def put_revision(cls, spec_key: str, spec: dict[str, Any], meta: dict[str, Any], revision: int) -> bool:
+        """Replace a stored spec by a later revision of it (a refinement); an equal or newer stored revision is left alone."""
+        result = cls.collection.update_one(
+            {"spec_key": spec_key, "$or": [{"revision": {"$lt": revision}}, {"revision": {"$exists": False}}]},
+            {"$set": {"spec": spec, "meta": meta, "revision": revision, "updated_at": time.time()}},
+        )
+        return bool(result.modified_count)
+
+    @classmethod
+    def set_review(cls, spec_key: str, warnings: list[str], reviewed: bool) -> None:
+        """Record the outcome of a review on the stored spec without changing its behaviour (or its revision)."""
+        cls.collection.update_one({"spec_key": spec_key}, {"$set": {"spec.warnings": warnings, "spec.reviewed": reviewed}})
 
 
 GenerationSpecModel.ensure_indexes()

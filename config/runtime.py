@@ -65,6 +65,15 @@ SPEC_LLM_TIMEOUT_MS = max(10000, int(os.getenv("SPEC_LLM_TIMEOUT_MS", "240000"))
 SPEC_REVIEW = os.getenv("SPEC_REVIEW", "true").strip().lower() in {"1", "true", "yes", "on"}
 # Total time one design may take across its repair rounds; once spent, the spec so far is rejected rather than waiting on.
 SPEC_COMPILE_BUDGET_SECONDS = max(30, int(os.getenv("SPEC_COMPILE_BUDGET_SECONDS", "600")))
+# Background refinement of a spec that already works: the reviewer's findings go back to the designer for up to this long.
+SPEC_REFINE_BUDGET_SECONDS = max(30, int(os.getenv("SPEC_REFINE_BUDGET_SECONDS", "900")))
+# background (default): generation uses the first verified spec at once and a refinement replaces it when it is better;
+# inline: a design is not offered until refinement has finished; off: no refinement.
+SPEC_REFINE_MODE = os.getenv("SPEC_REFINE_MODE", "background").strip().lower()
+if SPEC_REFINE_MODE not in {"background", "inline", "off"}:
+    SPEC_REFINE_MODE = "background"
+# The longest /scenario/generate waits for a spec that is still being designed before answering "not ready, retry".
+SPEC_GENERATE_WAIT_SECONDS = max(1, int(os.getenv("SPEC_GENERATE_WAIT_SECONDS", "90")))
 # Start designing a proposal's spec in the background as soon as it is proposed (the person reviews it meanwhile).
 SPEC_WARM_ON_PROPOSE = os.getenv("SPEC_WARM_ON_PROPOSE", "true").strip().lower() in {"1", "true", "yes", "on"}
 

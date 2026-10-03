@@ -128,6 +128,9 @@ class GenerationSpec(BaseModel):
     targets: list[Target] = Field(default_factory=list)
     output: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    revision: int = 0                                          # 0 = the first verified design; each accepted refinement adds one
+    reviewed: bool = False                                     # True once the reviewer's findings have been worked through (or none were found)
+    design: dict[str, Any] = Field(default_factory=dict)       # the designer's own spec, kept so a refinement can patch it
 
     @model_validator(mode="after")
     def _check(self) -> "GenerationSpec":
