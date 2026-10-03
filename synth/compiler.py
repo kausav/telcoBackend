@@ -47,7 +47,8 @@ logger = logging.getLogger(__name__)
 
 COMPILER_VERSION = 2
 MAX_REPAIR_ROUNDS = 2
-MAX_REFINE_ROUNDS = 2
+MAX_REFINE_ROUNDS = 4
+GOOD_ENOUGH_WEIGHT = 1                   # refinement stops once at most one minor finding is left
 SCENARIO_KEYS = ("industry", "domain", "country", "use_case", "scenario_type", "business_scenario", "business_response",
                  "expected_outcome", "type_of_data", "entity_key")
 REVIEW_ENTITIES = 5
@@ -108,7 +109,8 @@ WHAT YOU DECIDE
    size (consumed vs allowance, paid vs due, used vs balance) does not exceed it unless the column means an overage. Facts
    about an entity stay the same across its rows; a measure that is defined by other columns (the time until something runs out =
    what remains / the rate of use; a total = its parts; a ratio, rate or difference) is an expression of those columns with
-   matching units, never a separate draw; a recommendation, upgrade or "better fit" is better than what the entity has now in
+   matching units (state each unit in "assumptions" and convert), never a separate draw, and the magnitude of the result must be
+   realistic for the domain (a time until depletion of an hour on every row, or an average of 0, shows the units do not match); a recommendation, upgrade or "better fit" is better than what the entity has now in
    the dimension that matters (larger, higher tier, longer, cheaper per unit), never the same or smaller; the state or flag of
    a related subject (usage, order, provisioning, a benefit being active) follows the outcome of the transaction that causes
    it: nothing is activated, allocated or finished for a transaction that failed, was cancelled or is still in flight. Facts
@@ -689,7 +691,7 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
     report["empty_columns"] = empty_ids
     report["failed_targets"] = [t["id"] for t in report["targets"]["results"] if t["status"] == "fail"]
     if not problems:
-        report["advice"] = cadence_advice(spec, rows) + sparse_advice(spec, rows)
+        report["advice"] = cadence_advice(spec, rows) + constant_advice(spec, rows, variables) + sparse_advice(spec, rows)
         report["facts"] = shape_facts(spec, rows)
     return problems, report
 
@@ -764,6 +766,27 @@ def cadence_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dic
     return out[:2]
 
 
+def constant_advice(spec: GenerationSpec, rows: list[dict[str, Any]], variables: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for numeric columns that carry one single value on every row: a measure that never varies measures nothing."""
+    n = len(rows)
+    if n < 100:
+        return []
+    fixed = {str(v.get("name")) for v in variables
+             if isinstance(v.get("params"), dict) and v["params"].get("min") is not None and v["params"].get("min") == v["params"].get("max")}
+    out = []
+    for cid, name in spec.delivered.items():
+        if spec.columns[cid].dtype not in ("integer", "float") or name in fixed:
+            continue
+        values = {r.get(cid) for r in rows if r.get(cid) is not None}
+        if len(values) == 1 and sum(1 for r in rows if r.get(cid) is not None) >= n // 2:
+            out.append({"id": "constant_numeric_column", "severity": "error", "columns": [name],
+                        "problem": f"Column {name} has the value {next(iter(values))!r} on every row of every entity.",
+                        "evidence": f"{len(rows)} simulated rows, one distinct value",
+                        "fix": "A numeric fact varies from entity to entity (and from event to event when it is measured per event): draw it from a "
+                               "distribution, or compute it from the columns it is defined by with matching units so its magnitude is realistic."})
+    return out[:3]
+
+
 def sparse_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Findings for delivered columns that are present on (almost) no row: they cost a column but say nothing."""
     n = len(rows)
@@ -820,10 +843,19 @@ def shape_facts(spec: GenerationSpec, rows: list[dict[str, Any]]) -> dict[str, A
             entry["empty_share_by"] = {delivered[best[1]]: {k: round(c[1] / c[0], 2) for k, c in sorted(best[2].items())}}
         presence.append((0 if "empty_share_by" in entry else 1, entry))
     presence.sort(key=lambda t: t[0])
-    constant = [name for cid, name in delivered.items()
-                if n >= 30 and spec.columns[cid].kind != "entity" and len({str(r.get(cid)) for r in rows}) == 1 and rows[0].get(cid) is not None]
+    constant = {name: rows[0].get(cid) for cid, name in delivered.items()
+                if n >= 30 and len({str(r.get(cid)) for r in rows}) == 1 and rows[0].get(cid) is not None}
     if constant:
-        facts["constant_columns"] = constant[:MAX_FACT_COLUMNS]
+        facts["constant_columns"] = {k: (v if isinstance(v, (int, float, bool)) else str(v)[:40]) for k, v in list(constant.items())[:MAX_FACT_COLUMNS]}
+    spread: dict[str, Any] = {}
+    for cid, name in delivered.items():
+        if spec.columns[cid].dtype in ("integer", "float") and name not in constant:
+            vals = sorted(float(r[cid]) for r in rows if isinstance(r.get(cid), (int, float)) and not isinstance(r.get(cid), bool))
+            if len(vals) >= 30:
+                spread[name] = {"p5": round(vals[int(0.05 * (len(vals) - 1))], 2), "median": round(vals[len(vals) // 2], 2),
+                                "p95": round(vals[int(0.95 * (len(vals) - 1))], 2)}
+    if spread:
+        facts["numeric_spread"] = dict(list(spread.items())[:30])
     if presence:
         facts["sometimes_empty_columns"] = [e for _, e in presence[:MAX_FACT_COLUMNS]]
     return facts
@@ -851,7 +883,10 @@ Look for:
 "facts" are measured on a larger simulation of the same rules than the sample: the cadence of events (median days between an
 entity's events) and, for columns that are sometimes empty, how the share of empty values depends on another column
 ("empty_share_by": value -> share of rows where the column is empty) and the columns that carry one single value on every row
-("constant_columns": acceptable only for a fact that is truly fixed for the scenario, such as a currency). Judge each against what the column means: a fact that
+("constant_columns": column -> its one value; acceptable only for a fact that is truly fixed for the scenario, such as a currency)
+and the 5th/50th/95th percentile of every numeric column ("numeric_spread"): judge whether those magnitudes are realistic for what the
+column means (a time until depletion of one hour on nearly every row, an average of 0 for a quantity that is never 0, a count that
+exceeds what the other columns allow). Judge each against what the column means: a fact that
 only exists once something succeeded must be empty for every state that is not a success; a fact that applies must not be
 empty; windows (validity, term, cooldown) should not still be open when the same entity's next event of that kind starts
 unless the scenario renews them early; items (name, price, size, validity of one product or plan) must agree with each other;
@@ -1124,7 +1159,7 @@ class SpecCompiler:
             return rnd
         _, end_id = issue["ids"]
         events = int(rnd.spec.timeline.get("events") or events_per_entity(brief))
-        days = min(float(MAX_HISTORY_DAYS), max(float(history.get("days") or 0.0), math.ceil(events * issue["window_days_mean"] * 1.35)))
+        days = min(float(MAX_HISTORY_DAYS), max(float(history.get("days") or 0.0), math.ceil(events * issue["window_days_mean"] * 1.25)))
         overlay = copy.deepcopy(rnd.overlay)
         overlay["history"] = {**history, "days": days,
                               "earliest_next": f"prev['{end_id}'] if prev['{end_id}'] is not None else None"}
@@ -1183,7 +1218,8 @@ class SpecCompiler:
         return CompileResult(None, "rejected", problems, self.max_repairs, rnd.overlay if rnd else None)
 
     def refine(self, variables: list[dict[str, Any]], brief: dict[str, Any], current: CompileResult, *,
-               notes: dict[str, dict[str, Any]] | None = None, resources: dict[str, str] | None = None) -> CompileResult | None:
+               notes: dict[str, dict[str, Any]] | None = None, resources: dict[str, str] | None = None,
+               on_improve: Any = None) -> CompileResult | None:
         """A better spec than ``current`` (fewer and less serious findings), or None when none was found.
 
         The findings of ``current`` (measured advice, the reviewer's issues) go back to the author as a patch; each candidate
@@ -1205,7 +1241,7 @@ class SpecCompiler:
         first = build_prompt(brief, base, notes, resources)
         overlay, rounds = {k: v for k, v in current.overlay.items() if k != "healed"}, 0
         for _ in range(self.refine_rounds):
-            if not findings or time.monotonic() - started > self._refine_budget():
+            if _weight(findings) <= GOOD_ENOUGH_WEIGHT or time.monotonic() - started > self._refine_budget():
                 break
             rounds += 1
             try:
@@ -1224,6 +1260,13 @@ class SpecCompiler:
             logger.info("behaviour spec refinement round %d: %d finding(s), weight %d (best %d)", rounds, len(findings), weight, best[0])
             if weight < best[0]:
                 best = (weight, rnd.spec, rnd.overlay, rnd.report, findings, review)
+                if on_improve is not None:                  # whoever waits for the spec gets each improvement as soon as it exists
+                    report = dict(rnd.report)
+                    report.update(rounds=int(current.report.get("rounds", 0)) + rounds, review=review)
+                    try:
+                        on_improve(CompileResult(rnd.spec, "compiled", [], int(report["rounds"]), rnd.overlay, report, findings))
+                    except Exception:
+                        logger.exception("could not publish a refined generation spec")
         if best[1] is current.spec:
             current.findings = best[4]
             current.report["review"] = best[5]

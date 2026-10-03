@@ -103,13 +103,40 @@ class ExprError(ValueError):
     pass
 
 
+_VALID_ESCAPES = frozenset("\\'\"abfnrtvxNuU01234567\n")
+
+
+def _literal_escapes(source: str) -> str:
+    """``source`` with every backslash that does not start a Python string escape doubled (``'\\+91'`` keeps meaning a backslash and a plus).
+
+    A pattern such as ``matches('\\+91[0-9]{10}', x)`` is written that way by authors; Python only warns about it today and
+    will refuse it in a future version, and the value is the same either way.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(source):
+        ch = source[i]
+        if ch == "\\":
+            nxt = source[i + 1] if i + 1 < len(source) else ""
+            if nxt in _VALID_ESCAPES and nxt != "":
+                out.append(ch + nxt)
+                i += 2
+                continue
+            out.append("\\\\")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 class Expr:
     """Compiled expression. ``names`` are the free variables it reads (concept ids)."""
 
     def __init__(self, source: str):
         self.source = source
         try:
-            self._tree = ast.parse(source.strip(), mode="eval").body
+            self._tree = ast.parse(_literal_escapes(source.strip()), mode="eval").body
         except SyntaxError as exc:
             raise ExprError(f"invalid expression {source!r}: {exc}") from exc
         self.names: set[str] = set()

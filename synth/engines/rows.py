@@ -12,7 +12,7 @@ The engine owns only the time axis; everything else is declared by the generatio
   (optionally shaped by a ``timeline.hour_weights`` curve over the local hour of day);
 * ``timeline.earliest_next`` (optional expression over ``prev``) pushes an event later when the previous event
   of the same entity forbids another one yet - for example while a cooldown or suppression window is running.
-  The event then happens a little after that time (a natural delay of up to a quarter of the usual spacing).
+  The event then happens a little after that time (a natural delay of up to a fifth of the usual spacing).
   An entity whose events no longer fit before ``as_of`` is simulated again, so rows never break the rule;
 * ``scope: entity`` columns are drawn once per entity, in declaration order;
 * ``scope: event`` columns are drawn per row, in declaration order, and may read every column declared
@@ -209,8 +209,8 @@ class _Run:
                 floor = self.earliest({"prev": prev, "as_of": self.ctx.as_of, "REF": self.view, "P": self.P})
                 if floor is not None and floor > earliest:
                     # pushed by the rule: the next event follows the end of what the previous one opened after some natural
-                    # delay (up to a quarter of the usual spacing), not at the very instant it becomes possible
-                    earliest = floor + timedelta(seconds=self.ctx.rng.uniform(0.0, 0.25 * self.window_days(n) * 86400.0 / n))
+                    # delay (up to a fifth of the usual spacing), not at the very instant it becomes possible
+                    earliest = floor + timedelta(seconds=self.ctx.rng.uniform(0.0, 0.2 * self.window_days(n) * 86400.0 / n))
             if earliest > end:
                 return None
             at = earliest

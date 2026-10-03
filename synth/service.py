@@ -176,27 +176,34 @@ def _stored(variables: list[dict[str, Any]], brief: dict[str, Any], key: str, hi
 
 def _refine_job(variables: list[dict[str, Any]], brief: dict[str, Any], key: str, spec: GenerationSpec,
                 compiler: SpecCompiler | None) -> None:
-    """Improve the stored spec of ``key`` with the reviewer's findings; replace it only by a better one. Never raises."""
+    """Improve the stored spec of ``key`` with the reviewer's findings; every better version is stored as it is found. Never raises."""
     with _FLIGHT_LOCK:
         if key in _REFINING:
             return
         _REFINING.add(key)
+    published: dict[str, Any] = {"spec": spec}
     try:
         comp = compiler or SpecCompiler()
         notes, resources = source_notes(brief, variables)
         current = CompileResult(spec, "compiled", [], spec.revision, spec.design, {}, [])
-        better = comp.refine(variables, brief, current, notes=notes, resources=resources)
-        if better is not None and better.spec is not None:
-            better = finalize(better, spec.revision + 1)
-            better.spec = better.spec.model_copy(update={"reviewed": True, "design": better.overlay or {}})
+
+        def publish(better: CompileResult) -> None:
+            better = finalize(better, published["spec"].revision + 1)
+            better.spec = better.spec.model_copy(update={"reviewed": False, "design": better.overlay or {}})
             store.save(key, better.spec, {"brief": brief, "rounds": better.rounds})
-            logger.info("generation spec %s refined to revision %d (%d finding(s) left)", key[:8], better.spec.revision, len(better.findings))
-        else:
-            review = str(current.report.get("review") or "")
-            if review == "skipped":
-                with _FLIGHT_LOCK:
-                    _REFINE_BACKOFF[key] = time.monotonic()
-            store.annotate(key, spec, [finding_text(f) for f in current.findings] or spec.warnings, reviewed=review != "skipped")
+            published["spec"] = better.spec
+            logger.info("generation spec %s improved to revision %d (%d finding(s) left)", key[:8], better.spec.revision, len(better.findings))
+
+        better = comp.refine(variables, brief, current, notes=notes, resources=resources, on_improve=publish)
+        if better is not None and better.spec is not None and published["spec"] is spec:
+            publish(better)                                  # a refinement that did not publish as it went
+        review = str((better.report if better is not None else current.report).get("review") or "")
+        findings = better.findings if better is not None else current.findings
+        if review == "skipped":
+            with _FLIGHT_LOCK:
+                _REFINE_BACKOFF[key] = time.monotonic()
+        latest = published["spec"]
+        store.annotate(key, latest, [finding_text(f) for f in findings] or latest.warnings, reviewed=review != "skipped")
     except Exception:
         logger.exception("background refinement of generation spec %s failed", key[:8])
     finally:
