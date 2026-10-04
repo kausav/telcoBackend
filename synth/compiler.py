@@ -45,10 +45,11 @@ from synth.spec import EVAL_VARS, SPEC_VERSION, Emit, GenerationSpec, Invariant,
 
 logger = logging.getLogger(__name__)
 
-COMPILER_VERSION = 2
+COMPILER_VERSION = 3
 MAX_REPAIR_ROUNDS = 2
-MAX_REFINE_ROUNDS = 4
+MAX_REFINE_ROUNDS = 6
 DRAFT_REPAIR_ROUNDS = 1                  # patch rounds for measured errors before a spec is first served
+REJECTED_PATCH_ALLOWANCE = 2
 GOOD_ENOUGH_WEIGHT = 1                   # refinement stops once at most one minor finding is left
 SCENARIO_KEYS = ("industry", "domain", "country", "use_case", "scenario_type", "business_scenario", "business_response",
                  "expected_outcome", "type_of_data", "entity_key")
@@ -701,7 +702,7 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
     if not problems:
         report["advice"] = (cadence_advice(spec, rows) + constant_advice(spec, rows, variables) + sparse_advice(spec, rows)
                               + bound_advice(spec, rows) + inflight_advice(spec, rows) + shared_identifier_advice(spec, rows)
-                              + mirrored_advice(spec, rows) + counter_advice(spec, rows))
+                              + mirrored_advice(spec, rows) + counter_advice(spec, rows) + flag_state_advice(spec, rows))
         report["facts"] = shape_facts(spec, rows)
     return problems, report
 
@@ -835,8 +836,27 @@ def bound_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[
     return [f for _, f in found[:2]]
 
 
-_IN_FLIGHT = re.compile(r"^(created|pending|initiated|initialised|initialized|processing|in[ _-]?progress|queued|submitted)$", re.IGNORECASE)
+_IN_FLIGHT_WORDS = frozenset({"created", "pending", "initiated", "initialised", "initialized", "processing", "queued", "submitted",
+                              "inprogress", "awaiting"})
+_FINAL_WORDS = frozenset({"completed", "complete", "done", "failed", "cancelled", "canceled", "rejected", "resolved", "closed",
+                          "terminated", "verified", "expired", "declined", "abandoned", "aborted", "settled", "succeeded"})
+
+
+def _value_words(value: str) -> set[str]:
+    """The lower-case words of a state value, whatever its spelling (PENDING_VERIFICATION, inProgress, in-progress)."""
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    words = [w for w in re.split(r"[^a-z0-9]+", spaced.lower()) if w]
+    return set(words) | ({"inprogress"} if "in" in words and "progress" in words else set())
+
+
+def _is_in_flight(value: str) -> bool:
+    """True for a state that means "still under way": it names an in-flight step and no final outcome."""
+    words = _value_words(value)
+    return bool(words & _IN_FLIGHT_WORDS) and not (words & _FINAL_WORDS)
+
+
 STALE_IN_FLIGHT_DAYS = 30.0
+_STATE_NAME_WORDS = frozenset({"status", "state", "stage", "phase", "outcome", "result"})   # columns that hold a state, not free wording
 _AUTOMATED_ACTOR = re.compile(r"(system|auto|batch|bot|scheduler|platform|api|service|cron|robot)", re.IGNORECASE)
 
 
@@ -849,11 +869,13 @@ def inflight_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[di
     if not spec.clock or len(rows) < 100:
         return []
     as_of = datetime.fromisoformat(_VERIFY_AS_OF)
+    entity_level = set(getattr(spec, "entity_columns", []) or [])          # a customer's status is not the state of one event
     out = []
     for cid, name in spec.delivered.items():
-        if spec.columns[cid].dtype not in ("string", "categorical") or cid == spec.clock:
+        if spec.columns[cid].dtype not in ("string", "categorical") or cid == spec.clock or name in entity_level \
+                or not (re.split(r"[^a-z0-9]+", name.lower())[-1] in _STATE_NAME_WORDS):
             continue
-        flight = [r for r in rows if isinstance(r.get(cid), str) and _IN_FLIGHT.match(r[cid]) and r.get(spec.clock) is not None]
+        flight = [r for r in rows if isinstance(r.get(cid), str) and _is_in_flight(r[cid]) and r.get(spec.clock) is not None]
         stale = [r for r in flight if (as_of - r[spec.clock]).total_seconds() > STALE_IN_FLIGHT_DAYS * 86400.0]
         if flight and len(stale) >= 0.5 * len(flight) and len(stale) >= 2:
             out.append({"id": "stale_in_flight", "severity": "error", "columns": [name],
@@ -942,10 +964,11 @@ def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[di
 
 
 def counter_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Findings for a retry/attempt counter that counts up across events that are days apart.
+    """Findings for a counter that runs on from one event to the next although the events are days apart.
 
-    A retry or attempt follows its predecessor within minutes or hours; a counter that increments from one row to the next
-    while the rows are weeks apart counts unrelated events.
+    A retry or attempt count belongs to its own event (how many tries this request needed) and may be anything; a count that
+    is its predecessor's plus one far more often than chance pairing of the same values would give is a running total across
+    unrelated events.
     """
     groups = _by_entity(spec, rows)
     if not groups or not spec.clock:
@@ -954,22 +977,101 @@ def counter_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dic
     for cid, name in spec.delivered.items():
         if spec.columns[cid].dtype != "integer" or not (_tokens(name) & _COUNTER_WORDS):
             continue
-        steps = gaps = 0
+        pairs: list[tuple[int, int]] = []
         spans: list[float] = []
         for g in groups:
             for prev, nxt in zip(g, g[1:]):
                 a, b = prev.get(cid), nxt.get(cid)
-                if isinstance(a, int) and isinstance(b, int) and b > 0:
-                    steps += 1
-                    gaps += b == a + 1
+                if isinstance(a, int) and isinstance(b, int) and not isinstance(a, bool) and b > 0:
+                    pairs.append((a, b))
                     spans.append((nxt[spec.clock] - prev[spec.clock]).total_seconds() / 86400.0)
-        if steps >= 30 and gaps >= 0.8 * steps and _median(spans) > 1.0:
+        if len(pairs) < 30 or _median(spans) <= 1.0:
+            continue
+        observed = sum(b == a + 1 for a, b in pairs) / len(pairs)
+        firsts, seconds = [a for a, _ in pairs], [b for _, b in pairs]
+        shift = max(1, len(pairs) // 3)                         # the same values paired with other rows: what chance gives
+        chance = sum(seconds[i] == firsts[(i + shift) % len(pairs)] + 1 for i in range(len(pairs))) / len(pairs)
+        if observed >= 0.5 and observed >= chance + 0.2:
             out.append({"id": "counter_spacing", "severity": "error", "columns": [name],
-                        "problem": f"{name} counts up from one event to the next ({gaps} of {steps} steps) although those events are a median of {_median(spans):.0f} days apart.",
-                        "evidence": f"{steps} consecutive pairs with a positive counter",
-                        "fix": "A retry or attempt is a new try of the same action minutes or hours after the failed one: model it as a run of events "
-                               "close together (history.min_gap_minutes / a latent that groups attempts), and let the counter restart with a new action."})
+                        "problem": f"{name} is the previous event's value plus one on {observed:.0%} of {len(pairs)} steps (chance pairing gives {chance:.0%}) "
+                                   f"although those events are a median of {_median(spans):.0f} days apart.",
+                        "evidence": f"{len(pairs)} consecutive pairs with a positive counter",
+                        "fix": "A retry or attempt count belongs to its own event: draw it per event (more tries for failed or retried requests, none "
+                               "for a first-time success); do not carry it over from the previous event."})
     return out[:2]
+
+
+_GENERIC_FLAG_WORDS = frozenset({"flag", "indicator", "required", "customer", "subscriber", "account", "status", "state", "issue", "first",
+                                 "contact", "current", "latest", "previous", "total", "count", "value"})
+_NEGATING_PREFIXES = ("un", "non", "not", "in", "dis")
+
+
+_SUFFIXES = ("ation", "ition", "ing", "ed", "ion", "s", "d", "e")
+
+
+def _stem(word: str) -> str:
+    """The word without its ending, so that accepted / accept / accepts meet (but assistance and assisted do not)."""
+    for suffix in _SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            return word[: -len(suffix)]
+    return word
+
+
+def _flag_stems(name: str) -> set[str]:
+    return {_stem(t) for t in re.split(r"[^a-z0-9]+", name.lower()) if len(t) >= 5 and t not in _GENERIC_FLAG_WORDS}
+
+
+def _value_polarity(value: str, stems: set[str]) -> int:
+    """+1 when the value names what the flag says happened (Accepted / accepted_flag), -1 when it names the opposite (UNRESOLVED), else 0."""
+    for word in _value_words(value):
+        if len(word) >= 5 and _stem(word) in stems:
+            return 1
+        for prefix in _NEGATING_PREFIXES:
+            rest = word[len(prefix):]
+            if word.startswith(prefix) and len(rest) >= 5 and _stem(rest) in stems:
+                return -1
+    return 0
+
+
+def flag_state_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings where a yes/no flag disagrees with a state column that names the same thing.
+
+    ``offer_accepted_flag`` is true where the response is Accepted and false where it is Rejected; ``customer_issue_resolved_flag``
+    is true for RESOLVED and false for UNRESOLVED. The words are the only link the two columns have, so they are matched by
+    stem; a value that names the flag's step must carry the flag true, one that negates it false.
+    """
+    n = len(rows)
+    if n < 100:
+        return []
+    flags = [(cid, name, _flag_stems(name)) for cid, name in spec.delivered.items() if spec.columns[cid].dtype == "boolean"]
+    flags = [f for f in flags if f[2]]
+    if not flags:
+        return []
+    out = []
+    for cid, name in spec.delivered.items():
+        if spec.columns[cid].dtype not in ("string", "categorical") or cid == spec.entity_column:
+            continue
+        values = {r[cid] for r in rows if isinstance(r.get(cid), str)}
+        if not 2 <= len(values) <= 12:
+            continue
+        own = _flag_stems(name)                                  # words the two columns share name the resource, not the step
+        for fid, fname, flag_stems in flags:
+            stems = flag_stems - own
+            if not stems:
+                continue
+            for value in sorted(values):
+                polarity = _value_polarity(value, stems)
+                if not polarity:
+                    continue
+                known = [r for r in rows if r.get(cid) == value and isinstance(r.get(fid), bool)]
+                wrong = [r for r in known if r[fid] != (polarity > 0)]
+                if len(known) >= 8 and len(wrong) >= 5 and len(wrong) >= 0.1 * len(known):
+                    out.append({"id": "flag_contradicts_state", "severity": "error", "columns": [fname, name],
+                                "problem": f"{name} is '{value}' but {fname} is {'false' if polarity > 0 else 'true'} on {len(wrong)} of {len(known)} such rows.",
+                                "evidence": f"{len(known)} simulated rows with {name} = '{value}'",
+                                "fix": f"Derive {fname} from {name} (or both from one draw) so that a '{value}' row always carries "
+                                       f"{fname} {'true' if polarity > 0 else 'false'}."})
+    return out[:3]
 
 
 def sparse_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1043,7 +1145,38 @@ def shape_facts(spec: GenerationSpec, rows: list[dict[str, Any]]) -> dict[str, A
         facts["numeric_spread"] = dict(list(spread.items())[:30])
     if presence:
         facts["sometimes_empty_columns"] = [e for _, e in presence[:MAX_FACT_COLUMNS]]
+    flags = _flag_facts(spec, rows)
+    if flags:
+        facts["flags_vs_timestamps"] = flags
     return facts
+
+
+def _flag_facts(spec: GenerationSpec, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """For each yes/no flag that is true on some rows and false on others: the timestamps that do not follow it.
+
+    A flag that says a step happened should agree with that step's timestamp; the reviewer cannot see across a sample whether
+    a timestamp is present on every row whatever the flag says, so the measurement is handed over.
+    """
+    delivered = spec.delivered
+    stamps = [(cid, name) for cid, name in delivered.items() if spec.columns[cid].dtype in ("datetime", "date") and cid != spec.clock]
+    out: dict[str, Any] = {}
+    for fid, fname in delivered.items():
+        if spec.columns[fid].dtype != "boolean" or len(out) >= 6:
+            continue
+        yes = [r for r in rows if r.get(fid) is True]
+        no = [r for r in rows if r.get(fid) is False]
+        if len(yes) < 0.05 * len(rows) or len(no) < 0.05 * len(rows):
+            continue
+        entries = {}
+        for cid, name in stamps:
+            when_yes = sum(r.get(cid) is not None for r in yes) / len(yes)
+            when_no = sum(r.get(cid) is not None for r in no) / len(no)
+            if when_no >= 0.9 or when_yes <= 0.1 or abs(when_yes - when_no) >= 0.5:
+                entries[name] = (abs(when_yes - when_no), f"present on {when_yes:.0%} of rows where true, {when_no:.0%} where false")
+        if entries:
+            ranked = sorted(entries.items(), key=lambda kv: -kv[1][0])[:5]
+            out[fname] = {"true_share": round(len(yes) / (len(yes) + len(no)), 2), "timestamps": {k: v[1] for k, v in ranked}}
+    return out
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -1069,7 +1202,8 @@ Look for:
 entity's events) and, for columns that are sometimes empty, how the share of empty values depends on another column
 ("empty_share_by": value -> share of rows where the column is empty) and the columns that carry one single value on every row
 ("constant_columns": column -> its one value; acceptable only for a fact that is truly fixed for the scenario, such as a currency)
-and the 5th/50th/95th percentile of every numeric column ("numeric_spread"): judge whether those magnitudes are realistic for what the
+the timestamps that do not follow a yes/no flag ("flags_vs_timestamps": a timestamp present on nearly every row where the flag is false, or absent
+where it is true, contradicts a flag that says that step happened) and the 5th/50th/95th percentile of every numeric column ("numeric_spread"): judge whether those magnitudes are realistic for what the
 column means (a time until depletion of one hour on nearly every row, an average of 0 for a quantity that is never 0, a count that
 exceeds what the other columns allow). Judge each against what the column means: a fact that
 only exists once something succeeded must be empty for every state that is not a success; a fact that applies must not be
@@ -1165,7 +1299,7 @@ def spec_key(brief: dict[str, Any], variables: list[dict[str, Any]]) -> str:
 
 
 MEASURED_FINDINGS = frozenset({"window_overlap", "constant_numeric_column", "near_empty_column", "part_exceeds_bound", "stale_in_flight",
-                               "shared_identifier", "mirrored_columns", "counter_spacing", "healed_empty_column", "healed_target", "check"})
+                               "shared_identifier", "mirrored_columns", "counter_spacing", "flag_contradicts_state", "healed_empty_column", "healed_target", "check"})
 
 
 def _measured_weight(findings: list[dict[str, Any]]) -> int:
@@ -1474,7 +1608,8 @@ class SpecCompiler:
         best_measured, best_errors = _measured_weight(findings), sum(f["severity"] == "error" for f in findings)
         first = build_prompt(brief, base, notes, resources)
         overlay, rounds = {k: v for k, v in current.overlay.items() if k != "healed"}, 0
-        for _ in range(self.refine_rounds):
+        counted = 0                                        # rounds that produced a spec to judge; a rejected patch is a second chance, not a round
+        while counted < self.refine_rounds and rounds < self.refine_rounds + REJECTED_PATCH_ALLOWANCE:
             if _weight(findings) <= GOOD_ENOUGH_WEIGHT or time.monotonic() - started > self._refine_budget():
                 break
             rounds += 1
@@ -1488,6 +1623,7 @@ class SpecCompiler:
                 findings = [{"id": "check", "severity": "error", "columns": [], "problem": p, "evidence": "", "fix": ""} for p in rnd.problems[:8]] + findings
                 logger.info("behaviour spec refinement round %d: patch rejected (%d problem(s))", rounds, len(rnd.problems))
                 continue
+            counted += 1
             findings, review = self._all_findings(brief, base, rnd, notes, resources)
             overlay = rnd.overlay
             weight = _weight(findings)
