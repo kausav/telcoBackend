@@ -228,11 +228,11 @@ def _refine_job(variables: list[dict[str, Any]], brief: dict[str, Any], key: str
             publish(better)                                  # a refinement that did not publish as it went
         review = str((better.report if better is not None else current.report).get("review") or "")
         findings = better.findings if better is not None else current.findings
-        if review == "skipped":
+        if review in {"skipped", "deferred"}:
             with _FLIGHT_LOCK:
                 _REFINE_BACKOFF[key] = time.monotonic()
         latest = published["spec"]
-        store.annotate(key, latest, [finding_text(f) for f in findings] or latest.warnings, reviewed=review != "skipped")
+        store.annotate(key, latest, [finding_text(f) for f in findings] or latest.warnings, reviewed=review not in {"skipped", "deferred"})
     except Exception:
         logger.exception("background refinement of generation spec %s failed", key[:8])
     finally:

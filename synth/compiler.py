@@ -22,10 +22,12 @@ from __future__ import annotations
 import hashlib
 import copy
 import json
+import os
 import logging
 import math
 import re
 import statistics
+import threading
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -37,6 +39,7 @@ from synth.baseline import Baseline, SpecBuildError, build, order_entries, spec_
 from synth.clock import RunContext, get_tz
 from synth.contract import build_contract
 from synth.engines import get_engine
+from synth import expectations as expect
 from synth.expr import Expr
 from synth.projection import parse_columns, project, style_of, time_resolution
 from synth.samplers import is_rollup, sampler_names
@@ -45,12 +48,12 @@ from synth.spec import EVAL_VARS, SPEC_VERSION, Emit, GenerationSpec, Invariant,
 
 logger = logging.getLogger(__name__)
 
-COMPILER_VERSION = 6
+COMPILER_VERSION = 7
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
 DRAFT_REPAIRED_WARNINGS = frozenset({"shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
-                                     "complementary_columns", "near_constant_state", "identical_timestamps", "entity_stamp_inside_history"})
-DRAFT_REPAIR_ROUNDS = 1                  # patch rounds for measured errors before a spec is first served
+                                     "near_constant_state", "entity_stamp_inside_history", "expected_state_share"})
+DRAFT_REPAIR_ROUNDS = 1                  # patch rounds for measured errors before a spec is first served (the refinement does the rest)
 REJECTED_PATCH_ALLOWANCE = 2
 GOOD_ENOUGH_WEIGHT = 1                   # refinement stops once at most one minor finding is left
 SCENARIO_KEYS = ("industry", "domain", "country", "use_case", "scenario_type", "business_scenario", "business_response",
@@ -86,6 +89,14 @@ WHAT YOU RECEIVE
   industry standard, a curator or an uploaded CSV): dtype, description, allowed values, range, pattern, id format,
   nullability, formula, dependencies. THESE DEFINITIONS ARE A CONTRACT checked automatically on the simulated rows: a value
   outside "allowed", outside the range, not matching the pattern, or empty in a column marked non-nullable is rejected.
+- expectations (when present): acceptance criteria written independently of you, by someone who saw only the scenario and the
+  column definitions. "entity_facts" stay the same on every event of an entity (give them entity scope); "constants" are the only
+  columns allowed one single value on every row; "rules" are relations every row obeys (present_iff: the column has a value
+  exactly when the condition holds; order: later is not before earlier; at_most: a quantity does not exceed its bound;
+  determined_by: the column is a function of those columns, so draw the item once and read it; holds: the condition is true on
+  every row; separate: two different facts, never copies, relabellings or exact complements); "state_shares" are the expected
+  share bands of outcome values for this scenario type. They are measured on the simulated rows and a break is sent back to you:
+  build the behaviour so that they hold; do not copy them into invariants.
 - Each column is, by default, drawn independently from its own definition (entity columns once per entity, event columns
   once per row). You override only what needs behaviour.
 
@@ -361,7 +372,7 @@ def rollup_candidates(base: Baseline) -> list[dict[str, Any]]:
 
 
 def build_prompt(brief: dict[str, Any], base: Baseline, notes: dict[str, dict[str, Any]] | None = None,
-                 resources: dict[str, str] | None = None) -> str:
+                 resources: dict[str, str] | None = None, expectations: dict[str, Any] | None = None) -> str:
     scenario = {k: v for k, v in brief.items() if v not in (None, "") and k in SCENARIO_KEYS}
     spec = base.spec
     context: dict[str, Any] = {
@@ -376,13 +387,16 @@ def build_prompt(brief: dict[str, Any], base: Baseline, notes: dict[str, dict[st
     candidates = rollup_candidates(base)
     if candidates:
         context["rollup_candidates"] = candidates
+    rendered = expect.render(expectations)
+    if rendered:
+        context["expectations"] = rendered
     context["columns"] = column_cards(base, notes)
     return ("Design the behaviour spec for this scenario and these columns.\n"
             + json.dumps(context, ensure_ascii=False, separators=(",", ":")))
 
 
 def repair_prompt(first: str, overlay: dict[str, Any], problems: list[str]) -> str:
-    return (first + "\n\nYOUR CURRENT SPEC:\n" + json.dumps({k: v for k, v in overlay.items() if k != "healed"}, ensure_ascii=False, separators=(",", ":"))
+    return (first + "\n\nYOUR CURRENT SPEC:\n" + json.dumps({k: v for k, v in overlay.items() if k not in ("healed", "expectations")}, ensure_ascii=False, separators=(",", ":"))
             + "\n\nIT WAS SIMULATED AND CHECKED. THESE PROBLEMS MUST BE FIXED (the first ones are the most serious):\n- "
             + "\n- ".join(problems[:14])
             + "\n\nFix the root cause in the behaviour; do not remove an invariant or target merely to make it pass unless it is itself wrong. "
@@ -639,14 +653,16 @@ def merge(base: Baseline, overlay: dict[str, Any], *, brief: dict[str, Any]) -> 
 # ------------------------------------------------------------------------------------------------------------------
 def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: int = VERIFY_ENTITIES,
            per_entity: int | None = None, aggregational: bool = False,
-           records_out: list[dict[str, Any]] | None = None) -> tuple[list[str], dict[str, Any]]:
+           records_out: list[dict[str, Any]] | None = None,
+           expectations: dict[str, Any] | None = None) -> tuple[list[str], dict[str, Any]]:
     """Simulate the spec and return ``(problems, report)``; no problems means the spec may be used.
 
     The simulation has as many events per entity as the spec was designed for (``timeline.events``, at most
     ``VERIFY_MAX_EVENTS``; the history scales with the count, so spacing is the same), because rules about spacing and
     windows only mean something at the real number of events. ``records_out`` (optional) receives the simulated rows as
     a client would see them, for review; ``report["advice"]`` holds what the checks consider implausible without being
-    impossible, and ``report["facts"]`` what a reviewer needs to know about the shape of the data.
+    impossible, and ``report["facts"]`` what a reviewer needs to know about the shape of the data. ``expectations`` (see
+    ``synth.expectations``) are measured on the same rows and join the advice.
     """
     if per_entity is None:
         per_entity = max(2, min(VERIFY_MAX_EVENTS, int(spec.timeline.get("events") or VERIFY_ROWS_PER_ENTITY)))
@@ -715,11 +731,13 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
     report["empty_columns"] = empty_ids
     report["failed_targets"] = [t["id"] for t in report["targets"]["results"] if t["status"] == "fail"]
     if not problems:
-        report["advice"] = (cadence_advice(spec, rows) + constant_advice(spec, rows, variables) + sparse_advice(spec, rows)
-                              + bound_advice(spec, rows) + inflight_advice(spec, rows) + shared_identifier_advice(spec, rows)
-                              + mirrored_advice(spec, rows) + counter_advice(spec, rows) + flag_state_advice(spec, rows)
-                              + complement_advice(spec, rows) + near_constant_state_advice(spec, rows) + identical_timestamp_advice(spec, rows)
-                              + entity_stamp_advice(spec, rows))
+        declared = set((expectations or {}).get("constants") or [])
+        report["advice"] = (cadence_advice(spec, rows) + constant_advice(spec, rows, variables, declared) + sparse_advice(spec, rows)
+                            + bound_advice(spec, rows) + inflight_advice(spec, rows) + shared_identifier_advice(spec, rows)
+                            + mirrored_advice(spec, rows, expectations) + counter_advice(spec, rows) + flag_state_advice(spec, rows)
+                            + near_constant_state_advice(spec, rows) + entity_stamp_advice(spec, rows)
+                            + expect.check(spec, rows, expectations, ctx.as_of)
+                            + expect.constant_columns(spec, rows, expectations, _definition_fixed(variables)))
         report["facts"] = shape_facts(spec, rows)
     return problems, report
 
@@ -798,20 +816,35 @@ def cadence_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dic
     return out[:2]
 
 
-def constant_advice(spec: GenerationSpec, rows: list[dict[str, Any]], variables: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Findings for numeric columns that carry one single value on every row: a measure that never varies measures nothing."""
+def _definition_fixed(variables: list[dict[str, Any]]) -> set[str]:
+    """Names of the columns whose own definition fixes one value (min == max, or a single allowed value)."""
+    fixed: set[str] = set()
+    for v in variables:
+        params = v.get("params") if isinstance(v.get("params"), dict) else {}
+        choices = params.get("choices") if isinstance(params.get("choices"), list) else None
+        if (params.get("min") is not None and params.get("min") == params.get("max")) or (choices is not None and len(choices) == 1):
+            fixed.add(str(v.get("name")))
+    return fixed
+
+
+def constant_advice(spec: GenerationSpec, rows: list[dict[str, Any]], variables: list[dict[str, Any]],
+                    declared: set[str] | None = None) -> list[dict[str, Any]]:
+    """Findings for numeric and yes/no columns that carry one single value on every row: a measure that never varies measures nothing.
+
+    A column the definition fixes, or that the expectations declare constant, is left alone.
+    """
     n = len(rows)
     if n < 100:
         return []
-    fixed = {str(v.get("name")) for v in variables
-             if isinstance(v.get("params"), dict) and v["params"].get("min") is not None and v["params"].get("min") == v["params"].get("max")}
+    fixed = _definition_fixed(variables)
     out = []
     for cid, name in spec.delivered.items():
-        if spec.columns[cid].dtype not in ("integer", "float") or name in fixed:
+        dtype = spec.columns[cid].dtype
+        if dtype not in ("integer", "float", "boolean") or name in fixed or cid in (declared or ()):
             continue
         values = {r.get(cid) for r in rows if r.get(cid) is not None}
         present = [r.get(cid) for r in rows if r.get(cid) is not None]
-        if len(values) > 1 and len(present) >= n // 2:
+        if len(values) > 1 and len(present) >= n // 2 and dtype != "boolean":
             top, count = max(((v, present.count(v)) for v in values), key=lambda t: t[1])
             if top != 0 and count >= 0.9 * len(present):         # (a mostly-zero count is a normal shape; a mostly-25.0 amount is not)
                 out.append({"id": "near_constant_numeric_column", "severity": "warn", "columns": [name],
@@ -821,10 +854,10 @@ def constant_advice(spec: GenerationSpec, rows: list[dict[str, Any]], variables:
                                    "(the amount, the plan, the cause) so that its magnitude varies the way the real quantity does."})
                 continue
         if len(values) == 1 and len(present) >= n // 2:
-            out.append({"id": "constant_numeric_column", "severity": "error", "columns": [name],
+            out.append({"id": "constant_numeric_column", "severity": "warn" if dtype == "boolean" else "error", "columns": [name],
                         "problem": f"Column {name} has the value {next(iter(values))!r} on every row of every entity.",
                         "evidence": f"{len(rows)} simulated rows, one distinct value",
-                        "fix": "A numeric fact varies from entity to entity (and from event to event when it is measured per event): draw it from a "
+                        "fix": "A fact varies from entity to entity (and from event to event when it is measured per event): draw it from a "
                                "distribution, or compute it from the columns it is defined by with matching units so its magnitude is realistic."})
     return out[:3]
 
@@ -958,18 +991,22 @@ _ID_WORDS = {"id", "identifier", "code", "key", "number"}
 _LABEL_WORDS = {"name", "label", "title", "description"}
 
 
-def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Findings for two categorical columns that say the same thing twice.
+def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]], expectations: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Findings for two columns that say the same thing twice.
 
-    Two columns of the same kind (two statuses or states, two scores, two flags) where one is a function of the other, or two
-    columns of any kind that map one-to-one onto each other, add a column and no information: a status that is a relabelling
-    of another status, a "reason" that is the product name, a score that equals another score. An identifier and its label
-    (product_id and plan_name) are one fact written twice by design and are left alone.
+    Two categorical columns of the same kind (two statuses, two scores, two flags) where one is a function of the other, or two
+    columns of any kind that map one-to-one onto each other; two numbers that always add up to (or differ by) one constant, which
+    is one measure written twice; two dates that are the same instant on nearly every row. An identifier and its label
+    (product_id and plan_name) are one fact written twice by design and are left alone, and so is a pair the expectations
+    relate on purpose (a reason that follows its status, a flag that agrees with a state) - while a pair they declare separate is
+    judged by ``synth.expectations.check`` as an error.
     """
     n = len(rows)
     if n < 100:
         return []
     delivered = spec.delivered
+    related, separate = expect.declared_pairs(expectations)
+    exempt = related | separate
     cols = []
     for cid, name in delivered.items():
         dtype = spec.columns[cid].dtype
@@ -984,6 +1021,8 @@ def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[di
     found: list[tuple[int, dict[str, Any]]] = []
     for i, (a, na, ka, da, ca) in enumerate(cols):
         for b, nb, kb, db, cb in cols[i + 1:]:
+            if frozenset((a, b)) in exempt:
+                continue
             ta, tb = _tokens(na), _tokens(nb)
             if (ca or cb) and not {t for t in ta & tb if len(t) >= 5 and t not in _GENERIC_FLAG_WORDS | _GENERIC_TOKENS}:
                 continue                                            # a count and a label are tied only when they speak of the same thing
@@ -1006,16 +1045,36 @@ def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[di
             if one_to_one or (same_kind and (forward >= 0.97 or backward >= 0.97)):   # (a count is only ever compared one-to-one)
                 follower, leader = (nb, na) if forward >= 0.97 else (na, nb)
                 how = (f"map one-to-one onto each other ({len(da)} values each)" if one_to_one else f"{follower} is a function of {leader}")
-                found.append((0 if same_kind else 1, {
-                    "id": "mirrored_columns", "severity": "warn", "columns": [na, nb],
-                    "problem": f"{na} and {nb}: {how} on {min(max(forward, backward), 1.0):.0%} of rows." if not one_to_one
-                               else f"{na} and {nb} {how} on {min(forward, backward):.0%} of rows.",
-                    "evidence": f"{len(pairs)} simulated rows",
-                    "fix": "Two columns must describe different things (another stage, party or measure) or differ where reality differs "
-                           "(they are recorded at different moments, by different parties); do not relabel or derive one from the other "
-                           "one-to-one. A status of a related record follows its own cause, not the status of this record."}))
+                found.append((0 if same_kind else 1, _mirrored(na, nb, f"{how} on {min(max(forward, backward), 1.0):.0%} of rows" if not one_to_one
+                                                              else f"{how} on {min(forward, backward):.0%} of rows", len(pairs))))
+    # numbers that add up to a constant, and dates that are one instant
+    entity_level = set(spec.entity_columns)
+    measures = [(cid, name, spec.columns[cid].dtype in ("datetime", "date")) for cid, name in delivered.items()
+                if spec.columns[cid].dtype in ("integer", "float", "datetime", "date") and cid != spec.entity_column
+                and not _tokens(name) & _SHARE_WORDS]
+    for i, (a, na, ta_time) in enumerate(measures[:40]):
+        for b, nb, tb_time in measures[i + 1:40]:
+            if ta_time != tb_time or frozenset((a, b)) in exempt:
+                continue
+            if ta_time and (_tokens(na) | _tokens(nb)) & _WINDOW_WORDS and not (na in entity_level and nb in entity_level):
+                continue                                            # a window opens at the moment of the event that grants it
+            pairs = [(r[a], r[b]) for r in rows if r.get(a) is not None and r.get(b) is not None]
+            how = expect.same_fact(pairs) if len(pairs) >= 100 else None
+            if how:
+                said = {"identical": "carry the same value", "sum": "add up to one constant", "difference": "differ by one constant"}.get(how)
+                if said:
+                    found.append((2, _mirrored(na, nb, f"{said} on nearly every one of {len(pairs)} rows", len(pairs))))
     found.sort(key=lambda t: t[0])
     return [f for _, f in found][:4]
+
+
+def _mirrored(na: str, nb: str, how: str, n: int) -> dict[str, Any]:
+    return {"id": "mirrored_columns", "severity": "warn", "columns": [na, nb], "problem": f"{na} and {nb}: {how}.",
+            "evidence": f"{n} simulated rows",
+            "fix": "Two columns must describe different things (another stage, party or measure) or differ where reality differs "
+                   "(they are recorded at different moments, by different parties); do not relabel, copy or derive one from the other "
+                   "one-to-one, and do not make two measures exact complements: give each its own hidden driver (correlated if they are "
+                   "related, with its own variation) and each timestamp its own delay from the step before it."}
 
 
 def counter_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1094,6 +1153,11 @@ def _value_polarity(value: str, stems: set[str]) -> int:
     return 0
 
 
+def _shares_subject(first: set[str], second: set[str]) -> bool:
+    """Two sets of word stems name the same subject when a stem of one and a stem of the other begin alike (resolv / resolut)."""
+    return any(len(os.path.commonprefix([a, b])) >= 5 for a in first for b in second)
+
+
 def flag_state_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Findings where a yes/no flag disagrees with a state column that names the same thing.
 
@@ -1130,7 +1194,7 @@ def flag_state_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[
                     # an error only when the two columns speak of the same subject (a shared word in their names, such as the
                     # offer in offer_accepted_flag / offer_response_status); a state of some other process that happens to
                     # use the same word (a consumption state 'accepted') is a doubt, not a contradiction
-                    same_subject = bool(flag_stems & own) or bool(_tokens(name) & _ACTION_WORDS)   # (an action is what a permission flag governs)
+                    same_subject = _shares_subject(flag_stems, own) or bool(_tokens(name) & _ACTION_WORDS)   # (an action is what a permission flag governs)
                     out.append({"id": "flag_contradicts_state", "severity": "error" if same_subject else "warn", "columns": [fname, name],
                                 "problem": f"{name} is '{value}' but {fname} is {'false' if polarity > 0 else 'true'} on {len(wrong)} of {len(known)} such rows.",
                                 "evidence": f"{len(known)} simulated rows with {name} = '{value}'",
@@ -1140,42 +1204,6 @@ def flag_state_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[
 
 
 _SHARE_WORDS = frozenset({"share", "percent", "percentage", "pct", "ratio", "proportion", "fraction"})
-
-
-def complement_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Findings for two numeric columns whose sum (or difference) is the same on nearly every row.
-
-    A score and a risk rating that always add up to 100 are one measure written twice; so are two quantities that differ by a
-    fixed offset. Independent facts (even correlated ones) do not add up exactly. Shares of one whole are meant to sum to it
-    and are left alone.
-    """
-    n = len(rows)
-    if n < 100:
-        return []
-    cols = []
-    for cid, name in spec.delivered.items():
-        if spec.columns[cid].dtype not in ("integer", "float") or _tokens(name) & _SHARE_WORDS:
-            continue
-        values = [r[cid] for r in rows if isinstance(r.get(cid), (int, float)) and not isinstance(r.get(cid), bool)]
-        if len(values) >= n // 2 and len({round(v, 2) for v in values}) >= 8:        # a column with few values cannot add up to a constant by accident
-            cols.append((cid, name))
-    out = []
-    for i, (a, na) in enumerate(cols[:30]):
-        for b, nb in cols[i + 1:30]:
-            pairs = [(r[a], r[b]) for r in rows if isinstance(r.get(a), (int, float)) and isinstance(r.get(b), (int, float))
-                     and not isinstance(r.get(a), bool) and not isinstance(r.get(b), bool)]
-            if len(pairs) < 100:
-                continue
-            for what, fn in (("sum", lambda x, y: x + y), ("difference", lambda x, y: x - y)):
-                top, count = _mode_count([round(fn(x, y), 2) for x, y in pairs])
-                if count >= 0.97 * len(pairs):
-                    out.append({"id": "complementary_columns", "severity": "warn", "columns": [na, nb],
-                                "problem": f"The {what} of {na} and {nb} is {top:g} on {count / len(pairs):.0%} of {len(pairs)} rows.",
-                                "evidence": f"{len(pairs)} simulated rows, both columns vary",
-                                "fix": "Two measures must not be exact complements or offsets of each other: draw each from its own latent "
-                                       "(correlated if they are related, but with its own variation) or derive them from different facts."})
-                    break
-    return out[:2]
 
 
 def _mode_count(values: list[float]) -> tuple[float, int]:
@@ -1227,44 +1255,6 @@ def near_constant_state_advice(spec: GenerationSpec, rows: list[dict[str, Any]])
 
 
 _WINDOW_WORDS = frozenset({"valid", "start", "begin", "effective", "from", "end", "expiry", "expires", "until"})
-
-
-def identical_timestamp_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Findings for date columns that carry the same moment on nearly every row.
-
-    Two different steps of a process (requested and confirmed, notified and shown, converted and last accepted) are not the
-    same instant; the start of a window may be the moment of the event that opens it, but two facts of the entity (a profile
-    date and a validity start) are not one moment either.
-    """
-    n = len(rows)
-    if n < 100:
-        return []
-    entity_level = set(spec.entity_columns)
-    cols = [(cid, name) for cid, name in spec.delivered.items() if spec.columns[cid].dtype in ("datetime", "date")]
-    window = {cid for cid, name in cols if _tokens(name) & _WINDOW_WORDS}
-    parent = {cid: cid for cid, _ in cols}
-
-    def root(x: str) -> str:
-        while parent[x] != x:
-            x = parent[x]
-        return x
-
-    for i, (a, na) in enumerate(cols):
-        for b, nb in cols[i + 1:]:
-            if (a in window or b in window) and not (na in entity_level and nb in entity_level):
-                continue                                            # a window opens at the moment of the event that grants it
-            pairs = [(r[a], r[b]) for r in rows if r.get(a) is not None and r.get(b) is not None]
-            if len(pairs) >= 100 and sum(x == y for x, y in pairs) >= 0.98 * len(pairs):
-                parent[root(a)] = root(b)
-    groups: dict[str, list[str]] = {}
-    for cid, name in cols:
-        groups.setdefault(root(cid), []).append(name)
-    return [{"id": "identical_timestamps", "severity": "warn", "columns": names,
-             "problem": f"{', '.join(names)} carry the same moment on (nearly) every row.",
-             "evidence": f"{n} simulated rows",
-             "fix": "Different steps happen at different moments: derive each from the one before it with that step's own delay "
-                    "(minutes to days, by cause and channel), or drop the column that only repeats another."}
-            for names in groups.values() if len(names) >= 2][:3]
 
 
 def sparse_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1676,26 +1666,53 @@ def spec_key(brief: dict[str, Any], variables: list[dict[str, Any]]) -> str:
             continue
         cols.append({k: v.get(k) for k in ("name", "dtype", "gen", "params", "formula", "depends_on", "nullable", "scope", "source", "description")})
     payload = {
-        "compiler": [COMPILER_VERSION, SPEC_VERSION, hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest()[:12]],
+        "compiler": [COMPILER_VERSION, SPEC_VERSION, hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest()[:12], expect.PROMPT_HASH],
         "brief": {k: (brief.get(k) or "") for k in keys},
         "columns": sorted(cols, key=lambda c: str(c["name"])),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False).encode()).hexdigest()[:40]
 
 
-MEASURED_FINDINGS = frozenset({"window_overlap", "constant_numeric_column", "near_constant_numeric_column", "near_empty_column", "part_exceeds_bound", "stale_in_flight",
-                               "shared_identifier", "mirrored_columns", "counter_spacing", "flag_contradicts_state", "complementary_columns", "near_constant_state",
-                               "identical_timestamps", "entity_stamp_inside_history", "healed_empty_column", "healed_target", "check"})
+MEASURED_FINDINGS = frozenset({"window_overlap", "constant_numeric_column", "near_constant_numeric_column", "constant_column", "near_empty_column",
+                               "part_exceeds_bound", "stale_in_flight", "shared_identifier", "mirrored_columns", "counter_spacing",
+                               "flag_contradicts_state", "near_constant_state", "entity_stamp_inside_history", "healed_empty_column",
+                               "healed_target", "check"})
+
+
+def is_measured(finding: dict[str, Any]) -> bool:
+    """A finding that was measured on the simulation (certain, and the same on every run), as opposed to the reviewer's opinion."""
+    fid = str(finding.get("id") or "")
+    return fid in MEASURED_FINDINGS or fid.startswith("expected_")
 
 
 def _measured_weight(findings: list[dict[str, Any]]) -> int:
     """The weight of the findings that were measured on the simulation (the reviewer's findings change from run to run)."""
-    return _weight([f for f in findings if f.get("id") in MEASURED_FINDINGS])
+    return _weight([f for f in findings if is_measured(f)])
+
+
+def _measured_errors(findings: list[dict[str, Any]]) -> int:
+    return sum(1 for f in findings if is_measured(f) and f["severity"] == "error")
 
 
 def _weight(findings: list[dict[str, Any]]) -> int:
     """How much is still wrong: an impossible record weighs three implausible ones."""
     return 3 * sum(f["severity"] == "error" for f in findings) + sum(f["severity"] != "error" for f in findings)
+
+
+def _accepts(candidate: list[dict[str, Any]], best: list[dict[str, Any]], *, total: bool = False) -> bool:
+    """Whether ``candidate`` findings are an improvement on ``best`` without making anything that was measured worse.
+
+    No new measured error, no heavier measured findings; and then the measured part must be lighter - or, with ``total``, the
+    whole (the reviewer's opinions included) must be.
+    """
+    if _measured_errors(candidate) > _measured_errors(best) or _measured_weight(candidate) > _measured_weight(best):
+        return False
+    return _measured_weight(candidate) < _measured_weight(best) or (total and _weight(candidate) < _weight(best))
+
+
+_EXPECTATION_CACHE: dict[str, dict[str, Any]] = {}
+_EXPECTATION_CACHE_SIZE = 64
+_EXPECTATION_LOCK = threading.Lock()
 
 
 @dataclass
@@ -1745,6 +1762,12 @@ class SpecCompiler:
         from config.runtime import SPEC_COMPILE_BUDGET_SECONDS
 
         return float(SPEC_COMPILE_BUDGET_SECONDS)
+
+    @staticmethod
+    def _repair_window() -> float:
+        from config.runtime import SPEC_DRAFT_REPAIR_SECONDS
+
+        return float(SPEC_DRAFT_REPAIR_SECONDS)
 
     @staticmethod
     def _refine_budget() -> float:
@@ -1800,20 +1823,52 @@ class SpecCompiler:
         records: list[dict[str, Any]] = []
         definitions = [base.variables[c] | {"name": spec.columns[c].column} for c in spec.delivered if c in base.variables]
         aggregational = str(brief.get("type_of_data") or "").lower() == "aggregational"
-        problems, report = verify(spec, definitions, aggregational=aggregational, records_out=records)
+        problems, report = verify(spec, definitions, aggregational=aggregational, records_out=records,
+                                  expectations=overlay.get("expectations") if isinstance(overlay.get("expectations"), dict) else None)
         return _Round(spec if not problems else None, overlay, report, problems, records)
 
     def _round(self, base: Baseline, brief: dict[str, Any], prompt: str, current: dict[str, Any] | None, *,
-               final: bool = False) -> _Round:
+               final: bool = False, expectations: dict[str, Any] | None = None) -> _Round:
         """One model call (a full spec, or a patch of ``current``), merged, checked and, where that is safe, healed."""
         raw = self._generate(SYSTEM_PROMPT, prompt)
-        overlay = apply_patch(current, raw) if current is not None else (raw if isinstance(raw, dict) else {})
+        overlay = apply_patch(current, raw) if current is not None else (dict(raw) if isinstance(raw, dict) else {})
+        carried = expectations if expectations is not None else (current or {}).get("expectations")
+        overlay.pop("expectations", None)                  # the author does not write the expectations: they are the independent view
+        if carried is not None:
+            overlay["expectations"] = carried
         rnd = self._verified(base, brief, overlay)
         if rnd.spec is None:
             rnd = self._heal_soft(base, brief, rnd, final=final)
         elif any(f["id"] == "window_overlap" for f in rnd.report.get("advice") or []):
             rnd = self._heal_cadence(base, brief, rnd)
         return rnd
+
+    def _expectations(self, base: Baseline, brief: dict[str, Any], notes: dict[str, dict[str, Any]] | None) -> dict[str, Any] | None:
+        """The independent expectations of the scenario, or None when the model could not be asked (which never blocks a spec).
+
+        What is asked depends only on the scenario and the column definitions, so a design that is repeated (a failed attempt tried
+        again, the same columns under another request) reuses the answer instead of asking again.
+        """
+        columns = {cid for cid, col in base.spec.columns.items() if col.kind != "latent"}
+        prompt = expect.build_prompt(brief, column_cards(base, notes), events_per_entity(brief), SCENARIO_KEYS)
+        key = hashlib.sha256((expect.PROMPT_HASH + prompt).encode()).hexdigest()
+        with _EXPECTATION_LOCK:
+            cached = _EXPECTATION_CACHE.get(key)
+        if cached is not None:
+            return copy.deepcopy(cached)
+        try:
+            raw = self._generate(expect.EXPECTATION_PROMPT, prompt, attempts=2)
+        except Exception as exc:
+            logger.warning("behaviour expectations unavailable (%s: %s)", type(exc).__name__, _short(str(exc), 160))
+            return None
+        found = expect.parse(raw, columns, entity=base.spec.entity_column)
+        with _EXPECTATION_LOCK:
+            _EXPECTATION_CACHE[key] = copy.deepcopy(found)
+            while len(_EXPECTATION_CACHE) > _EXPECTATION_CACHE_SIZE:
+                _EXPECTATION_CACHE.pop(next(iter(_EXPECTATION_CACHE)))
+        logger.info("behaviour expectations: %d rule(s), %d entity fact(s), %d state share(s)", len(found.get("rules") or []),
+                    len(found.get("entity_facts") or []), len(found.get("state_shares") or []))
+        return found
 
     def _heal_soft(self, base: Baseline, brief: dict[str, Any], rnd: _Round, *, final: bool) -> _Round:
         """Repair what can be repaired without the model: a column that is empty on every row and a target the data misses.
@@ -1905,41 +1960,62 @@ class SpecCompiler:
         return candidate
 
     def _all_findings(self, brief: dict[str, Any], base: Baseline, rnd: _Round, notes: dict[str, dict[str, Any]] | None,
-                      resources: dict[str, str] | None) -> tuple[list[dict[str, Any]], str]:
-        """Measured advice plus the reviewer's findings for a spec that passed the deterministic checks."""
+                      resources: dict[str, str] | None, *, consult_reviewer: bool = True) -> tuple[list[dict[str, Any]], str]:
+        """Measured advice plus the reviewer's findings for a spec that passed the deterministic checks.
+
+        ``consult_reviewer=False`` skips the (slow) reviewer call when the measured findings alone already decide what happens next.
+        """
         findings = list(rnd.report.get("advice") or [])
         review = "off"
         if self.reviewing() and rnd.spec is not None:
-            reviewed = self._review_issues(brief, base, rnd.spec, rnd.records, notes, resources, rnd.report.get("facts"))
-            review = "skipped" if reviewed is None else "clean" if not reviewed else "findings"
-            findings += reviewed or []
+            if not consult_reviewer:
+                review = "deferred"
+            else:
+                reviewed = self._review_issues(brief, base, rnd.spec, rnd.records, notes, resources, rnd.report.get("facts"))
+                review = "skipped" if reviewed is None else "clean" if not reviewed else "findings"
+                findings += reviewed or []
         findings.sort(key=lambda f: f["severity"] != "error")
         return findings, review
 
     def _repair_measured(self, base: Baseline, brief: dict[str, Any], first: str, rnd: _Round, started: float) -> _Round:
-        """One patch round for the errors the checks measured on a spec that passed, before the spec is first served.
+        """Patch rounds for the errors the checks measured on a spec that passed, before the spec is first served.
 
-        Measured errors (a column that never varies, an in-flight state on old events, a counter that counts across weeks) are
-        certain, so waiting for the background review to find them only delays the fix. The patched spec replaces the first one
-        only when it passes every check again and has fewer measured errors; any failure leaves the first spec as it was.
+        Measured errors (a column that never varies, an in-flight state on old events, a relation the independent expectations
+        say must hold) are certain, so waiting for the background review to find them only delays the fix. A patched spec
+        replaces the current one only when it passes every check again and is better measured: no more measured errors, no
+        more measured weight overall, and less left to repair. A candidate that is worse tells the author what it broke.
         """
-        def errors(r: _Round) -> list[dict[str, Any]]:
-            return [f for f in r.report.get("advice") or []
-                    if f["id"] in MEASURED_FINDINGS and (f["severity"] == "error" or f["id"] in DRAFT_REPAIRED_WARNINGS)]
+        def due(r: _Round) -> list[dict[str, Any]]:
+            found = [f for f in r.report.get("advice") or []
+                     if is_measured(f) and (f["severity"] == "error" or f["id"] in DRAFT_REPAIRED_WARNINGS)]
+            return sorted(found, key=lambda f: f["severity"] != "error")
 
-        before = errors(rnd)
-        if not before or DRAFT_REPAIR_ROUNDS < 1 or time.monotonic() - started > self._budget():
-            return rnd
-        try:
-            cand = self._round(base, brief, repair_prompt(first, rnd.overlay, [review_problem(f) for f in before]), rnd.overlay)
-        except Exception as exc:
-            logger.warning("behaviour spec draft repair skipped (%s: %s)", type(exc).__name__, exc)
-            return rnd
-        if cand.spec is None or len(errors(cand)) >= len(before) or _measured_weight(cand.report.get("advice") or []) > _measured_weight(rnd.report.get("advice") or []):
-            logger.info("behaviour spec draft repair kept the first spec (%d measured error(s))", len(before))
-            return rnd
-        logger.info("behaviour spec draft repair: %d -> %d measured error(s)", len(before), len(errors(cand)))
-        return cand
+        expectations = rnd.overlay.get("expectations") if isinstance(rnd.overlay.get("expectations"), dict) else None
+        extra: list[str] = []
+        for _ in range(DRAFT_REPAIR_ROUNDS):
+            before = due(rnd)
+            if not before or time.monotonic() - started > min(self._budget(), self._repair_window()):
+                break                                      # a slow design is served as it is; the refinement patches it next
+            try:
+                cand = self._round(base, brief, repair_prompt(first, rnd.overlay, [review_problem(f) for f in before] + extra), rnd.overlay,
+                                   expectations=expectations)
+            except Exception as exc:
+                logger.warning("behaviour spec draft repair skipped (%s: %s)", type(exc).__name__, exc)
+                break
+            if cand.spec is None:
+                extra = [f"The previous attempt was rejected: {p}" for p in cand.problems[:4]]
+                logger.info("behaviour spec draft repair: patch rejected (%d problem(s))", len(cand.problems))
+                continue
+            after = cand.report.get("advice") or []
+            if _accepts(after, rnd.report.get("advice") or []) and _weight(due(cand)) < _weight(due(rnd)):
+                logger.info("behaviour spec draft repair: %d -> %d finding(s) to repair", len(before), len(due(cand)))
+                rnd, extra = cand, []
+                continue
+            known = {(f["id"], tuple(f["columns"])) for f in before}
+            extra = [f"The previous attempt introduced a new problem: {review_problem(f)}" for f in due(cand)
+                     if (f["id"], tuple(f["columns"])) not in known][:4]
+            logger.info("behaviour spec draft repair kept the spec it had (%d finding(s) to repair)", len(before))
+        return rnd
 
     def draft(self, variables: list[dict[str, Any]], brief: dict[str, Any], *, notes: dict[str, dict[str, Any]] | None = None,
               resources: dict[str, str] | None = None) -> CompileResult:
@@ -1948,7 +2024,8 @@ class SpecCompiler:
             base = build(variables, brief=brief)
         except SpecBuildError as exc:
             return CompileResult(None, "rejected", [str(exc)])
-        first = build_prompt(brief, base, notes, resources)
+        expectations = self._expectations(base, brief, notes)
+        first = build_prompt(brief, base, notes, resources, expectations)
         prompt, current, problems, rnd = first, None, [], None
         started = time.monotonic()
         for round_no in range(self.max_repairs + 1):
@@ -1956,7 +2033,7 @@ class SpecCompiler:
                 logger.warning("behaviour spec draft: time budget spent after %d round(s)", round_no)
                 break
             try:
-                rnd = self._round(base, brief, prompt, current, final=round_no == self.max_repairs)
+                rnd = self._round(base, brief, prompt, current, final=round_no == self.max_repairs, expectations=expectations)
             except Exception as exc:                      # no key, provider outage, timeout, invalid JSON
                 logger.warning("behaviour spec draft: model unavailable (%s: %s)", type(exc).__name__, exc)
                 return CompileResult(None, "unavailable", [f"{type(exc).__name__}: {_short(str(exc), 240)}"], round_no)
@@ -1977,7 +2054,8 @@ class SpecCompiler:
         """A better spec than ``current`` (fewer and less serious findings), or None when none was found.
 
         The findings of ``current`` (measured advice, the reviewer's issues) go back to the author as a patch; each candidate
-        must pass the deterministic checks again and is judged again. The candidate with the least left wrong wins.
+        must pass the deterministic checks again and is judged again. A candidate is kept only when nothing that was measured got
+        worse (no new measured error, no heavier measured findings) and the total left wrong is lighter or the measured part is.
         """
         if current.spec is None or current.overlay is None:
             return None
@@ -1986,22 +2064,30 @@ class SpecCompiler:
         except SpecBuildError:
             return None
         started = time.monotonic()
+        stored = current.overlay.get("expectations")
+        expectations = stored if isinstance(stored, dict) else self._expectations(base, brief, notes)
+        start_overlay = dict(current.overlay)
+        if expectations is not None:
+            start_overlay["expectations"] = expectations
         # the reviewer reads the spec that is being improved, on its own simulation
-        probe = self._round_for(base, brief, current)
-        findings, review = self._all_findings(brief, base, probe, notes, resources)
+        probe = self._round_for(base, brief, current.spec, start_overlay)
+        # measured findings that call for a patch go to the author at once; the reviewer reads the patched spec instead of this one
+        urgent = _weight([f for f in probe.report.get("advice") or []
+                          if is_measured(f) and (f["severity"] == "error" or f["id"] in DRAFT_REPAIRED_WARNINGS)]) > GOOD_ENOUGH_WEIGHT
+        findings, review = self._all_findings(brief, base, probe, notes, resources, consult_reviewer=not urgent)
         healed = [h for h in current.overlay.get("healed") or [] if isinstance(h, dict) and h.get("problem")]
         findings = sorted(healed + findings, key=lambda f: f["severity"] != "error")
-        best = (_weight(findings), current.spec, current.overlay, current.report, findings, review)
-        best_measured, best_errors = _measured_weight(findings), sum(f["severity"] == "error" for f in findings)
-        first = build_prompt(brief, base, notes, resources)
-        overlay, rounds = {k: v for k, v in current.overlay.items() if k != "healed"}, 0
+        best = (_weight(findings), current.spec, start_overlay, current.report, findings, review)
+        first = build_prompt(brief, base, notes, resources, expectations)
+        overlay, rounds = {k: v for k, v in start_overlay.items() if k != "healed"}, 0
         counted = 0                                        # rounds that produced a spec to judge; a rejected patch is a second chance, not a round
         while counted < self.refine_rounds and rounds < self.refine_rounds + REJECTED_PATCH_ALLOWANCE:
             if _weight(findings) <= GOOD_ENOUGH_WEIGHT or time.monotonic() - started > self._refine_budget():
                 break
             rounds += 1
             try:
-                rnd = self._round(base, brief, repair_prompt(first, overlay, [review_problem(f) for f in findings]), overlay)
+                rnd = self._round(base, brief, repair_prompt(first, overlay, [review_problem(f) for f in findings]), overlay,
+                                  expectations=expectations)
             except Exception as exc:
                 logger.warning("behaviour spec refinement: model unavailable (%s: %s)", type(exc).__name__, exc)
                 break
@@ -2011,23 +2097,25 @@ class SpecCompiler:
                 logger.info("behaviour spec refinement round %d: patch rejected (%d problem(s))", rounds, len(rnd.problems))
                 continue
             counted += 1
-            findings, review = self._all_findings(brief, base, rnd, notes, resources)
+            # a candidate that made something measured worse is not going to be kept: the reviewer need not read it
+            worse = _measured_errors(rnd.report.get("advice") or []) > _measured_errors(best[4]) \
+                or _measured_weight(rnd.report.get("advice") or []) > _measured_weight(best[4])
+            candidate, review = self._all_findings(brief, base, rnd, notes, resources, consult_reviewer=not worse)
             overlay = rnd.overlay
-            weight = _weight(findings)
-            logger.info("behaviour spec refinement round %d: %d finding(s), weight %d (best %d)", rounds, len(findings), weight, best[0])
-            measured, errors = _measured_weight(findings), sum(f["severity"] == "error" for f in findings)
-            # The reviewer reads the same data differently on every call and finds new issues in each candidate, so a lighter total is
-            # not the only sign of progress: fewer measured defects without more impossible records is one too.
-            if weight < best[0] or (measured < best_measured and errors <= best_errors):
-                best_measured, best_errors = min(best_measured, measured), min(best_errors, errors)
-                best = (weight, rnd.spec, rnd.overlay, rnd.report, findings, review)
+            weight = _weight(candidate)
+            logger.info("behaviour spec refinement round %d: %d finding(s), weight %d (best %d)", rounds, len(candidate), weight, best[0])
+            # The reviewer reads the same data differently on every call, so only what was measured is compared strictly; the
+            # reviewer's findings count for the total, which must then be lighter - or the measured part must be.
+            if _accepts(candidate, best[4], total=True):
+                best = (weight, rnd.spec, rnd.overlay, rnd.report, candidate, review)
                 if on_improve is not None:                  # whoever waits for the spec gets each improvement as soon as it exists
                     report = dict(rnd.report)
                     report.update(rounds=int(current.report.get("rounds", 0)) + rounds, review=review)
                     try:
-                        on_improve(CompileResult(rnd.spec, "compiled", [], int(report["rounds"]), rnd.overlay, report, findings))
+                        on_improve(CompileResult(rnd.spec, "compiled", [], int(report["rounds"]), rnd.overlay, report, candidate))
                     except Exception:
                         logger.exception("could not publish a refined generation spec")
+            findings = candidate
         if best[1] is current.spec:
             current.findings = best[4]
             current.report["review"] = best[5]
@@ -2036,13 +2124,14 @@ class SpecCompiler:
         report.update(rounds=int(current.report.get("rounds", 0)) + rounds, review=best[5])
         return CompileResult(best[1], "compiled", [], int(report["rounds"]), best[2], report, best[4])
 
-    def _round_for(self, base: Baseline, brief: dict[str, Any], current: CompileResult) -> _Round:
+    def _round_for(self, base: Baseline, brief: dict[str, Any], spec: GenerationSpec, overlay: dict[str, Any]) -> _Round:
         """Re-simulate an accepted spec (without a model call) to get the rows and facts a review needs."""
         records: list[dict[str, Any]] = []
-        definitions = [base.variables[c] | {"name": current.spec.columns[c].column} for c in current.spec.delivered if c in base.variables]
+        definitions = [base.variables[c] | {"name": spec.columns[c].column} for c in spec.delivered if c in base.variables]
         aggregational = str(brief.get("type_of_data") or "").lower() == "aggregational"
-        _, report = verify(current.spec, definitions, aggregational=aggregational, records_out=records)
-        return _Round(current.spec, current.overlay or {}, report, [], records)
+        _, report = verify(spec, definitions, aggregational=aggregational, records_out=records,
+                           expectations=overlay.get("expectations") if isinstance(overlay.get("expectations"), dict) else None)
+        return _Round(spec, overlay, report, [], records)
 
     def compile(self, variables: list[dict[str, Any]], brief: dict[str, Any], *, notes: dict[str, dict[str, Any]] | None = None,
                 resources: dict[str, str] | None = None) -> CompileResult:
