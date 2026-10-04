@@ -53,9 +53,12 @@ MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
 DRAFT_REPAIRED_WARNINGS = frozenset({"shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
                                      "near_constant_state", "entity_stamp_inside_history", "expected_state_share"})
+SOFT_IMMEDIATE = ("EMPTY ", "TARGET ")      # problems confined to their column at once (the column loses its condition, the target goes)
+SOFT_LATE = ("DUPLICATE ", "INVARIANT ", "CONTRACT ", "FORMAT ", "PLACEHOLDER ", "FUTURE ", "RUNTIME ")   # confined once no round is left
 DRAFT_REPAIR_ROUNDS = 1                  # patch rounds for measured errors before a spec is first served (the refinement does the rest)
 REJECTED_PATCH_ALLOWANCE = 2
 DRAFT_REVIEW_GRACE_SECONDS = 20          # how long a draft that has been repaired waits for the review that ran beside the repair
+REVIEW_SECONDS = 20.0                    # what a review of a design is expected to take (the estimate for a refinement round besides its author call)
 GOOD_ENOUGH_WEIGHT = 1                   # refinement stops once at most one minor finding is left
 SCENARIO_KEYS = ("industry", "domain", "country", "use_case", "scenario_type", "business_scenario", "business_response",
                  "expected_outcome", "type_of_data", "entity_key")
@@ -963,10 +966,12 @@ def inflight_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[di
         return []
     as_of = datetime.fromisoformat(_VERIFY_AS_OF)
     entity_level = set(getattr(spec, "entity_columns", []) or [])          # a customer's status is not the state of one event
+    subject = _tokens(spec.delivered.get(spec.entity_column, "")) - {"id", "identifier", "key", "code", "number", "no", "ref"} \
+        if spec.entity_column else set()                                  # customer_status is the life of the customer (customer_id), not of an event
     out = []
     for cid, name in spec.delivered.items():
         if spec.columns[cid].dtype not in ("string", "categorical") or cid == spec.clock or name in entity_level \
-                or not (re.split(r"[^a-z0-9]+", name.lower())[-1] in _STATE_NAME_WORDS):
+                or not (re.split(r"[^a-z0-9]+", name.lower())[-1] in _STATE_NAME_WORDS) or _tokens(name) & subject:
             continue
         flight = [r for r in rows if isinstance(r.get(cid), str) and _is_in_flight(r[cid]) and r.get(spec.clock) is not None]
         stale = [r for r in flight if (as_of - r[spec.clock]).total_seconds() > STALE_IN_FLIGHT_DAYS * 86400.0]
@@ -1159,6 +1164,7 @@ def counter_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dic
 _GENERIC_FLAG_WORDS = frozenset({"flag", "indicator", "required", "customer", "subscriber", "account", "status", "state", "issue", "first",
                                  "contact", "current", "latest", "previous", "total", "count", "value"})
 _NEGATING_PREFIXES = ("un", "non", "not", "in", "dis")
+_NEGATING_WORDS = frozenset({"no", "not", "non", "without", "never", "none"})
 
 
 _SUFFIXES = ("ation", "ition", "ing", "ed", "ion", "s", "d", "e")
@@ -1182,11 +1188,22 @@ def _names_step(word: str, stems: set[str]) -> bool:
     return stem in stems or any(len(word) >= 5 and s.startswith(word) for s in stems)
 
 
+def _ordered_words(value: str) -> list[str]:
+    """The lower-case words of a state value in the order they are written."""
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    return [w for w in re.split(r"[^a-z0-9]+", spaced.lower()) if w]
+
+
 def _value_polarity(value: str, stems: set[str]) -> int:
-    """+1 when the value names what the flag says happened (Accepted / accepted_flag), -1 when it names the opposite (UNRESOLVED), else 0."""
-    for word in _value_words(value):
+    """+1 when the value names what the flag says happened (Accepted / accepted_flag), -1 when it names the opposite.
+
+    The opposite is a negating prefix (UNRESOLVED) or a negating word right before the step (NO_RESPONSE, NOT_ACCEPTED, WITHOUT_OFFER);
+    a value that does not name the step is 0.
+    """
+    words = _ordered_words(value)
+    for i, word in enumerate(words):
         if len(word) >= 5 and _names_step(word, stems):
-            return 1
+            return -1 if i and words[i - 1] in _NEGATING_WORDS else 1
         for prefix in _NEGATING_PREFIXES:
             rest = word[len(prefix):]
             if word.startswith(prefix) and len(rest) >= 5 and _names_step(rest, stems):
@@ -1816,6 +1833,10 @@ class SpecCompiler:
 
         return float(SPEC_DRAFT_REPAIR_SECONDS)
 
+    def _affordable(self, started: float) -> bool:
+        """Another author call is expected to take as long as the last one; it is made now only if that ends inside the repair window."""
+        return time.monotonic() - started + self._author_seconds <= min(self._budget(), self._repair_window())
+
     @staticmethod
     def _refine_budget() -> float:
         from config.runtime import SPEC_REFINE_BUDGET_SECONDS
@@ -1934,9 +1955,8 @@ class SpecCompiler:
 
         Anything structural (an unknown column, a cycle) is still a rejected design.
         """
-        immediate = ("EMPTY ", "TARGET ")
-        late = ("DUPLICATE ", "INVARIANT ", "CONTRACT ", "FORMAT ", "PLACEHOLDER ", "FUTURE ", "RUNTIME ")
-        soft = [p for p in rnd.problems if p.startswith(immediate + late)]
+        immediate = SOFT_IMMEDIATE
+        soft = [p for p in rnd.problems if p.startswith(immediate + SOFT_LATE)]
         if not soft or not rnd.overlay:
             return rnd
         if not final and any(not p.startswith(immediate) for p in rnd.problems):
@@ -2089,9 +2109,9 @@ class SpecCompiler:
             return sorted(found, key=lambda f: f["severity"] != "error")
 
         expectations = rnd.overlay.get("expectations") if isinstance(rnd.overlay.get("expectations"), dict) else None
+
         def affordable() -> bool:
-            """A patch is expected to take as long as the author's last call; it is made now only if that ends inside the window."""
-            return time.monotonic() - started + self._author_seconds <= min(self._budget(), self._repair_window())
+            return self._affordable(started)
 
         if not due(rnd) or not affordable():
             return rnd                                     # a slow design is served as it is; the refinement reviews and patches it next
@@ -2103,11 +2123,12 @@ class SpecCompiler:
 
             thread = threading.Thread(target=read, name="draft-review", daemon=True)
             thread.start()
-        first_spec, extra = rnd.spec, []
+        first_spec, extra, calls = rnd.spec, [], 0
         for _ in range(DRAFT_REPAIR_ROUNDS):
             before = due(rnd)
             if not before or not affordable():
                 break
+            calls += 1
             try:
                 cand = self._round(base, brief, repair_prompt(first, rnd.overlay, [review_problem(f) for f in before] + extra), rnd.overlay,
                                    expectations=expectations)
@@ -2131,6 +2152,7 @@ class SpecCompiler:
             thread.join(timeout=DRAFT_REVIEW_GRACE_SECONDS if rnd.spec is not first_spec else None)
             if isinstance(reviewed.get("issues"), list):
                 rnd.overlay["draft_review"] = {"issues": reviewed["issues"], "stale": rnd.spec is not first_spec}
+        rnd.overlay["timing"] = {"repair_calls": calls}
         return rnd
 
     def draft(self, variables: list[dict[str, Any]], brief: dict[str, Any], *, notes: dict[str, dict[str, Any]] | None = None,
@@ -2167,12 +2189,13 @@ class SpecCompiler:
         first = build_prompt(brief, base, notes, resources, None)
         prompt, current, problems, rnd = first, None, [], None
         expectations: dict[str, Any] | None = None
-        resolved = False
+        resolved, drafted = False, 0
         for round_no in range(self.max_repairs + 1):
             if round_no and time.monotonic() - started > self._budget():
                 logger.warning("behaviour spec draft: time budget spent after %d round(s)", round_no)
                 break
             try:
+                drafted += 1
                 rnd = self._round(base, brief, prompt, current, final=round_no == self.max_repairs,
                                   expectations=expectations if resolved else expected)
             except Exception as exc:                      # no key, provider outage, timeout, invalid JSON
@@ -2185,22 +2208,27 @@ class SpecCompiler:
                 authored = time.monotonic() - started
                 rnd = self._repair_measured(base, brief, first, rnd, started, notes, resources)
                 rnd.report.update(rounds=round_no, problems=0)
+                repaired = (rnd.overlay.get("timing") or {}).get("repair_calls", 0) if isinstance(rnd.overlay.get("timing"), dict) else 0
                 rnd.overlay["timing"] = {"expectations": written.get("seconds"), "first_design": round(authored, 1),
-                                         "total": round(time.monotonic() - started, 1)}
+                                         "author_calls": round_no + 1 + repaired, "total": round(time.monotonic() - started, 1)}
                 findings = list(rnd.report.get("advice") or [])
                 return CompileResult(rnd.spec, "compiled", [], round_no, rnd.overlay, rnd.report, findings)
             problems = rnd.problems
             logger.info("behaviour spec draft round %d: %d problem(s)", round_no, len(problems))
             current = rnd.overlay or None            # an empty reply has nothing to patch: ask again from the start
+            if current and all(p.startswith(SOFT_IMMEDIATE + SOFT_LATE) for p in problems) and not self._affordable(started):
+                logger.info("behaviour spec draft: another round does not fit the repair window, confining %d problem(s)", len(problems))
+                break                                # defects that stay in their column are confined now; the refinement repairs them
             prompt = repair_prompt(first, rnd.overlay, problems) if current else first
         if rnd is not None and rnd.spec is None and rnd.overlay and rnd.problems:
             # the rounds are spent (or the time is): keep what works of the design rather than fall back to no behaviour at all
             healed = self._heal_soft(base, brief, rnd, final=True)
             if healed.spec is not None:
                 logger.info("behaviour spec draft kept after confining %d problem(s) to their columns", len(rnd.problems))
-                healed.report.update(rounds=self.max_repairs, problems=0)
-                healed.overlay["timing"] = {"expectations": written.get("seconds"), "total": round(time.monotonic() - started, 1)}
-                return CompileResult(healed.spec, "compiled", [], self.max_repairs, healed.overlay, healed.report,
+                healed.report.update(rounds=drafted - 1, problems=0)
+                healed.overlay["timing"] = {"expectations": written.get("seconds"), "author_calls": drafted,
+                                            "total": round(time.monotonic() - started, 1)}
+                return CompileResult(healed.spec, "compiled", [], drafted - 1, healed.overlay, healed.report,
                                      list(healed.report.get("advice") or []))
         return CompileResult(None, "rejected", problems, self.max_repairs, rnd.overlay if rnd else None)
 
@@ -2244,13 +2272,18 @@ class SpecCompiler:
         stats: dict[str, Any] = {"weight_before": _weight(findings), "findings_before": len(findings), "author_calls": 0, "accepted": 0,
                                  "rejected_by_checks": 0, "rejected_as_worse": 0, "stopped": "rounds"}
         first = build_prompt(brief, base, notes, resources, expectations)
+        spent = current.overlay.get("timing") if isinstance(current.overlay.get("timing"), dict) else {}
+        drafting = float(spent.get("total") or 0.0)         # what the design has used before the refinement began
+        first_author = float(spent.get("first_design") or 0.0)   # the estimate of an author call until one has been made here
         overlay, rounds = {k: v for k, v in start_overlay.items() if k != "healed"}, 0
         counted = 0                                        # rounds that produced a spec to judge; a rejected patch is a second chance, not a round
         while counted < self.refine_rounds and rounds < self.refine_rounds + REJECTED_PATCH_ALLOWANCE:
             if _weight(findings) <= GOOD_ENOUGH_WEIGHT:
                 stats["stopped"] = "good_enough"
                 break
-            if time.monotonic() - started > self._refine_budget():
+            # the budget counts from the start of the design: a round is begun only if it is expected to end inside it
+            expected = (self._author_seconds or first_author) + (REVIEW_SECONDS if self.reviewing() else 0.0)
+            if drafting + time.monotonic() - started + expected > self._refine_budget():
                 stats["stopped"] = "time"
                 break
             rounds += 1

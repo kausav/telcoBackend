@@ -86,8 +86,9 @@ GUIDANCE
   in the real world but a loose definition does not enforce, as "holds" rules you are sure of: an identifier in the format its
   country really issues (a phone number, tax or account number: use matches(regex, value) and allow an empty value when the
   column can be empty), a score or rating on the scale that country's institutions really use, a quantity that cannot be smaller
-  than the smallest real unit of what it counts. Two columns that rate the same subject move in opposite or the same direction:
-  say which with a "holds" rule instead of leaving them unrelated.
+  than the smallest real unit of what it counts. Two columns that rate the same subject (a score and a risk rating) agree in
+  direction but are not one fact: state it as a band ("holds" that a rating is within its band of the score, or that the
+  rating's order follows the score's order), never as an exact formula, because two independent assessments differ by noise.
 """
 
 PROMPT_HASH = hashlib.sha256(EXPECTATION_PROMPT.encode()).hexdigest()[:12]

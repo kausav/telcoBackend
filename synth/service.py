@@ -160,20 +160,18 @@ def refining(key: str | None) -> bool:
 
 
 def _after_refinement(key: str, spec: GenerationSpec, names: set[str], *, limit: float | None = None) -> GenerationSpec:
-    """The spec to generate from: ``spec``, or the refinement's first improvement of it when that arrives within the allowed wait.
+    """The spec to generate from: the settled one, once the refinement that is improving ``spec`` has ended.
 
-    A spec nobody has reviewed is the raw first design; waiting a little for its first reviewed revision costs less than data
-    that carries the first design's flaws. A refinement that finishes without improving it, or one that is not running, ends the wait.
-    ``limit`` is what is left of the request's own time allowance (the wait never takes the request beyond it).
+    A spec that is still being refined is not final, and data generated from it would differ from the data of the next request.
+    The refinement stops by its own budget (it begins no round that would end beyond it), so this waits for that end, and returns
+    what is stored then. ``limit`` is what is left of the request's own time allowance: if the refinement is still running when it
+    is spent, the best revision so far is used (and the description says that the spec is still being refined).
     """
-    from config.runtime import SPEC_GENERATE_REFINE_WAIT_SECONDS
-
-    wait = SPEC_GENERATE_REFINE_WAIT_SECONDS if limit is None else min(SPEC_GENERATE_REFINE_WAIT_SECONDS, limit)
-    if spec.reviewed or wait <= 0:
+    if spec.reviewed:
         return spec
-    deadline = time.monotonic() + wait
+    deadline = time.monotonic() + (SpecCompiler._budget() if limit is None else limit)
     with _REFINE_CHANGED:
-        while (key in _REFINING or key in _REFINE_SCHEDULED) and _REFINE_REVISION.get(key, spec.revision) <= spec.revision:
+        while key in _REFINING or key in _REFINE_SCHEDULED:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -394,7 +392,7 @@ def resolve_spec(context: dict[str, Any], variables: list[dict[str, Any]], *, wa
 
     A spec that is still being designed is waited for, but never longer than ``wait_seconds``
     (``SPEC_GENERATE_WAIT_SECONDS``): after that ``SpecNotReady`` says so, while the design carries on in the background.
-    Refinement of a spec that already exists never delays generation.
+    A spec that is still being refined is waited for as well (see ``_after_refinement``): every request for a scenario generates from the settled spec.
     """
     from config.runtime import SPEC_GENERATE_WAIT_SECONDS
 
