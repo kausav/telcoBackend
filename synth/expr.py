@@ -110,15 +110,36 @@ def _literal_escapes(source: str) -> str:
     """``source`` with every backslash that does not start a Python string escape doubled (``'\\+91'`` keeps meaning a backslash and a plus).
 
     A pattern such as ``matches('\\+91[0-9]{10}', x)`` is written that way by authors; Python only warns about it today and
-    will refuse it in a future version, and the value is the same either way.
+    will refuse it in a future version, and the value is the same either way. A raw string (``r'\\d+'``) is taken exactly as
+    written: its backslashes are the pattern's own.
     """
     out: list[str] = []
-    i = 0
-    while i < len(source):
+    i, n = 0, len(source)
+    quote = ""                                   # the quote that closes the string literal being read ('' outside one)
+    raw = False
+    while i < n:
         ch = source[i]
+        if not quote:
+            if ch in "'\"":
+                before = source[i - 1] if i else ""
+                earlier = source[i - 2] if i > 1 else ""
+                raw = bool(before) and before in "rR" and not (earlier.isalnum() or earlier == "_")
+                quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == quote:
+            quote, raw = "", False
+            out.append(ch)
+            i += 1
+            continue
         if ch == "\\":
-            nxt = source[i + 1] if i + 1 < len(source) else ""
-            if nxt in _VALID_ESCAPES and nxt != "":
+            nxt = source[i + 1] if i + 1 < n else ""
+            if raw:
+                out.append(ch + nxt)
+                i += 2
+                continue
+            if nxt and nxt in _VALID_ESCAPES:
                 out.append(ch + nxt)
                 i += 2
                 continue
@@ -159,6 +180,11 @@ class Expr:
         elif isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name) or node.func.id not in FUNCTIONS or node.keywords:
                 raise ExprError(f"call not allowed in {self.source!r}")
+            if node.func.id == "matches" and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                try:
+                    re.compile(node.args[0].value)
+                except re.error as exc:
+                    raise ExprError(f"matches() pattern {node.args[0].value!r} is not a valid regular expression: {exc}") from exc
         else:
             raise ExprError(f"{type(node).__name__} not allowed in {self.source!r}")
         for child in ast.iter_child_nodes(node):

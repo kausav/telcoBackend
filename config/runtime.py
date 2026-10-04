@@ -65,9 +65,6 @@ SPEC_LLM_TIMEOUT_MS = max(10000, int(os.getenv("SPEC_LLM_TIMEOUT_MS", "240000"))
 SPEC_REVIEW = os.getenv("SPEC_REVIEW", "true").strip().lower() in {"1", "true", "yes", "on"}
 # Total time one design may take across its repair rounds; once spent, the spec so far is rejected rather than waiting on.
 SPEC_COMPILE_BUDGET_SECONDS = max(30, int(os.getenv("SPEC_COMPILE_BUDGET_SECONDS", "600")))
-# A spec that passes the checks is served as soon as it exists; measured errors left in it are patched before that only while the
-# design has taken less than this long (the refinement patches them afterwards anyway).
-SPEC_DRAFT_REPAIR_SECONDS = max(0, int(os.getenv("SPEC_DRAFT_REPAIR_SECONDS", "90")))
 # Background refinement of a spec that already works: the reviewer's findings go back to the designer for up to this long.
 SPEC_REFINE_BUDGET_SECONDS = max(30, int(os.getenv("SPEC_REFINE_BUDGET_SECONDS", "900")))
 # background (default): generation uses the first verified spec at once and a refinement replaces it when it is better;
@@ -76,10 +73,15 @@ SPEC_REFINE_MODE = os.getenv("SPEC_REFINE_MODE", "background").strip().lower()
 if SPEC_REFINE_MODE not in {"background", "inline", "off"}:
     SPEC_REFINE_MODE = "background"
 # The longest /scenario/generate waits for a spec that is still being designed before answering "not ready, retry".
-SPEC_GENERATE_WAIT_SECONDS = max(1, int(os.getenv("SPEC_GENERATE_WAIT_SECONDS", "90")))
-# A spec that has not been reviewed yet is the raw first design; /scenario/generate waits up to this long for the refinement's first
-# improvement (or its end) before generating, so that the data comes from the reviewed spec. 0 generates from the first design at once.
-SPEC_GENERATE_REFINE_WAIT_SECONDS = max(0, int(os.getenv("SPEC_GENERATE_REFINE_WAIT_SECONDS", "150")))
+SPEC_GENERATE_WAIT_SECONDS = max(1, int(os.getenv("SPEC_GENERATE_WAIT_SECONDS", "240")))
+# A spec that passes the checks is served as soon as it exists. Measured errors left in it are patched before that only when the
+# patch is expected to be done within this long since the design began (the time its first model call took is the estimate for
+# the patch's); otherwise the refinement patches them afterwards. Default: 60% of the wait above.
+SPEC_DRAFT_REPAIR_SECONDS = max(0, int(os.getenv("SPEC_DRAFT_REPAIR_SECONDS", str(int(SPEC_GENERATE_WAIT_SECONDS * 0.6)))))
+# A spec that has not been reviewed yet is the raw first design; /scenario/generate waits up to this long (and never beyond the wait
+# above, counted from the start of the request) for the refinement's first improvement before generating from what exists. A refinement
+# round is a model call or two, so a wait much shorter than that mostly cannot pay off; 0 generates from the first design at once.
+SPEC_GENERATE_REFINE_WAIT_SECONDS = max(0, int(os.getenv("SPEC_GENERATE_REFINE_WAIT_SECONDS", "20")))
 # Start designing a proposal's spec in the background as soon as it is proposed (the person reviews it meanwhile).
 SPEC_WARM_ON_PROPOSE = os.getenv("SPEC_WARM_ON_PROPOSE", "true").strip().lower() in {"1", "true", "yes", "on"}
 

@@ -10,7 +10,9 @@ scenario would always show:
 * ``rules``          ``present_iff`` (a fact exists exactly when a condition holds), ``order`` (one moment is not before another),
                      ``at_most`` (a quantity does not exceed its bound), ``determined_by`` (a column is a function of others, such
                      as the attributes of one catalogue item), ``holds`` (any other condition every row satisfies) and
-                     ``separate`` (two columns are different facts, never a relabelling or an exact complement of each other);
+                     ``separate`` (two columns are different facts, never a relabelling or an exact complement of each other) and
+                     ``slow_state`` (a status of the entity or its account that persists from one event to the next and changes only
+                     on a rare, specific trigger, so it does not flip between most consecutive events);
 * ``state_shares``   how common a state value is, as a wide band, for this scenario type.
 
 ``check`` measures every expectation on the simulated rows. A spec is then judged against something it did not write, and the
@@ -34,7 +36,9 @@ MIN_VIOLATIONS = 5
 VIOLATION_SHARE = 0.03
 FUNCTIONAL_SHARE = 0.97                  # rows on which a determined column takes its group's commonest value
 SHARE_TOLERANCE = 0.05
-RULE_KINDS = ("present_iff", "order", "at_most", "determined_by", "holds", "separate")
+RULE_KINDS = ("present_iff", "order", "at_most", "determined_by", "holds", "separate", "slow_state")
+SLOW_STATE_CHANGE_SHARE = 0.12            # a slow state may change on at most this share of an entity's consecutive events
+MIN_TRANSITIONS = 60
 
 EXPECTATION_PROMPT = """You are a domain expert writing the acceptance criteria for a synthetic dataset BEFORE it exists.
 You receive a business scenario (industry, domain, country, use case, scenario type, scenario text), the number of events per
@@ -59,7 +63,8 @@ OUTPUT: one JSON object, nothing else:
   {"kind":"at_most","column":"id","bound":"id","why":"..."},            a quantity never exceeds the limit, total or capacity it is measured against
   {"kind":"determined_by","column":"id","by":["id"],"why":"..."},       the same values of "by" always give the same value of the column (the attributes of one catalogue item: its name determines its price, size, validity and kind)
   {"kind":"holds","expr":"<expr>","why":"..."},                         any other condition that is true on every row (a flag agrees with the state or timestamp that records the same step; a later step is never true while the step before it is false; an action that a flag forbids does not happen)
-  {"kind":"separate","columns":["id","id"],"why":"..."}                two columns that are different facts: neither is a relabelling, a copy, or an exact sum/difference complement of the other (two scores about one subject, two dates of one entity, two statuses of different stages)
+  {"kind":"separate","columns":["id","id"],"why":"..."},               two columns that are different facts: neither is a relabelling, a copy, or an exact sum/difference complement of the other (two scores about one subject, two dates of one entity, two statuses of different stages)
+  {"kind":"slow_state","column":"id","why":"..."}                      a status of the customer or account (lifecycle, standing, tier, restriction) that stays the same from one event to the next and changes only on a rare trigger; NOT the outcome of each event (a transaction's own status), which changes freely
  ],
  "state_shares": [{"column":"id","value":"one value of a status/outcome/stage column","min":0.0,"max":1.0}]
 }
@@ -156,6 +161,9 @@ def parse(raw: Any, columns: set[str], *, entity: str | None = None) -> dict[str
             expr = _expr(item.get("expr"), columns)
             if expr:
                 rule = {"kind": kind, "expr": expr}
+        elif kind == "slow_state":
+            if str(item.get("column")) in columns and str(item.get("column")) != entity:
+                rule = {"kind": kind, "column": str(item["column"])}
         elif kind == "separate":
             pair = _ids(item.get("columns"), columns)
             if len(pair) == 2 and pair[0] != pair[1]:
@@ -428,6 +436,28 @@ def check(spec: GenerationSpec, rows: list[dict[str, Any]], expectations: dict[s
                                     f"[{rule['expr']}] is false on {len(bad)} of {seen} rows{why}.",
                                     f"e.g. {_example(bad[0], names, ids)}",
                                     "Make the columns it relates agree, by deriving them from one hidden decision."))
+        elif kind == "slow_state":
+            col = rule["column"]
+            histories: dict[Any, list[dict[str, Any]]] = {}
+            for r in rows:
+                histories.setdefault(r.get(spec.entity_column), []).append(r)
+            moved = seen = 0
+            example: list[Any] = []
+            for g in histories.values():
+                ordered = sorted(g, key=lambda r: r.get(spec.clock) or as_of) if spec.clock else g
+                values = [r.get(col) for r in ordered if r.get(col) is not None]
+                for x, y in zip(values, values[1:]):
+                    seen += 1
+                    if x != y:
+                        moved += 1
+                        if not example:
+                            example = values[:5]
+            if seen >= MIN_TRANSITIONS and moved > SLOW_STATE_CHANGE_SHARE * seen:
+                out.append(_finding(kind, "error", [names[col]],
+                                    f"{names[col]} is a state that persists but it changes between {moved} of {seen} consecutive events of the same entity{why}.",
+                                    f"e.g. one entity: {_short(example, 100)}",
+                                    f"Draw its starting value once per entity (an entity-scope latent) and let each event carry the previous value "
+                                    f"(prev['{col}'] when it exists), changing it only on a rare, stated trigger."))
         elif kind == "separate":
             a, b = rule["columns"]
             pairs = [(r[a], r[b]) for r in rows if r.get(a) is not None and r.get(b) is not None]

@@ -41,6 +41,77 @@ def _extract_status_code(exc: Exception) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _close_open(text: str) -> str:
+    """``text`` with its open string, objects and arrays closed (a reply that was cut off)."""
+    stack: list[str] = []
+    in_string = escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+    out = text + ('"' if in_string else "")
+    out = re.sub(r"[,:\s]+$", "", out) if not in_string else out
+    if out.rstrip().endswith('"') and stack and stack[-1] == "}" and re.search(r'[{,]\s*"[^"]*"$', out):
+        out += ": null"                       # a key that was cut off before its value
+    return out + "".join(reversed(stack))
+
+
+def _mend(text: str, exc: json.JSONDecodeError) -> str | None:
+    """One repair for the commonest ways a model breaks JSON (a stray backslash, a missing or trailing comma, an unescaped quote
+    inside a string, trailing text, a reply cut off), or None when the error is not one of them."""
+    pos, msg = exc.pos, exc.msg
+    here = text[pos] if pos < len(text) else ""
+    before = pos - 1
+    while before >= 0 and text[before].isspace():
+        before -= 1
+    if msg.startswith("Invalid \\escape") or msg.startswith("Invalid control character"):
+        if msg.startswith("Invalid control character"):
+            return text[:pos] + {"\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(here, " ") + text[pos + 1:]
+        return text[:pos] + "\\" + text[pos:]
+    if msg.startswith("Extra data"):
+        return text[:pos]
+    if not here or msg.startswith("Unterminated string"):
+        return _close_open(text)
+    if here in "}]" and before >= 0 and text[before] == ",":
+        return text[:before] + text[before + 1:]
+    if msg.startswith("Expecting property name") and before >= 0 and text[before] == ",":
+        return text[:before] + text[before + 1:]
+    if msg.startswith("Expecting ',' delimiter"):
+        if here in '"{[' or here.isdigit() or text.startswith(("true", "false", "null"), pos):
+            return text[:pos] + "," + text[pos:]
+        if before >= 0 and text[before] == '"':
+            return text[:before] + "\\" + text[before:]            # that quote was part of the string
+    return None
+
+
+def loads_lenient(text: str) -> Any:
+    """``json.loads``, after mending the small breakages a model's JSON reply is prone to (the error is raised when it cannot be mended)."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as first:
+        fixed, exc = text, first
+        for _ in range(80):
+            mended = _mend(fixed, exc)
+            if mended is None or mended == fixed:
+                raise first
+            fixed = mended
+            try:
+                return json.loads(fixed)
+            except json.JSONDecodeError as again:
+                exc = again
+        raise first
+
+
 class GeminiClient:
     """Thin, synchronous wrapper around the supported ``google-genai`` SDK."""
 
@@ -126,6 +197,6 @@ class GeminiClient:
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
         try:
-            return json.loads(text)
+            return loads_lenient(text)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Gemini returned invalid JSON: {exc}") from exc

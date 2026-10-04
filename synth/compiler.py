@@ -48,7 +48,7 @@ from synth.spec import EVAL_VARS, SPEC_VERSION, Emit, GenerationSpec, Invariant,
 
 logger = logging.getLogger(__name__)
 
-COMPILER_VERSION = 8
+COMPILER_VERSION = 9
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
 DRAFT_REPAIRED_WARNINGS = frozenset({"shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
@@ -397,7 +397,7 @@ def build_prompt(brief: dict[str, Any], base: Baseline, notes: dict[str, dict[st
 
 
 def repair_prompt(first: str, overlay: dict[str, Any], problems: list[str]) -> str:
-    return (first + "\n\nYOUR CURRENT SPEC:\n" + json.dumps({k: v for k, v in overlay.items() if k not in ("healed", "expectations", "draft_review", "refinement")}, ensure_ascii=False, separators=(",", ":"))
+    return (first + "\n\nYOUR CURRENT SPEC:\n" + json.dumps({k: v for k, v in overlay.items() if k not in ("healed", "expectations", "draft_review", "refinement", "timing")}, ensure_ascii=False, separators=(",", ":"))
             + "\n\nIT WAS SIMULATED AND CHECKED. THESE PROBLEMS MUST BE FIXED (the first ones are the most serious):\n- "
             + "\n- ".join(problems[:14])
             + "\n\nFix the root cause in the behaviour; do not remove an invariant or target merely to make it pass unless it is itself wrong. "
@@ -1802,6 +1802,7 @@ class SpecCompiler:
         self.max_repairs = max_repairs
         self.refine_rounds = refine_rounds
         self._review = review
+        self._author_seconds = 0.0                          # how long the latest author call took: the estimate for the next one
 
     @staticmethod
     def _budget() -> float:
@@ -1874,9 +1875,13 @@ class SpecCompiler:
         return _Round(spec if not problems else None, overlay, report, problems, records)
 
     def _round(self, base: Baseline, brief: dict[str, Any], prompt: str, current: dict[str, Any] | None, *,
-               final: bool = False, expectations: dict[str, Any] | None = None) -> _Round:
+               final: bool = False, expectations: Any = None) -> _Round:
         """One model call (a full spec, or a patch of ``current``), merged, checked and, where that is safe, healed."""
+        called = time.monotonic()
         raw = self._generate(SYSTEM_PROMPT, prompt)
+        self._author_seconds = time.monotonic() - called
+        if callable(expectations):                          # still being written beside this call: it is needed only now
+            expectations = expectations()
         overlay = apply_patch(current, raw) if current is not None else (dict(raw) if isinstance(raw, dict) else {})
         carried = expectations if expectations is not None else (current or {}).get("expectations")
         overlay.pop("expectations", None)                  # the author does not write the expectations: they are the independent view
@@ -2084,7 +2089,11 @@ class SpecCompiler:
             return sorted(found, key=lambda f: f["severity"] != "error")
 
         expectations = rnd.overlay.get("expectations") if isinstance(rnd.overlay.get("expectations"), dict) else None
-        if not due(rnd) or time.monotonic() - started > min(self._budget(), self._repair_window()):
+        def affordable() -> bool:
+            """A patch is expected to take as long as the author's last call; it is made now only if that ends inside the window."""
+            return time.monotonic() - started + self._author_seconds <= min(self._budget(), self._repair_window())
+
+        if not due(rnd) or not affordable():
             return rnd                                     # a slow design is served as it is; the refinement reviews and patches it next
         reviewed: dict[str, Any] = {}
         thread = None
@@ -2097,7 +2106,7 @@ class SpecCompiler:
         first_spec, extra = rnd.spec, []
         for _ in range(DRAFT_REPAIR_ROUNDS):
             before = due(rnd)
-            if not before or time.monotonic() - started > min(self._budget(), self._repair_window()):
+            if not before or not affordable():
                 break
             try:
                 cand = self._round(base, brief, repair_prompt(first, rnd.overlay, [review_problem(f) for f in before] + extra), rnd.overlay,
@@ -2126,27 +2135,58 @@ class SpecCompiler:
 
     def draft(self, variables: list[dict[str, Any]], brief: dict[str, Any], *, notes: dict[str, dict[str, Any]] | None = None,
               resources: dict[str, str] | None = None) -> CompileResult:
-        """The first spec that passes the deterministic checks (what generation needs), with the measured advice attached."""
+        """The first spec that passes the deterministic checks (what generation needs), with the measured advice attached.
+
+        The independent expectations are written beside the author's first call, not before it: they are not needed to write
+        the first design, only to judge it and to patch it, and a scenario that is waiting for its first design should not wait
+        for both calls one after the other.
+        """
         try:
             base = build(variables, brief=brief)
         except SpecBuildError as exc:
             return CompileResult(None, "rejected", [str(exc)])
-        expectations = self._expectations(base, brief, notes)
-        first = build_prompt(brief, base, notes, resources, expectations)
-        prompt, current, problems, rnd = first, None, [], None
         started = time.monotonic()
+        written: dict[str, Any] = {}
+
+        def write() -> None:
+            began = time.monotonic()
+            try:
+                written["value"] = self._expectations(base, brief, notes)
+            except Exception:                              # the expectations never block a design
+                logger.exception("behaviour expectations could not be written")
+                written["value"] = None
+            written["seconds"] = round(time.monotonic() - began, 1)
+
+        writer = threading.Thread(target=write, name="expectations", daemon=True)
+        writer.start()
+
+        def expected() -> dict[str, Any] | None:
+            writer.join()
+            return written.get("value")
+
+        first = build_prompt(brief, base, notes, resources, None)
+        prompt, current, problems, rnd = first, None, [], None
+        expectations: dict[str, Any] | None = None
+        resolved = False
         for round_no in range(self.max_repairs + 1):
             if round_no and time.monotonic() - started > self._budget():
                 logger.warning("behaviour spec draft: time budget spent after %d round(s)", round_no)
                 break
             try:
-                rnd = self._round(base, brief, prompt, current, final=round_no == self.max_repairs, expectations=expectations)
+                rnd = self._round(base, brief, prompt, current, final=round_no == self.max_repairs,
+                                  expectations=expectations if resolved else expected)
             except Exception as exc:                      # no key, provider outage, timeout, invalid JSON
                 logger.warning("behaviour spec draft: model unavailable (%s: %s)", type(exc).__name__, exc)
                 return CompileResult(None, "unavailable", [f"{type(exc).__name__}: {_short(str(exc), 240)}"], round_no)
+            if not resolved:                               # from here on the author is shown what is expected of the scenario
+                expectations, resolved = expected(), True
+                first = build_prompt(brief, base, notes, resources, expectations)
             if rnd.spec is not None:
+                authored = time.monotonic() - started
                 rnd = self._repair_measured(base, brief, first, rnd, started, notes, resources)
                 rnd.report.update(rounds=round_no, problems=0)
+                rnd.overlay["timing"] = {"expectations": written.get("seconds"), "first_design": round(authored, 1),
+                                         "total": round(time.monotonic() - started, 1)}
                 findings = list(rnd.report.get("advice") or [])
                 return CompileResult(rnd.spec, "compiled", [], round_no, rnd.overlay, rnd.report, findings)
             problems = rnd.problems
@@ -2159,6 +2199,7 @@ class SpecCompiler:
             if healed.spec is not None:
                 logger.info("behaviour spec draft kept after confining %d problem(s) to their columns", len(rnd.problems))
                 healed.report.update(rounds=self.max_repairs, problems=0)
+                healed.overlay["timing"] = {"expectations": written.get("seconds"), "total": round(time.monotonic() - started, 1)}
                 return CompileResult(healed.spec, "compiled", [], self.max_repairs, healed.overlay, healed.report,
                                      list(healed.report.get("advice") or []))
         return CompileResult(None, "rejected", problems, self.max_repairs, rnd.overlay if rnd else None)

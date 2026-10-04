@@ -83,6 +83,9 @@ def _describe(spec: GenerationSpec | None, key: str | None, status: str, problem
         if isinstance(found, dict):
             report["expectations"] = {"rules": len(found.get("rules") or []), "entity_facts": len(found.get("entity_facts") or []),
                                       "constants": len(found.get("constants") or []), "state_shares": len(found.get("state_shares") or [])}
+        timing = spec.design.get("timing") if isinstance(spec.design, dict) else None
+        if isinstance(timing, dict):
+            report["design_seconds"] = timing
         refined = spec.design.get("refinement") if isinstance(spec.design, dict) else None
         if isinstance(refined, dict):
             report["refinement"] = refined
@@ -156,17 +159,19 @@ def refining(key: str | None) -> bool:
         return key in _REFINING or key in _REFINE_SCHEDULED
 
 
-def _after_refinement(key: str, spec: GenerationSpec, names: set[str]) -> GenerationSpec:
+def _after_refinement(key: str, spec: GenerationSpec, names: set[str], *, limit: float | None = None) -> GenerationSpec:
     """The spec to generate from: ``spec``, or the refinement's first improvement of it when that arrives within the allowed wait.
 
     A spec nobody has reviewed is the raw first design; waiting a little for its first reviewed revision costs less than data
     that carries the first design's flaws. A refinement that finishes without improving it, or one that is not running, ends the wait.
+    ``limit`` is what is left of the request's own time allowance (the wait never takes the request beyond it).
     """
     from config.runtime import SPEC_GENERATE_REFINE_WAIT_SECONDS
 
-    if spec.reviewed or SPEC_GENERATE_REFINE_WAIT_SECONDS <= 0:
+    wait = SPEC_GENERATE_REFINE_WAIT_SECONDS if limit is None else min(SPEC_GENERATE_REFINE_WAIT_SECONDS, limit)
+    if spec.reviewed or wait <= 0:
         return spec
-    deadline = time.monotonic() + SPEC_GENERATE_REFINE_WAIT_SECONDS
+    deadline = time.monotonic() + wait
     with _REFINE_CHANGED:
         while (key in _REFINING or key in _REFINE_SCHEDULED) and _REFINE_REVISION.get(key, spec.revision) <= spec.revision:
             remaining = deadline - time.monotonic()
@@ -394,6 +399,11 @@ def resolve_spec(context: dict[str, Any], variables: list[dict[str, Any]], *, wa
     from config.runtime import SPEC_GENERATE_WAIT_SECONDS
 
     wait = float(SPEC_GENERATE_WAIT_SECONDS if wait_seconds is None else wait_seconds)
+    began = time.monotonic()
+
+    def left() -> float:
+        return max(0.0, wait - (time.monotonic() - began))
+
     pinned_key = str(context.get("generation_spec_key") or "").strip() or None
     brief = make_brief(context)
     usable = [v for v in variables if isinstance(v, dict) and v.get("name")]
@@ -401,7 +411,7 @@ def resolve_spec(context: dict[str, Any], variables: list[dict[str, Any]], *, wa
     pinned = store.load(pinned_key)
     if pinned is not None and names == set(pinned.delivered.values()):
         _schedule_refinement(usable, brief, pinned_key, pinned, compiler)
-        pinned = _after_refinement(pinned_key, pinned, names)
+        pinned = _after_refinement(pinned_key, pinned, names, limit=left())
         return SpecResolution(pinned, pinned_key, "pinned", _describe(pinned, pinned_key, "pinned"))
     key = design_key(usable, brief)
     if key is None:
@@ -410,7 +420,7 @@ def resolve_spec(context: dict[str, Any], variables: list[dict[str, Any]], *, wa
     if found is not None:
         if found.spec is not None:
             _schedule_refinement(usable, brief, key, found.spec, compiler)
-            latest = _after_refinement(key, found.spec, names)
+            latest = _after_refinement(key, found.spec, names, limit=left())
             if latest is not found.spec:
                 return SpecResolution(latest, key, found.status, _describe(latest, key, found.status))
         return found
@@ -428,6 +438,7 @@ def resolve_spec(context: dict[str, Any], variables: list[dict[str, Any]], *, wa
     spec = store.load(waiting_on)
     if spec is not None and names == set(spec.delivered.values()):
         status = "pinned" if waiting_on == pinned_key else "cached"
+        spec = _after_refinement(waiting_on, spec, names, limit=left())
         return SpecResolution(spec, waiting_on, status, _describe(spec, waiting_on, status))
     if in_flight(waiting_on):
         raise SpecNotReady(waiting_on, retry_after=max(10, int(wait)))
