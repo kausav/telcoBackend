@@ -45,9 +45,11 @@ from synth.spec import EVAL_VARS, SPEC_VERSION, Emit, GenerationSpec, Invariant,
 
 logger = logging.getLogger(__name__)
 
-COMPILER_VERSION = 3
+COMPILER_VERSION = 6
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
+DRAFT_REPAIRED_WARNINGS = frozenset({"shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
+                                     "complementary_columns", "near_constant_state", "identical_timestamps", "entity_stamp_inside_history"})
 DRAFT_REPAIR_ROUNDS = 1                  # patch rounds for measured errors before a spec is first served
 REJECTED_PATCH_ALLOWANCE = 2
 GOOD_ENOUGH_WEIGHT = 1                   # refinement stops once at most one minor finding is left
@@ -173,6 +175,19 @@ WHAT YOU DECIDE
    persona or segment may shift; do not give every entity one of two or three fixed sets of values. A completion, confirmation or
    settlement time, and every amount, window or reference that only exists once something succeeded, is absent when it failed, was
    cancelled, was rejected, expired or is still in flight.
+13. Steps, snapshots and independent measures. The timestamps of different steps of one process (requested, confirmed,
+   notified, shown, answered, converted) are different moments: each is drawn from the step before it with its own delay and is
+   present only when that step happened; none is a single value kept for the entity's whole history, and a "last/latest X"
+   moment read at an event is derived from the entity's earlier events (prev) and is never later than that event. Two
+   dates of one entity (a profile date, a validity start) differ unless they really are one record. Two scores, ratings or
+   measures about one subject (a credit score and a credit risk, an affinity and a propensity) are separate facts: each has its
+   own latent and variation, never a constant minus the other; a label derived from a number (a frequency band from a count) is
+   computed from it, and counts over nested windows (30 days inside 90 days) are not fixed multiples of each other. The status of
+   an event keeps a realistic spread of the stages it can reach and does not repeat the outcome that another column records
+   (a status "completed_discrepancy" beside a verification result), nor stays one value on nearly every row. A recommended
+   action agrees with the flag that governs it (a retry action only where the flag says retryable) and with the cause of
+   the failure. A remainder, reserved or used quantity of a record follows what happened (usage, time), not a fixed share of
+   the amount. The kind of what an item delivers (data, voice, money) follows the item.
 
 THE LANGUAGE
 Expressions (python-like, safe subset). Variables: any column id or latent you declare (order is resolved automatically;
@@ -702,7 +717,9 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
     if not problems:
         report["advice"] = (cadence_advice(spec, rows) + constant_advice(spec, rows, variables) + sparse_advice(spec, rows)
                               + bound_advice(spec, rows) + inflight_advice(spec, rows) + shared_identifier_advice(spec, rows)
-                              + mirrored_advice(spec, rows) + counter_advice(spec, rows) + flag_state_advice(spec, rows))
+                              + mirrored_advice(spec, rows) + counter_advice(spec, rows) + flag_state_advice(spec, rows)
+                              + complement_advice(spec, rows) + near_constant_state_advice(spec, rows) + identical_timestamp_advice(spec, rows)
+                              + entity_stamp_advice(spec, rows))
         report["facts"] = shape_facts(spec, rows)
     return problems, report
 
@@ -793,7 +810,17 @@ def constant_advice(spec: GenerationSpec, rows: list[dict[str, Any]], variables:
         if spec.columns[cid].dtype not in ("integer", "float") or name in fixed:
             continue
         values = {r.get(cid) for r in rows if r.get(cid) is not None}
-        if len(values) == 1 and sum(1 for r in rows if r.get(cid) is not None) >= n // 2:
+        present = [r.get(cid) for r in rows if r.get(cid) is not None]
+        if len(values) > 1 and len(present) >= n // 2:
+            top, count = max(((v, present.count(v)) for v in values), key=lambda t: t[1])
+            if top != 0 and count >= 0.9 * len(present):         # (a mostly-zero count is a normal shape; a mostly-25.0 amount is not)
+                out.append({"id": "near_constant_numeric_column", "severity": "warn", "columns": [name],
+                            "problem": f"Column {name} has the value {top!r} on {count / len(present):.0%} of the {len(present)} rows that carry one.",
+                            "evidence": f"{len(values)} distinct values, one of them on {count} rows",
+                            "fix": "A measure that is the same on nearly every row measures nothing: let it follow what it depends on "
+                                   "(the amount, the plan, the cause) so that its magnitude varies the way the real quantity does."})
+                continue
+        if len(values) == 1 and len(present) >= n // 2:
             out.append({"id": "constant_numeric_column", "severity": "error", "columns": [name],
                         "problem": f"Column {name} has the value {next(iter(values))!r} on every row of every entity.",
                         "evidence": f"{len(rows)} simulated rows, one distinct value",
@@ -915,52 +942,80 @@ def shared_identifier_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -
     return out[:2]
 
 
-_MIRROR_KINDS = {"status", "state", "score", "flag", "type", "level", "rating", "tier", "grade"}
 _COUNTER_WORDS = {"retry", "retries", "attempt", "attempts", "resend", "resends", "redelivery"}
 
 
-def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Findings for two columns of the same kind (two statuses, two scores...) that map one-to-one onto each other.
+_STATE_KINDS = {"status", "state", "stage", "phase", "outcome", "result"}
 
-    A status that is a relabelling of another status, or a score that equals another score, says the same thing twice; a
-    reader of the data cannot tell it from a second measurement.
+
+def _kind(name: str) -> str:
+    last = re.split(r"[^a-z0-9]+", name.lower())[-1]
+    return "state" if last in _STATE_KINDS else last
+
+
+_GRADE_KINDS = {"score", "level", "rating", "tier", "grade"}
+_ID_WORDS = {"id", "identifier", "code", "key", "number"}
+_LABEL_WORDS = {"name", "label", "title", "description"}
+
+
+def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for two categorical columns that say the same thing twice.
+
+    Two columns of the same kind (two statuses or states, two scores, two flags) where one is a function of the other, or two
+    columns of any kind that map one-to-one onto each other, add a column and no information: a status that is a relabelling
+    of another status, a "reason" that is the product name, a score that equals another score. An identifier and its label
+    (product_id and plan_name) are one fact written twice by design and are left alone.
     """
     n = len(rows)
     if n < 100:
         return []
+    delivered = spec.delivered
     cols = []
-    for cid, name in spec.delivered.items():
-        if cid == spec.entity_column or spec.columns[cid].dtype not in ("string", "categorical", "boolean", "integer"):
+    for cid, name in delivered.items():
+        dtype = spec.columns[cid].dtype
+        if cid == spec.entity_column or dtype not in ("string", "categorical", "boolean", "integer"):
             continue
-        parts = [t for t in re.split(r"[^a-z0-9]+", name.lower()) if t]
-        if parts and parts[-1] in _MIRROR_KINDS:
-            cols.append((cid, name, parts[-1]))
-    found: list[dict[str, Any]] = []
-    for i, (a, na, ka) in enumerate(cols):
-        for b, nb, kb in cols[i + 1:]:
-            if ka != kb:
-                continue
+        counting = dtype == "integer" and _kind(name) not in _GRADE_KINDS          # a count is a label only next to a column named alike
+        present = [str(r.get(cid)) for r in rows if r.get(cid) is not None]
+        values = set(present)
+        # a column that says one thing on nearly every row has no information to repeat (or to be repeated by)
+        if 2 <= len(values) <= 12 and len(present) >= 100 and max(present.count(v) for v in values) <= 0.95 * len(present):
+            cols.append((cid, name, _kind(name), values, counting))
+    found: list[tuple[int, dict[str, Any]]] = []
+    for i, (a, na, ka, da, ca) in enumerate(cols):
+        for b, nb, kb, db, cb in cols[i + 1:]:
+            ta, tb = _tokens(na), _tokens(nb)
+            if (ca or cb) and not {t for t in ta & tb if len(t) >= 5 and t not in _GENERIC_FLAG_WORDS | _GENERIC_TOKENS}:
+                continue                                            # a count and a label are tied only when they speak of the same thing
+            if (ta & _ID_WORDS and tb & _LABEL_WORDS) or (tb & _ID_WORDS and ta & _LABEL_WORDS):
+                continue                                            # an identifier and its label are one fact written twice by design
+            if {ka, kb} == {"state", "reason"}:
+                continue                                            # a reason elaborates its status; it is meant to follow it
+            same_kind = not (ca or cb) and ka == kb and ka in (_STATE_KINDS | {"state", "score", "flag", "type", "level", "rating", "tier", "grade"})
             pairs = [(str(r.get(a)), str(r.get(b))) for r in rows if r.get(a) is not None and r.get(b) is not None]
             if len(pairs) < 100:
                 continue
-            da, db = {x for x, _ in pairs}, {y for _, y in pairs}
-            if not (2 <= len(da) <= 12 and len(da) == len(db)):
-                continue
             ab: dict[str, dict[str, int]] = {}
-            for x, y in pairs:
-                ab.setdefault(x, {})[y] = ab.setdefault(x, {}).get(y, 0) + 1
             ba: dict[str, dict[str, int]] = {}
             for x, y in pairs:
+                ab.setdefault(x, {})[y] = ab.setdefault(x, {}).get(y, 0) + 1
                 ba.setdefault(y, {})[x] = ba.setdefault(y, {}).get(x, 0) + 1
-            forward = sum(max(c.values()) for c in ab.values()) / len(pairs)
+            forward = sum(max(c.values()) for c in ab.values()) / len(pairs)       # share of rows where b is the commonest b for its a
             backward = sum(max(c.values()) for c in ba.values()) / len(pairs)
-            if forward >= 0.97 and backward >= 0.97:
-                found.append({"id": "mirrored_columns", "severity": "warn", "columns": [na, nb],
-                              "problem": f"{na} and {nb} map one-to-one onto each other ({len(da)} values each) on {min(forward, backward):.0%} of rows.",
-                              "evidence": f"{len(pairs)} simulated rows",
-                              "fix": "Two columns of the same kind must describe different things (another stage, party or measure) or differ where "
-                                     "reality differs (they are recorded at different moments, by different parties); do not relabel one into the other."})
-    return found[:3]
+            one_to_one = forward >= 0.97 and backward >= 0.97 and len(da) == len(db)
+            if one_to_one or (same_kind and (forward >= 0.97 or backward >= 0.97)):   # (a count is only ever compared one-to-one)
+                follower, leader = (nb, na) if forward >= 0.97 else (na, nb)
+                how = (f"map one-to-one onto each other ({len(da)} values each)" if one_to_one else f"{follower} is a function of {leader}")
+                found.append((0 if same_kind else 1, {
+                    "id": "mirrored_columns", "severity": "warn", "columns": [na, nb],
+                    "problem": f"{na} and {nb}: {how} on {min(max(forward, backward), 1.0):.0%} of rows." if not one_to_one
+                               else f"{na} and {nb} {how} on {min(forward, backward):.0%} of rows.",
+                    "evidence": f"{len(pairs)} simulated rows",
+                    "fix": "Two columns must describe different things (another stage, party or measure) or differ where reality differs "
+                           "(they are recorded at different moments, by different parties); do not relabel or derive one from the other "
+                           "one-to-one. A status of a related record follows its own cause, not the status of this record."}))
+    found.sort(key=lambda t: t[0])
+    return [f for _, f in found][:4]
 
 
 def counter_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1021,14 +1076,20 @@ def _flag_stems(name: str) -> set[str]:
     return {_stem(t) for t in re.split(r"[^a-z0-9]+", name.lower()) if len(t) >= 5 and t not in _GENERIC_FLAG_WORDS}
 
 
+def _names_step(word: str, stems: set[str]) -> bool:
+    """The word is a stem of the flag, or a whole word the flag's longer word begins with (RETRY / is_retryable)."""
+    stem = _stem(word)
+    return stem in stems or any(len(word) >= 5 and s.startswith(word) for s in stems)
+
+
 def _value_polarity(value: str, stems: set[str]) -> int:
     """+1 when the value names what the flag says happened (Accepted / accepted_flag), -1 when it names the opposite (UNRESOLVED), else 0."""
     for word in _value_words(value):
-        if len(word) >= 5 and _stem(word) in stems:
+        if len(word) >= 5 and _names_step(word, stems):
             return 1
         for prefix in _NEGATING_PREFIXES:
             rest = word[len(prefix):]
-            if word.startswith(prefix) and len(rest) >= 5 and _stem(rest) in stems:
+            if word.startswith(prefix) and len(rest) >= 5 and _names_step(rest, stems):
                 return -1
     return 0
 
@@ -1066,12 +1127,144 @@ def flag_state_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[
                 known = [r for r in rows if r.get(cid) == value and isinstance(r.get(fid), bool)]
                 wrong = [r for r in known if r[fid] != (polarity > 0)]
                 if len(known) >= 8 and len(wrong) >= 5 and len(wrong) >= 0.1 * len(known):
-                    out.append({"id": "flag_contradicts_state", "severity": "error", "columns": [fname, name],
+                    # an error only when the two columns speak of the same subject (a shared word in their names, such as the
+                    # offer in offer_accepted_flag / offer_response_status); a state of some other process that happens to
+                    # use the same word (a consumption state 'accepted') is a doubt, not a contradiction
+                    same_subject = bool(flag_stems & own) or bool(_tokens(name) & _ACTION_WORDS)   # (an action is what a permission flag governs)
+                    out.append({"id": "flag_contradicts_state", "severity": "error" if same_subject else "warn", "columns": [fname, name],
                                 "problem": f"{name} is '{value}' but {fname} is {'false' if polarity > 0 else 'true'} on {len(wrong)} of {len(known)} such rows.",
                                 "evidence": f"{len(known)} simulated rows with {name} = '{value}'",
                                 "fix": f"Derive {fname} from {name} (or both from one draw) so that a '{value}' row always carries "
                                        f"{fname} {'true' if polarity > 0 else 'false'}."})
     return out[:3]
+
+
+_SHARE_WORDS = frozenset({"share", "percent", "percentage", "pct", "ratio", "proportion", "fraction"})
+
+
+def complement_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for two numeric columns whose sum (or difference) is the same on nearly every row.
+
+    A score and a risk rating that always add up to 100 are one measure written twice; so are two quantities that differ by a
+    fixed offset. Independent facts (even correlated ones) do not add up exactly. Shares of one whole are meant to sum to it
+    and are left alone.
+    """
+    n = len(rows)
+    if n < 100:
+        return []
+    cols = []
+    for cid, name in spec.delivered.items():
+        if spec.columns[cid].dtype not in ("integer", "float") or _tokens(name) & _SHARE_WORDS:
+            continue
+        values = [r[cid] for r in rows if isinstance(r.get(cid), (int, float)) and not isinstance(r.get(cid), bool)]
+        if len(values) >= n // 2 and len({round(v, 2) for v in values}) >= 8:        # a column with few values cannot add up to a constant by accident
+            cols.append((cid, name))
+    out = []
+    for i, (a, na) in enumerate(cols[:30]):
+        for b, nb in cols[i + 1:30]:
+            pairs = [(r[a], r[b]) for r in rows if isinstance(r.get(a), (int, float)) and isinstance(r.get(b), (int, float))
+                     and not isinstance(r.get(a), bool) and not isinstance(r.get(b), bool)]
+            if len(pairs) < 100:
+                continue
+            for what, fn in (("sum", lambda x, y: x + y), ("difference", lambda x, y: x - y)):
+                top, count = _mode_count([round(fn(x, y), 2) for x, y in pairs])
+                if count >= 0.97 * len(pairs):
+                    out.append({"id": "complementary_columns", "severity": "warn", "columns": [na, nb],
+                                "problem": f"The {what} of {na} and {nb} is {top:g} on {count / len(pairs):.0%} of {len(pairs)} rows.",
+                                "evidence": f"{len(pairs)} simulated rows, both columns vary",
+                                "fix": "Two measures must not be exact complements or offsets of each other: draw each from its own latent "
+                                       "(correlated if they are related, but with its own variation) or derive them from different facts."})
+                    break
+    return out[:2]
+
+
+def _mode_count(values: list[float]) -> tuple[float, int]:
+    """The commonest value of a list and how often it occurs."""
+    counts: dict[float, int] = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    top = max(counts.items(), key=lambda kv: kv[1])
+    return top[0], top[1]
+
+
+def near_constant_state_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for the state of an event that is the same on nearly every row while another state of it varies.
+
+    When a request's status reads "completed" on 99% of its events and a second state (a verification, a settlement) says
+    what really happened, the first state carries no information and usually repeats the outcome inside its value.
+    """
+    n = len(rows)
+    if n < 100:
+        return []
+    entity_level = set(spec.entity_columns)
+    states = []
+    for cid, name in spec.delivered.items():
+        if spec.columns[cid].dtype not in ("string", "categorical") or cid == spec.clock or name in entity_level \
+                or re.split(r"[^a-z0-9]+", name.lower())[-1] not in _STATE_NAME_WORDS:
+            continue
+        present = [str(r[cid]) for r in rows if r.get(cid) is not None]
+        if len(present) < 0.9 * n:
+            continue
+        counts: dict[str, int] = {}
+        for v in present:
+            counts[v] = counts.get(v, 0) + 1
+        top = max(counts.items(), key=lambda kv: kv[1])
+        states.append((name, top[0], top[1] / len(present), sum(c >= 0.1 * len(present) for c in counts.values()), set(counts)))
+    varying = [(s[0], set().union(*(_value_words(v) for v in s[4]))) for s in states if s[3] >= 2]
+    out = []
+    for name, top, share, _, _ in states:
+        if share < 0.97:
+            continue
+        # the dominant value repeats a word of the outcome another state records ("completed_discrepancy" next to VERIFIED_DISCREPANCY)
+        twin = next((v for v, words in varying if v != name and {w for w in _value_words(top) & words if len(w) >= 5}), None)
+        if twin:
+            out.append({"id": "near_constant_state", "severity": "warn", "columns": [name, twin],
+                        "problem": f"{name} is '{top}' on {share:.0%} of the rows and repeats the outcome that {twin} records, which varies.",
+                        "evidence": f"{len(rows)} simulated rows",
+                        "fix": f"Let {name} follow what happened to the event (the stages it can really reach, in realistic proportions) "
+                               f"and keep the outcome that {twin} records out of its value."})
+    return out[:2]
+
+
+_WINDOW_WORDS = frozenset({"valid", "start", "begin", "effective", "from", "end", "expiry", "expires", "until"})
+
+
+def identical_timestamp_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for date columns that carry the same moment on nearly every row.
+
+    Two different steps of a process (requested and confirmed, notified and shown, converted and last accepted) are not the
+    same instant; the start of a window may be the moment of the event that opens it, but two facts of the entity (a profile
+    date and a validity start) are not one moment either.
+    """
+    n = len(rows)
+    if n < 100:
+        return []
+    entity_level = set(spec.entity_columns)
+    cols = [(cid, name) for cid, name in spec.delivered.items() if spec.columns[cid].dtype in ("datetime", "date")]
+    window = {cid for cid, name in cols if _tokens(name) & _WINDOW_WORDS}
+    parent = {cid: cid for cid, _ in cols}
+
+    def root(x: str) -> str:
+        while parent[x] != x:
+            x = parent[x]
+        return x
+
+    for i, (a, na) in enumerate(cols):
+        for b, nb in cols[i + 1:]:
+            if (a in window or b in window) and not (na in entity_level and nb in entity_level):
+                continue                                            # a window opens at the moment of the event that grants it
+            pairs = [(r[a], r[b]) for r in rows if r.get(a) is not None and r.get(b) is not None]
+            if len(pairs) >= 100 and sum(x == y for x, y in pairs) >= 0.98 * len(pairs):
+                parent[root(a)] = root(b)
+    groups: dict[str, list[str]] = {}
+    for cid, name in cols:
+        groups.setdefault(root(cid), []).append(name)
+    return [{"id": "identical_timestamps", "severity": "warn", "columns": names,
+             "problem": f"{', '.join(names)} carry the same moment on (nearly) every row.",
+             "evidence": f"{n} simulated rows",
+             "fix": "Different steps happen at different moments: derive each from the one before it with that step's own delay "
+                    "(minutes to days, by cause and channel), or drop the column that only repeats another."}
+            for names in groups.values() if len(names) >= 2][:3]
 
 
 def sparse_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1148,7 +1341,195 @@ def shape_facts(spec: GenerationSpec, rows: list[dict[str, Any]]) -> dict[str, A
     flags = _flag_facts(spec, rows)
     if flags:
         facts["flags_vs_timestamps"] = flags
+    for key, found in (("item_vs_measure", _item_facts(spec, rows)), ("entity_constant_timestamps", _entity_stamp_facts(spec, rows)),
+                       ("flags_vs_columns", _flag_column_facts(spec, rows)), ("constant_ratios", _ratio_facts(spec, rows))):
+        if found:
+            facts[key] = found
     return facts
+
+
+_ITEM_WORDS = frozenset({"product", "plan", "offering", "package", "item", "sku", "pack", "bundle"})
+_MEASURE_WORDS = frozenset({"amount", "price", "fee", "cost", "charge", "size", "limit", "allocated", "validity", "quota", "volume"})
+_ACTION_WORDS = frozenset({"action", "remedy", "decision", "next"})
+
+
+def _item_facts(spec: GenerationSpec, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Item names (product, plan, offer) whose price or size is not a function of the item.
+
+    An item has its own price, size and validity; a name that sells at several different amounts is two facts drawn
+    independently. Only the weak pairs are handed over; a name whose measure follows it is as it should be.
+    """
+    n = len(rows)
+    items, measures = [], []
+    for cid, name in spec.delivered.items():
+        dtype = spec.columns[cid].dtype
+        if cid == spec.entity_column or not _tokens(name) & (_ITEM_WORDS | _MEASURE_WORDS):
+            continue
+        present = [r[cid] for r in rows if r.get(cid) is not None and not isinstance(r.get(cid), bool)]
+        if len(present) < max(100, n // 2):
+            continue
+        distinct = {round(v, 2) if isinstance(v, float) else v for v in present}
+        if dtype in ("string", "categorical") and _tokens(name) & _ITEM_WORDS and 2 <= len(distinct) <= 12:
+            items.append((cid, name))
+        elif dtype in ("integer", "float") and _tokens(name) & _MEASURE_WORDS and _kind(name) not in _GRADE_KINDS and 2 <= len(distinct) <= 12:
+            measures.append((cid, name))
+    kinds = []
+    for cid, name in spec.delivered.items():
+        if cid != spec.entity_column and spec.columns[cid].dtype in ("string", "categorical") and _kind(name) in {"type", "category", "kind", "class"}:
+            present = [str(r[cid]) for r in rows if r.get(cid) is not None]
+            if len(present) >= max(100, n // 2) and 2 <= len(set(present)) <= 8:
+                kinds.append((cid, name))
+    out: dict[str, tuple[float, str]] = {}
+    for a, na in items:
+        for b, nb in measures:
+            table: dict[Any, dict[Any, int]] = {}
+            for r in rows:
+                x, y = r.get(a), r.get(b)
+                if x is not None and y is not None:
+                    cell = table.setdefault(x, {})
+                    cell[round(y, 2)] = cell.get(round(y, 2), 0) + 1
+            total = sum(sum(c.values()) for c in table.values())
+            if total < 100:
+                continue
+            agreement = sum(max(c.values()) for c in table.values()) / total
+            if agreement < 0.6:
+                spread = sum(len(c) for c in table.values()) / len(table)
+                out[f"{na} -> {nb}"] = (agreement, f"{agreement:.0%} of rows carry the item's commonest {nb}; {spread:.1f} different values per item on average")
+    for a, na in items:
+        for b, nb in kinds:                                     # the kind of thing an item is (data, voice, monetary) follows the item
+            table = {}
+            for r in rows:
+                x, y = r.get(a), r.get(b)
+                if x is not None and y is not None:
+                    cell = table.setdefault(x, {})
+                    cell[str(y)] = cell.get(str(y), 0) + 1
+            total = sum(sum(c.values()) for c in table.values())
+            if total < 100:
+                continue
+            overall: dict[str, int] = {}
+            for c in table.values():
+                for y, k in c.items():
+                    overall[y] = overall.get(y, 0) + k
+            agreement = sum(max(c.values()) for c in table.values()) / total
+            baseline = max(overall.values()) / total
+            if len(overall) >= 2 and baseline < 0.95 and agreement < baseline + 0.05:
+                out[f"{na} -> {nb}"] = (agreement, f"the item tells nothing about {nb}: {agreement:.0%} of rows carry the item's commonest value, "
+                                                   f"{baseline:.0%} carry the commonest value overall")
+    return {k: v[1] for k, v in sorted(out.items(), key=lambda kv: kv[1][0])[:5]}
+
+
+def _ratio_facts(spec: GenerationSpec, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Numeric columns that are the same fraction of another column on nearly every row (remaining = 90% of the amount).
+
+    That is how a tax or a unit conversion behaves; a balance, a usage or a remainder follows what happened and does not.
+    """
+    n = len(rows)
+    cols = []
+    for cid, name in spec.delivered.items():
+        if n >= 100 and spec.columns[cid].dtype in ("integer", "float") and not _tokens(name) & _SHARE_WORDS:
+            values = [r[cid] for r in rows if isinstance(r.get(cid), (int, float)) and not isinstance(r.get(cid), bool) and r[cid] > 0]
+            if len(values) >= 30 and len({round(v, 2) for v in values}) >= 5:
+                cols.append((cid, name))
+    out: dict[str, str] = {}
+    for i, (a, na) in enumerate(cols[:30]):
+        for b, nb in cols[i + 1:30]:
+            ratios = [float(f"{r[b] / r[a]:.3g}") for r in rows if isinstance(r.get(a), (int, float)) and isinstance(r.get(b), (int, float))
+                      and not isinstance(r.get(a), bool) and not isinstance(r.get(b), bool) and r[a] > 0 and r[b] > 0]
+            if len(ratios) < 30:
+                continue
+            top, count = _mode_count(ratios)
+            if count >= 0.97 * len(ratios) and abs(top - 1.0) > 0.001:
+                out[f"{nb} / {na}"] = f"{top:g} on {count / len(ratios):.0%} of the {len(ratios)} rows where both are above zero"
+    return dict(list(out.items())[:4])
+
+
+def _entity_stamps(spec: GenerationSpec, rows: list[dict[str, Any]]) -> dict[str, tuple[float, int]]:
+    """Date columns that hold one value per entity: the share of the entity's events that happen before that date, and how many events were counted."""
+    groups = _by_entity(spec, rows)
+    if not groups:
+        return {}
+    out: dict[str, tuple[float, int]] = {}
+    for cid, name in spec.delivered.items():
+        if spec.columns[cid].dtype not in ("datetime", "date") or cid == spec.clock:
+            continue
+        events = before = 0
+        constant = True
+        try:
+            for g in groups:
+                stamps = {r.get(cid) for r in g}
+                if len(stamps) != 1:
+                    constant = False
+                    break
+                stamp = next(iter(stamps))
+                if stamp is not None:
+                    events += len(g)
+                    before += sum(r[spec.clock] < stamp for r in g)
+        except TypeError:
+            continue
+        if constant and events >= 30:
+            out[name] = (before / events, events)
+    return out
+
+
+def _entity_stamp_facts(spec: GenerationSpec, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Date columns that hold one value per entity while the entity's events run on: how many events happen before that date."""
+    found = {name: f"one value per entity; {share:.0%} of the entity's events happen before it"
+             for name, (share, _) in _entity_stamps(spec, rows).items() if 0.05 <= share <= 0.95}
+    return dict(list(found.items())[:6])
+
+
+def entity_stamp_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for a date that is fixed for a whole entity yet lies in the middle of that entity's events.
+
+    A notification, an impression, a response, a conversion or a "last top-up" belongs to one event (or is the entity's latest
+    one as of that event); a single value for the whole history cannot be before some of the events and after the others.
+    """
+    if len(rows) < 100:
+        return []
+    return [{"id": "entity_stamp_inside_history", "severity": "warn", "columns": [name],
+             "problem": f"{name} has one value per entity but {share:.0%} of that entity's events happen before it.",
+             "evidence": f"{events} events of the simulated entities",
+             "fix": f"Record {name} per event (present only when that step happened, after the step before it), or, for the latest "
+                    "earlier occurrence, derive it from the entity's previous events (prev) so it never lies after the event it is read at."}
+            for name, (share, events) in _entity_stamps(spec, rows).items() if 0.05 <= share <= 0.95][:3]
+
+
+def _flag_column_facts(spec: GenerationSpec, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """For each yes/no flag: what retry counters and next-action columns say on the rows where it is true and where it is false.
+
+    A "retryable" flag that is false should not sit next to attempts or a retry action; the sample alone rarely shows the share.
+    """
+    delivered = spec.delivered
+    counters = [(cid, name) for cid, name in delivered.items() if spec.columns[cid].dtype == "integer" and _tokens(name) & _COUNTER_WORDS]
+    actions = [(cid, name) for cid, name in delivered.items()
+               if spec.columns[cid].dtype in ("string", "categorical") and _tokens(name) & _ACTION_WORDS
+               and 2 <= len({r.get(cid) for r in rows if r.get(cid) is not None}) <= 12]
+    if not counters and not actions:
+        return {}
+    out: dict[str, Any] = {}
+    for fid, fname in delivered.items():
+        if spec.columns[fid].dtype != "boolean" or len(out) >= 6:
+            continue
+        yes = [r for r in rows if r.get(fid) is True]
+        no = [r for r in rows if r.get(fid) is False]
+        if len(yes) < 0.05 * len(rows) or len(no) < 0.05 * len(rows):
+            continue
+        entry: dict[str, Any] = {}
+        for cid, name in counters:
+            positive = [sum(isinstance(r.get(cid), int) and r[cid] > 0 for r in side) / len(side) for side in (yes, no)]
+            entry[name] = f"above zero on {positive[0]:.0%} of rows where true, {positive[1]:.0%} where false"
+        for cid, name in actions:
+            sides = []
+            for side in (yes, no):
+                counts: dict[str, int] = {}
+                for r in side:
+                    if r.get(cid) is not None:
+                        counts[str(r[cid])] = counts.get(str(r[cid]), 0) + 1
+                top = sorted(counts.items(), key=lambda kv: -kv[1])[:3]
+                sides.append({k: round(c / len(side), 2) for k, c in top})
+            entry[name] = {"where_true": sides[0], "where_false": sides[1]}
+        out[fname] = {"true_share": round(len(yes) / (len(yes) + len(no)), 2), **entry}
+    return out
 
 
 def _flag_facts(spec: GenerationSpec, rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1203,7 +1584,11 @@ entity's events) and, for columns that are sometimes empty, how the share of emp
 ("empty_share_by": value -> share of rows where the column is empty) and the columns that carry one single value on every row
 ("constant_columns": column -> its one value; acceptable only for a fact that is truly fixed for the scenario, such as a currency)
 the timestamps that do not follow a yes/no flag ("flags_vs_timestamps": a timestamp present on nearly every row where the flag is false, or absent
-where it is true, contradicts a flag that says that step happened) and the 5th/50th/95th percentile of every numeric column ("numeric_spread"): judge whether those magnitudes are realistic for what the
+where it is true, contradicts a flag that says that step happened), the item names whose price or size is not a function of the item
+("item_vs_measure": a product sold at several different prices, or of a kind - data, voice - that does not follow the product, is wrong), the dates fixed for a whole entity although its events go on
+before and after them ("entity_constant_timestamps") and what retry counters and next-action columns say when a yes/no flag is true and when it is false
+("flags_vs_columns": a retry count or a retry action next to a flag that says "not retryable" is a contradiction), the quantities that are always the same fraction of another
+("constant_ratios": right for a tax or a unit conversion, wrong for a balance, a remainder or a usage) and the 5th/50th/95th percentile of every numeric column ("numeric_spread"): judge whether those magnitudes are realistic for what the
 column means (a time until depletion of one hour on nearly every row, an average of 0 for a quantity that is never 0, a count that
 exceeds what the other columns allow). Judge each against what the column means: a fact that
 only exists once something succeeded must be empty for every state that is not a success; a fact that applies must not be
@@ -1298,8 +1683,9 @@ def spec_key(brief: dict[str, Any], variables: list[dict[str, Any]]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False).encode()).hexdigest()[:40]
 
 
-MEASURED_FINDINGS = frozenset({"window_overlap", "constant_numeric_column", "near_empty_column", "part_exceeds_bound", "stale_in_flight",
-                               "shared_identifier", "mirrored_columns", "counter_spacing", "flag_contradicts_state", "healed_empty_column", "healed_target", "check"})
+MEASURED_FINDINGS = frozenset({"window_overlap", "constant_numeric_column", "near_constant_numeric_column", "near_empty_column", "part_exceeds_bound", "stale_in_flight",
+                               "shared_identifier", "mirrored_columns", "counter_spacing", "flag_contradicts_state", "complementary_columns", "near_constant_state",
+                               "identical_timestamps", "entity_stamp_inside_history", "healed_empty_column", "healed_target", "check"})
 
 
 def _measured_weight(findings: list[dict[str, Any]]) -> int:
@@ -1538,7 +1924,8 @@ class SpecCompiler:
         only when it passes every check again and has fewer measured errors; any failure leaves the first spec as it was.
         """
         def errors(r: _Round) -> list[dict[str, Any]]:
-            return [f for f in r.report.get("advice") or [] if f["severity"] == "error" and f["id"] in MEASURED_FINDINGS]
+            return [f for f in r.report.get("advice") or []
+                    if f["id"] in MEASURED_FINDINGS and (f["severity"] == "error" or f["id"] in DRAFT_REPAIRED_WARNINGS)]
 
         before = errors(rnd)
         if not before or DRAFT_REPAIR_ROUNDS < 1 or time.monotonic() - started > self._budget():

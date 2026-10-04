@@ -104,6 +104,9 @@ class SpecNotReady(RuntimeError):
 _FLIGHT_LOCK = threading.Lock()
 _IN_FLIGHT: dict[str, threading.Event] = {}
 _REFINING: set[str] = set()
+_REFINE_SCHEDULED: set[str] = set()                         # refinements that were started and have not begun yet
+_REFINE_REVISION: dict[str, int] = {}                        # the newest revision a running refinement has stored
+_REFINE_CHANGED = threading.Condition(_FLIGHT_LOCK)          # signalled when a refinement stores a revision or ends
 _REFINE_BACKOFF: dict[str, float] = {}
 REFINE_BACKOFF_SECONDS = 300.0
 
@@ -140,7 +143,28 @@ def in_flight(key: str | None) -> bool:
 
 def refining(key: str | None) -> bool:
     with _FLIGHT_LOCK:
-        return key in _REFINING
+        return key in _REFINING or key in _REFINE_SCHEDULED
+
+
+def _after_refinement(key: str, spec: GenerationSpec, names: set[str]) -> GenerationSpec:
+    """The spec to generate from: ``spec``, or the refinement's first improvement of it when that arrives within the allowed wait.
+
+    A spec nobody has reviewed is the raw first design; waiting a little for its first reviewed revision costs less than data
+    that carries the first design's flaws. A refinement that finishes without improving it, or one that is not running, ends the wait.
+    """
+    from config.runtime import SPEC_GENERATE_REFINE_WAIT_SECONDS
+
+    if spec.reviewed or SPEC_GENERATE_REFINE_WAIT_SECONDS <= 0:
+        return spec
+    deadline = time.monotonic() + SPEC_GENERATE_REFINE_WAIT_SECONDS
+    with _REFINE_CHANGED:
+        while (key in _REFINING or key in _REFINE_SCHEDULED) and _REFINE_REVISION.get(key, spec.revision) <= spec.revision:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _REFINE_CHANGED.wait(remaining)
+    latest = store.load(key)
+    return latest if latest is not None and names == set(latest.delivered.values()) else spec
 
 
 def design_key(variables: list[dict[str, Any]], brief: dict[str, Any]) -> str | None:
@@ -178,9 +202,11 @@ def _refine_job(variables: list[dict[str, Any]], brief: dict[str, Any], key: str
                 compiler: SpecCompiler | None) -> None:
     """Improve the stored spec of ``key`` with the reviewer's findings; every better version is stored as it is found. Never raises."""
     with _FLIGHT_LOCK:
+        _REFINE_SCHEDULED.discard(key)
         if key in _REFINING:
             return
         _REFINING.add(key)
+        _REFINE_REVISION.setdefault(key, spec.revision)
     published: dict[str, Any] = {"spec": spec}
     try:
         comp = compiler or SpecCompiler()
@@ -192,6 +218,9 @@ def _refine_job(variables: list[dict[str, Any]], brief: dict[str, Any], key: str
             better.spec = better.spec.model_copy(update={"reviewed": False, "design": better.overlay or {}})
             store.save(key, better.spec, {"brief": brief, "rounds": better.rounds})
             published["spec"] = better.spec
+            with _REFINE_CHANGED:
+                _REFINE_REVISION[key] = better.spec.revision
+                _REFINE_CHANGED.notify_all()
             logger.info("generation spec %s improved to revision %d (%d finding(s) left)", key[:8], better.spec.revision, len(better.findings))
 
         better = comp.refine(variables, brief, current, notes=notes, resources=resources, on_improve=publish)
@@ -207,8 +236,10 @@ def _refine_job(variables: list[dict[str, Any]], brief: dict[str, Any], key: str
     except Exception:
         logger.exception("background refinement of generation spec %s failed", key[:8])
     finally:
-        with _FLIGHT_LOCK:
+        with _REFINE_CHANGED:
             _REFINING.discard(key)
+            _REFINE_REVISION.pop(key, None)
+            _REFINE_CHANGED.notify_all()
 
 
 def _schedule_refinement(variables: list[dict[str, Any]], brief: dict[str, Any], key: str, spec: GenerationSpec,
@@ -220,6 +251,8 @@ def _schedule_refinement(variables: list[dict[str, Any]], brief: dict[str, Any],
     with _FLIGHT_LOCK:
         if time.monotonic() - _REFINE_BACKOFF.get(key, -REFINE_BACKOFF_SECONDS) < REFINE_BACKOFF_SECONDS:
             return                                           # the reviewer could not be reached a moment ago
+        if not (inline or mode == "inline"):
+            _REFINE_SCHEDULED.add(key)
     if inline or mode == "inline":
         _refine_job(variables, brief, key, spec, compiler)
         return
@@ -357,6 +390,7 @@ def resolve_spec(context: dict[str, Any], variables: list[dict[str, Any]], *, wa
     pinned = store.load(pinned_key)
     if pinned is not None and names == set(pinned.delivered.values()):
         _schedule_refinement(usable, brief, pinned_key, pinned, compiler)
+        pinned = _after_refinement(pinned_key, pinned, names)
         return SpecResolution(pinned, pinned_key, "pinned", _describe(pinned, pinned_key, "pinned"))
     key = design_key(usable, brief)
     if key is None:
@@ -365,6 +399,9 @@ def resolve_spec(context: dict[str, Any], variables: list[dict[str, Any]], *, wa
     if found is not None:
         if found.spec is not None:
             _schedule_refinement(usable, brief, key, found.spec, compiler)
+            latest = _after_refinement(key, found.spec, names)
+            if latest is not found.spec:
+                return SpecResolution(latest, key, found.status, _describe(latest, key, found.status))
         return found
     if store.recently_failed(key):
         return SpecResolution(None, key, "unavailable", _describe(None, key, "unavailable", _why(key, "a recent attempt to design this spec failed")))

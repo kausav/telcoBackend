@@ -74,6 +74,9 @@ if SPEC_REFINE_MODE not in {"background", "inline", "off"}:
     SPEC_REFINE_MODE = "background"
 # The longest /scenario/generate waits for a spec that is still being designed before answering "not ready, retry".
 SPEC_GENERATE_WAIT_SECONDS = max(1, int(os.getenv("SPEC_GENERATE_WAIT_SECONDS", "90")))
+# A spec that has not been reviewed yet is the raw first design; /scenario/generate waits up to this long for the refinement's first
+# improvement (or its end) before generating, so that the data comes from the reviewed spec. 0 generates from the first design at once.
+SPEC_GENERATE_REFINE_WAIT_SECONDS = max(0, int(os.getenv("SPEC_GENERATE_REFINE_WAIT_SECONDS", "150")))
 # Start designing a proposal's spec in the background as soon as it is proposed (the person reviews it meanwhile).
 SPEC_WARM_ON_PROPOSE = os.getenv("SPEC_WARM_ON_PROPOSE", "true").strip().lower() in {"1", "true", "yes", "on"}
 
