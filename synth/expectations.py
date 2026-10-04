@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import statistics
 from datetime import datetime
 from typing import Any
 
@@ -249,6 +250,31 @@ def same_fact(pairs: list[tuple[Any, Any]]) -> str | None:
     return None
 
 
+def entity_pairs(spec: GenerationSpec, rows: list[dict[str, Any]], a: str, b: str) -> list[tuple[Any, Any]]:
+    """One ``(a, b)`` pair per entity, for two entity-level columns (their rows repeat the same value, so rows would overcount)."""
+    seen: dict[Any, tuple[Any, Any]] = {}
+    for r in rows:
+        if r.get(a) is not None and r.get(b) is not None:
+            seen.setdefault(r.get(spec.entity_column), (r[a], r[b]))
+    return list(seen.values())
+
+
+def near_linear(pairs: list[tuple[Any, Any]]) -> float | None:
+    """The Pearson correlation of two numeric columns when it is so close to +-1 that one is the other with a little noise.
+
+    Meant for facts of the entity (two scores, two ratings), measured on one pair per entity: two such facts about one subject
+    that move together this exactly are one measure written twice (a rating that is a constant minus the score).
+    """
+    nums = [(x, y) for x, y in pairs if isinstance(x, (int, float)) and isinstance(y, (int, float)) and not isinstance(x, bool) and not isinstance(y, bool)]
+    if len(nums) < 15 or len({round(x, 2) for x, _ in nums}) < 10 or len({round(y, 2) for _, y in nums}) < 10:
+        return None
+    try:
+        r = statistics.correlation([x for x, _ in nums], [y for _, y in nums])
+    except statistics.StatisticsError:
+        return None
+    return r if abs(r) >= 0.98 else None
+
+
 def _short(value: Any, limit: int = 60) -> str:
     text = value.isoformat() if isinstance(value, datetime) else repr(value)
     return text if len(text) <= limit else text[:limit - 1] + "…"
@@ -401,6 +427,13 @@ def check(spec: GenerationSpec, rows: list[dict[str, Any]], expectations: dict[s
             a, b = rule["columns"]
             pairs = [(r[a], r[b]) for r in rows if r.get(a) is not None and r.get(b) is not None]
             how = same_fact(pairs)
+            if how is None and names[a] in spec.entity_columns and names[b] in spec.entity_columns:
+                r = near_linear(entity_pairs(spec, rows, a, b))
+                if r is not None:
+                    out.append(_finding(kind, "error", [names[a], names[b]],
+                                        f"{names[a]} and {names[b]} move together almost exactly (correlation {r:+.2f} across entities) although they are "
+                                        f"different facts{why}.", f"{len(entity_pairs(spec, rows, a, b))} entities",
+                                        "Give each its own hidden driver (correlated if related, but with its own variation)."))
             if how:
                 said = {"identical": "carry the same value", "sum": "add up to one constant", "difference": "differ by one constant",
                         "one_to_one": "relabel each other one-to-one"}[how]
@@ -456,32 +489,6 @@ def _state_shares(spec: GenerationSpec, rows: list[dict[str, Any]], expectations
                                 f"Set the probabilities behind {spec.delivered[col]} so that '{item['value']}' falls in that band "
                                 f"(or state in 'assumptions' why this scenario differs)."))
     return out[:6]
-
-
-def constant_columns(spec: GenerationSpec, rows: list[dict[str, Any]], expectations: dict[str, Any] | None, fixed: set[str]) -> list[dict[str, Any]]:
-    """Findings for non-numeric columns that carry one single value on every row and were not declared constant.
-
-    ``fixed`` are the columns whose own definition fixes the value. Without expectations nothing is said (a constant string is
-    often right: a currency, a country); with them, a constant that nobody expected is a column that was never modelled.
-    """
-    if not expectations:
-        return []
-    n = len(rows)
-    if n < 100:
-        return []
-    declared = set(expectations.get("constants") or [])
-    out = []
-    for cid, name in spec.delivered.items():
-        if cid in declared or name in fixed or cid == spec.entity_column or spec.columns[cid].dtype in ("integer", "float", "boolean"):
-            continue
-        present = [r.get(cid) for r in rows if r.get(cid) is not None]
-        if len(present) >= n // 2 and len({repr(v) for v in present}) == 1:
-            out.append({"id": "constant_column", "severity": "warn", "columns": [name],
-                        "problem": f"Column {name} has the value {_short(present[0])} on every row of every entity.",
-                        "evidence": f"{n} simulated rows, one distinct value",
-                        "fix": "Unless this is a fact that is truly fixed for the scenario, let it vary the way the real fact does "
-                               "(by entity, by event, by cause) with realistic values for the country and industry."})
-    return out[:3]
 
 
 def render(expectations: dict[str, Any] | None) -> dict[str, Any] | None:

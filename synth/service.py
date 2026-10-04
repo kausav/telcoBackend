@@ -79,6 +79,10 @@ def _describe(spec: GenerationSpec | None, key: str | None, status: str, problem
         report.update(source=spec.source, assumptions=spec.assumptions, currency=spec.currency, timezone=spec.timezone,
                       invariants=len(spec.invariants), targets=len(spec.targets), columns=len(spec.delivered),
                       revision=spec.revision, reviewed=spec.reviewed, refining=refining(key))
+        found = spec.design.get("expectations") if isinstance(spec.design, dict) else None
+        if isinstance(found, dict):
+            report["expectations"] = {"rules": len(found.get("rules") or []), "entity_facts": len(found.get("entity_facts") or []),
+                                      "constants": len(found.get("constants") or []), "state_shares": len(found.get("state_shares") or [])}
         if spec.warnings:
             report["review_warnings"] = spec.warnings
     if problems:
@@ -457,15 +461,28 @@ def _attempt_seed(seed: int | None, attempt: int) -> int | None:
     return (int(seed) * 1_000_003 + attempt) % 2_147_483_647
 
 
+def _degenerate(spec: GenerationSpec, columns: set[str], rows: list[dict[str, Any]]) -> int:
+    """How badly a small dataset misrepresents its columns: a column empty on every row weighs two, a number or yes/no that is
+    one single value on every row weighs one (a conditional fact that chance happened never to trigger reads as a broken column)."""
+    score = 0
+    for c in columns:
+        present = [row[c] for row in rows if row.get(c) is not None]
+        if not present:
+            score += 2
+        elif len(rows) >= 20 and spec.columns[c].dtype in ("integer", "float", "boolean") and len({repr(v) for v in present}) == 1:
+            score += 1
+    return score
+
+
 def _simulate_with_coverage(engine, spec: GenerationSpec, columns: set[str], *, seed: int | None, as_of: Any, count: int,
                             per_entity: int):
-    """Simulate, preferring a dataset in which every delivered column carries at least one value.
+    """Simulate, preferring a dataset in which every delivered column carries a value and no number or flag is stuck on one.
 
-    A conditional fact (a recurring-top-up period, a suspension reason) is empty on the rows it does not apply
-    to, but in a small dataset chance alone can leave it empty everywhere, which reads as a broken column. The
+    A conditional fact (a recurring-top-up period, a suspension reason, a retry count) is empty or stuck on the rows it does
+    not apply to, but in a small dataset chance alone can leave it so everywhere, which reads as a broken column. The
     attempts are a deterministic sequence derived from the seed (the first is the seed itself), so the same
-    request always yields the same dataset; the first attempt that represents every column wins, otherwise the
-    one with the fewest empty columns.
+    request always yields the same dataset; the first attempt that has no such column wins, otherwise the
+    one with the least of them (a column that really is constant makes every attempt equal, and the first stays).
     """
     base_as_of = RunContext(seed=0, as_of=as_of, tz_name=spec.timezone).as_of
     attempts = max(1, min(_COVERAGE_MAX_ATTEMPTS, _COVERAGE_ROW_BUDGET // max(1, count * per_entity)))
@@ -473,10 +490,10 @@ def _simulate_with_coverage(engine, spec: GenerationSpec, columns: set[str], *, 
     for attempt in range(attempts):
         ctx = RunContext(seed=_attempt_seed(seed, attempt), as_of=base_as_of, tz_name=spec.timezone)
         rows = engine.simulate(spec, ctx, entities=count, per_entity=per_entity, hints={})
-        empty = sum(1 for c in columns if all(row.get(c) is None for row in rows))
-        if best is None or empty < best[0]:
-            best = (empty, ctx, rows)
-        if empty == 0:
+        score = _degenerate(spec, columns, rows)
+        if best is None or score < best[0]:
+            best = (score, ctx, rows)
+        if score == 0:
             break
     return best[1], best[2]
 
