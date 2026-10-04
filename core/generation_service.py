@@ -278,7 +278,7 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
 
     if spec_state is None:
         # No verified spec: the definition-driven generator ran. Say so, never let it pass for the spec-driven path.
-        state.validation_report = {**(state.validation_report or {}), "generation_engine": LEGACY_ENGINE,
+        state.validation_report = {**(state.validation_report or {}), "generation_engine": LEGACY_ENGINE, "quality_target_met": False,
                                    "generation_spec": spec_report,
                                    "generation_warning": "No verified generation spec was available for this scenario, so every "
                                    "column was generated from its own definition without scenario-level behaviour modelling."}

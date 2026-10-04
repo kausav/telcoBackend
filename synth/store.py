@@ -73,9 +73,15 @@ def save(key: str, spec: GenerationSpec, meta: dict[str, Any]) -> bool:
         return False
 
 
-def annotate(key: str, spec: GenerationSpec, warnings: list[str], reviewed: bool = True) -> GenerationSpec:
-    """The same spec with the outcome of a review recorded on it (behaviour and revision unchanged)."""
-    updated = spec.model_copy(update={"warnings": warnings, "reviewed": reviewed})
+def annotate(key: str, spec: GenerationSpec, warnings: list[str], reviewed: bool = True,
+             refinement: dict[str, Any] | None = None) -> GenerationSpec:
+    """The same spec with the outcome of a review recorded on it (behaviour and revision unchanged).
+
+    ``refinement`` (what the improvement rounds did) is kept with the in-memory design so the report can show it."""
+    changes: dict[str, Any] = {"warnings": warnings, "reviewed": reviewed}
+    if refinement:
+        changes["design"] = {**(spec.design or {}), "refinement": refinement}
+    updated = spec.model_copy(update=changes)
     with _LOCK:
         current = _SPECS.get(key)
         if current is None or current[0].revision <= updated.revision:

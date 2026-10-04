@@ -48,7 +48,7 @@ from synth.spec import EVAL_VARS, SPEC_VERSION, Emit, GenerationSpec, Invariant,
 
 logger = logging.getLogger(__name__)
 
-COMPILER_VERSION = 7
+COMPILER_VERSION = 8
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
 DRAFT_REPAIRED_WARNINGS = frozenset({"shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
@@ -397,7 +397,7 @@ def build_prompt(brief: dict[str, Any], base: Baseline, notes: dict[str, dict[st
 
 
 def repair_prompt(first: str, overlay: dict[str, Any], problems: list[str]) -> str:
-    return (first + "\n\nYOUR CURRENT SPEC:\n" + json.dumps({k: v for k, v in overlay.items() if k not in ("healed", "expectations", "draft_review")}, ensure_ascii=False, separators=(",", ":"))
+    return (first + "\n\nYOUR CURRENT SPEC:\n" + json.dumps({k: v for k, v in overlay.items() if k not in ("healed", "expectations", "draft_review", "refinement")}, ensure_ascii=False, separators=(",", ":"))
             + "\n\nIT WAS SIMULATED AND CHECKED. THESE PROBLEMS MUST BE FIXED (the first ones are the most serious):\n- "
             + "\n- ".join(problems[:14])
             + "\n\nFix the root cause in the behaviour; do not remove an invariant or target merely to make it pass unless it is itself wrong. "
@@ -674,7 +674,8 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
     try:
         rows = engine.simulate(spec, ctx, entities=entities, per_entity=1 if aggregational else per_entity, hints={})
     except SpecRuntimeError as exc:
-        return [f"RUNTIME column '{exc.column}' failed while being drawn: {_short(str(exc.cause), 200)}"], {}
+        return [f"RUNTIME column '{exc.column}' failed while being drawn: {_short(str(exc.cause), 200)}"], \
+            {"quarantine": {"duplicates": [], "invariants": [], "columns": {str(exc.column): "its expression failed while being drawn"}}}
     except Exception as exc:
         return [f"RUNTIME the simulation failed: {_short(f'{type(exc).__name__}: {exc}', 240)}"], {}
     delivered = spec.delivered
@@ -685,14 +686,21 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
     contract = build_contract(variables, delivered)
     report = score_rows(spec, parsed, engine.reference_view(spec, ctx), columns=set(delivered), parse_errors=parse_errors, contract=contract)
     problems: list[str] = []
+    by_name = {name: cid for cid, name in delivered.items()}
+    quarantine: dict[str, Any] = {"duplicates": [], "invariants": [], "columns": {}}
     for err in report["structure"]["parse_errors"][:3]:
+        if err.get("column") in by_name:
+            quarantine["columns"][by_name[err["column"]]] = "its values could not be parsed in the delivered format"
         problems.append(f"FORMAT column '{err['column']}' produced an unparseable value {err['value']!r}: {err['error']}")
     for v in report["structure"]["contract_violations"]:
+        if v.get("column") in by_name:
+            quarantine["columns"].setdefault(by_name[v["column"]], "its values broke its own definition")
         problems.append(f"CONTRACT column '{v['column']}': {v['violations']} value(s) break its definition ({v['rule']}"
                         f"{' ' + _short(v['allowed'], 160) if v['allowed'] is not None and v['rule'] != 'not_null' else ''}); e.g. "
                         f"{_short([e['value'] for e in v['examples']], 100)}"
                         + ("  -> the column is non-nullable: it must always have a value" if v["rule"] == "not_null" else ""))
     for f in report["invariants"]["failed"]:
+        quarantine["invariants"].append(f["id"])
         ex = f["examples"][0] if f.get("examples") else {}
         problems.append(f"INVARIANT '{f['id']}' failed on {f['violations']} of {f['evaluated']} {f['level']}s ({f['message']}); e.g. {_short(ex, 220)}")
     for t in report["targets"]["results"]:
@@ -700,6 +708,7 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
             problems.append(f"TARGET '{t['id']}' expects {t['min']}..{t['max']} but the simulation gives {t.get('observed')} (n={t.get('n')}); "
                             "either the behaviour or the expectation is wrong")
     for d in report["structure"]["duplicate_columns"]:
+        quarantine["duplicates"].append(list(d["columns"]))
         problems.append(f"DUPLICATE columns {d['columns']} carry the same value on every row; draw the fact once and derive the other column from it, or make the difference real")
     # placeholders and impossible future timestamps
     future_ok = set(spec.output.get("future_ok") or [])
@@ -711,8 +720,10 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
             v = r.get(cid)
             if isinstance(v, str) and _PLACEHOLDER.match(v):
                 placeholders.setdefault(cid, v)
+                quarantine["columns"].setdefault(cid, "it only produced neutral placeholder tokens")
             elif col.dtype == "datetime" and v is not None and v > ctx.as_of and cid not in future_ok:
                 future[cid] = future.get(cid, 0) + 1
+                quarantine["columns"].setdefault(cid, "it recorded moments later than as_of")
     total = len(rows)
     empty_ids: list[str] = []
     if total >= 30:
@@ -729,6 +740,7 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
         problems.append(f"FUTURE column '{cid}' has {n} value(s) later than as_of, but it records something that has already happened; "
                         "bound its delay, make it absent when it would be in the future, or list it in 'future_ok' if it is a planned/future fact")
     report["problems"] = len(problems)
+    report["quarantine"] = quarantine
     report["empty_columns"] = empty_ids
     report["failed_targets"] = [t["id"] for t in report["targets"]["results"] if t["status"] == "fail"]
     if not problems:
@@ -1706,7 +1718,7 @@ def spec_key(brief: dict[str, Any], variables: list[dict[str, Any]]) -> str:
 MEASURED_FINDINGS = frozenset({"window_overlap", "constant_numeric_column", "near_constant_numeric_column", "near_empty_column",
                                "part_exceeds_bound", "stale_in_flight", "shared_identifier", "mirrored_columns", "counter_spacing",
                                "flag_contradicts_state", "near_constant_state", "near_complement", "entity_stamp_inside_history", "healed_empty_column",
-                               "healed_target", "check"})
+                               "healed_target", "healed_duplicate", "healed_invariant", "healed_column", "check"})
 
 
 def is_measured(finding: dict[str, Any]) -> bool:
@@ -1732,12 +1744,16 @@ def _weight(findings: list[dict[str, Any]]) -> int:
 def _accepts(candidate: list[dict[str, Any]], best: list[dict[str, Any]], *, total: bool = False) -> bool:
     """Whether ``candidate`` findings are an improvement on ``best`` without making anything that was measured worse.
 
-    No new measured error, no heavier measured findings; and then the measured part must be lighter - or, with ``total``, the
-    whole (the reviewer's opinions included) must be.
+    No new measured error, no heavier measured findings; and then the measured part must be lighter - or, with ``total`` (the
+    reviewer read the candidate too), the whole must be. A fix of an impossible record is worth one new minor measured finding: with
+    ``total``, a candidate that is at least three lighter overall may carry one more measured warning than the spec it replaces.
     """
-    if _measured_errors(candidate) > _measured_errors(best) or _measured_weight(candidate) > _measured_weight(best):
+    if _measured_errors(candidate) > _measured_errors(best):
         return False
-    return _measured_weight(candidate) < _measured_weight(best) or (total and _weight(candidate) < _weight(best))
+    measured = _measured_weight(candidate) - _measured_weight(best)
+    if measured > 0:
+        return total and measured <= 1 and _weight(candidate) - _weight(best) <= -3
+    return measured < 0 or (total and _weight(candidate) < _weight(best))
 
 
 _EXPECTATION_CACHE: dict[str, dict[str, Any]] = {}
@@ -1901,25 +1917,45 @@ class SpecCompiler:
         return found
 
     def _heal_soft(self, base: Baseline, brief: dict[str, Any], rnd: _Round, *, final: bool) -> _Round:
-        """Repair what can be repaired without the model: a column that is empty on every row and a target the data misses.
+        """Keep a design whose defects are confined to a few columns, instead of losing it (and every column's behaviour) for them.
 
-        A target is the author's expectation of a share or median, a condition that never holds is the author's mistake about
-        when a fact exists; neither is a reason to lose the whole design. The column then carries values from its own
-        definition, the target is dropped, and the change is reported as a finding so that the refinement can model it properly.
-        Only when nothing else is wrong (or the repair rounds are spent) - otherwise the author gets to fix it itself first.
+        The damage is confined to the column that caused it, and each repair is reported as a finding for the refinement:
+
+        * a column empty on every row loses its condition, else falls back to its own definition; a target the data misses is dropped
+          (both at once, when nothing else is wrong - they are the author's mistakes about when a fact exists);
+        * once the repair rounds are spent: a column that is identical to another becomes a derivation of it (which is what the repair
+          message asks for), a failing invariant is dropped, and a column whose values break its definition, cannot be parsed, only
+          shows placeholders, lies in the future or cannot be drawn falls back to its own definition.
+
+        Anything structural (an unknown column, a cycle) is still a rejected design.
         """
-        soft = [p for p in rnd.problems if p.startswith(("EMPTY ", "TARGET "))]
-        if not soft or not rnd.overlay or (not final and len(soft) != len(rnd.problems)):
+        immediate = ("EMPTY ", "TARGET ")
+        late = ("DUPLICATE ", "INVARIANT ", "CONTRACT ", "FORMAT ", "PLACEHOLDER ", "FUTURE ", "RUNTIME ")
+        soft = [p for p in rnd.problems if p.startswith(immediate + late)]
+        if not soft or not rnd.overlay:
+            return rnd
+        if not final and any(not p.startswith(immediate) for p in rnd.problems):
+            return rnd                                    # the author gets to fix it itself first
+        if final and len(soft) != len(rnd.problems):
             return rnd
         overlay = copy.deepcopy(rnd.overlay)
         notes: list[dict[str, Any]] = []
         current = rnd
-        for step in range(2):
-            empty = list(current.report.get("empty_columns") or [])
-            failed = set(current.report.get("failed_targets") or [])
-            if not empty and not failed:
+        order = {cid: i for i, cid in enumerate(base.spec.columns)}
+
+        def note(fid: str, columns: list[str], problem: str, fix: str) -> None:
+            notes.append({"id": fid, "severity": "warn", "columns": columns, "problem": problem, "evidence": "", "fix": fix})
+
+        for step in range(3):
+            report = current.report or {}
+            empty = list(report.get("empty_columns") or [])
+            failed = set(report.get("failed_targets") or [])
+            quarantine = report.get("quarantine") or {}
+            if not empty and not failed and not (final and (quarantine.get("duplicates") or quarantine.get("invariants")
+                                                            or quarantine.get("columns"))):
                 break
             columns = overlay.get("columns") if isinstance(overlay.get("columns"), list) else []
+            overlay["columns"] = columns
             for cid in empty:
                 entry = next((c for c in columns if isinstance(c, dict) and c.get("name") == cid), None)
                 if entry is None:
@@ -1930,15 +1966,38 @@ class SpecCompiler:
                 else:
                     columns.remove(entry)
                     what = "its behaviour left it empty and was replaced by its definition"
-                notes.append({"id": "healed_empty_column", "severity": "warn", "columns": [cid],
-                              "problem": f"Column {cid} was empty on every row; {what}.", "evidence": "",
-                              "fix": "Model when this fact really exists and make that situation occur in this scenario."})
+                note("healed_empty_column", [cid], f"Column {cid} was empty on every row; {what}.",
+                     "Model when this fact really exists and make that situation occur in this scenario.")
             if failed and isinstance(overlay.get("targets"), list):
                 overlay["targets"] = [t for t in overlay["targets"] if not (isinstance(t, dict) and t.get("id") in failed)]
                 for tid in sorted(failed):
-                    notes.append({"id": "healed_target", "severity": "warn", "columns": [],
-                                  "problem": f"Target {tid} did not hold on the simulated data and was dropped.", "evidence": "",
-                                  "fix": "Either change the behaviour so the expectation holds or state a realistic expectation."})
+                    note("healed_target", [], f"Target {tid} did not hold on the simulated data and was dropped.",
+                         "Either change the behaviour so the expectation holds or state a realistic expectation.")
+            if final:
+                for group in quarantine.get("duplicates") or []:
+                    keep, *rest = sorted(group, key=lambda c: order.get(c, 0))
+                    for cid in rest:
+                        columns[:] = [c for c in columns if not (isinstance(c, dict) and c.get("name") == cid)]
+                        columns.append({"name": cid, "scope": "event", "expr": keep})
+                        note("healed_duplicate", [keep, cid], f"Column {cid} carried the same value as {keep} on every row and is now derived from it.",
+                             "If they are two facts, make the difference real (one holds only under a condition, or a different outcome).")
+                gone = set(quarantine.get("invariants") or [])
+                if gone and isinstance(overlay.get("invariants"), list):
+                    kept = []
+                    for i, item in enumerate(overlay["invariants"]):
+                        ident = str(item.get("id") or f"invariant_{i + 1}") if isinstance(item, dict) else ""
+                        if ident in gone:
+                            note("healed_invariant", [], f"Invariant {ident} failed on the simulated data and was dropped.",
+                                 "Either change the behaviour so the rule holds or state the rule the data really follows.")
+                        else:
+                            kept.append(item)
+                    overlay["invariants"] = kept
+                for cid, why in (quarantine.get("columns") or {}).items():
+                    before = len(columns)
+                    columns[:] = [c for c in columns if not (isinstance(c, dict) and c.get("name") == cid)]
+                    if len(columns) != before:
+                        note("healed_column", [cid], f"Column {cid} fell back to its own definition because {why}.",
+                             "Model this column's behaviour again so that it agrees with the rest of the scenario.")
             current = self._verified(base, brief, overlay)
             if current.spec is not None:
                 current.report["advice"] = notes + list(current.report.get("advice") or [])
@@ -2094,6 +2153,14 @@ class SpecCompiler:
             logger.info("behaviour spec draft round %d: %d problem(s)", round_no, len(problems))
             current = rnd.overlay or None            # an empty reply has nothing to patch: ask again from the start
             prompt = repair_prompt(first, rnd.overlay, problems) if current else first
+        if rnd is not None and rnd.spec is None and rnd.overlay and rnd.problems:
+            # the rounds are spent (or the time is): keep what works of the design rather than fall back to no behaviour at all
+            healed = self._heal_soft(base, brief, rnd, final=True)
+            if healed.spec is not None:
+                logger.info("behaviour spec draft kept after confining %d problem(s) to their columns", len(rnd.problems))
+                healed.report.update(rounds=self.max_repairs, problems=0)
+                return CompileResult(healed.spec, "compiled", [], self.max_repairs, healed.overlay, healed.report,
+                                     list(healed.report.get("advice") or []))
         return CompileResult(None, "rejected", problems, self.max_repairs, rnd.overlay if rnd else None)
 
     def refine(self, variables: list[dict[str, Any]], brief: dict[str, Any], current: CompileResult, *,
@@ -2114,7 +2181,7 @@ class SpecCompiler:
         started = time.monotonic()
         stored = current.overlay.get("expectations")
         expectations = stored if isinstance(stored, dict) else self._expectations(base, brief, notes)
-        start_overlay = {k: v for k, v in current.overlay.items() if k != "draft_review"}
+        start_overlay = {k: v for k, v in current.overlay.items() if k not in ("draft_review", "refinement")}
         if expectations is not None:
             start_overlay["expectations"] = expectations
         drafted = current.overlay.get("draft_review")
@@ -2133,20 +2200,29 @@ class SpecCompiler:
         healed = [h for h in current.overlay.get("healed") or [] if isinstance(h, dict) and h.get("problem")]
         findings = sorted(healed + findings, key=lambda f: f["severity"] != "error")
         best = (_weight(findings), current.spec, start_overlay, current.report, findings, review)
+        stats: dict[str, Any] = {"weight_before": _weight(findings), "findings_before": len(findings), "author_calls": 0, "accepted": 0,
+                                 "rejected_by_checks": 0, "rejected_as_worse": 0, "stopped": "rounds"}
         first = build_prompt(brief, base, notes, resources, expectations)
         overlay, rounds = {k: v for k, v in start_overlay.items() if k != "healed"}, 0
         counted = 0                                        # rounds that produced a spec to judge; a rejected patch is a second chance, not a round
         while counted < self.refine_rounds and rounds < self.refine_rounds + REJECTED_PATCH_ALLOWANCE:
-            if _weight(findings) <= GOOD_ENOUGH_WEIGHT or time.monotonic() - started > self._refine_budget():
+            if _weight(findings) <= GOOD_ENOUGH_WEIGHT:
+                stats["stopped"] = "good_enough"
+                break
+            if time.monotonic() - started > self._refine_budget():
+                stats["stopped"] = "time"
                 break
             rounds += 1
+            stats["author_calls"] += 1
             try:
                 rnd = self._round(base, brief, repair_prompt(first, overlay, [review_problem(f) for f in findings]), overlay,
                                   expectations=expectations)
             except Exception as exc:
                 logger.warning("behaviour spec refinement: model unavailable (%s: %s)", type(exc).__name__, exc)
+                stats["stopped"] = "model_unavailable"
                 break
             if rnd.spec is None:                           # the patch broke a deterministic check: tell the author, keep the old spec
+                stats["rejected_by_checks"] += 1
                 overlay = rnd.overlay if rnd.overlay else overlay
                 findings = [{"id": "check", "severity": "error", "columns": [], "problem": p, "evidence": "", "fix": ""} for p in rnd.problems[:8]] + findings
                 logger.info("behaviour spec refinement round %d: patch rejected (%d problem(s))", rounds, len(rnd.problems))
@@ -2154,14 +2230,15 @@ class SpecCompiler:
             counted += 1
             # a candidate that made something measured worse is not going to be kept: the reviewer need not read it
             worse = _measured_errors(rnd.report.get("advice") or []) > _measured_errors(best[4]) \
-                or _measured_weight(rnd.report.get("advice") or []) > _measured_weight(best[4])
+                or _measured_weight(rnd.report.get("advice") or []) > _measured_weight(best[4]) + 1
             candidate, review = self._all_findings(brief, base, rnd, notes, resources, consult_reviewer=not worse)
             overlay = rnd.overlay
             weight = _weight(candidate)
             logger.info("behaviour spec refinement round %d: %d finding(s), weight %d (best %d)", rounds, len(candidate), weight, best[0])
             # The reviewer reads the same data differently on every call, so only what was measured is compared strictly; the
             # reviewer's findings count for the total, which must then be lighter - or the measured part must be.
-            if _accepts(candidate, best[4], total=True):
+            if _accepts(candidate, best[4], total=review in ("clean", "findings")):
+                stats["accepted"] += 1
                 best = (weight, rnd.spec, rnd.overlay, rnd.report, candidate, review)
                 if on_improve is not None:                  # whoever waits for the spec gets each improvement as soon as it exists
                     report = dict(rnd.report)
@@ -2170,13 +2247,17 @@ class SpecCompiler:
                         on_improve(CompileResult(rnd.spec, "compiled", [], int(report["rounds"]), rnd.overlay, report, candidate))
                     except Exception:
                         logger.exception("could not publish a refined generation spec")
+            else:
+                stats["rejected_as_worse"] += 1
             findings = candidate
+        stats.update(weight_after=best[0], findings_after=len(best[4]))
+        current.report["refinement"] = stats
         if best[1] is current.spec:
             current.findings = best[4]
             current.report["review"] = best[5]
             return None
         report = dict(best[3])
-        report.update(rounds=int(current.report.get("rounds", 0)) + rounds, review=best[5])
+        report.update(rounds=int(current.report.get("rounds", 0)) + rounds, review=best[5], refinement=stats)
         return CompileResult(best[1], "compiled", [], int(report["rounds"]), best[2], report, best[4])
 
     def _round_for(self, base: Baseline, brief: dict[str, Any], spec: GenerationSpec, overlay: dict[str, Any]) -> _Round:

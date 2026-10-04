@@ -77,7 +77,12 @@ GUIDANCE
   you cannot judge. Never give a band for an identifier.
 - Prefer a few rules you are sure of (at most 30) over many guesses: a rule that is wrong rejects correct data. Do not write a rule
   for a column pair that has no real relation. Every rule needs a one-sentence "why" that is true for this scenario.
-- Do not restate a column's own definition (allowed values, ranges, formats): those are already checked.
+- Do not restate a column's own definition (allowed values, ranges, formats): those are already checked. DO state what is true
+  in the real world but a loose definition does not enforce, as "holds" rules you are sure of: an identifier in the format its
+  country really issues (a phone number, tax or account number: use matches(regex, value) and allow an empty value when the
+  column can be empty), a score or rating on the scale that country's institutions really use, a quantity that cannot be smaller
+  than the smallest real unit of what it counts. Two columns that rate the same subject move in opposite or the same direction:
+  say which with a "holds" rule instead of leaving them unrelated.
 """
 
 PROMPT_HASH = hashlib.sha256(EXPECTATION_PROMPT.encode()).hexdigest()[:12]

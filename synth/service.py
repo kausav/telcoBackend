@@ -83,6 +83,12 @@ def _describe(spec: GenerationSpec | None, key: str | None, status: str, problem
         if isinstance(found, dict):
             report["expectations"] = {"rules": len(found.get("rules") or []), "entity_facts": len(found.get("entity_facts") or []),
                                       "constants": len(found.get("constants") or []), "state_shares": len(found.get("state_shares") or [])}
+        refined = spec.design.get("refinement") if isinstance(spec.design, dict) else None
+        if isinstance(refined, dict):
+            report["refinement"] = refined
+        healed = spec.design.get("healed") if isinstance(spec.design, dict) else None
+        if healed:
+            report["confined_defects"] = [str(h.get("problem")) for h in healed if isinstance(h, dict)][:12]
         if spec.warnings:
             report["review_warnings"] = spec.warnings
     if problems:
@@ -236,7 +242,8 @@ def _refine_job(variables: list[dict[str, Any]], brief: dict[str, Any], key: str
             with _FLIGHT_LOCK:
                 _REFINE_BACKOFF[key] = time.monotonic()
         latest = published["spec"]
-        store.annotate(key, latest, [finding_text(f) for f in findings] or latest.warnings, reviewed=review not in {"skipped", "deferred"})
+        store.annotate(key, latest, [finding_text(f) for f in findings] or latest.warnings, reviewed=review not in {"skipped", "deferred"},
+                       refinement=(better.report if better is not None else current.report).get("refinement"))
     except Exception:
         logger.exception("background refinement of generation spec %s failed", key[:8])
     finally:
@@ -443,7 +450,7 @@ def generate(spec: GenerationSpec, variables: list[dict[str, Any]], *, count: in
     report = score_rows(spec, parsed, engine.reference_view(spec, ctx), columns=set(delivered), parse_errors=parse_errors,
                         contract=build_contract(variables, delivered))
     report.update(seed=seed, as_of=ctx.as_of.isoformat(), engine=spec.engine, generation_engine=spec.engine,
-                  spec_revision=spec.revision, spec_assumptions=spec.assumptions, **_summary_keys(report, count, per_entity, len(records), len(spec.warnings)))
+                  spec_revision=spec.revision, spec_assumptions=spec.assumptions, **_summary_keys(report, count, per_entity, len(records), spec.warnings))
     clock = spec.columns[spec.clock].column if spec.clock else None
     return SpecGeneration(records=records, fields=list(records[0]) if records else [], entity_columns=spec.entity_columns,
                           clock_column=clock, validation_report=report)
@@ -498,7 +505,7 @@ def _simulate_with_coverage(engine, spec: GenerationSpec, columns: set[str], *, 
     return best[1], best[2]
 
 
-def _summary_keys(report: dict[str, Any], count: int, per_entity: int, produced: int, warnings: int) -> dict[str, Any]:
+def _summary_keys(report: dict[str, Any], count: int, per_entity: int, produced: int, warnings: list[str]) -> dict[str, Any]:
     """The keys clients already read, filled with values *measured* on the delivered rows (never constants)."""
     from config.runtime import MIN_LOGIC_QUALITY_PERCENT
 
@@ -511,6 +518,7 @@ def _summary_keys(report: dict[str, Any], count: int, per_entity: int, produced:
 
     conformance = pct(max(0, produced - int(report.get("structure", {}).get("contract_rows_failed", 0))), produced)
     clean = round(100.0 * comps.get("clean_rows", 0.0), 3)
+    open_errors = sum(1 for w in warnings if str(w).startswith("error:"))
     return {
         "requested_records": expected,
         "total_input": produced,
@@ -524,12 +532,14 @@ def _summary_keys(report: dict[str, Any], count: int, per_entity: int, produced:
         "repaired_record_rate": 0.0,
         "target_valid_record_rate": 100.0,
         "target_contract_conformance_percent": MIN_LOGIC_QUALITY_PERCENT,
+        # the checks above only prove the rows follow the spec's own rules: a known error the review left open is a failed target
         "quality_target_met": report.get("verdict") == "pass" and clean >= MIN_LOGIC_QUALITY_PERCENT and conformance >= MIN_LOGIC_QUALITY_PERCENT
-                              and produced == expected,
+                              and produced == expected and open_errors == 0,
+        "open_findings": {"errors": open_errors, "warnings": len(warnings) - open_errors},
         "contract_pass_rate": round(100.0 * comps.get("consistency", 0.0), 3),
         "recovered": 0,
         "algo_fixes": 0,
         "llm_fixes": 0,
-        "llm_issues": warnings,
+        "llm_issues": len(warnings),
         "deterministic_checks": ["spec_invariants", "distribution_targets", "definition_contract", "structure"],
     }
