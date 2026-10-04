@@ -13,6 +13,7 @@ from core.industry_source_store import (
     _canonical_catalog_dtype,
     _catalog_role,
     _normalize_model_name,
+    _source_redundancy_signature,
     canonical_variable_semantic_key,
     normalize_lookup_key,
 )
@@ -132,6 +133,8 @@ def _definition_key(row: dict[str, Any]) -> tuple:
 
 
 _REFERENCE_NOISE = {"related", "ref", "refs", "reference", "or", "value", "link", "linked"}
+_HISTORY_WORDS = {"history", "log", "audit", "journal", "ledger", "trail", "archive"}
+_HISTORY_ASKED = _HISTORY_WORDS | {"timeline", "event", "past", "previous", "changes"}
 _HIERARCHY_WORDS = {"parent", "child", "hierarchy", "hierarchical", "linked", "chain", "predecessor", "successor", "previous"}
 
 
@@ -146,6 +149,23 @@ def _reference_target(row: dict[str, Any]) -> str:
         return ""
     parts = [p for p in str(row.get("source_owner_model") or "").split("_") if p and p not in _REFERENCE_NOISE]
     return "_".join(parts)
+
+
+_REFERENCE_SEGMENT = re.compile(r"^(?P<name>.+?)(RefOrValue|Ref|Reference)$")
+
+
+def _reference_path(row: dict[str, Any]) -> tuple[str, str]:
+    """``(referenced resource, property path inside it)`` for a leaf reached through a reference-or-value segment, else ``("", "")``.
+
+    ``UsageConsumption.bucketRefOrValue[].remainingValue.amount`` is the ``Bucket`` resource's own ``remainingValue.amount``
+    seen through the reference.
+    """
+    segments = [seg.replace("[]", "") for seg in str(row.get("path") or "").split(".")]
+    for index, segment in enumerate(segments[1:], 1):
+        match = _REFERENCE_SEGMENT.match(segment)
+        if match and index + 1 < len(segments):
+            return _normalize_model_name(match.group("name")), ".".join(segments[index + 1:])
+    return "", ""
 
 
 def _description_text(value: Any) -> str:
@@ -245,11 +265,35 @@ def _restating_rows(
                     break
         if name in removed:
             continue
+        # The same property of a resource reached through a reference-or-value segment of another resource.
+        ref_model, ref_rest = _reference_path(row)
+        if ref_model and any(
+            _leaf_path(other) == ref_rest for other in by_model.get(ref_model, ()) if other is not row
+        ):
+            removed.add(name)
+            continue
         # <entity>_<x> next to a persisted <x>: the same fact reached through the entity.
         model_tokens = _tokens(row.get("business_model") or row.get("model"))
         head, _, rest = name.partition("_")
         if head in _ENTITY_WORDS and head in model_tokens and rest in db_names and rest != name:
             removed.add(name)
+    # One resource that reaches the same shared object through two paths (a summary under the resource and again under each of
+    # its nested items) carries that object's leaves twice: the owning object, its role and the property are the same.
+    # The shallowest path is the resource's own; the deeper ones are repeats.
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in selected:
+        name = normalize_lookup_key(row.get("name"))
+        signature = _source_redundancy_signature(row)
+        if signature is None or name in removed or name in protected:
+            continue
+        groups.setdefault((model_of(row), signature), []).append(row)
+    for rows in groups.values():
+        if len(rows) < 2:
+            continue
+        keep = min(rows, key=lambda r: str(r.get("path") or "").count("."))
+        for row in rows:
+            if row is not keep:
+                removed.add(normalize_lookup_key(row.get("name")))
     return removed
 
 
@@ -421,12 +465,28 @@ def select_source_rows(
             return False
         return target == model or target in models
 
+    # A history/log/audit resource that records actions on a resource already in the dataset describes those actions: its fields
+    # either restate the resource (status, dates, amounts) or are specific to an operation the scenario does not run (the cost
+    # of a transfer on a top-up). It is only wanted when the request asks for history, audit or a timeline.
+    history_asked = bool(context & _HISTORY_ASKED)
+    references: dict[str, set[str]] = {}
+    for row in canonical:
+        target = _reference_target(row)
+        owner = _normalize_model_name(row.get("business_model") or row.get("model"))
+        if target and owner and target != owner:
+            references.setdefault(owner, set()).add(target)
+
+    def history_of_present_resource(model: str) -> bool:
+        if history_asked or not (_tokens(model.replace("_", " ")) & _HISTORY_WORDS):
+            return False
+        return bool(references.get(model, set()) & models)
+
     scored: list[tuple[float, dict[str, Any], str]] = []
     for row in canonical:
         model = _normalize_model_name(row.get("business_model") or row.get("model"))
         if model not in models and model not in related:
             continue
-        if points_at_present_resource(row, model):
+        if points_at_present_resource(row, model) or (history_of_present_resource(model) and normalize_lookup_key(row.get("name")) not in forced):
             continue
         score = _relevance_score(row, context)
         name = normalize_lookup_key(row.get("name"))
@@ -502,7 +562,7 @@ def select_source_rows(
         name = normalize_lookup_key(row.get("name"))
         model = _normalize_model_name(row.get("business_model") or row.get("model"))
         sem = canonical_variable_semantic_key(row) or name
-        if name not in preferred or sem in selected_sem or model not in models or points_at_present_resource(row, model):
+        if name not in preferred or sem in selected_sem or model not in models or points_at_present_resource(row, model) or history_of_present_resource(model):
             continue
         selected.append(dict(row)); selected_sem.add(sem)
 

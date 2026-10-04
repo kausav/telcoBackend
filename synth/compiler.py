@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 COMPILER_VERSION = 2
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 4
+DRAFT_REPAIR_ROUNDS = 1                  # patch rounds for measured errors before a spec is first served
 GOOD_ENOUGH_WEIGHT = 1                   # refinement stops once at most one minor finding is left
 SCENARIO_KEYS = ("industry", "domain", "country", "use_case", "scenario_type", "business_scenario", "business_response",
                  "expected_outcome", "type_of_data", "entity_key")
@@ -120,7 +121,10 @@ WHAT YOU DECIDE
    viewed, accepted, converted, resolved) agrees with everything that records that step: its timestamp, amount and status exist
    exactly when the flag is true, and a later step (accepted, converted) is never true when the step before it (presented,
    offered) is false. An automatic, scheduled or system-initiated flag agrees with who initiates the row (its requestor, role
-   and channel): an automatic action is requested by the system, a customer-initiated one is not.
+   and channel): an automatic action is requested by the system, a customer-initiated one is not. An automatic or recurring action
+   also uses a means that can run unattended (a stored mandate, card, wallet, bank account), never a physical or assisted one (cash,
+   counter, in person, agent). People and points of sale that act (agents, retailers, staff, devices) are many: their identifiers
+   vary across entities; only an automated or system actor has one shared identifier.
 6. Realistic values. Where a definition lists no values (marked needs_values), derive realistic values for the scenario's
    industry, country and currency from the column's description and the other columns (names, reasons, plan or product
    names, channels, categories, amounts in local currency and realistic magnitudes) and put them in "reference". Identifiers and contact values follow the real format of the scenario's country
@@ -696,7 +700,8 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
     report["failed_targets"] = [t["id"] for t in report["targets"]["results"] if t["status"] == "fail"]
     if not problems:
         report["advice"] = (cadence_advice(spec, rows) + constant_advice(spec, rows, variables) + sparse_advice(spec, rows)
-                              + bound_advice(spec, rows))
+                              + bound_advice(spec, rows) + inflight_advice(spec, rows) + shared_identifier_advice(spec, rows)
+                              + mirrored_advice(spec, rows) + counter_advice(spec, rows))
         report["facts"] = shape_facts(spec, rows)
     return problems, report
 
@@ -830,6 +835,143 @@ def bound_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[
     return [f for _, f in found[:2]]
 
 
+_IN_FLIGHT = re.compile(r"^(created|pending|initiated|initialised|initialized|processing|in[ _-]?progress|queued|submitted)$", re.IGNORECASE)
+STALE_IN_FLIGHT_DAYS = 30.0
+_AUTOMATED_ACTOR = re.compile(r"(system|auto|batch|bot|scheduler|platform|api|service|cron|robot)", re.IGNORECASE)
+
+
+def inflight_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for states that mean "still in flight" (created, pending, processing...) on events long past.
+
+    Such a state is only possible for an event recent enough that it could still be in flight; an old event has reached a
+    final state. Measured against the event clock and the simulation's as_of.
+    """
+    if not spec.clock or len(rows) < 100:
+        return []
+    as_of = datetime.fromisoformat(_VERIFY_AS_OF)
+    out = []
+    for cid, name in spec.delivered.items():
+        if spec.columns[cid].dtype not in ("string", "categorical") or cid == spec.clock:
+            continue
+        flight = [r for r in rows if isinstance(r.get(cid), str) and _IN_FLIGHT.match(r[cid]) and r.get(spec.clock) is not None]
+        stale = [r for r in flight if (as_of - r[spec.clock]).total_seconds() > STALE_IN_FLIGHT_DAYS * 86400.0]
+        if flight and len(stale) >= 0.5 * len(flight) and len(stale) >= 2:
+            out.append({"id": "stale_in_flight", "severity": "error", "columns": [name],
+                        "problem": f"{len(stale)} of {len(flight)} rows in an in-flight state of {name} are older than {STALE_IN_FLIGHT_DAYS:.0f} days.",
+                        "evidence": f"e.g. {sorted({str(r[cid]) for r in stale})[:3]} on events months before as_of",
+                        "fix": "Let an in-flight state occur only for events newer than a few days (condition on secs(as_of, event_at)); "
+                               "older events get a final state."})
+    return out[:2]
+
+
+def shared_identifier_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for an identifier column in which one human or point-of-sale identifier is shared by many entities.
+
+    People, retailers, agents and devices that act are many; only an automated actor legitimately has one shared identifier.
+    """
+    entities = {r.get(spec.entity_column) for r in rows} if spec.entity_column else set()
+    if len(entities) < 8 or len(rows) < 100:
+        return []
+    out = []
+    for cid, name in spec.delivered.items():
+        if cid == spec.entity_column or spec.columns[cid].dtype != "string" or not (_tokens(name) & {"id", "identifier", "key", "code"}):
+            continue
+        by_value: dict[str, set[Any]] = {}
+        for r in rows:
+            if isinstance(r.get(cid), str):
+                by_value.setdefault(r[cid], set()).add(r.get(spec.entity_column))
+        if len(by_value) < len(entities) / 2:
+            continue                                  # a code list, not an identifier of individuals
+        shared = {v: len(e) for v, e in by_value.items() if len(e) >= 5 and len(e) >= 0.4 * len(entities) and not _AUTOMATED_ACTOR.search(v)}
+        if shared:
+            value, count = max(shared.items(), key=lambda kv: kv[1])
+            out.append({"id": "shared_identifier", "severity": "warn", "columns": [name],
+                        "problem": f"The identifier {value!r} in {name} is used by {count} of {len(entities)} entities.",
+                        "evidence": f"{len(by_value)} distinct values in {len(rows)} rows",
+                        "fix": "An agent, retailer, store, device or other acting party is one of many: draw its identifier from a pool "
+                               "(per entity or per event); keep one shared identifier only for an automated or system actor."})
+    return out[:2]
+
+
+_MIRROR_KINDS = {"status", "state", "score", "flag", "type", "level", "rating", "tier", "grade"}
+_COUNTER_WORDS = {"retry", "retries", "attempt", "attempts", "resend", "resends", "redelivery"}
+
+
+def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for two columns of the same kind (two statuses, two scores...) that map one-to-one onto each other.
+
+    A status that is a relabelling of another status, or a score that equals another score, says the same thing twice; a
+    reader of the data cannot tell it from a second measurement.
+    """
+    n = len(rows)
+    if n < 100:
+        return []
+    cols = []
+    for cid, name in spec.delivered.items():
+        if cid == spec.entity_column or spec.columns[cid].dtype not in ("string", "categorical", "boolean", "integer"):
+            continue
+        parts = [t for t in re.split(r"[^a-z0-9]+", name.lower()) if t]
+        if parts and parts[-1] in _MIRROR_KINDS:
+            cols.append((cid, name, parts[-1]))
+    found: list[dict[str, Any]] = []
+    for i, (a, na, ka) in enumerate(cols):
+        for b, nb, kb in cols[i + 1:]:
+            if ka != kb:
+                continue
+            pairs = [(str(r.get(a)), str(r.get(b))) for r in rows if r.get(a) is not None and r.get(b) is not None]
+            if len(pairs) < 100:
+                continue
+            da, db = {x for x, _ in pairs}, {y for _, y in pairs}
+            if not (2 <= len(da) <= 12 and len(da) == len(db)):
+                continue
+            ab: dict[str, dict[str, int]] = {}
+            for x, y in pairs:
+                ab.setdefault(x, {})[y] = ab.setdefault(x, {}).get(y, 0) + 1
+            ba: dict[str, dict[str, int]] = {}
+            for x, y in pairs:
+                ba.setdefault(y, {})[x] = ba.setdefault(y, {}).get(x, 0) + 1
+            forward = sum(max(c.values()) for c in ab.values()) / len(pairs)
+            backward = sum(max(c.values()) for c in ba.values()) / len(pairs)
+            if forward >= 0.97 and backward >= 0.97:
+                found.append({"id": "mirrored_columns", "severity": "warn", "columns": [na, nb],
+                              "problem": f"{na} and {nb} map one-to-one onto each other ({len(da)} values each) on {min(forward, backward):.0%} of rows.",
+                              "evidence": f"{len(pairs)} simulated rows",
+                              "fix": "Two columns of the same kind must describe different things (another stage, party or measure) or differ where "
+                                     "reality differs (they are recorded at different moments, by different parties); do not relabel one into the other."})
+    return found[:3]
+
+
+def counter_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for a retry/attempt counter that counts up across events that are days apart.
+
+    A retry or attempt follows its predecessor within minutes or hours; a counter that increments from one row to the next
+    while the rows are weeks apart counts unrelated events.
+    """
+    groups = _by_entity(spec, rows)
+    if not groups or not spec.clock:
+        return []
+    out = []
+    for cid, name in spec.delivered.items():
+        if spec.columns[cid].dtype != "integer" or not (_tokens(name) & _COUNTER_WORDS):
+            continue
+        steps = gaps = 0
+        spans: list[float] = []
+        for g in groups:
+            for prev, nxt in zip(g, g[1:]):
+                a, b = prev.get(cid), nxt.get(cid)
+                if isinstance(a, int) and isinstance(b, int) and b > 0:
+                    steps += 1
+                    gaps += b == a + 1
+                    spans.append((nxt[spec.clock] - prev[spec.clock]).total_seconds() / 86400.0)
+        if steps >= 30 and gaps >= 0.8 * steps and _median(spans) > 1.0:
+            out.append({"id": "counter_spacing", "severity": "error", "columns": [name],
+                        "problem": f"{name} counts up from one event to the next ({gaps} of {steps} steps) although those events are a median of {_median(spans):.0f} days apart.",
+                        "evidence": f"{steps} consecutive pairs with a positive counter",
+                        "fix": "A retry or attempt is a new try of the same action minutes or hours after the failed one: model it as a run of events "
+                               "close together (history.min_gap_minutes / a latent that groups attempts), and let the counter restart with a new action."})
+    return out[:2]
+
+
 def sparse_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Findings for delivered columns that are present on (almost) no row: they cost a column but say nothing."""
     n = len(rows)
@@ -933,7 +1075,8 @@ exceeds what the other columns allow). Judge each against what the column means:
 only exists once something succeeded must be empty for every state that is not a success; a fact that applies must not be
 empty; windows (validity, term, cooldown) should not still be open when the same entity's next event of that kind starts
 unless the scenario renews them early; items (name, price, size, validity of one product or plan) must agree with each other;
-the actor's role, identifier and channel must agree (and with an automatic/scheduled flag: automatic means requested by the system);
+the actor's role, identifier and channel must agree (and with an automatic/scheduled flag: automatic means requested by the system and paid by a
+means that can run unattended, not cash or in person; one retailer/agent identifier shared by many customers is wrong);
 a flag that says a step happened (presented, viewed, accepted, converted, resolved) agrees with that step's timestamp, amount and status,
 and a later step is never true while the step before it is false; statuses of one subject must not contradict each other.
 Timestamp layouts ("timestamp_layouts") are fixed by the platform, are written in the scenario's local time and are rounded to the
@@ -1019,6 +1162,15 @@ def spec_key(brief: dict[str, Any], variables: list[dict[str, Any]]) -> str:
         "columns": sorted(cols, key=lambda c: str(c["name"])),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False).encode()).hexdigest()[:40]
+
+
+MEASURED_FINDINGS = frozenset({"window_overlap", "constant_numeric_column", "near_empty_column", "part_exceeds_bound", "stale_in_flight",
+                               "shared_identifier", "mirrored_columns", "counter_spacing", "healed_empty_column", "healed_target", "check"})
+
+
+def _measured_weight(findings: list[dict[str, Any]]) -> int:
+    """The weight of the findings that were measured on the simulation (the reviewer's findings change from run to run)."""
+    return _weight([f for f in findings if f.get("id") in MEASURED_FINDINGS])
 
 
 def _weight(findings: list[dict[str, Any]]) -> int:
@@ -1244,6 +1396,30 @@ class SpecCompiler:
         findings.sort(key=lambda f: f["severity"] != "error")
         return findings, review
 
+    def _repair_measured(self, base: Baseline, brief: dict[str, Any], first: str, rnd: _Round, started: float) -> _Round:
+        """One patch round for the errors the checks measured on a spec that passed, before the spec is first served.
+
+        Measured errors (a column that never varies, an in-flight state on old events, a counter that counts across weeks) are
+        certain, so waiting for the background review to find them only delays the fix. The patched spec replaces the first one
+        only when it passes every check again and has fewer measured errors; any failure leaves the first spec as it was.
+        """
+        def errors(r: _Round) -> list[dict[str, Any]]:
+            return [f for f in r.report.get("advice") or [] if f["severity"] == "error" and f["id"] in MEASURED_FINDINGS]
+
+        before = errors(rnd)
+        if not before or DRAFT_REPAIR_ROUNDS < 1 or time.monotonic() - started > self._budget():
+            return rnd
+        try:
+            cand = self._round(base, brief, repair_prompt(first, rnd.overlay, [review_problem(f) for f in before]), rnd.overlay)
+        except Exception as exc:
+            logger.warning("behaviour spec draft repair skipped (%s: %s)", type(exc).__name__, exc)
+            return rnd
+        if cand.spec is None or len(errors(cand)) >= len(before) or _measured_weight(cand.report.get("advice") or []) > _measured_weight(rnd.report.get("advice") or []):
+            logger.info("behaviour spec draft repair kept the first spec (%d measured error(s))", len(before))
+            return rnd
+        logger.info("behaviour spec draft repair: %d -> %d measured error(s)", len(before), len(errors(cand)))
+        return cand
+
     def draft(self, variables: list[dict[str, Any]], brief: dict[str, Any], *, notes: dict[str, dict[str, Any]] | None = None,
               resources: dict[str, str] | None = None) -> CompileResult:
         """The first spec that passes the deterministic checks (what generation needs), with the measured advice attached."""
@@ -1264,6 +1440,7 @@ class SpecCompiler:
                 logger.warning("behaviour spec draft: model unavailable (%s: %s)", type(exc).__name__, exc)
                 return CompileResult(None, "unavailable", [f"{type(exc).__name__}: {_short(str(exc), 240)}"], round_no)
             if rnd.spec is not None:
+                rnd = self._repair_measured(base, brief, first, rnd, started)
                 rnd.report.update(rounds=round_no, problems=0)
                 findings = list(rnd.report.get("advice") or [])
                 return CompileResult(rnd.spec, "compiled", [], round_no, rnd.overlay, rnd.report, findings)
@@ -1294,6 +1471,7 @@ class SpecCompiler:
         healed = [h for h in current.overlay.get("healed") or [] if isinstance(h, dict) and h.get("problem")]
         findings = sorted(healed + findings, key=lambda f: f["severity"] != "error")
         best = (_weight(findings), current.spec, current.overlay, current.report, findings, review)
+        best_measured, best_errors = _measured_weight(findings), sum(f["severity"] == "error" for f in findings)
         first = build_prompt(brief, base, notes, resources)
         overlay, rounds = {k: v for k, v in current.overlay.items() if k != "healed"}, 0
         for _ in range(self.refine_rounds):
@@ -1314,7 +1492,11 @@ class SpecCompiler:
             overlay = rnd.overlay
             weight = _weight(findings)
             logger.info("behaviour spec refinement round %d: %d finding(s), weight %d (best %d)", rounds, len(findings), weight, best[0])
-            if weight < best[0]:
+            measured, errors = _measured_weight(findings), sum(f["severity"] == "error" for f in findings)
+            # The reviewer reads the same data differently on every call and finds new issues in each candidate, so a lighter total is
+            # not the only sign of progress: fewer measured defects without more impossible records is one too.
+            if weight < best[0] or (measured < best_measured and errors <= best_errors):
+                best_measured, best_errors = min(best_measured, measured), min(best_errors, errors)
                 best = (weight, rnd.spec, rnd.overlay, rnd.report, findings, review)
                 if on_improve is not None:                  # whoever waits for the spec gets each improvement as soon as it exists
                     report = dict(rnd.report)

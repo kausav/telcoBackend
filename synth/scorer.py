@@ -236,8 +236,19 @@ def _score_target(t: Target, rows: list[dict[str, Any]], present: set[str], colu
         m = len(values)
         observed = values[m // 2] if t.stat == "median" and m % 2 else (
             (values[m // 2 - 1] + values[m // 2]) / 2 if t.stat == "median" else sum(values) / m)
-    ok = t.min <= observed <= t.max
-    return {**base, "status": "pass" if ok else "fail", "observed": round(observed, 4), "n": population}
+        # Rows of one entity are not independent draws, so with few entities a median or mean moves a lot from one run to the
+        # next. A target fails only when the whole 99% interval of the statistic lies outside [min, max].
+        effective = max(1.0, min(float(m), entities * 3.0))
+        if t.stat == "median":
+            half = 2.576 * 0.5 / effective ** 0.5
+            lo = values[max(0, min(m - 1, int((0.5 - half) * (m - 1))))]
+            hi = values[max(0, min(m - 1, int(round((0.5 + half) * (m - 1)))))]
+        else:
+            sd = (sum((v - observed) ** 2 for v in values) / max(1, m - 1)) ** 0.5
+            lo, hi = observed - 2.576 * sd / effective ** 0.5, observed + 2.576 * sd / effective ** 0.5
+        interval = [round(lo, 4), round(hi, 4)]
+        ok = hi >= t.min - 1e-9 and lo <= t.max + 1e-9
+        return {**base, "status": "pass" if ok else "fail", "observed": round(observed, 4), "n": population, "interval99": interval}
 
 
 def _reads(spec: GenerationSpec) -> dict[str, set[str]]:
