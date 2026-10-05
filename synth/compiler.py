@@ -58,6 +58,7 @@ SOFT_LATE = ("DUPLICATE ", "INVARIANT ", "CONTRACT ", "FORMAT ", "PLACEHOLDER ",
 DRAFT_REPAIR_ROUNDS = 1                  # patch rounds for measured errors before a spec is first served (the refinement does the rest)
 REJECTED_PATCH_ALLOWANCE = 2
 DRAFT_REVIEW_GRACE_SECONDS = 20          # how long a draft that has been repaired waits for the review that ran beside the repair
+PATCH_SECONDS = 45.0                     # the least a patch of a design is expected to take (the estimate before one has been measured)
 REVIEW_SECONDS = 20.0                    # what a review of a design is expected to take (the estimate for a refinement round besides its author call)
 GOOD_ENOUGH_WEIGHT = 1                   # refinement stops once at most one minor finding is left
 SCENARIO_KEYS = ("industry", "domain", "country", "use_case", "scenario_type", "business_scenario", "business_response",
@@ -1828,20 +1829,22 @@ class SpecCompiler:
         return float(SPEC_COMPILE_BUDGET_SECONDS)
 
     @staticmethod
-    def _repair_window() -> float:
-        from config.runtime import SPEC_DRAFT_REPAIR_SECONDS
+    def _design_window() -> float:
+        from config.runtime import SPEC_DESIGN_SECONDS
 
-        return float(SPEC_DRAFT_REPAIR_SECONDS)
+        return float(SPEC_DESIGN_SECONDS)
+
+    def _round_fits(self, spent: float, first_author: float = 0.0, *, review: bool = False) -> bool:
+        """Another model round is expected to end inside the design window, ``spent`` seconds into the design.
+
+        A patch takes at least ``PATCH_SECONDS`` (measured: much longer than the first design, which writes less than a patch has to
+        weigh) and as long as the longest author call so far; a refinement round is followed by a review.
+        """
+        expected = max(self._author_seconds, first_author, PATCH_SECONDS) + (REVIEW_SECONDS if review and self.reviewing() else 0.0)
+        return spent + expected <= self._design_window()
 
     def _affordable(self, started: float) -> bool:
-        """Another author call is expected to take as long as the last one; it is made now only if that ends inside the repair window."""
-        return time.monotonic() - started + self._author_seconds <= min(self._budget(), self._repair_window())
-
-    @staticmethod
-    def _refine_budget() -> float:
-        from config.runtime import SPEC_REFINE_BUDGET_SECONDS
-
-        return float(SPEC_REFINE_BUDGET_SECONDS)
+        return self._round_fits(time.monotonic() - started)
 
     def reviewing(self) -> bool:
         if self._review is not None:
@@ -2254,6 +2257,11 @@ class SpecCompiler:
         if expectations is not None:
             start_overlay["expectations"] = expectations
         drafted = current.overlay.get("draft_review")
+        spent = current.overlay.get("timing") if isinstance(current.overlay.get("timing"), dict) else {}
+        drafting = float(spent.get("total") or 0.0)         # what the design has used before the refinement began
+        first_author = float(spent.get("first_design") or 0.0)   # the estimate of an author call until one has been made here
+        # a review is only worth waiting for when a round is left to act on it
+        room = self._round_fits(drafting + time.monotonic() - started, first_author, review=True)
         # the reviewer reads the spec that is being improved, on its own simulation
         probe = self._round_for(base, brief, current.spec, start_overlay)
         # measured findings that call for a patch go to the author at once; the reviewer reads the patched spec instead of this one
@@ -2265,26 +2273,21 @@ class SpecCompiler:
             findings, review = sorted(list(probe.report.get("advice") or []) + issues, key=lambda f: f["severity"] != "error"), \
                 "findings" if issues else "clean"
         else:
-            findings, review = self._all_findings(brief, base, probe, notes, resources, consult_reviewer=not urgent)
+            findings, review = self._all_findings(brief, base, probe, notes, resources, consult_reviewer=not urgent and room)
         healed = [h for h in current.overlay.get("healed") or [] if isinstance(h, dict) and h.get("problem")]
         findings = sorted(healed + findings, key=lambda f: f["severity"] != "error")
         best = (_weight(findings), current.spec, start_overlay, current.report, findings, review)
         stats: dict[str, Any] = {"weight_before": _weight(findings), "findings_before": len(findings), "author_calls": 0, "accepted": 0,
                                  "rejected_by_checks": 0, "rejected_as_worse": 0, "stopped": "rounds"}
         first = build_prompt(brief, base, notes, resources, expectations)
-        spent = current.overlay.get("timing") if isinstance(current.overlay.get("timing"), dict) else {}
-        drafting = float(spent.get("total") or 0.0)         # what the design has used before the refinement began
-        first_author = float(spent.get("first_design") or 0.0)   # the estimate of an author call until one has been made here
         overlay, rounds = {k: v for k, v in start_overlay.items() if k != "healed"}, 0
         counted = 0                                        # rounds that produced a spec to judge; a rejected patch is a second chance, not a round
         while counted < self.refine_rounds and rounds < self.refine_rounds + REJECTED_PATCH_ALLOWANCE:
             if _weight(findings) <= GOOD_ENOUGH_WEIGHT:
                 stats["stopped"] = "good_enough"
                 break
-            # the budget counts from the start of the design: a round is begun only if it is expected to end inside it
-            expected = (self._author_seconds or first_author) + (REVIEW_SECONDS if self.reviewing() else 0.0)
-            if drafting + time.monotonic() - started + expected > self._refine_budget():
-                stats["stopped"] = "time"
+            if not self._round_fits(drafting + time.monotonic() - started, first_author, review=True):
+                stats["stopped"] = "time"                  # the window counts from the start of the design
                 break
             rounds += 1
             stats["author_calls"] += 1

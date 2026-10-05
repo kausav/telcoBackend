@@ -239,14 +239,17 @@ def _refine_job(variables: list[dict[str, Any]], brief: dict[str, Any], key: str
         better = comp.refine(variables, brief, current, notes=notes, resources=resources, on_improve=publish)
         if better is not None and better.spec is not None and published["spec"] is spec:
             publish(better)                                  # a refinement that did not publish as it went
-        review = str((better.report if better is not None else current.report).get("review") or "")
+        report = better.report if better is not None else current.report
+        review = str(report.get("review") or "")
         findings = better.findings if better is not None else current.findings
-        if review in {"skipped", "deferred"}:
+        # a refinement that ended because the design window was spent is settled: nothing more will be tried for this spec
+        settled = (report.get("refinement") or {}).get("stopped") == "time"
+        if review in {"skipped", "deferred"} and not settled:
             with _FLIGHT_LOCK:
                 _REFINE_BACKOFF[key] = time.monotonic()
         latest = published["spec"]
-        store.annotate(key, latest, [finding_text(f) for f in findings] or latest.warnings, reviewed=review not in {"skipped", "deferred"},
-                       refinement=(better.report if better is not None else current.report).get("refinement"))
+        store.annotate(key, latest, [finding_text(f) for f in findings] or latest.warnings,
+                       reviewed=settled or review not in {"skipped", "deferred"}, refinement=report.get("refinement"))
     except Exception:
         logger.exception("background refinement of generation spec %s failed", key[:8])
     finally:

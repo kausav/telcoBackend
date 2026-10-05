@@ -73,13 +73,11 @@ if SPEC_REFINE_MODE not in {"background", "inline", "off"}:
     SPEC_REFINE_MODE = "background"
 # The longest /scenario/generate waits for a spec that is still being designed before answering "not ready, retry".
 SPEC_GENERATE_WAIT_SECONDS = max(1, int(os.getenv("SPEC_GENERATE_WAIT_SECONDS", "240")))
-# A design is the first verified spec followed by its refinement, and a request waits for both, so that the data it gets is the data
-# every later request gets. The refinement starts no further round once this long has passed since the design began (a round is
-# expected to take as long as the last author call plus a review); the default keeps 30 s of the wait above in hand.
-SPEC_REFINE_BUDGET_SECONDS = max(30, int(os.getenv("SPEC_REFINE_BUDGET_SECONDS", str(max(30, SPEC_GENERATE_WAIT_SECONDS - 30)))))
-# Measured errors left in the first spec are patched right away (the reviewer reads it at the same time) only when that patch is
-# expected to be done within this long since the design began; otherwise the refinement patches them. Default: half of the wait.
-SPEC_DRAFT_REPAIR_SECONDS = max(0, int(os.getenv("SPEC_DRAFT_REPAIR_SECONDS", str(int(SPEC_GENERATE_WAIT_SECONDS * 0.5)))))
+# How long one design is expected to take, draft and refinement together, counted from when it began (default 90 s, under the usual
+# gateway timeout). No further model round is begun that is expected to end beyond it: a repair of the first spec that cannot be
+# confined to its column, the patch made while the first spec is checked, and every refinement round. A request waits for the design
+# to settle and then generates from the settled spec, so a repeat request gets the same data; a longer window buys more refinement.
+SPEC_DESIGN_SECONDS = max(30, int(os.getenv("SPEC_DESIGN_SECONDS", "90")))
 # Start designing a proposal's spec in the background as soon as it is proposed (the person reviews it meanwhile).
 SPEC_WARM_ON_PROPOSE = os.getenv("SPEC_WARM_ON_PROPOSE", "true").strip().lower() in {"1", "true", "yes", "on"}
 

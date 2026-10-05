@@ -15,6 +15,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+_ORDERING = (ast.Lt, ast.LtE, ast.Gt, ast.GtE)
 _BIN = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv}
 _CMP = {
     ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt, ast.LtE: operator.le,
@@ -87,15 +88,23 @@ def _sigmoid(x: float) -> float:
     return e / (1.0 + e)
 
 
+def _empty_in_empty_out(function: Callable[..., Any]) -> Callable[..., Any]:
+    """The function, but empty when any argument is empty (a number or a time that does not exist has no sum, rounding or distance)."""
+    def wrapped(*args: Any) -> Any:
+        return None if any(a is None for a in args) else function(*args)
+
+    return wrapped
+
+
 FUNCTIONS: dict[str, Callable[..., Any]] = {
-    "add_days": _add_days, "add_secs": _add_secs, "text": lambda x: None if x is None else str(x),
+    "add_days": _empty_in_empty_out(_add_days), "add_secs": _empty_in_empty_out(_add_secs), "text": lambda x: None if x is None else str(x),
     "lower": lambda x: None if x is None else str(x).lower(), "upper": lambda x: None if x is None else str(x).upper(),
-    "int": int, "float": float, "sigmoid": _sigmoid,
-    "abs": abs, "min": min, "max": max, "len": len, "round": round,
-    "secs": _secs, "days": _days, "matches": _matches,
+    "int": _empty_in_empty_out(int), "float": _empty_in_empty_out(float), "sigmoid": _empty_in_empty_out(_sigmoid),
+    "abs": _empty_in_empty_out(abs), "min": min, "max": max, "len": len, "round": _empty_in_empty_out(round),
+    "secs": _empty_in_empty_out(_secs), "days": _empty_in_empty_out(_days), "matches": _matches,
     "is_none": lambda x: x is None,
     "distinct": _distinct, "pairs": _pairs, "strictly_increasing": _strictly_increasing, "non_decreasing": _non_decreasing, "all_after": _all_after,
-    "min_gap_secs": _min_gap_secs, "hour_of": _hour_of,
+    "min_gap_secs": _min_gap_secs, "hour_of": _empty_in_empty_out(_hour_of),
 }
 
 
@@ -223,13 +232,18 @@ class Expr:
             return result
         if isinstance(n, ast.UnaryOp):
             v = self._eval(n.operand, env)
-            return (not v) if isinstance(n.op, ast.Not) else (-v if isinstance(n.op, ast.USub) else +v)
+            if isinstance(n.op, ast.Not):
+                return not v
+            return None if v is None else (-v if isinstance(n.op, ast.USub) else +v)      # arithmetic on an empty value is empty
         if isinstance(n, ast.BinOp):
-            return _BIN[type(n.op)](self._eval(n.left, env), self._eval(n.right, env))
+            left, right = self._eval(n.left, env), self._eval(n.right, env)
+            return None if left is None or right is None else _BIN[type(n.op)](left, right)
         if isinstance(n, ast.Compare):
             left = self._eval(n.left, env)
             for op, comp in zip(n.ops, n.comparators):
                 right = self._eval(comp, env)
+                if type(op) in _ORDERING and (left is None or right is None):
+                    return False                                                        # an empty value is neither larger nor smaller
                 if not _CMP[type(op)](left, right):
                     return False
                 left = right
