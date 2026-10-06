@@ -23,6 +23,7 @@ from typing import Any
 from langgraph.graph import StateGraph, END
 
 from core.dynamic_scenarios import resolve_variables
+from synth.expr import FUNCTIONS as _EXPR_FUNCTIONS
 from core.llm_client import GeminiClient
 from core.state import WorkflowState
 from core.scenario_semantics import temporal_role as _temporal_role
@@ -44,6 +45,12 @@ from config.country_metadata import COUNTRY_BASE
 logger = logging.getLogger(__name__)
 
 _GENERATION_RNG: ContextVar[_random_module.Random | None] = ContextVar("generation_rng", default=None)
+# The instant a run is generated "as of"; every relative timestamp is measured from it, never from the wall clock.
+_GENERATION_NOW: ContextVar[datetime | None] = ContextVar("generation_now", default=None)
+
+
+def _now_utc() -> datetime:
+    return _GENERATION_NOW.get() or datetime.now(timezone.utc)
 
 
 def _rng():
@@ -688,7 +695,7 @@ def _uniform_bounded(params: dict, rec: dict):
 
 def _recent_datetime(params: dict, _rec: dict) -> str:
     days_back = int(params.get("days_back", 0) or 0)
-    base = datetime.now(timezone.utc) - timedelta(
+    base = _now_utc() - timedelta(
         days=_rng().randint(0, max(0, days_back)),
         hours=_rng().randint(0, 23),
         minutes=_rng().randint(0, 59),
@@ -700,7 +707,7 @@ def _recent_datetime(params: dict, _rec: dict) -> str:
 def _recent_date(params: dict, _rec: dict) -> str:
     """Generate an ISO-8601 calendar date for fields declared as JSON Schema ``format=date``."""
     days_back = int(params.get("days_back", 0) or 0)
-    base = datetime.now(timezone.utc).date() - timedelta(
+    base = _now_utc().date() - timedelta(
         days=_rng().randint(0, max(0, days_back))
     )
     return base.isoformat()
@@ -856,7 +863,7 @@ def _prefixed_uuid(params: dict, _rec: dict) -> str:
 
 
 def _tx_id(params: dict, rec: dict) -> str:
-    ts = rec.get("record_timestamp", datetime.now(timezone.utc).isoformat())
+    ts = rec.get("record_timestamp", _now_utc().isoformat())
     date_part = ts[:10].replace("-", "")
     rand_part = _rng().randint(1_000_000, 9_999_999)
     return f"{params['prefix']}{date_part}-{rand_part}"
@@ -1341,6 +1348,11 @@ def _formula_from_rules(field_name: str, rules: dict | None):
     return None
 
 
+# The formula language's callable names come from the expression engine itself, so a function the engine
+# can evaluate is never mistaken for a field name by a dependency or unknown-field check.
+FORMULA_FUNCTION_NAMES = frozenset(_EXPR_FUNCTIONS) | {"sum", "DATE"}
+
+
 @lru_cache(maxsize=4096)
 def _formula_dependencies(expression: str) -> set[str]:
     """Extract field names referenced by a simple formula expression.
@@ -1351,7 +1363,7 @@ def _formula_dependencies(expression: str) -> set[str]:
     try:
         tree = ast.parse(expression, mode="eval")
         return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
-                and node.id not in {"round", "min", "max", "abs", "sum", "True", "False", "None", "DATE"}}
+                and node.id not in FORMULA_FUNCTION_NAMES and node.id not in {"True", "False", "None"}}
     except Exception:
         return set()
 
@@ -2017,7 +2029,7 @@ def _transactional_records(compiled, user_count: int, records_per_user: int = 10
 
         # Generate timestamps for the history window first, then sort newest-first
         # at the API boundary. Keep the period bounded to the last 90 days.
-        end_ts=datetime.now(timezone.utc)
+        end_ts=_now_utc()
         span=max(records_per_user,1)-1
         if span:
             step_seconds=_history_interval_driver_seconds(variables, user_context)
@@ -2134,7 +2146,7 @@ _FORMULA_ALLOWED_NODES = (
     ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
     ast.BoolOp, ast.And, ast.Or, ast.Not, ast.IfExp,
 )
-_ALLOWED_FORMULA_FUNCS = {"round", "min", "max", "abs", "sum", "DATE"}
+_ALLOWED_FORMULA_FUNCS = FORMULA_FUNCTION_NAMES
 
 @lru_cache(maxsize=4096)
 def _compile_safe_formula(expr: str):
@@ -2186,13 +2198,8 @@ def _safe_formula(expr: str, rec: dict):
             names[k] = parsed if parsed is not None else v
         else:
             names[k] = v
-    names.update({
-        "round": round,
-        "min": min,
-        "max": max,
-        "abs": abs,
-        "sum": sum,
-    })
+    names.update(_EXPR_FUNCTIONS)
+    names["sum"] = sum
     names["DATE"] = DATE
     try:
         return eval(code, {"__builtins__": {}}, names)
@@ -2604,6 +2611,16 @@ def _enforce_csv_contract(
     return rec, issues
 
 
+@lru_cache(maxsize=2048)
+def _formula_literals(expression: str) -> frozenset[str]:
+    """Every string constant a formula can return or compare against (its declared outputs)."""
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except Exception:
+        return frozenset()
+    return frozenset(node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str))
+
+
 def _is_placeholder_value(field_name: str, value: Any, var: dict) -> bool:
     """Reject obvious schema/sample placeholders while preserving legitimate declared values."""
     if isinstance(value, dict) and not value:
@@ -2615,6 +2632,9 @@ def _is_placeholder_value(field_name: str, value: Any, var: dict) -> bool:
         return False
     declared = _declared_param_options(var.get("params") or {})
     if declared and any(_matches_declared_option(text, opt) for opt in declared):
+        return False
+    # A value the variable's own formula names (``'NONE' if ... else 'RETRY'``) is a declared output, not a placeholder.
+    if text in _formula_literals(str(var.get("formula") or "")):
         return False
 
     norm_value = re.sub(r"[^a-z0-9]+", "", text.lower())
@@ -3347,6 +3367,31 @@ def _validate_record(
 
 
 def run_deterministic_agentic_generation(
+    scenario: str,
+    count: int,
+    industry: str,
+    country: str | None,
+    type_of_data: str,
+    scenario_context: dict[str, Any],
+    records_per_user: int = 10,
+    seed: int | None = None,
+    as_of: Any = None,
+) -> WorkflowState:
+    """Generate a confirmed agentic scenario as of ``as_of`` (default: now), so one seed and one instant give one dataset."""
+    from synth.clock import parse_as_of
+
+    now = parse_as_of(as_of) or datetime.now(timezone.utc).replace(microsecond=0)
+    token = _GENERATION_NOW.set(now)
+    try:
+        return _run_deterministic_agentic_generation(
+            scenario, count, industry, country, type_of_data, scenario_context,
+            records_per_user=records_per_user, seed=seed, as_of=as_of,
+        )
+    finally:
+        _GENERATION_NOW.reset(token)
+
+
+def _run_deterministic_agentic_generation(
     scenario: str,
     count: int,
     industry: str,

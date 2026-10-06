@@ -7,7 +7,9 @@ generator compatibility); they carry no domain vocabulary.
 """
 from __future__ import annotations
 
+import io
 import re
+import tokenize
 from typing import Any
 
 from core.agentic_models import GeneratedSchemaField
@@ -16,17 +18,72 @@ from core.agentic_models import GeneratedSchemaField
 _QUOTED_NAME = re.compile(r"""(['"])([A-Za-z_][A-Za-z0-9_]*)\1""")
 
 
+def _token_spans(text: str, kinds: set[int]) -> list[tuple[int, int, str]] | None:
+    """``(start, end, token)`` for every token of ``kinds`` in ``text``, or None when the text cannot be tokenised."""
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return None
+    starts = [0]
+    for line in text.splitlines(True):
+        starts.append(starts[-1] + len(line))
+    return [
+        (starts[tok.start[0] - 1] + tok.start[1], starts[tok.end[0] - 1] + tok.end[1], tok.string)
+        for tok in tokens
+        if tok.type in kinds
+    ]
+
+
+def rewrite_formula_names(formula: str, mapping: dict[str, str]) -> str:
+    """``formula`` with each referenced name in ``mapping`` replaced, leaving string literals untouched.
+
+    A name is only a reference where the expression uses it as one; the same word inside a quoted literal
+    (a JSON key, a status text) is data and must keep its spelling.
+    """
+    if not mapping:
+        return formula
+    spans = _token_spans(formula, {tokenize.NAME})
+    if spans is None:
+        return formula
+    out: list[str] = []
+    last = 0
+    for start, end, token in spans:
+        replacement = mapping.get(token)
+        if replacement and replacement != token:
+            out.append(formula[last:start])
+            out.append(replacement)
+            last = end
+    out.append(formula[last:])
+    return "".join(out)
+
+
 def clean_formula(formula: Any, depends_on: Any = ()) -> Any:
     """Make a stored formula parseable without changing what it computes.
 
     CSV-style exports quote the referenced variables (`` 'a' - 'b'``) and pad the text with spaces. A name
     declared in ``depends_on`` is a reference, not a string literal, so its quotes are dropped; every other
-    quoted token (a real literal such as ``'completed'``) is left alone.
+    quoted token (a real literal such as ``'completed'``) is left alone. Only a whole quoted token is
+    considered: the same name inside a longer literal (``'{"is_depleted":'``) is text and keeps its quotes.
     """
     if not isinstance(formula, str):
         return formula
     names = {str(d).strip() for d in (depends_on or ()) if str(d).strip()}
-    text = _QUOTED_NAME.sub(lambda m: m.group(2) if m.group(2) in names else m.group(0), formula.strip())
+    text = formula.strip()
+    if names:
+        spans = _token_spans(text, {tokenize.STRING})
+        if spans is None:
+            text = _QUOTED_NAME.sub(lambda m: m.group(2) if m.group(2) in names else m.group(0), text)
+        else:
+            out: list[str] = []
+            last = 0
+            for start, end, token in spans:
+                match = _QUOTED_NAME.fullmatch(token)
+                if match and match.group(2) in names:
+                    out.append(text[last:start])
+                    out.append(match.group(2))
+                    last = end
+            out.append(text[last:])
+            text = "".join(out)
     return text or None
 
 

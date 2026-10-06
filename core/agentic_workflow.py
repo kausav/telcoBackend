@@ -19,11 +19,12 @@ from core.dynamic_scenarios import new_draft_id, save_draft
 from core.runtime_cache import get_proposal, set_proposal
 from core.scenario_variable_store import get_recommended, get_selection_lock, get_user_variables, lock_selection, save_proposal
 from core.json_domain_policy import source_manifest
-from core.variable_contract import validate_db_definition
+from core.variable_contract import rewrite_formula_names, validate_db_definition
 
 logger = logging.getLogger(__name__)
 from agents.intent_agent import GeminiIntentAgent
 from agents.schema_compiler import SchemaCompiler
+from agents.data_generation_agent import FORMULA_FUNCTION_NAMES
 from config.runtime import PROPOSE_LLM_ADVISOR, SCHEMA_MAX_VARIABLES, SPEC_WARM_ON_PROPOSE
 from core.variable_semantics import variable_semantic_aliases
 from core.industry_source_store import normalize_industry_key, normalize_lookup_key, semantic_exclusion_aliases, catalog_for_request
@@ -409,18 +410,15 @@ class AgenticSchemaWorkflow:
                 )
             except SyntaxError:
                 identifiers = []
+            mapping = {}
             for identifier in identifiers:
                 replacement = resolve_runtime_name(identifier)
                 if replacement and replacement != identifier:
-                    result = re.sub(
-                        rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])",
-                        replacement,
-                        result,
-                    )
-            return result
+                    mapping[identifier] = replacement
+            return rewrite_formula_names(result, mapping)
 
         final_names = {str(field.name or "").strip() for field in ordered if str(field.name or "").strip()}
-        allowed_formula_names = {"round", "min", "max", "abs", "sum", "DATE", "True", "False", "None"}
+        allowed_formula_names = set(FORMULA_FUNCTION_NAMES) | {"True", "False", "None"}
         for field in ordered:
             if field.depends_on:
                 resolved_dependencies: list[str] = []

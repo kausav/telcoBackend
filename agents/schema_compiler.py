@@ -364,8 +364,10 @@ class SchemaCompiler:
                 params["multiple_of"] = spec["multipleOf"]
             return "uniform_int", "integer", params
         if dtype in {"number", "float", "double", "decimal", "numeric"}:
+            # A percentage with no declared ceiling tops out at 100, the range every percentage check assumes.
+            default_maximum = 100.0 if any(token in str(spec.get("name") or "").lower() for token in ("pct", "percent")) else 1000.0
             minimum_raw = spec.get("minimum", 0.0)
-            maximum_raw = spec.get("maximum", 1000.0)
+            maximum_raw = spec.get("maximum", default_maximum)
             exclusive_min = spec.get("exclusiveMinimum")
             exclusive_max = spec.get("exclusiveMaximum")
             try:
@@ -375,7 +377,7 @@ class SchemaCompiler:
             try:
                 maximum = float(maximum_raw)
             except (TypeError, ValueError):
-                maximum = max(minimum + 1.0, 1000.0)
+                maximum = max(minimum + 1.0, default_maximum)
             if isinstance(exclusive_min, bool):
                 if exclusive_min:
                     minimum = math.nextafter(minimum, math.inf)
