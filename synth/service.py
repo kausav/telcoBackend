@@ -462,7 +462,7 @@ def generate(spec: GenerationSpec, variables: list[dict[str, Any]], *, count: in
     report = score_rows(spec, parsed, engine.reference_view(spec, ctx), columns=set(delivered), parse_errors=parse_errors,
                         contract=build_contract(variables, delivered))
     report.update(seed=seed, as_of=ctx.as_of.isoformat(), engine=spec.engine, generation_engine=spec.engine,
-                  spec_revision=spec.revision, spec_assumptions=spec.assumptions, **_summary_keys(report, count, per_entity, len(records), spec.warnings))
+                  spec_revision=spec.revision, spec_assumptions=spec.assumptions, **_summary_keys(report, count, per_entity, len(records), spec.warnings, _confined(spec)))
     clock = spec.columns[spec.clock].column if spec.clock else None
     return SpecGeneration(records=records, fields=list(records[0]) if records else [], entity_columns=spec.entity_columns,
                           clock_column=clock, validation_report=report)
@@ -517,7 +517,20 @@ def _simulate_with_coverage(engine, spec: GenerationSpec, columns: set[str], *, 
     return best[1], best[2]
 
 
-def _summary_keys(report: dict[str, Any], count: int, per_entity: int, produced: int, warnings: list[str]) -> dict[str, Any]:
+_UNMET_WHEN_CONFINED = frozenset({"healed_empty_column", "healed_column", "healed_invariant", "healed_target"})
+
+
+def _confined(spec: GenerationSpec) -> list[str]:
+    """What the design repair removed from the spec to make it usable (a column's behaviour, a rule, a target), still unrepaired.
+
+    The refinement drops this record when it models the removed behaviour again, so what is listed here is still missing.
+    """
+    healed = spec.design.get("healed") if isinstance(spec.design, dict) else None
+    return [str(h.get("problem")) for h in healed or [] if isinstance(h, dict) and h.get("id") in _UNMET_WHEN_CONFINED and h.get("problem")]
+
+
+def _summary_keys(report: dict[str, Any], count: int, per_entity: int, produced: int, warnings: list[str],
+                  confined: list[str] | None = None) -> dict[str, Any]:
     """The keys clients already read, filled with values *measured* on the delivered rows (never constants)."""
     from config.runtime import MIN_LOGIC_QUALITY_PERCENT
 
@@ -530,7 +543,12 @@ def _summary_keys(report: dict[str, Any], count: int, per_entity: int, produced:
 
     conformance = pct(max(0, produced - int(report.get("structure", {}).get("contract_rows_failed", 0))), produced)
     clean = round(100.0 * comps.get("clean_rows", 0.0), 3)
-    open_errors = sum(1 for w in warnings if str(w).startswith("error:"))
+    reported_errors = sum(1 for w in warnings if str(w).startswith("error:"))
+    # What the repair removed to make the spec usable is a rule or behaviour the data does not follow: it stays an open error until
+    # the refinement models it again, whatever the score of the remaining rules says.
+    removed = confined or []
+    listed = sum(1 for w in warnings if not str(w).startswith("error:") and any(text in str(w) for text in removed))
+    open_errors = reported_errors + len(removed)
     return {
         "requested_records": expected,
         "total_input": produced,
@@ -547,7 +565,7 @@ def _summary_keys(report: dict[str, Any], count: int, per_entity: int, produced:
         # the checks above only prove the rows follow the spec's own rules: a known error the review left open is a failed target
         "quality_target_met": report.get("verdict") == "pass" and clean >= MIN_LOGIC_QUALITY_PERCENT and conformance >= MIN_LOGIC_QUALITY_PERCENT
                               and produced == expected and open_errors == 0,
-        "open_findings": {"errors": open_errors, "warnings": len(warnings) - open_errors},
+        "open_findings": {"errors": open_errors, "warnings": max(0, len(warnings) - reported_errors - listed)},
         "contract_pass_rate": round(100.0 * comps.get("consistency", 0.0), 3),
         "recovered": 0,
         "algo_fixes": 0,

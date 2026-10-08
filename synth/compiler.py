@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 COMPILER_VERSION = 9
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
-DRAFT_REPAIRED_WARNINGS = frozenset({"shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
+DRAFT_REPAIRED_WARNINGS = frozenset({"healed_empty_column", "shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
                                      "near_constant_state", "entity_stamp_inside_history", "expected_state_share"})
 SOFT_IMMEDIATE = ("EMPTY ", "TARGET ")      # problems confined to their column at once (the column loses its condition, the target goes)
 SOFT_LATE = ("DUPLICATE ", "INVARIANT ", "CONTRACT ", "FORMAT ", "PLACEHOLDER ", "FUTURE ", "RUNTIME ")   # confined once no round is left
@@ -656,6 +656,75 @@ def merge(base: Baseline, overlay: dict[str, Any], *, brief: dict[str, Any]) -> 
 
 
 # ------------------------------------------------------------------------------------------------------------------
+def _why_empty(entry: Emit, rows: list[dict[str, Any]], base: dict[str, Any]) -> dict[str, str]:
+    """What keeps one column empty on every simulated row, measured on those rows (never guessed from the spec's wording)."""
+    from synth.samplers import case_for
+
+    held: list[dict[str, Any]] | None = rows
+    if entry.when:
+        guard = Expr(entry.when)
+        try:
+            held = [r for r in rows if guard({**base, **r})]
+        except Exception:
+            held = None                                    # the guard needs something the rows do not carry: say nothing about it
+        if held is not None and not held:
+            return {"kind": "when", "text": f"its condition `{entry.when}` was false on all {len(rows)} rows"}
+    sample = entry.sample if isinstance(entry.sample, dict) else {}
+    table = sample.get("cases") if sample.get("type") == "switch" else sample.get("tables") if sample.get("type") == "choice" else None
+    if held and isinstance(table, dict) and isinstance(sample.get("by"), str):
+        selector = Expr(sample["by"])
+        try:
+            seen: dict[str, Any] = {}
+            for r in held:
+                value = selector({**base, **r})
+                seen.setdefault(str(value), value)
+        except Exception:
+            seen = {}
+        if seen and all(case_for(table, value) is None for value in seen.values()):
+            return {"kind": "no_case", "text": f"it selects by `{sample['by']}`, which takes the values {sorted(seen)[:6]} while its keys are "
+                                               f"{sorted(table)[:8]}, so no key matches"}
+    if entry.expr:
+        return {"kind": "expr", "text": f"its expression `{entry.expr}` has no value on any row"}
+    return {"kind": "value", "text": "its sampler drew no value on any row"}
+
+
+def _empty_analysis(spec: GenerationSpec, rows: list[dict[str, Any]], empties: list[str], view: dict[str, Any]) -> dict[str, Any]:
+    """The columns that are the real cause of the empty delivered ``empties``.
+
+    A column that reads an empty column is empty because of it, not for a reason of its own, so only the columns without an
+    empty column behind them are roots (a hidden driver can be one). ``dependents`` maps every other empty column to the empty
+    columns it reads; ``why`` gives each root's measured reason.
+    """
+    emits = {e.column: e for e in spec.emit}
+    known = set(emits)
+    dead = {cid for cid in emits if all(r.get(cid) is None for r in rows)}
+    base = {"REF": view, "P": spec.model, "as_of": view.get("as_of")}
+    order = {cid: i for i, cid in enumerate(emits)}
+    roots: set[str] = set()
+    dependents: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    frontier = list(empties)
+    while frontier:
+        cid = frontier.pop()
+        if cid in seen or cid not in emits:
+            continue
+        seen.add(cid)
+        behind = sorted(_reads(emits[cid], known) & dead - {cid}, key=order.get)
+        if behind:
+            dependents[cid] = behind
+            frontier.extend(behind)
+        else:
+            roots.add(cid)
+    ordered = sorted(roots, key=order.get)
+    return {"roots": ordered, "dependents": dependents, "why": {cid: _why_empty(emits[cid], rows, base) for cid in ordered}}
+
+
+_EMPTY_HINT = {
+    "when": "drop the condition that never holds, or make that situation occur in this scenario",
+    "no_case": "key the cases by the values the column really takes (a true/false column takes True and False)",
+}
+
+
 def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: int = VERIFY_ENTITIES,
            per_entity: int | None = None, aggregational: bool = False,
            records_out: list[dict[str, Any]] | None = None,
@@ -730,13 +799,27 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
                 quarantine["columns"].setdefault(cid, "it recorded moments later than as_of")
     total = len(rows)
     empty_ids: list[str] = []
+    empty_info: dict[str, Any] = {"roots": [], "dependents": {}, "why": {}}
     if total >= 30:
-        for cid, name in delivered.items():
-            if all(r.get(cid) is None for r in rows):
-                empty_ids.append(cid)
-                problems.append(f"EMPTY column '{name}' is empty on every simulated row; a delivered column must carry a value whenever its "
-                                "situation exists, and that situation must occur in this scenario (drop the condition that never holds, or "
-                                "derive the value from the fact it describes)")
+        empty_ids = [cid for cid in delivered if all(r.get(cid) is None for r in rows)]
+        if empty_ids:
+            empty_info = _empty_analysis(spec, rows, empty_ids, engine.reference_view(spec, ctx))
+            for cid in empty_ids:
+                behind = empty_info["dependents"].get(cid)
+                if behind:
+                    names = ", ".join(f"'{delivered.get(b, b)}'" for b in behind)
+                    problems.append(f"EMPTY column '{delivered[cid]}' is empty on every simulated row only because {names}, which it reads, "
+                                    f"{'is' if len(behind) == 1 else 'are'} empty; repair {'that column' if len(behind) == 1 else 'those columns'} and this one follows")
+                else:
+                    why = empty_info["why"].get(cid) or {}
+                    problems.append(f"EMPTY column '{delivered[cid]}' is empty on every simulated row because {why.get('text', 'it draws no value')}; a "
+                                    "delivered column must carry a value whenever its situation exists, and that situation must occur in this "
+                                    f"scenario ({_EMPTY_HINT.get(why.get('kind'), 'derive the value from the fact it describes')})")
+            for cid in empty_info["roots"]:
+                if cid not in delivered:
+                    why = empty_info["why"].get(cid) or {}
+                    problems.append(f"EMPTY hidden column '{cid}' is empty on every simulated row because {why.get('text', 'it draws no value')}; "
+                                    f"every delivered column that reads it is empty as well ({_EMPTY_HINT.get(why.get('kind'), 'give it a value')})")
     for cid, example in placeholders.items():
         problems.append(f"PLACEHOLDER column '{cid}' still draws neutral tokens such as '{example}'; give it realistic values for this "
                         "scenario (declare them in 'reference')")
@@ -746,6 +829,9 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
     report["problems"] = len(problems)
     report["quarantine"] = quarantine
     report["empty_columns"] = empty_ids
+    report["empty_roots"] = empty_info["roots"]
+    report["empty_why"] = empty_info["why"]
+    report["empty_behind"] = empty_info["dependents"]
     report["failed_targets"] = [t["id"] for t in report["targets"]["results"] if t["status"] == "fail"]
     if not problems:
         declared = set((expectations or {}).get("constants") or [])
@@ -1974,9 +2060,13 @@ class SpecCompiler:
         def note(fid: str, columns: list[str], problem: str, fix: str) -> None:
             notes.append({"id": fid, "severity": "warn", "columns": columns, "problem": problem, "evidence": "", "fix": fix})
 
+        dropped: set[str] = set()                          # conditions already taken off, so none is dropped twice
+
         for step in range(3):
             report = current.report or {}
             empty = list(report.get("empty_columns") or [])
+            roots = list(report.get("empty_roots") or empty)
+            why = report.get("empty_why") or {}
             failed = set(report.get("failed_targets") or [])
             quarantine = report.get("quarantine") or {}
             if not empty and not failed and not (final and (quarantine.get("duplicates") or quarantine.get("invariants")
@@ -1984,19 +2074,45 @@ class SpecCompiler:
                 break
             columns = overlay.get("columns") if isinstance(overlay.get("columns"), list) else []
             overlay["columns"] = columns
-            for cid in empty:
-                entry = next((c for c in columns if isinstance(c, dict) and c.get("name") == cid), None)
+
+            def confine(cid: str) -> bool:
+                """Take the cause off one empty column: its condition when that is what kept it empty, else its behaviour."""
+                latents = overlay.get("latents") if isinstance(overlay.get("latents"), list) else []
+                entry = next((c for c in (*columns, *latents) if isinstance(c, dict) and c.get("name") == cid), None)
                 if entry is None:
-                    continue
-                if entry.get("when") and step == 0:
+                    return False
+                reason = why.get(cid) or {}
+                kind, because = reason.get("kind"), reason.get("text")
+                behind = (report.get("empty_behind") or {}).get(cid)
+                if not because and behind:                 # empty only because of what it reads: say what that is
+                    root = next((why[b] for b in behind if b in why), None)
+                    because = f"{', '.join(behind)}, which it reads, is empty" + (f" ({root['text']})" if root else "")
+                cause = f" because {because}" if because else ""
+                hint = "Model when this fact really exists and make that situation occur in this scenario."
+                if kind == "no_case":
+                    hint = f"{because[:1].upper()}{because[1:]}: key the cases by the values the column really takes (a true/false column takes True and False)."
+                if entry.get("when") and cid not in dropped and kind in (None, "when"):
                     entry["when"] = None
-                    what = "its condition never held in this scenario and was dropped"
-                else:
-                    columns.remove(entry)
-                    what = "its behaviour left it empty and was replaced by its definition"
-                note("healed_empty_column", [cid], f"Column {cid} was empty on every row; {what}.",
-                     "Model when this fact really exists and make that situation occur in this scenario.")
-            if failed and isinstance(overlay.get("targets"), list):
+                    dropped.add(cid)
+                    note("healed_empty_column", [cid], f"Column {cid} was empty on every row{cause}; the condition was dropped.", hint)
+                    return True
+                if cid not in empty or entry not in columns:   # a hidden driver cannot be removed: the columns that read it need it
+                    return False
+                columns.remove(entry)
+                note("healed_empty_column", [cid], f"Column {cid} was empty on every row{cause}; it was replaced by its definition.", hint)
+                return True
+
+            # The real cause first: a column that reads an empty column is empty because of it, and may be right once that is
+            # repaired. Everything empty is confined only when no cause could be treated, or when no step is left.
+            acted = False
+            if empty:
+                pools = [roots, empty] if step < 2 else [list(dict.fromkeys(empty + roots))]
+                for pool in pools:
+                    acted = any([confine(cid) for cid in pool])
+                    if acted:
+                        break
+            # A target that fails because a column was empty is judged again on the repaired data before it is dropped.
+            if failed and isinstance(overlay.get("targets"), list) and (not acted or step == 2):
                 overlay["targets"] = [t for t in overlay["targets"] if not (isinstance(t, dict) and t.get("id") in failed)]
                 for tid in sorted(failed):
                     note("healed_target", [], f"Target {tid} did not hold on the simulated data and was dropped.",

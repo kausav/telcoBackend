@@ -77,6 +77,20 @@ def sampler_names(spec: dict[str, Any]) -> set[str]:
     return names - {"_choice"}
 
 
+def case_for(table: dict[str, Any], value: Any) -> Any:
+    """The entry of ``table`` that belongs to ``value``, or None.
+
+    Keys are the text of the value. A true/false value is written ``True``/``False`` by the engine but ``true``/``false`` in JSON,
+    so either spelling selects the case; without that, a switch on a flag silently matched nothing and its column came out empty.
+    """
+    if not isinstance(table, dict):
+        return None
+    hit = table.get(str(value))
+    if hit is None and isinstance(value, bool):
+        hit = table.get(str(value).lower())
+    return hit
+
+
 class SamplerError(ValueError):
     pass
 
@@ -189,7 +203,7 @@ class Sampler:
         if kind == "after_parents":
             return self._after(spec, env, rt)
         if kind == "switch":
-            case = spec["cases"].get(str(self._expr(spec["by"])(env)))
+            case = case_for(spec["cases"], self._expr(spec["by"])(env))
             if case is None:
                 return None
             value = self._draw(case, env, rt, concept)
@@ -207,7 +221,7 @@ class Sampler:
     def _choice(self, spec: dict[str, Any], env: dict[str, Any], rt: "Runtime") -> Any:
         if "by" in spec:
             tables = spec["tables"] if "tables" in spec else rt.ref_path(spec["tables_ref"])
-            table = tables.get(str(self._expr(spec["by"])(env)))
+            table = case_for(tables, self._expr(spec["by"])(env))
             if table is None:
                 return None
             flt = None
