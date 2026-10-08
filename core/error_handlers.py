@@ -111,6 +111,11 @@ async def llm_upstream_exception_handler(request: Request, exc: LLMUpstreamError
     )
 
 
+def _is_retryable(exc: HTTPException) -> bool:
+    """A 503 that tells the client when to ask again (the scenario's generation design is still running) is not a server fault."""
+    return exc.status_code == 503 and isinstance(exc.detail, dict) and "retryAfterSeconds" in exc.detail
+
+
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     """Normalize application and FastAPI HTTP exceptions."""
     code = error_code_for_status(exc.status_code)
@@ -120,7 +125,7 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
     if exc.status_code == 502:
         message = "An upstream service failed to complete the request"
         details = _safe_upstream_diagnostics(exc.detail)
-    elif exc.status_code >= 500:
+    elif exc.status_code >= 500 and not _is_retryable(exc):
         message = "An unexpected server error occurred"
         details = None
 

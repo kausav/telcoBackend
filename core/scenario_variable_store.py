@@ -10,7 +10,6 @@ from typing import Any
 from core.variable_contract import clean_definition
 from models.scenario_variable import ScenarioVariableModel
 from models.scenario_user_variable import ScenarioUserVariableModel
-from models.scenario_proposal import ScenarioProposalModel
 from models.selection_lock import SelectionLockModel
 
 
@@ -36,10 +35,6 @@ def delete_user_variable(user_id: str, requested_scenario_id: str, scenario_vers
 
 def get_user_variable_records(user_id: str, requested_scenario_id: str, scenario_version: int) -> list[dict[str, Any]]:
     return ScenarioUserVariableModel.get_records(user_id, requested_scenario_id, scenario_version)
-
-
-def save_proposal(request_id: str, user_id: str | None, requested_scenario_id: str, scenario_version: int, payload: dict[str, Any]) -> None:
-    ScenarioProposalModel.save(request_id, user_id, requested_scenario_id, scenario_version, payload)
 
 
 def get_selection_lock(lock_key: str) -> dict[str, Any] | None:

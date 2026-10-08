@@ -1,28 +1,22 @@
 """Initialize MongoDB model indexes in one explicit place."""
 from models.scenario import ScenarioModel
 from models.scenario_draft import ScenarioDraftModel
-from models.scenario_feedback import ScenarioFeedbackModel
 from models.scenario_variable import ScenarioVariableModel
 from models.scenario_user_variable import ScenarioUserVariableModel
-from models.scenario_proposal import ScenarioProposalModel
-from models.conversation import ConversationModel
-from models.chat_message import ChatMessageModel
 from models.industry_source import IndustrySourceModel
 from models.selection_lock import SelectionLockModel
 from models.generation_spec import GenerationSpecModel
+from models.catalog import CATALOG_MODELS
 
 ALL_MODELS = (
     ScenarioModel,
     ScenarioDraftModel,
-    ScenarioFeedbackModel,
     ScenarioVariableModel,
     ScenarioUserVariableModel,
-    ScenarioProposalModel,
-    ConversationModel,
-    ChatMessageModel,
     IndustrySourceModel,
     SelectionLockModel,
     GenerationSpecModel,
+    *CATALOG_MODELS,
 )
 
 

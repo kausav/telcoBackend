@@ -14,10 +14,9 @@ import re
 
 from core.agentic_models import ScenarioImportResponse, ScenarioProposeRequest, ScenarioSchema, ScenarioIntent, GeneratedSchemaField
 from core.definition_audit import incomplete_definitions
-from core.conversation_store import append_message, ensure_conversation
 from core.dynamic_scenarios import new_draft_id, save_draft
 from core.runtime_cache import get_proposal, set_proposal
-from core.scenario_variable_store import get_recommended, get_selection_lock, get_user_variables, lock_selection, save_proposal
+from core.scenario_variable_store import get_recommended, get_selection_lock, get_user_variables, lock_selection
 from core.json_domain_policy import source_manifest
 from core.variable_contract import rewrite_formula_names, validate_db_definition
 
@@ -722,11 +721,8 @@ class AgenticSchemaWorkflow:
         if cached is not None:
             intent = ScenarioIntent.model_validate(cached["intent"])
             schema = ScenarioSchema.model_validate(cached["schema"])
-            cid = ensure_conversation(requested_scenario_id, req.user_id, requested_scenario_id)
             logger.info("[AgenticSchemaWorkflow] Proposal cache hit; Gemini skipped.")
         else:
-            cid = ensure_conversation(requested_scenario_id, req.user_id, requested_scenario_id)
-            append_message(cid, "user", agent_prompt, requested_scenario_id=requested_scenario_id)
             if PROPOSE_LLM_ADVISOR:
                 # The model's choice is locked the first time it is made, per distinct input (request, DB
                 # variables, source documents). Every later run of the same scenario reuses it and skips the
@@ -857,7 +853,6 @@ class AgenticSchemaWorkflow:
             "entity_key": entity_key,
             "records_per_user": 10,
             "agentic": True,
-            "conversation_id": cid,
             "intent": intent.model_dump(),
             "schema": schema.model_dump(),
             "approval_questions": unresolved_questions,
@@ -872,22 +867,6 @@ class AgenticSchemaWorkflow:
         }
         draft["generation_spec_key"] = self._warm_generation_spec(draft, variables)
         save_draft(draft_id, draft)
-        save_proposal(
-            request_id=draft_id,
-            user_id=req.user_id.strip() if req.user_id else None,
-            requested_scenario_id=requested_scenario_id,
-            scenario_version=1,
-            payload={
-                "scenario_id": req.requested_scenario_id,
-                "requested_scenario_id": requested_scenario_id,
-                "variables": variables,
-                "field_order": field_order,
-                "intent": intent.model_dump(),
-                "variable_sources": variable_sources,
-                "behavioral_rules": behavioral_rules,
-            },
-        )
-        append_message(cid, "assistant", json.dumps({"intent": intent.model_dump(), "action": "schema_proposed"}, sort_keys=True), requested_scenario_id=requested_scenario_id)
         return ScenarioImportResponse(
             success=True,
             draft_id=draft_id,

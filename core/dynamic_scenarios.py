@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 from models.scenario import ScenarioModel
 from models.scenario_draft import ScenarioDraftModel
-from models.scenario_feedback import ScenarioFeedbackModel
 from core.scenario_variable_store import get_recommended
 from core.industry_source_store import has_sources
 
@@ -141,13 +140,4 @@ def resolve_entity_key(requested_scenario_id: str) -> str | None:
 
 def list_scenarios() -> list[dict[str, Any]]:
     return ScenarioModel.list()
-
-
-def add_feedback(requested_scenario_id: str, domain: str, business_scenario: str, feedback: str) -> None:
-    if not feedback:
-        return
-    requested = str(requested_scenario_id or "").strip()
-    if not requested:
-        raise ValueError("requested_scenario_id is required")
-    ScenarioFeedbackModel.add(requested, domain, business_scenario, feedback)
 

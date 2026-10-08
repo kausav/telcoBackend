@@ -1,0 +1,273 @@
+{
+  "industries": [
+    {
+      "id": "telecommunications",
+      "name": "Telecommunications",
+      "subDomains": [
+        {
+          "id": "telecommunications.subscriber-lifecycle-retention",
+          "name": "Subscriber Lifecycle & Retention",
+          "useCases": [
+            {
+              "id": "telecommunications.subscriber-lifecycle-retention.prepaid-customer",
+              "name": "Prepaid Customer",
+              "proposeValue": "prepaid",
+              "journeys": [
+                {
+                  "id": "low-balance-top-up",
+                  "name": "Low Balance & Top-up",
+                  "dataTypes": [
+                    "transactional",
+                    "aggregational"
+                  ],
+                  "industryType": "Telecommunications",
+                  "domain": "Low Balance & Top-up",
+                  "entityKey": "customer_id",
+                  "scenarios": [
+                    {
+                      "scenarioId": "LB-01",
+                      "scenarioType": "Normal",
+                      "businessScenario": "Model periodic prepaid top-up lifecycles with TMF 654 bucket reloads, nominal payment gateway settlement latency, and E.164 MSISDN validation."
+                    },
+                    {
+                      "scenarioId": "LB-02",
+                      "scenarioType": "Suppression",
+                      "businessScenario": "Enforce suppression rules for accounts with active contact fatigue flags, opt-out preferences, or pending auto-recharge schedules to prevent unwanted notifications."
+                    },
+                    {
+                      "scenarioId": "LB-03",
+                      "scenarioType": "Customer Declines",
+                      "businessScenario": "Simulate explicit top-up offer rejection via USSD/SMS with recorded decline telemetry and downstream churn hazard weighting."
+                    },
+                    {
+                      "scenarioId": "LB-04",
+                      "scenarioType": "No Response",
+                      "businessScenario": "Capture unacknowledged notification timeout events after low-balance warning pushes, scheduling grace-period reminder retries."
+                    },
+                    {
+                      "scenarioId": "LB-05",
+                      "scenarioType": "Assisted",
+                      "businessScenario": "Orchestrate customer-care agent assisted reload flows with IVR verification, CSR ticket generation, and voucher token redemption."
+                    },
+                    {
+                      "scenarioId": "LB-06",
+                      "scenarioType": "Failure",
+                      "businessScenario": "Simulate payment gateway timeout and card decline exceptions during reload triggers, creating TMF 632 billing alarm notifications."
+                    },
+                    {
+                      "scenarioId": "LB-07",
+                      "scenarioType": "Exceptional",
+                      "businessScenario": "Synthesize edge-case ledger balance anomalies, sudden zero-credit drops during active voice calls, and overdraft protection triggers."
+                    },
+                    {
+                      "scenarioId": "LB-08",
+                      "scenarioType": "Duplicate Trigger",
+                      "businessScenario": "Detect and debounce concurrent automated top-up requests initiated within 30 seconds to prevent double bucket credits."
+                    },
+                    {
+                      "scenarioId": "LB-09",
+                      "scenarioType": "Concurrent Journey",
+                      "businessScenario": "Handle overlapping Low Balance warning during an in-flight Data Depletion or eSIM activation flow with priority resolution."
+                    }
+                  ]
+                },
+                {
+                  "id": "data-depletion-upsell",
+                  "name": "Data Depletion & Upsell",
+                  "dataTypes": [
+                    "transactional",
+                    "aggregational"
+                  ],
+                  "industryType": "Telecommunications",
+                  "domain": "Data Depletion & Upsell",
+                  "entityKey": "customer_id",
+                  "scenarios": [
+                    {
+                      "scenarioId": "DU-01",
+                      "scenarioType": "Normal",
+                      "businessScenario": "Incorporate 3GPP 5G slice handoff logs into low-balance customer journey. Enforce TMF 654 quantity bucket depletion constraints with high churn hazard correlation."
+                    },
+                    {
+                      "scenarioId": "DU-02",
+                      "scenarioType": "Booster / Add-on",
+                      "businessScenario": "Synthesize on-demand 5G high-speed data booster purchase events triggered when cellular usage velocity breaches 80% quota threshold."
+                    },
+                    {
+                      "scenarioId": "DU-03",
+                      "scenarioType": "Better-Fit Plan",
+                      "businessScenario": "Analyze longitudinal monthly usage patterns to recommend higher-tier postpaid/unlimited tier plans based on predictive consumption modeling."
+                    },
+                    {
+                      "scenarioId": "DU-04",
+                      "scenarioType": "Suppression",
+                      "businessScenario": "Enforce marketing suppression rules for high-depletion subscribers on enterprise corporate APNs or active complaint holds."
+                    },
+                    {
+                      "scenarioId": "DU-05",
+                      "scenarioType": "Customer Declines / No Response",
+                      "businessScenario": "Record upsell prompt ignore and dismiss telemetry, evaluating subsequent throttle degradation and retention churn coefficients."
+                    },
+                    {
+                      "scenarioId": "DU-06",
+                      "scenarioType": "Assisted",
+                      "businessScenario": "Model retail store or hotline assisted upsell conversion with plan migration contracts and SIM profile updates."
+                    },
+                    {
+                      "scenarioId": "DU-07",
+                      "scenarioType": "Failure",
+                      "businessScenario": "Simulate billing rating engine transaction aborts during quota top-up purchases with compensatory quota rollback events."
+                    },
+                    {
+                      "scenarioId": "DU-08",
+                      "scenarioType": "Exceptional",
+                      "businessScenario": "Model extreme data depletion spikes from runaway tethering or background app anomalies breaching 100% quota in under 15 minutes."
+                    },
+                    {
+                      "scenarioId": "DU-09",
+                      "scenarioType": "Repeated Depletion",
+                      "businessScenario": "Track recurring multi-cycle quota exhaustion within the same billing period, escalating subscriber to preferential VIP upsell tiers."
+                    },
+                    {
+                      "scenarioId": "DU-10",
+                      "scenarioType": "Concurrent Journey",
+                      "businessScenario": "Reconcile simultaneous Data Depletion alert while subscriber is already in an unresolved Low Balance top-up state."
+                    }
+                  ]
+                },
+                {
+                  "id": "cross-journey",
+                  "name": "Cross-Journey",
+                  "dataTypes": [
+                    "transactional"
+                  ],
+                  "industryType": "Telecommunications",
+                  "domain": "Cross-Journey",
+                  "entityKey": "customer_id",
+                  "scenarios": [
+                    {
+                      "scenarioId": "CJ-01",
+                      "scenarioType": "Single Journey",
+                      "businessScenario": "Isolate baseline single-trajectory execution guaranteeing zero side-effects on secondary BSS billing or provisioning queues."
+                    },
+                    {
+                      "scenarioId": "CJ-02",
+                      "scenarioType": "Concurrent",
+                      "businessScenario": "Simulate concurrent lifecycle trajectories executing simultaneously across Low Balance top-up and Data Depletion upsell pipelines."
+                    },
+                    {
+                      "scenarioId": "CJ-03",
+                      "scenarioType": "Active Journey",
+                      "businessScenario": "Enforce state locks and mutex validation when a subscriber already possesses an in-flight uncommitted transaction."
+                    },
+                    {
+                      "scenarioId": "CJ-04",
+                      "scenarioType": "Duplicate",
+                      "businessScenario": "Generate deduplicated event streams resolving identical webhook triggers across OSS slice management and BSS ordering engines."
+                    },
+                    {
+                      "scenarioId": "CJ-05",
+                      "scenarioType": "Situation Change",
+                      "businessScenario": "Model mid-journey tariff plan changes, line disconnection, or roaming handover altering ongoing fulfillment rules in real time."
+                    },
+                    {
+                      "scenarioId": "CJ-06",
+                      "scenarioType": "No Clear Priority",
+                      "businessScenario": "Synthesize arbitration matrix resolving conflicting simultaneous journey triggers under TM Forum Open Digital Architecture priority rules."
+                    }
+                  ]
+                }
+              ],
+              "description": "Prepaid account lifecycles, real-time top-ups, data quota exhaustion, and cross-journey coordination."
+            }
+          ],
+          "description": "Prepaid subscriber lifecycle, balance and retention journeys"
+        }
+      ],
+      "description": "TM Forum and 3GPP standards"
+    },
+    {
+      "id": "retail-banking",
+      "name": "Retail Banking",
+      "subDomains": [
+        {
+          "id": "retail-banking.fraud-management-aml",
+          "name": "Fraud Management & Anti-Money Laundering (AML)",
+          "useCases": [
+            {
+              "id": "retail-banking.fraud-management-aml.fraud-detection-aml-model-training",
+              "name": "Fraud Detection & AML Model Training",
+              "journeys": [
+                {
+                  "id": "customer-onboarding-to-case-closure",
+                  "name": "Customer Onboarding → Account Usage → Transaction Processing → Fraud Monitoring → Alert Investigation → Case Closure",
+                  "dataTypes": [
+                    "transactional"
+                  ],
+                  "industryType": "BFSI",
+                  "domain": "Fraud Management & AML",
+                  "entityKey": "customer_id",
+                  "scenarios": [
+                    {
+                      "scenarioId": "FA-01",
+                      "scenarioType": "Normal - Salaried Customer Baseline",
+                      "businessScenario": "Retail banking customers with ordinary salaried behaviour. Salary credits arrive monthly by ACH into the account, followed by rent, bill payments and everyday retail spend through MobileApp, InternetBanking and POS, mostly via RealTimePayment and CardPresent. Payees are established merchants, utilities and individuals with Low counterparty risk. Amounts are small to moderate, all in INR, in the customer's home country, from one or two registered devices. KYC is Verified, risk rating is mostly Low, no PEP flag and sanctions screening is Clear. Fraud evaluations pass with low fraud scores, nearly all decisions are Approve, and alerts and cases are rare. Use as the clean baseline population for fraud and AML model training."
+                    },
+                    {
+                      "scenarioId": "FA-02",
+                      "scenarioType": "Normal - Legitimate High-Value Purchase",
+                      "businessScenario": "Genuine customers who occasionally make a single unusually large payment, such as a property deposit, a gold purchase, a vehicle down payment or an insurance premium, against otherwise stable monthly activity. The large debit is sent from the customer's usual device and channel to a Low or Medium risk payee, with a clear payment purpose. These trigger a rule or elevated fraud score and sometimes a Review decision, but the test result is Pass or Inconclusive and the customer is genuine. Where an alert is raised, the case is closed as FalsePositive with a short investigation. Use to teach models to separate large but legitimate payments from fraud."
+                    },
+                    {
+                      "scenarioId": "FA-03",
+                      "scenarioType": "Normal - Genuine Travel and Cross-Border Spend",
+                      "businessScenario": "Genuine customers travelling abroad or paying overseas merchants and family. Spend appears from ipCountry values such as US, GB, AE and SG through CardNotPresent, ECommerce and ATMWithdrawal, with cross-border payments by SWIFT for family support, investment or gifts. Activity follows a plausible travel pattern: a stable home-country history, a short burst abroad, then a return to normal. The device is the customer's own. Some evaluations flag a geographic anomaly and return Review, but they are resolved as genuine and cleared. Use to reduce false positives on cross-border behaviour."
+                    },
+                    {
+                      "scenarioId": "FA-04",
+                      "scenarioType": "Normal - Small Business Seasonal Cash Flow",
+                      "businessScenario": "Small business and sole-proprietor customers with high but explainable turnover. Credits arrive from many Business and Merchant counterparties, and debits go to suppliers, utilities and payroll by ACH and RealTimePayment, with seasonal peaks around festivals and quarter ends. Monthly credit and debit turnover is much higher than for salaried customers and balances fluctuate, but the counterparties are repeat and Low or Medium risk. Occasional cash deposits at the Branch are within normal limits. KYC is Verified and alerts are mostly cleared as FalsePositive. Use to teach models that high turnover alone is not suspicious."
+                    },
+                    {
+                      "scenarioId": "FA-05",
+                      "scenarioType": "Normal - Alert Cleared After Review",
+                      "businessScenario": "Customers whose activity briefly looks unusual and whose alert is investigated and closed with no wrongdoing. A transaction raises the fraud score through a VelocityBreach, NewDeviceHighValue or UnusualCounterparty rule, an alert is raised with Medium or High priority, and an InvestigationCase is opened. The analyst checks the customer, finds a genuine explanation such as a new phone, a one-off bill or a family transfer, and closes the case with outcome FalsePositive and root cause NoIssueFound within a few days, with no escalation to compliance and no regulatory report. Use for alert-optimisation and false-positive-reduction training."
+                    },
+                    {
+                      "scenarioId": "FA-06",
+                      "scenarioType": "Negative - Mule Account Rapid Pass-Through",
+                      "businessScenario": "Money-mule accounts that receive funds and move them out within hours. A recently opened account, often with a Pending or recently Verified KYC and a young or student customer, receives several credits from many different Individual counterparties through RealTimePayment, then forwards almost the full amount within hours to one or two new or High risk counterparties, sometimes cross-border to NG, PK or RU. Balance after each transaction returns near zero. The account is used from several devices. Evaluations trigger RapidPassThrough and fail with high fraud scores, decisions are Block or Review, and alerts of type MuleAccount are raised with High or Critical priority. Most cases close as ConfirmedSuspicious with root cause MuleRecruitment and an escalation to compliance."
+                    },
+                    {
+                      "scenarioId": "FA-07",
+                      "scenarioType": "Negative - Structuring and Smurfing",
+                      "businessScenario": "Customers who split large sums into repeated deposits or transfers just below reporting thresholds. Over several days the account receives many credits of similar amounts by Cash, Cheque and ATMWithdrawal payment mechanisms at the Branch and ATM channels, each below the threshold, and the combined total is far above the customer's declared income. Funds are then consolidated and moved out to a small set of counterparties. Evaluations trigger StructuringPattern, alerts of type StructuringSmurfing are raised, cases are confirmed as ConfirmedSuspicious, and a regulatory report (SAR, STR or CTR) is filed with typology Structuring, mostly within the filing deadline."
+                    },
+                    {
+                      "scenarioId": "FA-08",
+                      "scenarioType": "Negative - Account Takeover",
+                      "businessScenario": "Genuine customer accounts taken over by a fraudster. After a normal history, a login arrives from a new device and an unusual ipCountry, followed by a change of access and a rapid sequence of high-value debits through MobileApp or InternetBanking to new counterparties, draining the balance in minutes. The customer's usual pattern stops. Evaluations trigger NewDeviceHighValue or GeoImpossibleTravel, the CardHolderAuthenticationTest fails, and decisions are Block or Review. Alerts of type AccountTakeover are raised as Critical, and cases close as ConfirmedFraud with root cause CredentialTheft or SocialEngineering, with partial amounts recovered."
+                    },
+                    {
+                      "scenarioId": "FA-09",
+                      "scenarioType": "Negative - Card-Not-Present Fraud Burst",
+                      "businessScenario": "Compromised cards used for online fraud. After a quiet period, a burst of CardNotPresent ECommerce transactions appears within minutes at high-risk merchant categories such as digital goods, gambling and money transfer (MCC 5999, 7995, 4829, 6051) from foreign ipCountry values, with several small test amounts followed by larger ones. Many are Declined or Held. CardTransactionFraudTest fails with high fraud scores and a VelocityBreach rule. Alerts of type CardFraud are raised, cases close as ConfirmedFraud, amounts at risk are mostly blocked or recovered, and some customers dispute afterwards."
+                    },
+                    {
+                      "scenarioId": "FA-10",
+                      "scenarioType": "Negative - Layering Through Shell Counterparties",
+                      "businessScenario": "Customers moving illicit funds through a chain of counterparties to hide their origin. Large credits are followed by quick onward transfers, split across several Business counterparties with High risk rating and a few on the watchlist, in cross-border SWIFT payments to jurisdictions such as AE, RU and NG, with vague payment purposes. Round-sum transfers repeat across weeks and the account balance does not build up. Some customers show PEP flags or PotentialMatch sanctions screening. Evaluations fail RegulatoryComplianceTest and LegalComplianceTest, alerts of type UnusualCounterparty or SanctionsHit are raised, and cases are escalated to compliance. Regulatory reports (SAR or STR) are filed with typology Layering or TradeBasedLaundering."
+                    }
+                  ],
+                  "description": "Customer onboarding through account usage, transaction processing, fraud monitoring, alert investigation and case closure."
+                }
+              ],
+              "description": "Synthetic customer, account, payment and transaction data with normal and suspicious patterns for fraud and AML model training."
+            }
+          ],
+          "description": "Fraud detection, AML monitoring and investigation"
+        }
+      ],
+      "description": "BIAN data model"
+    }
+  ]
+}

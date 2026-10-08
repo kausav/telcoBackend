@@ -14,9 +14,19 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Literal
 
+from core import catalog_store
+from core.catalog_models import (
+    CatalogImportRequest,
+    CatalogCountry,
+    CatalogImportResponse,
+    CatalogItem,
+    CatalogJourney,
+    CatalogScenarioDetail,
+    CatalogScenarioList,
+    CatalogTree,
+)
 from core.seed import ensure_seeded
 from core.dynamic_scenarios import (
-    add_feedback,
     confirm_scenario,
     get_draft,
     new_draft_id,
@@ -236,7 +246,7 @@ class ConfirmRequest(BaseModel):
     add: list[dict] = Field(default_factory=list, description="Optional new variable definitions for legacy/imported drafts; leave empty for agentic proposals")
     edit: list[VariableEdit] = Field(default_factory=list, description="Optional HITL edits to existing variables")
     delete: list[str] = Field(default_factory=list, description="Optional variable names to delete")
-    feedback: str | None = None
+    feedback: str | None = Field(default=None, description="Accepted for compatibility; feedback is not stored")
 
 
 class ScenarioVariableRecommendationRequest(BaseModel):
@@ -605,6 +615,72 @@ def remove_industry_source(source_id: str):
     return {"success": True, "sourceId": source_id, "deleted": True}
 
 
+def _catalog_lookup(read, *args):
+    """Run a catalog read; an id that is not in the catalog is a 404 and not an empty dropdown."""
+    try:
+        return read(*args)
+    except catalog_store.CatalogNotFound as exc:
+        raise HTTPException(404, detail={"error": str(exc)}) from exc
+
+
+@app.get("/catalog/countries", response_model=list[CatalogCountry])
+def catalog_countries():
+    """Countries a scenario can be proposed for (the country field of /scenario/propose)."""
+    return catalog_store.countries()
+
+
+@app.get("/catalog/industries", response_model=list[CatalogItem])
+def catalog_industries():
+    """Industry domains for the first dropdown."""
+    return catalog_store.industries()
+
+
+@app.get("/catalog/sub-domains", response_model=list[CatalogItem])
+def catalog_sub_domains(industryId: str):
+    """Sub-domains of one industry."""
+    return _catalog_lookup(catalog_store.sub_domains, industryId)
+
+
+@app.get("/catalog/use-cases", response_model=list[CatalogItem])
+def catalog_use_cases(subDomainId: str):
+    """Use cases of one sub-domain."""
+    return _catalog_lookup(catalog_store.use_cases, subDomainId)
+
+
+@app.get("/catalog/journeys", response_model=list[CatalogJourney])
+def catalog_journeys(useCaseId: str):
+    """Customer journeys of one use case, with the data types each supports."""
+    return _catalog_lookup(catalog_store.journeys, useCaseId)
+
+
+@app.get("/catalog/scenarios", response_model=CatalogScenarioList)
+def catalog_scenarios(journeyId: str):
+    """Scenarios of one journey, with the 'all scenarios' label."""
+    return _catalog_lookup(catalog_store.scenarios, journeyId)
+
+
+@app.get("/catalog/scenarios/{scenario_id}", response_model=CatalogScenarioDetail)
+def catalog_scenario(scenario_id: str):
+    """One scenario with its path through the catalog and the /scenario/propose fields the catalog knows."""
+    return _catalog_lookup(catalog_store.scenario_detail, scenario_id)
+
+
+@app.get("/catalog/tree", response_model=CatalogTree)
+def catalog_tree():
+    """The whole active catalog in one call."""
+    return catalog_store.tree()
+
+
+@app.post("/catalog/import", response_model=CatalogImportResponse)
+def catalog_import(req: CatalogImportRequest):
+    """Add catalog entries and update the ones that exist; switch an entry off with ``active: false``. Nothing is deleted."""
+    try:
+        counts = catalog_store.import_catalog(req)
+    except ValueError as exc:
+        raise HTTPException(400, detail={"error": str(exc)}) from exc
+    return {"success": True, **counts}
+
+
 @app.post("/scenario/import-csv", response_model=CsvImportResponse)
 def import_scenario_csv(
     file: UploadFile = File(..., description="CSV scenario definition containing variables"),
@@ -795,8 +871,6 @@ def confirm_scenario_route(req: ConfirmRequest):
         raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
     invalidate_scenario(scenario_id)
     clear_scenario(scenario_id)
-    if not _is_placeholder(req.feedback):
-        add_feedback(requested_scenario_id, draft.get("domain", ""), draft.get("business_scenario", ""), req.feedback)
     pop_draft(req.draft_id)
     return ConfirmResponse(
         success=True,

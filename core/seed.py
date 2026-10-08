@@ -1,9 +1,9 @@
 """Reference data the application ships with and keeps in MongoDB.
 
-The domain vocabulary lives in MongoDB alongside source documents and scenario variables. A fresh deployment
-starts without it, so the bundled vocabulary in ``seed/`` is inserted the first time it is needed.
+The domain vocabulary and the scenario catalog live in MongoDB alongside source documents and scenario variables. A fresh
+deployment starts without them, so the bundled data in ``seed/`` is inserted the first time it is needed.
 
-Only missing vocabulary is inserted; existing MongoDB data is never overwritten. Set ``SEED_REFERENCE_DATA=0``
+Only missing entries are inserted; existing MongoDB data is never overwritten. Set ``SEED_REFERENCE_DATA=0``
 to turn this off.
 """
 from __future__ import annotations
@@ -85,6 +85,12 @@ def _seed() -> dict[str, int]:
             except Exception as exc:                   # one rejected document must not block the others
                 failures.append(f"{default} {key}: {type(exc).__name__}: {exc}"[:200])
         inserted[default] = count
+    try:
+        from core.catalog_store import seed_bundled
+
+        inserted.update(seed_bundled())
+    except Exception as exc:                           # the catalog must not block the vocabulary, and is retried with it
+        failures.append(f"catalog: {type(exc).__name__}: {exc}"[:200])
     if failures:
         raise RuntimeError("; ".join(failures[:3]) + (f" (+{len(failures) - 3} more)" if len(failures) > 3 else ""))
     return {name: count for name, count in inserted.items() if count}
