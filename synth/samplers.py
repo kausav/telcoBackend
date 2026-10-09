@@ -127,9 +127,18 @@ def validate(spec: Any, where: str) -> None:
             raise SamplerError(f"{where}: 'choice' needs weights, from_ref, tables or tables_ref")
         if ("tables" in spec or "tables_ref" in spec) and "by" not in spec:
             raise SamplerError(f"{where}: table choices need 'by'")
+        weight_tables = [spec["weights"]] if isinstance(spec.get("weights"), dict) else []
         for table in (spec.get("tables") or {}).values():
             if isinstance(table, dict) and isinstance(table.get("filter"), str):
                 Expr(table["filter"])
+            if isinstance(table, dict):
+                weight_tables.append(table.get("weights") if isinstance(table.get("weights"), dict) else table)
+        for table in weight_tables:
+            for label, weight in table.items():
+                if isinstance(weight, str):
+                    Expr(weight)                  # an expression weight must parse now, not fail while the data is drawn
+                elif isinstance(weight, bool) or not isinstance(weight, (int, float, list, dict)):
+                    raise SamplerError(f"{where}: the weight of {label!r} must be a number or an expression")
     if kind == "time_shift":
         if spec["direction"] not in ("before", "after"):
             raise SamplerError(f"{where}: direction must be before|after")
@@ -235,7 +244,8 @@ class Sampler:
             labels = [c for c in labels if expr({**env, "_choice": c})]
             if not labels:
                 raise SamplerError(f"choice filter {flt!r} excluded every option for {env.get('event_type')!r}")
-        weights = [float(table[c]) if not isinstance(table[c], (list, dict)) else 1.0 for c in labels]
+        # a weight is a number or an expression over the current variables and the model parameters ("P['p_retry']")
+        weights = [float(self._num(table[c], env) or 0.0) if not isinstance(table[c], (list, dict)) else 1.0 for c in labels]
         return rt.ctx.weighted(labels, weights)
 
     def _id(self, spec: dict[str, Any], env: dict[str, Any], rt: "Runtime", concept: str) -> str:

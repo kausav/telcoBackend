@@ -460,9 +460,15 @@ def generate(spec: GenerationSpec, variables: list[dict[str, Any]], *, count: in
     records = project(rows, spec, delivered)
     parsed, parse_errors = parse_columns(records, spec, delivered)
     report = score_rows(spec, parsed, engine.reference_view(spec, ctx), columns=set(delivered), parse_errors=parse_errors,
-                        contract=build_contract(variables, delivered))
+                        contract=build_contract(variables, delivered, spec.scenario.get("country")))
+    summary = _summary_keys(report, count, per_entity, len(records), spec.warnings, _confined(spec))
+    # columns that carry no value on any row stay visible: the design left them empty because the scenario excludes the fact
+    summary["empty_columns"] = [name for name in delivered.values() if records and all(r.get(name) is None for r in records)]
+    if report.get("verdict") == "pass" and summary["open_findings"]["errors"]:
+        # the rows follow the spec's own rules, but the design review left errors open: that is not a clean pass
+        report["spec_verdict"], report["verdict"] = "pass", "review"
     report.update(seed=seed, as_of=ctx.as_of.isoformat(), engine=spec.engine, generation_engine=spec.engine,
-                  spec_revision=spec.revision, spec_assumptions=spec.assumptions, **_summary_keys(report, count, per_entity, len(records), spec.warnings, _confined(spec)))
+                  spec_revision=spec.revision, spec_assumptions=spec.assumptions, **summary)
     clock = spec.columns[spec.clock].column if spec.clock else None
     return SpecGeneration(records=records, fields=list(records[0]) if records else [], entity_columns=spec.entity_columns,
                           clock_column=clock, validation_report=report)
@@ -565,7 +571,8 @@ def _summary_keys(report: dict[str, Any], count: int, per_entity: int, produced:
         # the checks above only prove the rows follow the spec's own rules: a known error the review left open is a failed target
         "quality_target_met": report.get("verdict") == "pass" and clean >= MIN_LOGIC_QUALITY_PERCENT and conformance >= MIN_LOGIC_QUALITY_PERCENT
                               and produced == expected and open_errors == 0,
-        "open_findings": {"errors": open_errors, "warnings": max(0, len(warnings) - reported_errors - listed)},
+        "open_findings": {"errors": open_errors, "warnings": max(0, len(warnings) - reported_errors - listed),
+                          "items": [str(w) for w in warnings if str(w).startswith("error:")][:10] + removed[:10]},
         "contract_pass_rate": round(100.0 * comps.get("consistency", 0.0), 3),
         "recovered": 0,
         "algo_fixes": 0,

@@ -198,67 +198,50 @@
               "name": "Fraud Detection & AML Model Training",
               "journeys": [
                 {
-                  "id": "customer-onboarding-to-case-closure",
-                  "name": "Customer Onboarding → Account Usage → Transaction Processing → Fraud Monitoring → Alert Investigation → Case Closure",
+                  "id": "core-banking-growth",
+                  "name": "Core Banking & Growth",
                   "dataTypes": [
-                    "transactional"
+                    "transactional",
+                    "aggregational"
                   ],
-                  "industryType": "BFSI",
+                  "industryType": "Retail Banking",
                   "domain": "Fraud Management & AML",
                   "entityKey": "customer_id",
                   "scenarios": [
                     {
-                      "scenarioId": "FA-01",
-                      "scenarioType": "Normal - Salaried Customer Baseline",
-                      "businessScenario": "Retail banking customers with ordinary salaried behaviour. Salary credits arrive monthly by ACH into the account, followed by rent, bill payments and everyday retail spend through MobileApp, InternetBanking and POS, mostly via RealTimePayment and CardPresent. Payees are established merchants, utilities and individuals with Low counterparty risk. Amounts are small to moderate, all in INR, in the customer's home country, from one or two registered devices. KYC is Verified, risk rating is mostly Low, no PEP flag and sanctions screening is Clear. Fraud evaluations pass with low fraud scores, nearly all decisions are Approve, and alerts and cases are rare. Use as the clean baseline population for fraud and AML model training."
+                      "scenarioId": "CBG-01",
+                      "scenarioType": "Everyday Banking",
+                      "businessScenario": "Generate realistic day-to-day banking activity including salary credits, bill payments, merchant purchases, ATM withdrawals, digital payments, and recurring transactions. Preserve normal spending behavior, transaction frequency, channel usage, and seasonal patterns.\n\nBusiness response: Establish baseline customer transaction behavior for fraud detection, AML monitoring, anomaly detection, and false-positive reduction.\n\nExpected outcome: High-quality synthetic transaction datasets representing legitimate banking activity that can serve as the benchmark population for fraud and AML analytics."
                     },
                     {
-                      "scenarioId": "FA-02",
-                      "scenarioType": "Normal - Legitimate High-Value Purchase",
-                      "businessScenario": "Genuine customers who occasionally make a single unusually large payment, such as a property deposit, a gold purchase, a vehicle down payment or an insurance premium, against otherwise stable monthly activity. The large debit is sent from the customer's usual device and channel to a Low or Medium risk payee, with a clear payment purpose. These trigger a rule or elevated fraud score and sometimes a Review decision, but the test result is Pass or Inconclusive and the customer is genuine. Where an alert is raised, the case is closed as FalsePositive with a short investigation. Use to teach models to separate large but legitimate payments from fraud."
-                    },
-                    {
-                      "scenarioId": "FA-03",
-                      "scenarioType": "Normal - Genuine Travel and Cross-Border Spend",
-                      "businessScenario": "Genuine customers travelling abroad or paying overseas merchants and family. Spend appears from ipCountry values such as US, GB, AE and SG through CardNotPresent, ECommerce and ATMWithdrawal, with cross-border payments by SWIFT for family support, investment or gifts. Activity follows a plausible travel pattern: a stable home-country history, a short burst abroad, then a return to normal. The device is the customer's own. Some evaluations flag a geographic anomaly and return Review, but they are resolved as genuine and cleared. Use to reduce false positives on cross-border behaviour."
-                    },
-                    {
-                      "scenarioId": "FA-04",
-                      "scenarioType": "Normal - Small Business Seasonal Cash Flow",
-                      "businessScenario": "Small business and sole-proprietor customers with high but explainable turnover. Credits arrive from many Business and Merchant counterparties, and debits go to suppliers, utilities and payroll by ACH and RealTimePayment, with seasonal peaks around festivals and quarter ends. Monthly credit and debit turnover is much higher than for salaried customers and balances fluctuate, but the counterparties are repeat and Low or Medium risk. Occasional cash deposits at the Branch are within normal limits. KYC is Verified and alerts are mostly cleared as FalsePositive. Use to teach models that high turnover alone is not suspicious."
-                    },
-                    {
-                      "scenarioId": "FA-05",
-                      "scenarioType": "Normal - Alert Cleared After Review",
-                      "businessScenario": "Customers whose activity briefly looks unusual and whose alert is investigated and closed with no wrongdoing. A transaction raises the fraud score through a VelocityBreach, NewDeviceHighValue or UnusualCounterparty rule, an alert is raised with Medium or High priority, and an InvestigationCase is opened. The analyst checks the customer, finds a genuine explanation such as a new phone, a one-off bill or a family transfer, and closes the case with outcome FalsePositive and root cause NoIssueFound within a few days, with no escalation to compliance and no regulatory report. Use for alert-optimisation and false-positive-reduction training."
-                    },
-                    {
-                      "scenarioId": "FA-06",
-                      "scenarioType": "Negative - Mule Account Rapid Pass-Through",
-                      "businessScenario": "Money-mule accounts that receive funds and move them out within hours. A recently opened account, often with a Pending or recently Verified KYC and a young or student customer, receives several credits from many different Individual counterparties through RealTimePayment, then forwards almost the full amount within hours to one or two new or High risk counterparties, sometimes cross-border to NG, PK or RU. Balance after each transaction returns near zero. The account is used from several devices. Evaluations trigger RapidPassThrough and fail with high fraud scores, decisions are Block or Review, and alerts of type MuleAccount are raised with High or Critical priority. Most cases close as ConfirmedSuspicious with root cause MuleRecruitment and an escalation to compliance."
-                    },
-                    {
-                      "scenarioId": "FA-07",
-                      "scenarioType": "Negative - Structuring and Smurfing",
-                      "businessScenario": "Customers who split large sums into repeated deposits or transfers just below reporting thresholds. Over several days the account receives many credits of similar amounts by Cash, Cheque and ATMWithdrawal payment mechanisms at the Branch and ATM channels, each below the threshold, and the combined total is far above the customer's declared income. Funds are then consolidated and moved out to a small set of counterparties. Evaluations trigger StructuringPattern, alerts of type StructuringSmurfing are raised, cases are confirmed as ConfirmedSuspicious, and a regulatory report (SAR, STR or CTR) is filed with typology Structuring, mostly within the filing deadline."
-                    },
-                    {
-                      "scenarioId": "FA-08",
-                      "scenarioType": "Negative - Account Takeover",
-                      "businessScenario": "Genuine customer accounts taken over by a fraudster. After a normal history, a login arrives from a new device and an unusual ipCountry, followed by a change of access and a rapid sequence of high-value debits through MobileApp or InternetBanking to new counterparties, draining the balance in minutes. The customer's usual pattern stops. Evaluations trigger NewDeviceHighValue or GeoImpossibleTravel, the CardHolderAuthenticationTest fails, and decisions are Block or Review. Alerts of type AccountTakeover are raised as Critical, and cases close as ConfirmedFraud with root cause CredentialTheft or SocialEngineering, with partial amounts recovered."
-                    },
-                    {
-                      "scenarioId": "FA-09",
-                      "scenarioType": "Negative - Card-Not-Present Fraud Burst",
-                      "businessScenario": "Compromised cards used for online fraud. After a quiet period, a burst of CardNotPresent ECommerce transactions appears within minutes at high-risk merchant categories such as digital goods, gambling and money transfer (MCC 5999, 7995, 4829, 6051) from foreign ipCountry values, with several small test amounts followed by larger ones. Many are Declined or Held. CardTransactionFraudTest fails with high fraud scores and a VelocityBreach rule. Alerts of type CardFraud are raised, cases close as ConfirmedFraud, amounts at risk are mostly blocked or recovered, and some customers dispute afterwards."
-                    },
-                    {
-                      "scenarioId": "FA-10",
-                      "scenarioType": "Negative - Layering Through Shell Counterparties",
-                      "businessScenario": "Customers moving illicit funds through a chain of counterparties to hide their origin. Large credits are followed by quick onward transfers, split across several Business counterparties with High risk rating and a few on the watchlist, in cross-border SWIFT payments to jurisdictions such as AE, RU and NG, with vague payment purposes. Round-sum transfers repeat across weeks and the account balance does not build up. Some customers show PEP flags or PotentialMatch sanctions screening. Evaluations fail RegulatoryComplianceTest and LegalComplianceTest, alerts of type UnusualCounterparty or SanctionsHit are raised, and cases are escalated to compliance. Regulatory reports (SAR or STR) are filed with typology Layering or TradeBasedLaundering."
+                      "scenarioId": "CBG-02",
+                      "scenarioType": "Customer Growth",
+                      "businessScenario": "Generate customer lifecycle journeys covering onboarding, KYC completion, account opening, product acquisition, balance growth, loan relationships, and evolving customer risk profiles. Maintain realistic relationships across customers, accounts, products, and financial activities over time.\n\nBusiness response: Support customer segmentation, relationship analytics, risk profiling, lifecycle modeling, and validation of fraud and AML controls across different customer maturity stages.\n\nExpected outcome: Relationship-aware synthetic datasets that accurately represent customer evolution, product adoption, and long-term banking relationships."
                     }
+                  ]
+                },
+                {
+                  "id": "risk-financial-crime",
+                  "name": "Risk & Financial Crime",
+                  "dataTypes": [
+                    "transactional",
+                    "aggregational"
                   ],
-                  "description": "Customer onboarding through account usage, transaction processing, fraud monitoring, alert investigation and case closure."
+                  "industryType": "Retail Banking",
+                  "domain": "Fraud Management & AML",
+                  "entityKey": "customer_id",
+                  "scenarios": [
+                    {
+                      "scenarioId": "RFC-01",
+                      "scenarioType": "Risk Monitoring",
+                      "businessScenario": "Generate synthetic customer and account activity that evolves from normal behavior to increasingly suspicious behavior over time, including abnormal transaction volumes, unusual fund movement, high-risk counterparties, frequent cash transactions, and risk score deterioration. The dataset should model customer risk progression and trigger monitoring alerts based on behavioral changes.\n\nBusiness response: Enable risk monitoring systems, customer risk-rating models, and transaction monitoring platforms to identify emerging financial crime risks, assess customer risk profiles, and validate alert generation logic.\n\nExpected outcome: Synthetic datasets containing realistic customer risk evolution patterns that support risk-scoring model development, alert optimization, behavioral anomaly detection, and compliance monitoring."
+                    },
+                    {
+                      "scenarioId": "RFC-02",
+                      "scenarioType": "AML Investigation",
+                      "businessScenario": "Generate synthetic networks of customers, accounts, counterparties, organizations, and transactions containing organized financial crime typologies such as mule account networks, structuring, layering, shell-company relationships, circular fund flows, and cross-entity money movement. The dataset should preserve multi-level relationships and transaction chains for graph-based investigation and AML analytics.\n\nBusiness response: Enable AML monitoring systems, graph analytics engines, financial crime investigation teams, and network detection models to identify suspicious fund flows, hidden relationships, beneficial ownership structures, and coordinated financial crime activities.\n\nExpected outcome: Relationship-rich synthetic datasets that support graph analytics, AML investigations, transaction monitoring validation, suspicious activity detection, and financial crime network identification."
+                    }
+                  ]
                 }
               ],
               "description": "Synthetic customer, account, payment and transaction data with normal and suspicious patterns for fraud and AML model training."
@@ -267,7 +250,7 @@
           "description": "Fraud detection, AML monitoring and investigation"
         }
       ],
-      "description": "BIAN data model"
+      "description": "BIAN, FIBO and ISO 20022 banking data models"
     }
   ]
 }

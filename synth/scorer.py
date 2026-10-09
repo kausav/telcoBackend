@@ -126,7 +126,10 @@ def score_rows(
 
     evaluated = [r for r in results if r["status"] != "skipped"]
     consistency = (sum(r["pass_rate"] for r in evaluated) / len(evaluated)) if evaluated else 1.0
-    clean_rows = 1.0 - (sum(row_fail) / n)
+    # a row that breaks a column's own definition (a pattern, a range, an allowed value) is as unclean as one that breaks a rule
+    contract_bad: set[int] = set()
+    contract_violations = check_contract(rows, contract or [], contract_bad)
+    clean_rows = 1.0 - (sum(1 for i in range(n) if row_fail[i] or i in contract_bad) / n)
 
     # ---- targets -------------------------------------------------------------------------------
     target_results = [_score_target(t, rows, present, column_names, ref, len(by_entity) or n) for t in spec.targets]
@@ -135,8 +138,6 @@ def score_rows(
 
     # ---- structure -----------------------------------------------------------------------------
     dup = _duplicate_columns(rows, present, spec)
-    contract_bad: set[int] = set()
-    contract_violations = check_contract(rows, contract or [], contract_bad)
     structure = {
         "contract_checks": len(contract or []),
         "contract_violations": contract_violations,

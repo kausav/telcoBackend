@@ -107,6 +107,12 @@ class EventRows:
         timeline = spec.timeline or {}
         if "history_days" not in timeline:
             raise ValueError("timeline needs history_days (engine event_rows/v1)")
+        share, window = timeline.get("burst_share"), timeline.get("burst_seconds")
+        if share is not None and not (isinstance(share, (int, float)) and 0.0 <= share <= 0.9):
+            raise ValueError("timeline.burst_share must be a number from 0 to 0.9")
+        if window is not None and not (isinstance(window, (list, tuple)) and len(window) == 2
+                                       and all(isinstance(v, (int, float)) and 0 <= v <= 86400 for v in window)):
+            raise ValueError("timeline.burst_seconds must be [low, high] seconds within one day")
         if timeline.get("earliest_next"):
             unknown = Expr(timeline["earliest_next"]).names - {"prev", "as_of"}
             if unknown:
@@ -144,6 +150,9 @@ class _Run:
         self.gap = float(timeline.get("min_gap_minutes", 0)) * 60.0
         self.margin = timedelta(minutes=float(timeline.get("margin_minutes", 0)))
         self.earliest = Expr(timeline["earliest_next"]) if timeline.get("earliest_next") else None
+        self.burst_share = float(timeline.get("burst_share") or 0.0)
+        low, high = (timeline.get("burst_seconds") or [0.0, 0.0])[:2]
+        self.burst_seconds = (float(min(low, high)), float(max(low, high)))
         curve = timeline.get("hour_weights") or (self.rt.ref_path(timeline["hour_weights_ref"]) if timeline.get("hour_weights_ref") else None)
         self.hour_weights = _hour_weights(curve) if curve else None
         self.offset_min = view["tz_offset_min"]
@@ -203,6 +212,22 @@ class _Run:
         at: datetime | None = None
         for i, nominal in enumerate(anchors):
             earliest = nominal
+            follows = None
+            if at is not None and self.burst_share > 0.0 and self.ctx.rng.random() < self.burst_share:
+                # a burst: this event follows the previous one within seconds (a repeated request, a retry, a concurrent trigger),
+                # so it is not held back by the spacing rules that separate unrelated events
+                follows = at + timedelta(seconds=self.ctx.rng.uniform(*self.burst_seconds))
+                if follows > end:
+                    follows = None
+            if follows is not None:
+                at = follows.replace(microsecond=0)
+                row_env = dict(env)
+                row_env.update(event_at=at, event_index=i, prev=prev)
+                for step in self.event_emits:
+                    row_env[step.column] = step.draw(row_env, self.rt)
+                prev = {s.column: row_env[s.column] for s in (*self.entity_emits, *self.event_emits)}
+                rows.append(prev)
+                continue
             if at is not None:
                 earliest = max(earliest, at + timedelta(seconds=gap))
             if self.earliest is not None and prev is not None:

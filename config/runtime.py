@@ -73,11 +73,13 @@ if SPEC_REFINE_MODE not in {"background", "inline", "off"}:
     SPEC_REFINE_MODE = "background"
 # The longest /scenario/generate waits for a spec that is still being designed before answering "not ready, retry".
 SPEC_GENERATE_WAIT_SECONDS = max(1, int(os.getenv("SPEC_GENERATE_WAIT_SECONDS", "240")))
-# How long one design is expected to take, draft and refinement together, counted from when it began (default 90 s, under the usual
-# gateway timeout). No further model round is begun that is expected to end beyond it: a repair of the first spec that cannot be
-# confined to its column, the patch made while the first spec is checked, and every refinement round. A request waits for the design
-# to settle and then generates from the settled spec, so a repeat request gets the same data; a longer window buys more refinement.
-SPEC_DESIGN_SECONDS = max(30, int(os.getenv("SPEC_DESIGN_SECONDS", "90")))
+# How long one design is expected to take, draft and refinement together, counted from when it began. By default it is as long as a
+# request is willing to wait for a design (SPEC_GENERATE_WAIT_SECONDS), because a request waits for the design to settle and then
+# generates from the settled spec, so a repeat request gets the same data. No further model round is begun that is expected to end
+# beyond it: a repair of the first spec that cannot be confined to its column, the patch made while the first spec is checked, and every
+# refinement round. A refinement round needs about a minute, so a window shorter than the first design plus one round never refines at all
+# and the errors the checks found stay open.
+SPEC_DESIGN_SECONDS = max(30, int(os.getenv("SPEC_DESIGN_SECONDS", str(SPEC_GENERATE_WAIT_SECONDS))))
 # Start designing a proposal's spec in the background as soon as it is proposed (the person reviews it meanwhile).
 SPEC_WARM_ON_PROPOSE = os.getenv("SPEC_WARM_ON_PROPOSE", "true").strip().lower() in {"1", "true", "yes", "on"}
 

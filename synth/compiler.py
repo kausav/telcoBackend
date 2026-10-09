@@ -48,7 +48,7 @@ from synth.spec import EVAL_VARS, SPEC_VERSION, Emit, GenerationSpec, Invariant,
 
 logger = logging.getLogger(__name__)
 
-COMPILER_VERSION = 9
+COMPILER_VERSION = 10
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
 DRAFT_REPAIRED_WARNINGS = frozenset({"healed_empty_column", "shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
@@ -204,6 +204,13 @@ WHAT YOU DECIDE
    action agrees with the flag that governs it (a retry action only where the flag says retryable) and with the cause of
    the failure. A remainder, reserved or used quantity of a record follows what happened (usage, time), not a fixed share of
    the amount. The kind of what an item delivers (data, voice, money) follows the item.
+14. Events that repeat or overlap within a short window. When the scenario is defined by events that follow one another within
+   seconds or minutes (a repeated or duplicate request, a retry, a concurrent or overlapping trigger, a debounce or suppression
+   window), the events cannot be evenly spread over the history: declare history.burst {"share": s, "seconds": [lo, hi]}, the share
+   of an entity's events that follow the previous event after lo..hi seconds (choose lo and hi from the window the scenario names,
+   inside it for the repeats). A burst event ignores min_gap_minutes and earliest_next. Whether an event is such a repeat, and how
+   many came before it, is then computed from the measured gap (secs(event_at, prev['<clock column>']) <= the window), never drawn
+   as a free flag or counter, and the window itself is the figure the scenario states (converted to the column's unit).
 
 THE LANGUAGE
 Expressions (python-like, safe subset). Variables: any column id or latent you declare (order is resolved automatically;
@@ -225,7 +232,7 @@ Guard None before arithmetic or comparison: "x is None or x > y". An undefined n
 Samplers - an emit gives either "expr" or "sample":
 {"type":"const","value":V}
 {"type":"expr","expr":"..."}
-{"type":"choice","weights":{"label":w,...}}                      labels are strings; add "cast":"int"|"float" for numbers
+{"type":"choice","weights":{"label":w,...}}                      labels are strings; w is a number or an expression such as "P['p_x']" or "1 - P['p_x']"; add "cast":"int"|"float" for numbers
 {"type":"choice","from_ref":"table"}                             weights from REF['table'] (a {label: weight} mapping)
 {"type":"choice","by":"<expr>","tables":{"key":{"label":w},...}} weights chosen by another value
 {"type":"bernoulli","p":0.3}                                     p: number or an expression, e.g. "P['p_fail']"
@@ -246,7 +253,7 @@ OUTPUT: one JSON object, nothing else:
 {
  "timezone": "<IANA zone of the scenario's country>", "currency": "<ISO 4217>",
  "assumptions": ["each modelling assumption in one sentence, including every invented value list and parameter"],
- "history": {"days": 120, "min_gap_minutes": 60, "margin_minutes": 20, "earliest_next": null, "hour_weights": null},
+ "history": {"days": 120, "min_gap_minutes": 60, "margin_minutes": 20, "earliest_next": null, "hour_weights": null, "burst": null},
  "clock": "<datetime column id>",
  "model": {"name": number-or-text, ...},
  "reference": {"table": {"label": weight, ...}},
@@ -258,7 +265,7 @@ OUTPUT: one JSON object, nothing else:
 }
 history.earliest_next (optional) is an expression over prev and as_of giving the earliest time the next event of the same
 entity may happen (for example the end of a cooldown: "prev['cooldown_end']"). hour_weights (optional) is 24 relative weights
-for the local hour of day. Use only the supplied column ids and your own latents. Mention only columns that need behaviour.
+for the local hour of day. burst (optional) is {"share": 0.3, "seconds": [2, 25]}: see rule 14. Use only the supplied column ids and your own latents. Mention only columns that need behaviour.
 
 A TINY EXAMPLE OF THE FORMAT ONLY (an unrelated delivery scenario; never copy its names):
 {"timezone":"Europe/Paris","currency":"EUR","assumptions":["Late delivery rate is 12% for this scenario."],
@@ -508,7 +515,7 @@ def _first_error(exc: Exception) -> str:
     return str(exc).replace("Value error, ", "")
 
 
-def merge(base: Baseline, overlay: dict[str, Any], *, brief: dict[str, Any]) -> tuple[GenerationSpec | None, list[str]]:
+def merge(base: Baseline, overlay: dict[str, Any], *, brief: dict[str, Any], guarded: bool = True) -> tuple[GenerationSpec | None, list[str]]:
     """Layer a model-written overlay over the baseline. Returns ``(spec, errors)``; ``spec`` is None when errors remain."""
     errors: list[str] = []
     if not isinstance(overlay, dict):
@@ -588,6 +595,15 @@ def merge(base: Baseline, overlay: dict[str, Any], *, brief: dict[str, Any]) -> 
         errors.append("history.days / min_gap_minutes / margin_minutes must be numbers")
     if history.get("earliest_next"):
         timeline["earliest_next"] = str(history["earliest_next"])
+    burst = history.get("burst")
+    if isinstance(burst, dict) and burst.get("share") is not None:
+        try:
+            share, (low, high) = float(burst["share"]), [float(v) for v in (burst.get("seconds") or [])[:2]]
+            if not (0.0 < share <= 0.9 and 0.0 <= low <= high <= 86400.0):
+                raise ValueError
+            timeline["burst_share"], timeline["burst_seconds"] = share, [low, high]
+        except (TypeError, ValueError):
+            errors.append("history.burst needs share (0 to 0.9) and seconds [low, high] (within one day)")
     weights = history.get("hour_weights")
     if weights:
         if isinstance(weights, list) and len(weights) == 24 and all(isinstance(w, (int, float)) and w >= 0 for w in weights) and sum(weights) > 0:
@@ -601,6 +617,8 @@ def merge(base: Baseline, overlay: dict[str, Any], *, brief: dict[str, Any]) -> 
                 or sum(float(w) for w in table.values()) <= 0:
             errors.append(f"reference '{key}' must be a non-empty {{label: non-negative weight}} mapping")
 
+    if guarded:
+        entries = _presence_guarded(base, entries, columns, clock, overlay.get("expectations"))
     ordered: list[dict[str, Any]] = []
     try:
         ordered = order_entries(list(entries.values()))
@@ -653,6 +671,45 @@ def merge(base: Baseline, overlay: dict[str, Any], *, brief: dict[str, Any]) -> 
     except (ValidationError, ValueError) as exc:
         return None, [_first_error(exc)]
     return spec, []
+
+
+def _has_guards(expectations: Any) -> bool:
+    rules = expectations.get("rules") if isinstance(expectations, dict) else None
+    return any(isinstance(r, dict) and r.get("kind") == "present_iff" for r in rules or [])
+
+
+def _presence_guarded(base: Baseline, entries: dict[str, dict[str, Any]], columns: dict[str, SpecColumn], clock: str | None,
+                      expectations: Any) -> dict[str, dict[str, Any]]:
+    """The emits with every ``present_iff`` expectation enforced on the side that can be enforced: the fact is empty when its condition is false.
+
+    The expectations are the independent view of what a real system running the scenario always shows (a completion time exists
+    only for a completed request). A designer's spec that fills such a column anyway is wrong by that view, and the wrong value
+    can be removed without inventing anything. A guard is added only to an optional (nullable) event column, and only when the
+    emits can still be ordered with it (the condition must not read what the column feeds); the other side - a fact that should
+    be there and is not - stays the designer's to model.
+    """
+    rules = expectations.get("rules") if isinstance(expectations, dict) else None
+    guarded = dict(entries)
+    for rule in rules or []:
+        if not isinstance(rule, dict) or rule.get("kind") != "present_iff":
+            continue
+        cid, cond = str(rule.get("column")), str(rule.get("when") or "").strip()
+        entry, column = guarded.get(cid), columns.get(cid)
+        if not cond or entry is None or column is None or column.kind != "event" or entry.get("scope") != "event" or cid == clock:
+            continue
+        definition = base.variables.get(cid) or {}
+        if definition.get("nullable") is not True or definition.get("required") or is_rollup(entry.get("sample")):
+            continue
+        current = str(entry.get("when") or "").strip()
+        if cond in current:
+            continue
+        trial = {**entry, "when": f"({current}) and ({cond})" if current else cond}
+        try:
+            order_entries(list({**guarded, cid: trial}.values()))
+        except SpecBuildError:
+            continue
+        guarded[cid] = trial
+    return guarded
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -719,6 +776,46 @@ def _empty_analysis(spec: GenerationSpec, rows: list[dict[str, Any]], empties: l
     return {"roots": ordered, "dependents": dependents, "why": {cid: _why_empty(emits[cid], rows, base) for cid in ordered}}
 
 
+def _absent_by_design(spec: GenerationSpec, rows: list[dict[str, Any]], info: dict[str, Any],
+                      definitions: dict[str, dict[str, Any]]) -> set[str]:
+    """The empty delivered columns that are empty on purpose: optional facts the scenario rules out.
+
+    A column qualifies when its own definition makes it optional (nullable, not required) and the design says it is absent: it
+    emits no value at all, or it is guarded by a condition on columns that do carry values but never satisfy it (a "customer
+    declines" scenario has no completed top-up, so the completion time never exists). A column that is empty only because of
+    something broken (a missing case, an expression that draws nothing, a column it reads that is empty) does not qualify.
+    """
+    delivered = spec.delivered
+    emits = {e.column: e for e in spec.emit}
+
+    def optional(cid: str) -> bool:
+        v = definitions.get(delivered.get(cid, ""))
+        return bool(v) and v.get("nullable") is True and not v.get("required")
+
+    def stated(cid: str) -> bool:
+        entry = emits.get(cid)
+        if entry is None:
+            return False
+        if entry.expr and entry.expr.strip() in ("None", "null"):
+            return True
+        if (info["why"].get(cid) or {}).get("kind") == "when" and entry.when:
+            read = Expr(entry.when).names & set(delivered)
+            # the condition is a statement about columns that do have values, so it is the scenario's outcomes that exclude the
+            # fact (a confirmation exists only for a completed top-up, and this scenario has none), not a column that failed
+            return bool(read) and all(any(r.get(c) is not None for r in rows) for c in read)
+        return False
+
+    absent = {cid for cid in info["roots"] if cid in delivered and optional(cid) and stated(cid)}
+    grown = bool(absent)
+    while grown:                                           # an optional column that reads only absent columns is absent with them
+        grown = False
+        for cid, behind in info["dependents"].items():
+            if cid in delivered and cid not in absent and optional(cid) and behind and all(b in absent for b in behind):
+                absent.add(cid)
+                grown = True
+    return absent
+
+
 _EMPTY_HINT = {
     "when": "drop the condition that never holds, or make that situation occur in this scenario",
     "no_case": "key the cases by the values the column really takes (a true/false column takes True and False)",
@@ -756,7 +853,7 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
     if records_out is not None:
         records_out.extend(records)
     parsed, parse_errors = parse_columns(records, spec, delivered)
-    contract = build_contract(variables, delivered)
+    contract = build_contract(variables, delivered, spec.scenario.get("country"))
     report = score_rows(spec, parsed, engine.reference_view(spec, ctx), columns=set(delivered), parse_errors=parse_errors, contract=contract)
     problems: list[str] = []
     by_name = {name: cid for cid, name in delivered.items()}
@@ -804,6 +901,15 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
         empty_ids = [cid for cid in delivered if all(r.get(cid) is None for r in rows)]
         if empty_ids:
             empty_info = _empty_analysis(spec, rows, empty_ids, engine.reference_view(spec, ctx))
+            absent = _absent_by_design(spec, rows, empty_info, {str(v.get("name")): v for v in variables})
+            if absent:
+                # an optional fact the scenario itself rules out (no response was ever given, so there is no response time) is
+                # correct as empty; replacing it by a draw from its definition would invent the very fact the scenario excludes
+                empty_ids = [cid for cid in empty_ids if cid not in absent]
+                empty_info = {"roots": [c for c in empty_info["roots"] if c not in absent] if empty_ids else [],
+                              "dependents": {c: b for c, b in empty_info["dependents"].items() if c not in absent},
+                              "why": {c: w for c, w in empty_info["why"].items() if c not in absent}}
+                report["absent_by_design"] = sorted(delivered[c] for c in absent)
             for cid in empty_ids:
                 behind = empty_info["dependents"].get(cid)
                 if behind:
@@ -1920,14 +2026,16 @@ class SpecCompiler:
 
         return float(SPEC_DESIGN_SECONDS)
 
-    def _round_fits(self, spent: float, first_author: float = 0.0, *, review: bool = False) -> bool:
+    def _round_fits(self, spent: float, first_author: float = 0.0, *, review: bool = False, window: float | None = None) -> bool:
         """Another model round is expected to end inside the design window, ``spent`` seconds into the design.
 
         A patch takes at least ``PATCH_SECONDS`` (measured: much longer than the first design, which writes less than a patch has to
-        weigh) and as long as the longest author call so far; a refinement round is followed by a review.
+        weigh) and as long as the longest author call so far; a refinement round is followed by a review. ``window`` replaces the design
+        window (the refinement's first round may use the whole compile budget: a design that is slower than the window would otherwise
+        never be repaired, and the errors the checks found would ship).
         """
         expected = max(self._author_seconds, first_author, PATCH_SECONDS) + (REVIEW_SECONDS if review and self.reviewing() else 0.0)
-        return spent + expected <= self._design_window()
+        return spent + expected <= (self._design_window() if window is None else window)
 
     def _affordable(self, started: float) -> bool:
         return self._round_fits(time.monotonic() - started)
@@ -1974,15 +2082,23 @@ class SpecCompiler:
 
     def _verified(self, base: Baseline, brief: dict[str, Any], overlay: dict[str, Any]) -> _Round:
         """Merge ``overlay`` into the baseline and run the deterministic checks on the result."""
-        spec, errors = merge(base, overlay, brief=brief)
-        if spec is None:
-            return _Round(None, overlay, {}, [f"STRUCTURE {e}" for e in errors])
-        records: list[dict[str, Any]] = []
-        definitions = [base.variables[c] | {"name": spec.columns[c].column} for c in spec.delivered if c in base.variables]
         aggregational = str(brief.get("type_of_data") or "").lower() == "aggregational"
-        problems, report = verify(spec, definitions, aggregational=aggregational, records_out=records,
-                                  expectations=overlay.get("expectations") if isinstance(overlay.get("expectations"), dict) else None)
-        return _Round(spec if not problems else None, overlay, report, problems, records)
+        expectations = overlay.get("expectations") if isinstance(overlay.get("expectations"), dict) else None
+        best: _Round | None = None
+        for guarded in (True, False):                       # the presence guards are kept only when they do not make the design worse
+            spec, errors = merge(base, overlay, brief=brief, guarded=guarded)
+            if spec is None:
+                rnd = _Round(None, overlay, {}, [f"STRUCTURE {e}" for e in errors])
+            else:
+                records: list[dict[str, Any]] = []
+                definitions = [base.variables[c] | {"name": spec.columns[c].column} for c in spec.delivered if c in base.variables]
+                problems, report = verify(spec, definitions, aggregational=aggregational, records_out=records, expectations=expectations)
+                rnd = _Round(spec if not problems else None, overlay, report, problems, records)
+            if best is None or len(rnd.problems) < len(best.problems):
+                best = rnd
+            if not best.problems or not _has_guards(expectations):
+                break
+        return best
 
     def _round(self, base: Baseline, brief: dict[str, Any], prompt: str, current: dict[str, Any] | None, *,
                final: bool = False, expectations: Any = None) -> _Round:
@@ -2377,7 +2493,8 @@ class SpecCompiler:
         drafting = float(spent.get("total") or 0.0)         # what the design has used before the refinement began
         first_author = float(spent.get("first_design") or 0.0)   # the estimate of an author call until one has been made here
         # a review is only worth waiting for when a round is left to act on it
-        room = self._round_fits(drafting + time.monotonic() - started, first_author, review=True)
+        elapsed = drafting + time.monotonic() - started
+        room = self._round_fits(elapsed, first_author, review=True) or self._round_fits(elapsed, first_author, review=True, window=self._budget())
         # the reviewer reads the spec that is being improved, on its own simulation
         probe = self._round_for(base, brief, current.spec, start_overlay)
         # measured findings that call for a patch go to the author at once; the reviewer reads the patched spec instead of this one
@@ -2402,7 +2519,9 @@ class SpecCompiler:
             if _weight(findings) <= GOOD_ENOUGH_WEIGHT:
                 stats["stopped"] = "good_enough"
                 break
-            if not self._round_fits(drafting + time.monotonic() - started, first_author, review=True):
+            elapsed = drafting + time.monotonic() - started
+            if not self._round_fits(elapsed, first_author, review=True) and not (
+                    stats["author_calls"] == 0 and self._round_fits(elapsed, first_author, review=True, window=self._budget())):
                 stats["stopped"] = "time"                  # the window counts from the start of the design
                 break
             rounds += 1

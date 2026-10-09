@@ -18,6 +18,31 @@ from typing import Any
 
 MAX_EXAMPLES = 3
 _NUMERIC = {"integer", "int", "float", "decimal", "number", "numeric"}
+_FREE_TEXT_GENS = {"semantic_string", "generic", "semantic_event"}
+# A column named for a subscriber / phone number: its name alone says it is a telephone number.
+_PHONE_NAME = re.compile(r"(^|_)(msisdn|phone|mobile)(_?(number|no|num))?$")
+# National-number shapes of the countries whose numbering plan the value generators know; any other country code is held to the
+# general E.164 shape (a leading "+", the country code, 6-12 more digits).
+_PHONE_SHAPES = {
+    "+91": r"[6-9]\d{9}",
+    "+44": r"7\d{9}",
+    "+971": r"(?:50|52|54|55|56|58)\d{7}",
+}
+
+
+def phone_pattern(country: Any = None) -> str:
+    """The pattern an international telephone number of ``country`` (a code or a name; None = any country) must match."""
+    from config.country_metadata import COUNTRY_BASE
+
+    text = str(country or "").strip()
+    meta = COUNTRY_BASE.get(text.upper())
+    if meta is None:
+        meta = next((m for m in COUNTRY_BASE.values() if m["country_name"].casefold() == text.casefold()), None)
+    code = str((meta or {}).get("phone_country_code") or "").strip()
+    if not code:
+        return r"\+[1-9]\d{7,14}"
+    shape = _PHONE_SHAPES.get(code, r"\d{6,12}")
+    return rf"\{code}{shape}"
 
 
 def _definition_params(variable: dict[str, Any]) -> dict[str, Any]:
@@ -28,8 +53,10 @@ def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def build_contract(variables: list[dict[str, Any]], columns: dict[str, str]) -> list[dict[str, Any]]:
-    """One entry per delivered column that its definition constrains. ``columns``: spec column id -> column name."""
+def build_contract(variables: list[dict[str, Any]], columns: dict[str, str], country: Any = None) -> list[dict[str, Any]]:
+    """One entry per delivered column that its definition constrains. ``columns``: spec column id -> column name.
+
+    ``country`` (the scenario's) fixes the shape of a telephone-number column whose definition gives no pattern of its own."""
     by_column = {str(v.get("name")): v for v in variables}
     contract: list[dict[str, Any]] = []
     for cid, column in columns.items():
@@ -50,6 +77,9 @@ def build_contract(variables: list[dict[str, Any]], columns: dict[str, str]) -> 
                 entry["pattern"] = params["pattern"]
             except re.error:
                 pass
+        if "pattern" not in entry and "choices" not in entry and str(v.get("dtype") or "string").lower() == "string" \
+                and str(v.get("gen") or "generic") in _FREE_TEXT_GENS and _PHONE_NAME.search(column.casefold()):
+            entry["pattern"] = phone_pattern(country)
         for key in ("min_length", "max_length"):
             if _number(params.get(key)):
                 entry[key] = int(params[key])
