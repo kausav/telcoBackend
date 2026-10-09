@@ -620,6 +620,10 @@ class AgenticSchemaWorkflow:
         return current_fields, current_source_map, current_persisted_map, sorted(set(removed_names))
 
     def propose(self, req: ScenarioProposeRequest) -> ScenarioImportResponse:
+        # The variable set is designed once per scenario, in its transactional shape, whichever data type is requested: an
+        # aggregational request gets the same variables (and reuses the same cached proposal and locked model choice), and
+        # only the response's typeOfData and entityKey follow what was asked for.
+        design = req if req.type_of_data == "transactional" else req.model_copy(update={"type_of_data": "transactional"})
         prompt = req.business_scenario.strip()
         requested_scenario_id = req.requested_scenario_id.strip()
         industry_key = normalize_industry_key(req.industry_type)
@@ -667,7 +671,7 @@ class AgenticSchemaWorkflow:
             f"Business domain: {req.domain}\n"
             f"Use case: {req.use_case}\n"
             f"Scenario type: {req.scenario_type}\n"
-            f"Data type: {req.type_of_data}\n"
+            f"Data type: {design.type_of_data}\n"
             f"Country: {req.country}\n"
             f"Business scenario: {prompt}\n\n"
             "Variable-design requirement: propose a broad fresh semantic variable set without an artificial minimum count. Maximize DISTINCT analytical coverage rather than raw field count. "
@@ -704,7 +708,7 @@ class AgenticSchemaWorkflow:
                 entity_key=req.entity_key,
                 industry_type=req.industry_type,
                 scenario_type=req.scenario_type,
-                type_of_data=req.type_of_data,
+                type_of_data=design.type_of_data,
                 use_case=req.use_case,
                 business_scenario=req.business_scenario,
                 business_response="",
@@ -716,7 +720,7 @@ class AgenticSchemaWorkflow:
                 forced_names=forced,
             )
 
-        cache_key = self._cache_key(req, db_variables, source_sources) + (pool_cap,)
+        cache_key = self._cache_key(design, db_variables, source_sources) + (pool_cap,)
         cached = get_proposal(cache_key)
         if cached is not None:
             intent = ScenarioIntent.model_validate(cached["intent"])
@@ -727,7 +731,7 @@ class AgenticSchemaWorkflow:
                 # The model's choice is locked the first time it is made, per distinct input (request, DB
                 # variables, source documents). Every later run of the same scenario reuses it and skips the
                 # model, so the proposal is identical until one of those inputs changes.
-                lock_key = self._lock_key(req, db_variables, source_sources)
+                lock_key = self._lock_key(design, db_variables, source_sources)
                 stored = get_selection_lock(lock_key)
                 if stored is None:
                     fresh = self._get_intent_agent().run(
@@ -751,7 +755,7 @@ class AgenticSchemaWorkflow:
             if req.country:
                 intent.country = req.country
             intent.scenario_type = req.scenario_type
-            intent.type_of_data = req.type_of_data
+            intent.type_of_data = design.type_of_data
             intent.entity_key = req.entity_key or ""
             intent.use_case = req.use_case
 
@@ -774,7 +778,7 @@ class AgenticSchemaWorkflow:
                 # their stored contracts and never ask a registry/static source for replacements.
                 db_fields = [GeneratedSchemaField.model_validate(dict(item)) for item in db_variables]
                 names = [field.name for field in db_fields]
-                resolved_entity_key = req.entity_key or (names[0] if req.type_of_data == "transactional" and names else None)
+                resolved_entity_key = req.entity_key or (names[0] if names else None)
                 schema = ScenarioSchema(
                     domain=req.domain,
                     subdomain="unknown",
