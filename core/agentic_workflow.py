@@ -21,7 +21,7 @@ from core.json_domain_policy import source_manifest
 from core.variable_contract import rewrite_formula_names, validate_db_definition
 
 logger = logging.getLogger(__name__)
-from agents.intent_agent import GeminiIntentAgent
+from agents.intent_agent import NAMES_VERSION, GeminiIntentAgent
 from agents.schema_compiler import SchemaCompiler
 from agents.data_generation_agent import FORMULA_FUNCTION_NAMES
 from config.runtime import PROPOSE_LLM_ADVISOR, SCHEMA_MAX_VARIABLES, SPEC_WARM_ON_PROPOSE
@@ -77,7 +77,10 @@ class AgenticSchemaWorkflow:
                 item = dict(persisted[key])
             else:
                 item = field.model_dump()
+                technical = str((item.get("provenance") or {}).get("technical_name") or "").strip()
                 item.pop("provenance", None)
+                if technical:
+                    item["technical_name"] = technical        # the name the data model gives the field; the readable name is `name`
             variables.append(item)
             field_order.append(field.name)
         return variables, field_order
@@ -722,6 +725,8 @@ class AgenticSchemaWorkflow:
 
         cache_key = self._cache_key(design, db_variables, source_sources) + (pool_cap,)
         cached = get_proposal(cache_key)
+        if cached is not None and cached.get("names") != NAMES_VERSION:
+            cached = None                                              # proposed before fields got readable names: rebuild (the model's field choice is locked, so it is not re-asked)
         if cached is not None:
             intent = ScenarioIntent.model_validate(cached["intent"])
             schema = ScenarioSchema.model_validate(cached["schema"])
@@ -784,6 +789,20 @@ class AgenticSchemaWorkflow:
                     },
                     scenario_id=requested_scenario_id,
                 )
+                # The fields were compiled from the data models under their technical names. Now give them the short business
+                # names a person reads; the technical name stays in each field's provenance, and the entity key and the columns
+                # a DB variable depends on keep theirs.
+                schema.fields, _renames, names_complete = self._get_intent_agent().humanize_names(
+                    schema.fields,
+                    context={
+                        "industry": req.industry_type, "domain": req.domain, "use_case": req.use_case, "country": req.country,
+                        "standards": sorted({str(s.get("name") or "") for s in source_sources if s.get("name")}),
+                    },
+                    scenario_id=requested_scenario_id,
+                    keep={str(req.entity_key or "")} | set(forced),
+                    reserved=set(protected_name_set),
+                )
+                profiles_complete = profiles_complete and names_complete
             else:
                 # No JSON source exists for this pair. The only executable definitions allowed
                 # are the persisted MongoDB scenario variables; build the schema directly from
@@ -806,7 +825,7 @@ class AgenticSchemaWorkflow:
                     warnings=["No industry-standard JSON source is registered for this industry/domain pair; MongoDB scenario variables are the complete executable source."],
                 )
             if profiles_complete:                                      # an incomplete profile pass is retried by the next proposal
-                set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
+                set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump(), "names": NAMES_VERSION})
 
         schema, variable_sources, raw_persisted_by_name = self._merge_persisted_variables(
             schema,
@@ -1082,7 +1101,10 @@ class AgenticSchemaWorkflow:
                     data["params"] = dict(field.params or {})
             else:
                 data = field.model_dump()
+                technical = str((data.get("provenance") or {}).get("technical_name") or "").strip()
                 data.pop("provenance", None)
+                if technical:
+                    data["technical_name"] = technical
             variables.append(data)
             field_order.append(field.name)
 

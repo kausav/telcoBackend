@@ -125,7 +125,10 @@ def score_rows(
         })
 
     evaluated = [r for r in results if r["status"] != "skipped"]
-    consistency = (sum(r["pass_rate"] for r in evaluated) / len(evaluated)) if evaluated else 1.0
+    # A rule that could not be evaluated (its column is not delivered) proves nothing: it counts against consistency as unverified
+    # instead of vanishing from the score, and a dataset whose error-level rule is unverified is at best "review", never a clean pass.
+    unverified = [r["id"] for r in results if r["status"] == "skipped" and r["severity"] == "error"]
+    consistency = (sum(r["pass_rate"] for r in evaluated) / (len(evaluated) + len(unverified))) if (evaluated or unverified) else 1.0
     # a row that breaks a column's own definition (a pattern, a range, an allowed value) is as unclean as one that breaks a rule
     contract_bad: set[int] = set()
     contract_violations = check_contract(rows, contract or [], contract_bad)
@@ -156,6 +159,8 @@ def score_rows(
     error_failures = [r["id"] for r in evaluated if r["severity"] == "error" and r["status"] == "fail"]
     # Rows are consistent by construction, so a single error-level violation is a defect, not noise.
     verdict = "pass" if (not error_failures and (realism is None or realism >= 0.9) and structure_ok) else "fail"
+    if verdict == "pass" and unverified:
+        verdict = "review"
 
     report.update(
         overall=round(overall, 4),
@@ -163,6 +168,7 @@ def score_rows(
         components={k: round(v, 4) for k, v in parts.items()},
         weights={k: WEIGHTS[k] for k in parts},
         verdict=verdict,
+        unverified_rules=unverified,
         invariants={
             "evaluated": len(evaluated), "skipped": len(results) - len(evaluated),
             "failed": [r for r in evaluated if r["status"] == "fail"],

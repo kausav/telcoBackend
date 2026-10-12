@@ -48,7 +48,7 @@ from synth.spec import EVAL_VARS, SPEC_VERSION, Emit, GenerationSpec, Invariant,
 
 logger = logging.getLogger(__name__)
 
-COMPILER_VERSION = 10
+COMPILER_VERSION = 12
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
 DRAFT_REPAIRED_WARNINGS = frozenset({"healed_empty_column", "shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
@@ -160,7 +160,9 @@ WHAT YOU DECIDE
 8. One fact, one value. Every column in the list is delivered - none can be removed - so columns that record the same fact
    (the same identifier under two names, the same amount, state or flag in two places, a record and the history entry that
    describes it) must agree: draw the fact once (a latent or the first column) and derive the others from it, or make the
-   difference real (an earlier event, a different party). Columns that look unrelated to the scenario are still modelled
+   difference real (an earlier event, a different party). A column that refers to the entity's own key or to its account (an
+   account identifier, an "applies to account" or "owned asset" reference) is that key column's value, not a new identifier.
+   Columns that look unrelated to the scenario are still modelled
    realistically for it; they are never left to contradict the columns that matter.
 9. Self-checks. Write at least one invariant for every causal, presence, state/flag, arithmetic and window rule you modelled
    (ordering of timestamps, state/flag agreement, presence rules, windows as entity-level invariants) - a rule without an
@@ -211,6 +213,28 @@ WHAT YOU DECIDE
    inside it for the repeats). A burst event ignores min_gap_minutes and earliest_next. Whether an event is such a repeat, and how
    many came before it, is then computed from the measured gap (secs(event_at, prev['<clock column>']) <= the window), never drawn
    as a free flag or counter, and the window itself is the figure the scenario states (converted to the column's unit).
+
+15. Variety. A column with several allowed values, example values or a reference list takes them all, with realistic unequal
+   weights shaped by the scenario type; it never holds one value on every row unless the expectations name it a constant or the
+   definition allows only that value. When the scenario is about a condition (suppression, decline, depletion, delinquency), the
+   status, reason and type columns that describe the entity show the causes of that condition in the proportions it implies - a
+   suppression scenario does not show every contact as "Active" in "good standing".
+16. The kind of the record drives its facts. When rows are of different kinds (a payment, a deposit, a withdrawal, a bill, a salary
+   credit, a transfer), draw the kind once into a latent and derive from it the category and sub-category, the amount's size, the
+   channel or mechanism that is possible for it, and which kind-specific columns exist (the others are empty). Cash leaves at a
+   branch or ATM, a card purchase comes through a terminal or a web checkout, a bill is paid through a biller, a salary credit comes
+   in once a month near month-end or month-start. Amounts take the magnitude of that kind in the scenario's currency (a utility bill
+   is hundreds to a few thousand rupees; a salary credit tens of thousands; an ATM withdrawal stays below the usual per-transaction
+   limit): a column's declared range is the envelope the values must stay inside, not the part to aim at - use the part of it that is
+   real for each kind. The generic amount of a transaction and its kind-specific amount describe the same money: they are equal, or
+   differ by a fee that is itself a column.
+17. A story over time (normal turning suspicious, growth, depletion, a customer being lost) is a trajectory of each entity with its
+   own start, speed and persona, not the same step at the same position for every entity. Its early phase looks like the ordinary
+   activity of that persona (the amounts, channels and cadence of everyday life) before anything changes.
+18. A moment that records a fact is drawn from the clock and the delays of the process. The time of generation (as_of) is never
+   the value of a business fact, and a column holding the same moment on every row of every entity is wrong.
+19. Facts that end a life (closed, terminated, released, expired) exist only for the rows in that state, and activity of the same
+   subject does not continue after them. Never make every entity closed in a scenario about activity or growth.
 
 THE LANGUAGE
 Expressions (python-like, safe subset). Variables: any column id or latent you declare (order is resolved automatically;
@@ -801,8 +825,13 @@ def _absent_by_design(spec: GenerationSpec, rows: list[dict[str, Any]], info: di
         if (info["why"].get(cid) or {}).get("kind") == "when" and entry.when:
             read = Expr(entry.when).names & set(delivered)
             # the condition is a statement about columns that do have values, so it is the scenario's outcomes that exclude the
-            # fact (a confirmation exists only for a completed top-up, and this scenario has none), not a column that failed
-            return bool(read) and all(any(r.get(c) is not None for r in rows) for c in read)
+            # fact (a confirmation exists only for a completed top-up, and this scenario has none), not a column that failed.
+            # A condition on the design's own hidden decisions only (an account that "is closed", never true in a growth
+            # scenario) is the scenario's outcome as well: the optional fact is absent, and filling it on every row by taking the
+            # condition off would make every entity closed. Facts the expectations require are still reported by their own check.
+            if not read:
+                return True
+            return all(any(r.get(c) is not None for r in rows) for c in read)
         return False
 
     absent = {cid for cid in info["roots"] if cid in delivered and optional(cid) and stated(cid)}

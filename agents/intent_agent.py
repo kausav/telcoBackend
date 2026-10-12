@@ -594,11 +594,12 @@ def _compact_source_catalog_for_llm(
 # stand-in range (0-100, 0-1000). profile_values asks the model, once per scenario, what a real system of the industry and
 # country holds in each such field, checks the answer against the field's own contract and locks it, so the same scenario
 # always proposes the same values and generation needs no model call for these fields.
-PROFILE_VERSION = "value-profile-v1"
+PROFILE_VERSION = "value-profile-v2"
 CHUNK = 30                       # fields per model call
 WORKERS = 3                      # chunks asked at the same time
 MIN_VALUES = 4                   # fewer distinct usable values than this is no profile
 MAX_VALUES = 20
+_STALE_YEAR = re.compile(r"(?<![0-9])(?:19|20)\d{2}(?:(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))?(?![0-9])")          # a year inside a value goes stale
 _GENERIC = re.compile(
     r"^(?:syn[_\-\s]?\w*|sample\w*|test\w*|example\w*|dummy\w*|lorem.*|foo\w*|bar|baz|xxx+|n/?a|na|none|null|nil|unknown|"
     r"string|value\s*\d*|text\s*\d*|type\s*[a-z0-9]|item\s*\d+|option\s*\d+|field\s*\d*|placeholder\w*|tbd|todo)$",
@@ -621,11 +622,18 @@ Rules:
 3. Honour every constraint given for the field: minLength / maxLength, format, and the country's conventions (language, currency,
    phone, postal and ID formats).
 4. Give 8 to 20 distinct values. Mix common and less common ones, as real data would. Keep every value on one line.
-5. Stay consistent with the business scenario where the field's meaning allows it (a fraud-alert narrative reads differently from
-   a salary-credit narrative), but never invent values the field cannot hold.
+5. Describe the whole population of the field, not the scenario's special case. The business scenario may colour a narrative or
+   a reason field (a fraud-alert narrative reads differently from a salary-credit narrative), but the values of a code, type,
+   status or channel field are the ones the system holds for every kind of record, and a number's range covers the routine small
+   values as well as the large ones. How often each value or size occurs for a scenario is decided later by the generator.
 6. If you cannot tell what a field holds, return an empty list (text) or null min and max (number). That is better than a guess.
-7. For a number, min must be below max, and the range must be what a real system would hold (a retail payment is not 0-100, a
-   percentage is 0-100, a count of failed logins is small).
+7. For a number, min must be below max. Give the range in which most real values of the field lie across all records, from the
+   smallest routine value to the large ones (a retail payment ranges from tens to lakhs of rupees, not 45,000 to 950,000; a
+   percentage is 0-100; a count of failed logins is small). Never narrow it to what only the scenario's suspicious or rare records show.
+8. Identifiers, references and codes that systems generate: give the format with made-up digits (a prefix, a separator, digits). Never
+   put a calendar year, a date or the name of a real company, bank or brand inside them. A value that is itself a name (a bank, a
+   card network, a payment scheme, a city) may be a real one, only in a field that holds exactly that kind of name.
+9. Text values never contain a calendar year or date that will go stale (no "2023", no "Jan-2024"), unless the field is a date.
 
 Return only JSON: {"fields": [{"name": "<exact field name>", "values": ["...", "..."]}, {"name": "<number field>", "min": 0, "max": 0}]}.
 Include every field you were given, once."""
@@ -679,7 +687,7 @@ def _usable(field: GeneratedSchemaField, raw: Any) -> list[str]:
         folded = text.casefold()
         if not text or folded in seen or not (low <= len(text) <= high):
             continue
-        if _GENERIC.match(text) or re.sub(r"[^a-z0-9]+", "", folded) == key:
+        if _GENERIC.match(text) or re.sub(r"[^a-z0-9]+", "", folded) == key or _STALE_YEAR.search(text):
             continue
         seen.add(folded)
         out.append(text)
@@ -700,6 +708,184 @@ def _usable_range(field: GeneratedSchemaField, low: Any, high: Any) -> dict[str,
         lo, hi = int(round(lo)), int(round(hi))
         return {"min": lo, "max": hi} if lo < hi else None
     return {"min": round(lo, 6), "max": round(hi, 6)}
+
+
+# ---- readable names ---------------------------------------------------------------------------------------------
+# A field compiled from a standard is named after its path inside that standard, which is exact but unreadable
+# (bank_to_customer_debit_credit_notification_v14_grp_hdr_msg_rcpt_ctct_dtls_othr_chanl_tp). The fields are compiled from the data
+# models first, with the source name kept in their provenance; humanize_names then gives each a short business name, once per
+# set of fields, locks it, and the proposal carries the readable names from then on. Nothing downstream looks a field up by its
+# technical name: provenance (source_json_original_name, source_json_semantic_key, source_json_path) still leads back to the model.
+NAMES_VERSION = "readable-names-v1"
+NAME_MAX_LEN = 48
+NAME_MIN_LEN = 3
+_NAME_OK = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+_NAME_FILLER = {"field", "value", "data", "column", "attribute", "item", "thing", "info", "misc", "syn"}
+# Shorthand that standards and APIs use inside their tags. The model reads these too; this table is the fallback when it cannot be reached.
+_ABBREVIATIONS = {
+    "acct": "account", "addr": "address", "amt": "amount", "appl": "application", "auth": "authorization", "bal": "balance",
+    "bic": "bic", "cd": "code", "chanl": "channel", "chnl": "channel", "ctct": "contact", "cntry": "country", "cre": "created",
+    "cr": "credit", "cur": "currency", "ccy": "currency", "cust": "customer", "dbtr": "debtor", "cdtr": "creditor", "db": "debit",
+    "dt": "date", "tm": "time", "dts": "date", "dtls": "details", "dtl": "detail", "desc": "description", "dest": "destination",
+    "doc": "document", "dur": "duration", "end": "end", "exp": "expiry", "fee": "fee", "freq": "frequency", "grp": "group",
+    "hdr": "header", "id": "id", "idx": "index", "info": "information", "inst": "instruction", "instd": "instructed",
+    "instg": "instructing", "msg": "message", "nm": "name", "no": "number", "nb": "number", "num": "number", "ntfctn": "notification",
+    "ntry": "entry", "ownr": "owner", "othr": "other", "pmt": "payment", "pstl": "postal", "prd": "period", "ref": "reference",
+    "rcpt": "recipient", "rltd": "related", "rsn": "reason", "sts": "status", "stat": "status", "svc": "service", "tp": "type",
+    "txn": "transaction", "trx": "transaction", "tx": "transaction", "ts": "timestamp", "val": "value", "ctry": "country",
+    "ultmt": "ultimate", "orgnl": "original", "grpg": "grouping", "tot": "total", "qty": "quantity", "prty": "priority",
+    "mmb": "member", "agt": "agent", "ctrl": "control", "sum": "summary", "seq": "sequence", "nbr": "number", "ind": "indicator",
+}
+_NOISE_TOKENS = {"v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16"}
+
+NAMES_PROMPT = """You rename the columns of a synthetic dataset so that a business user, not a programmer, understands them at a glance.
+
+You get a list of fields. Each has its current technical "name" (built from the path of the field inside an industry data model:
+BIAN, FIBO, ISO 20022, TM Forum, FHIR, ACORD and so on), its "description", its "source_path", the "model" it belongs to and its
+data type, and sometimes example values. Give every field a "readable" name.
+
+Rules:
+1. snake_case, lowercase letters, digits and underscores only, starting with a letter. 2 to 5 words, at most 40 characters.
+2. Say what the value is, in the words a business person uses: transaction_amount, payment_channel, account_open_date,
+   notification_sent_at, cash_withdrawal_type. Expand every abbreviation (Dbtr is debtor, Ntry is entry, ctct dtls is contact
+   details, tp is type, cre dt tm is created date time, othr is other). Keep only universally known short forms (id, kyc, aml, sms).
+3. Drop wrapper words that only describe the message or API envelope (the message name, version numbers such as v14, "request",
+   "response", "grp hdr", "details", "record") unless two fields would otherwise be indistinguishable.
+4. When the same leaf word appears for different owners (an amount of a deposit and an amount of a withdrawal, a date of the
+   account opening and of the account closing), keep the owner word that tells them apart: deposit_amount, withdrawal_amount,
+   account_open_date, account_close_date.
+5. End with a word that names the kind of value when natural: _id, _date, _timestamp (date and time), _amount, _status, _type, _code,
+   _flag (yes/no), _count, _name, _channel, _reason, _score, _rate.
+6. Use the same word for the same concept across the whole list ("transaction" everywhere, never txn in one and trx in another;
+   "customer" or "party" consistently).
+7. Every readable name must be unique in the list, and must not be one of the names in "reserved".
+8. Do not change what the field means and do not invent meaning that the description and path do not support. If a name is
+   already clear, return it unchanged. Never use filler such as field, value, data, column, attribute, item, syn, and never
+   end a name in a number.
+
+Return only JSON: {"fields": [{"name": "<current technical name, exactly as given>", "readable": "<new name>"}]}.
+Include every field you were given, once."""
+
+
+def _name_tokens(text: str) -> list[str]:
+    return [t for t in re.split(r"[^a-z0-9]+", str(text or "").lower()) if t]
+
+
+_WRAPPER_TOKENS = {"details", "detail", "header", "group", "record", "message", "request", "response"}
+
+
+def _plain_name(name: str) -> list[str]:
+    """Deterministic readable tokens of a technical name: shorthand expanded, versions, envelope words and repeats dropped."""
+    out: list[str] = []
+    for token in _name_tokens(name):
+        if token in _NOISE_TOKENS or re.fullmatch(r"v\d+", token):
+            continue
+        out.append(_ABBREVIATIONS.get(token, token))
+    core = [t for t in out if t not in _WRAPPER_TOKENS]
+    out = core if len(core) >= 2 else out
+    merged: list[str] = []
+    for token in out:                                   # date + time is a timestamp
+        if token == "time" and merged and merged[-1] == "date":
+            merged[-1] = "timestamp"
+        else:
+            merged.append(token)
+    seen: set[str] = set()                              # a word said twice is said once, where it matters most (the later place)
+    unique: list[str] = []
+    for token in reversed(merged):
+        if token not in seen:
+            seen.add(token)
+            unique.append(token)
+    return unique[::-1]
+
+
+def _shorten(tokens: list[str], limit: int = NAME_MAX_LEN) -> str:
+    """Whole name when it fits; otherwise the owner word at the front plus as many closing words as fit (the most specific part)."""
+    if len("_".join(tokens)) <= limit:
+        return "_".join(tokens)
+    kept: list[str] = []
+    room = limit - len(tokens[0]) - 1 if len(tokens) > 1 else limit
+    for token in reversed(tokens[1:]):
+        if len("_".join([token] + kept)) > room:
+            break
+        kept.insert(0, token)
+    return "_".join(([tokens[0]] if tokens and len(tokens) > 1 else []) + kept) if kept else tokens[-1][:limit]
+
+
+def _readable_ok(candidate: Any, taken: set[str]) -> str | None:
+    text = re.sub(r"[^a-z0-9]+", "_", re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(candidate or "").strip()).lower()).strip("_")
+    if not (NAME_MIN_LEN <= len(text) <= NAME_MAX_LEN) or not _NAME_OK.match(text):
+        return None
+    parts = text.split("_")
+    # filler is a defect only when it is all the name says or the word it ends in ("bucket_remaining_value_amount" is fine)
+    if all(p in _NAME_FILLER for p in parts) or parts[-1] in _NAME_FILLER or re.search(r"\d$", text) or _GENERIC.match(text):
+        return None
+    return None if text in taken else text
+
+
+def _fallback_name(field: GeneratedSchemaField, taken: set[str]) -> str:
+    """A readable name without the model: expanded tokens, shortened, made unique with the owner words of the source path."""
+    tokens = _plain_name(field.name)
+    context = _plain_name(str((field.provenance or {}).get("source_json_model") or ""))
+    attempts = [tokens] + [context[-n:] + tokens for n in (1, 2, 3)] if context else [tokens]
+    for attempt in attempts:
+        candidate = _readable_ok(_shorten(attempt), taken)
+        if candidate:
+            return candidate
+    base = _shorten(tokens, NAME_MAX_LEN - 3) or "field_value"
+    n = 2
+    while f"{base}_{n}" in taken:
+        n += 1
+    return f"{base}_{n}" if _NAME_OK.match(f"{base}_{n}") else f"attribute_{n}"
+
+
+def _name_signature(field: GeneratedSchemaField) -> dict[str, Any]:
+    params = field.params or {}
+    prov = field.provenance or {}
+    examples = params.get("source_examples") or params.get("choices") or []
+    return {
+        "name": field.name,
+        "description": (field.description or "")[:220],
+        "source_path": str(prov.get("source_json_path") or "")[:200],
+        "model": str(prov.get("source_json_model") or "")[:100],
+        "dtype": field.dtype,
+        "examples": [str(x)[:40] for x in list(examples)[:3]] if isinstance(examples, list) else [],
+    }
+
+
+def rename_in_text(text: Any, mapping: dict[str, str]) -> Any:
+    """``text`` with every whole-word technical name replaced (a formula, a rule text)."""
+    if not isinstance(text, str) or not text or not mapping:
+        return text
+    for old in sorted(mapping, key=len, reverse=True):
+        text = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(old)}(?![A-Za-z0-9_])", mapping[old], text)
+    return text
+
+
+def apply_renames(fields: list[GeneratedSchemaField], mapping: dict[str, str]) -> list[GeneratedSchemaField]:
+    """Rename fields and every reference to them (depends_on, formula, reference parameters); the old name stays in provenance."""
+    if not mapping:
+        return fields
+    reference_keys = ("depends_on_field", "field", "segment_field", "hi_field", "lo_field", "base_field", "source_field", "add_seconds_field")
+    out: list[GeneratedSchemaField] = []
+    for field in fields:
+        params = dict(field.params or {})
+        for key in reference_keys:
+            if isinstance(params.get(key), str) and params[key] in mapping:
+                params[key] = mapping[params[key]]
+        update: dict[str, Any] = {
+            "depends_on": [mapping.get(d, d) for d in (field.depends_on or [])],
+            "formula": rename_in_text(field.formula, mapping),
+            "params": params,
+        }
+        if field.name in mapping:
+            prov = dict(field.provenance or {})
+            prov.setdefault("source_json_original_name", field.name)
+            prov.setdefault("source_json_name", field.name)
+            prov["technical_name"] = field.name
+            prov["readable_names"] = NAMES_VERSION
+            update.update(name=mapping[field.name], provenance=prov)
+        out.append(field.model_copy(update=update))
+    return out
 
 
 class GeminiIntentAgent:
@@ -1079,6 +1265,71 @@ class GeminiIntentAgent:
             enriched.append(field)
         logger.info("[IntentAgent/ValueProfile] %d of %d placeholder-only field(s) given values", filled, len(targets))
         return enriched, complete
+
+
+    def humanize_names(self, fields: list[GeneratedSchemaField], *, context: dict[str, Any], scenario_id: str,
+                       keep: set[str] | None = None, reserved: set[str] | None = None) -> tuple[list[GeneratedSchemaField], dict[str, str], bool]:
+        """Give source-backed fields short business names: ``(fields, {technical name: readable name}, complete)``.
+
+        ``keep`` names are never renamed (the entity key, columns a DB variable refers to). ``reserved`` names (the DB variables)
+        are never taken. The model proposes, every proposal is checked (shape, length, no filler, unique), and anything it did
+        not give or got wrong is named by the deterministic fallback, so the result is always complete; ``complete`` is False only
+        when the model could not be reached, so the caller does not freeze a fallback-only answer.
+        """
+        keep_keys = {str(k).casefold() for k in (keep or set())}
+        targets = [f for f in fields if (f.provenance or {}).get("source_json_id") and f.name.casefold() not in keep_keys]
+        if not targets:
+            return fields, {}, True
+        fixed = {f.name.casefold() for f in fields if f not in targets} | {str(r).casefold() for r in (reserved or set())}
+        digest = hashlib.sha256(json.dumps(
+            [NAMES_VERSION, {k: context.get(k) for k in ("industry", "domain", "standards")}, sorted(fixed),
+             sorted((_name_signature(f) for f in targets), key=lambda s: s["name"])], sort_keys=True, ensure_ascii=False, default=str,
+        ).encode("utf-8")).hexdigest()
+        lock_key = f"{NAMES_VERSION}:{digest}"
+        stored = None
+        try:
+            stored = get_selection_lock(lock_key)
+        except Exception as exc:
+            logger.warning("[IntentAgent/Names] lock store unavailable: %s: %s", type(exc).__name__, exc)
+        complete = True
+        proposed: dict[str, str] = {}
+        if stored is not None:
+            proposed = {str(k): str(v) for k, v in ((stored or {}).get("names") or {}).items()}
+        else:
+            prompt = json.dumps({"context": {k: context.get(k) for k in ("industry", "domain", "use_case", "country", "standards")},
+                                 "reserved": sorted(fixed)[:80], "fields": [_name_signature(f) for f in targets]}, ensure_ascii=False, indent=1)
+            try:
+                reply = self._get_client().generate_json(NAMES_PROMPT, prompt, temperature=0.2)
+                rows = reply.get("fields") if isinstance(reply, dict) else reply
+                for row in rows or []:
+                    if isinstance(row, dict) and isinstance(row.get("name"), str):
+                        proposed[row["name"]] = str(row.get("readable") or "")
+            except Exception as exc:
+                complete = False
+                logger.warning("[IntentAgent/Names] model call for %d field(s) failed: %s: %s", len(targets), type(exc).__name__, exc)
+        taken = set(fixed)
+        mapping: dict[str, str] = {}
+        from_model = 0
+        for field in targets:                                               # pass 1: accepted model names, first come first served
+            candidate = _readable_ok(proposed.get(field.name), taken)
+            if candidate:
+                mapping[field.name] = candidate
+                taken.add(candidate)
+                from_model += 1
+        for field in targets:                                               # pass 2: the fallback names the rest
+            if field.name not in mapping:
+                candidate = _fallback_name(field, taken)
+                mapping[field.name] = candidate
+                taken.add(candidate)
+        if stored is None and complete:
+            try:
+                lock_selection(lock_key, scenario_id, {"names": mapping})
+            except Exception as exc:
+                logger.warning("[IntentAgent/Names] could not lock names: %s: %s", type(exc).__name__, exc)
+        mapping = {old: new for old, new in mapping.items() if old != new}
+        logger.info("[IntentAgent/Names] %d of %d field(s) renamed (%d by the model)", len(mapping), len(targets), from_model)
+        return apply_renames(fields, mapping), mapping, complete
+
 
 # Backward-compatible internal alias for older imports.
 PydanticAIIntentAgent = GeminiIntentAgent

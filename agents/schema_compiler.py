@@ -88,6 +88,46 @@ class SchemaCompiler:
     _SOURCE_BOOLEAN_PREFIXES = {"is", "has", "can", "should"}
 
 
+    PUBLIC_NAME_TARGET_LENGTH = 56
+    _PUBLIC_NAME_LENGTHS = (56, 72, 96)
+
+    @staticmethod
+    def _name_tokens(value: str) -> list[str]:
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value or ""))
+        text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", text)
+        return [t for t in re.split(r"[^A-Za-z0-9]+", text.lower()) if t]
+
+    @classmethod
+    def _readable_public_name(cls, source_name: str, limit: int | None = None) -> str:
+        """Turn a flattened source path into a short name a person can read; the same input always gives the same name.
+
+        Generic rules, no industry knowledge: drop version tags (``v14``), collapse a word that is repeated next to itself
+        (``medium_medium_type``) or a phrase that repeats later in the path, and, when the name is still longer than the limit,
+        drop words from the middle of the path (the first word names the owner and the last words name the field). The
+        full original name stays in the field's provenance and still resolves as an alias.
+        """
+        tokens = [t for t in cls._name_tokens(source_name) if not re.fullmatch(r"v\d+", t)]
+        for size in (4, 3, 2):                                    # a phrase that comes back later in the path
+            index = 0
+            while index + size <= len(tokens):
+                phrase = tokens[index:index + size]
+                later = next((j for j in range(index + size, len(tokens) - size + 1) if tokens[j:j + size] == phrase), None)
+                if later is None:
+                    index += 1
+                else:
+                    del tokens[later:later + size]
+        collapsed: list[str] = []
+        for token in tokens:                                      # the same word twice in a row
+            if not collapsed or collapsed[-1] != token:
+                collapsed.append(token)
+        tokens = collapsed
+        # "contact_medium" + "medium_type": the last word of the owner is the first word of the field
+        limit = int(limit or cls.PUBLIC_NAME_TARGET_LENGTH)
+        while len("_".join(tokens)) > limit and len(tokens) > 4:
+            del tokens[1]                                         # keep the owner word and the closing words
+        name = "_".join(tokens)
+        return cls._normalize_variable_key(name) if name else cls._normalize_variable_key(source_name)
+
     @classmethod
     def _source_readable_names(
         cls,
@@ -244,6 +284,23 @@ class SchemaCompiler:
 
 
     @staticmethod
+    def _temporal_kind(name: str) -> str | None:
+        """``"datetime"`` / ``"date"`` when the last words of a field name say it holds a moment / a day, else None.
+
+        Whole trailing words only (date, datetime, timestamp, "date time", "dt tm"), so ``update_reason`` or ``timeout_rule``
+        are not dates and ``..._created_date_time`` is.
+        """
+        tokens = [t for t in re.split(r"[^a-z0-9]+", re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name).lower()) if t]
+        if not tokens:
+            return None
+        last, before = tokens[-1], (tokens[-2] if len(tokens) > 1 else "")
+        if last in {"datetime", "timestamp", "dttm"} or (last, before) in {("time", "date"), ("tm", "dt"), ("time", "dt")}:
+            return "datetime"
+        if last in {"date", "dt"}:
+            return "date"
+        return None
+
+    @staticmethod
     def _json_source_contract(
         spec: dict[str, object],
         country: str | None,
@@ -270,6 +327,16 @@ class SchemaCompiler:
                 "timezone": "Asia/Kolkata" if str(country or "IN").upper() == "IN" else "UTC",
                 "days_back": 365,
             }
+
+        # A standard often types a date as a plain string ("deposit_transaction_date": string). Read in the words of its own
+        # name it is still a date or a moment, and generated as text it would sit beside real dates in another format.
+        if dtype in {"string", "str", "text"} and not fmt and not spec.get("pattern") and not spec.get("examples") and not spec.get("example"):
+            temporal = SchemaCompiler._temporal_kind(str(spec.get("name") or ""))
+            if temporal:
+                zone = "Asia/Kolkata" if str(country or "IN").upper() == "IN" else "UTC"
+                if temporal == "datetime":
+                    return "recent_datetime", "datetime", {"timezone": zone, "days_back": 365}
+                return "recent_date", "date", {"timezone": zone, "days_back": 365}
 
         # Honor standard-defined string formats before generic semantic name heuristics. This is
         # important for other sources where a field named ``id`` may legally be a UUID/URI.

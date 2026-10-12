@@ -41,4 +41,36 @@ class GenerationSpecModel:
         cls.collection.update_one({"spec_key": spec_key}, {"$set": {"spec.warnings": warnings, "spec.reviewed": reviewed}})
 
 
+class GenerationSpecClaimModel:
+    """Who is designing (or refining) a spec right now, across every worker process: one short-lived document per key."""
+
+    collection = get_database()[collection_name("MONGODB_GENERATION_SPEC_CLAIMS_COLLECTION", "generation_spec_claims")]
+
+    @classmethod
+    def ensure_indexes(cls) -> None:
+        cls.collection.create_index("spec_key", unique=True)
+
+    @classmethod
+    def claim(cls, spec_key: str, owner: str, ttl_seconds: float) -> bool:
+        """True when ``owner`` now holds the claim; False when another live claim exists. An expired claim is taken over."""
+        from pymongo.errors import DuplicateKeyError
+
+        now = time.time()
+        cls.collection.delete_one({"spec_key": spec_key, "expires_at": {"$lt": now}})
+        try:
+            cls.collection.insert_one({"spec_key": spec_key, "owner": owner, "started_at": now, "expires_at": now + ttl_seconds})
+            return True
+        except DuplicateKeyError:
+            return False
+
+    @classmethod
+    def active(cls, spec_key: str) -> bool:
+        return cls.collection.find_one({"spec_key": spec_key, "expires_at": {"$gte": time.time()}}, {"_id": 1}) is not None
+
+    @classmethod
+    def release(cls, spec_key: str, owner: str) -> None:
+        cls.collection.delete_one({"spec_key": spec_key, "owner": owner})
+
+
 GenerationSpecModel.ensure_indexes()
+GenerationSpecClaimModel.ensure_indexes()

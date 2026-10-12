@@ -44,7 +44,9 @@ def source_notes(brief: dict[str, Any], variables: list[dict[str, Any]]) -> tupl
     resources: dict[str, str] = {}
     for variable in variables:
         name = str(variable.get("name") or "") if isinstance(variable, dict) else ""
-        row = next((by_alias[a] for a in sorted(variable_semantic_aliases(name)) if a in by_alias), None) if name else None
+        # A field with a readable name still leads back to its data model through the technical name it was compiled under.
+        names = [n for n in (name, str(variable.get("technical_name") or "") if isinstance(variable, dict) else "") if n]
+        row = next((by_alias[a] for n in names for a in sorted(variable_semantic_aliases(n)) if a in by_alias), None)
         if row is None:
             continue
         resource = str(row.get("business_model") or row.get("model") or "").strip()

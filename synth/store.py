@@ -8,8 +8,10 @@ the process cache (the spec is then recompiled after a restart); it never fails 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
+import uuid
 from typing import Any
 
 from synth.spec import GenerationSpec
@@ -30,12 +32,13 @@ def _model():
     return GenerationSpecModel
 
 
-def load(key: str | None) -> GenerationSpec | None:
+def load(key: str | None, *, fresh: bool = False) -> GenerationSpec | None:
+    """The spec stored under ``key``. ``fresh`` skips the process cache (to see a revision another worker just stored)."""
     if not key:
         return None
     with _LOCK:
         cached = _SPECS.get(key)
-    if cached is not None and time.monotonic() - cached[1] < CACHE_SECONDS:
+    if cached is not None and not fresh and time.monotonic() - cached[1] < CACHE_SECONDS:
         return cached[0]
     try:
         document = _model().get(key)
@@ -111,6 +114,46 @@ def failure_reason(key: str | None) -> str:
     with _LOCK:
         entry = _FAILED.get(key) if key else None
     return entry[1] if entry else ""
+
+
+# ---- who is designing what, across worker processes --------------------------------------------------------------
+# A design takes minutes. Without a shared record, a request that lands on another worker than the one designing would start the
+# same design again and wait for it from zero. The claim is a short-lived MongoDB document; a database that cannot be reached
+# means "no other worker known", which falls back to the process-local behaviour.
+_OWNER = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+CLAIM_SECONDS = 900.0
+
+
+def _claims():
+    from models.generation_spec import GenerationSpecClaimModel
+
+    return GenerationSpecClaimModel
+
+
+def claim_remote(key: str, ttl: float = CLAIM_SECONDS) -> bool:
+    """True when this process may design ``key``: nobody else holds a live claim (or the claims cannot be read)."""
+    try:
+        return _claims().claim(key, _OWNER, ttl)
+    except Exception as exc:
+        logger.warning("design claim for %s could not be taken: %s: %s", key[:8], type(exc).__name__, exc)
+        return True
+
+
+def release_remote(key: str) -> None:
+    try:
+        _claims().release(key, _OWNER)
+    except Exception as exc:
+        logger.warning("design claim for %s could not be released: %s: %s", key[:8], type(exc).__name__, exc)
+
+
+def designing_elsewhere(key: str | None) -> bool:
+    """True while a live claim on ``key`` exists (held by this process or another; callers check the local flight first)."""
+    if not key:
+        return False
+    try:
+        return bool(_claims().active(key))
+    except Exception:
+        return False
 
 
 def clear_cache() -> None:

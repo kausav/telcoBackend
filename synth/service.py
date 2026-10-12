@@ -114,6 +114,7 @@ class SpecNotReady(RuntimeError):
         self.key, self.retry_after = key, retry_after
 
 
+RETRY_AFTER_SECONDS = 30
 _FLIGHT_LOCK = threading.Lock()
 _IN_FLIGHT: dict[str, threading.Event] = {}
 _REFINING: set[str] = set()
@@ -122,6 +123,14 @@ _REFINE_REVISION: dict[str, int] = {}                        # the newest revisi
 _REFINE_CHANGED = threading.Condition(_FLIGHT_LOCK)          # signalled when a refinement stores a revision or ends
 _REFINE_BACKOFF: dict[str, float] = {}
 REFINE_BACKOFF_SECONDS = 300.0
+_REFINE_PREFIX = "refine:"                                 # claim key of a refinement (see synth.store.claim_remote)
+
+
+def _claim_seconds() -> float:
+    """How long a design claim stays valid if its process dies: the longest a design may run, plus slack."""
+    from config.runtime import SPEC_COMPILE_BUDGET_SECONDS
+
+    return float(SPEC_COMPILE_BUDGET_SECONDS) + 120.0
 
 
 def _claim(key: str) -> bool:
@@ -176,7 +185,9 @@ def _after_refinement(key: str, spec: GenerationSpec, names: set[str], *, limit:
             if remaining <= 0:
                 break
             _REFINE_CHANGED.wait(remaining)
-    latest = store.load(key)
+    while time.monotonic() < deadline and key not in _REFINING and store.designing_elsewhere(_REFINE_PREFIX + key):
+        time.sleep(min(3.0, max(0.0, deadline - time.monotonic())))      # another worker is refining it: wait for its last revision
+    latest = store.load(key, fresh=True)
     return latest if latest is not None and names == set(latest.delivered.values()) else spec
 
 
@@ -257,6 +268,7 @@ def _refine_job(variables: list[dict[str, Any]], brief: dict[str, Any], key: str
             _REFINING.discard(key)
             _REFINE_REVISION.pop(key, None)
             _REFINE_CHANGED.notify_all()
+        store.release_remote(_REFINE_PREFIX + key)
 
 
 def _schedule_refinement(variables: list[dict[str, Any]], brief: dict[str, Any], key: str, spec: GenerationSpec,
@@ -270,6 +282,10 @@ def _schedule_refinement(variables: list[dict[str, Any]], brief: dict[str, Any],
             return                                           # the reviewer could not be reached a moment ago
         if not (inline or mode == "inline"):
             _REFINE_SCHEDULED.add(key)
+    if not store.claim_remote(_REFINE_PREFIX + key, _claim_seconds()):        # another worker is refining this spec already
+        with _FLIGHT_LOCK:
+            _REFINE_SCHEDULED.discard(key)
+        return
     if inline or mode == "inline":
         _refine_job(variables, brief, key, spec, compiler)
         return
@@ -339,6 +355,7 @@ def _background(variables: list[dict[str, Any]], brief: dict[str, Any], key: str
         store.remember_failure(key, f"{type(exc).__name__}: {exc}"[:600], transient=True)
     finally:
         _release(key)
+        store.release_remote(key)
 
 
 def warm_spec(variables: list[dict[str, Any]], brief: dict[str, Any], *, hint_key: str | None = None) -> str | None:
@@ -356,10 +373,14 @@ def warm_spec(variables: list[dict[str, Any]], brief: dict[str, Any], *, hint_ke
             return key
         if store.recently_failed(key) or not _claim(key):
             return key
+        if not store.claim_remote(key, _claim_seconds()):          # another worker process is designing this very spec
+            _release(key)
+            return key
         try:
             threading.Thread(target=_background, args=(list(variables), dict(brief), key, hint_key), name=f"spec-{key[:8]}", daemon=True).start()
         except Exception:
             _release(key)
+            store.release_remote(key)
             raise
         return key
     except Exception:
@@ -434,15 +455,22 @@ def resolve_spec(context: dict[str, Any], variables: list[dict[str, Any]], *, wa
         warm_spec(usable, brief, hint_key=pinned_key)
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
-        if _wait(waiting_on, timeout=max(0.0, deadline - time.monotonic())):
+        if in_flight(waiting_on):                               # designed by this process: wait for its end
+            if _wait(waiting_on, timeout=max(0.0, deadline - time.monotonic())):
+                break
+        elif store.designing_elsewhere(waiting_on):             # designed by another worker: wait until its spec is stored
+            if store.load(waiting_on, fresh=True) is not None:
+                break
+            time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+        else:
             break
-    spec = store.load(waiting_on)
+    spec = store.load(waiting_on, fresh=True)
     if spec is not None and names == set(spec.delivered.values()):
         status = "pinned" if waiting_on == pinned_key else "cached"
         spec = _after_refinement(waiting_on, spec, names, limit=left())
         return SpecResolution(spec, waiting_on, status, _describe(spec, waiting_on, status))
-    if in_flight(waiting_on):
-        raise SpecNotReady(waiting_on, retry_after=max(10, int(wait)))
+    if in_flight(waiting_on) or store.designing_elsewhere(waiting_on):
+        raise SpecNotReady(waiting_on, retry_after=RETRY_AFTER_SECONDS)       # the request has waited its share already: ask to come back soon, not after another full wait
     return SpecResolution(None, key, "unavailable", _describe(None, key, "unavailable", _why(key, "the design of this spec did not produce a usable spec")))
 
 
@@ -464,9 +492,14 @@ def generate(spec: GenerationSpec, variables: list[dict[str, Any]], *, count: in
     summary = _summary_keys(report, count, per_entity, len(records), spec.warnings, _confined(spec))
     # columns that carry no value on any row stay visible: the design left them empty because the scenario excludes the fact
     summary["empty_columns"] = [name for name in delivered.values() if records and all(r.get(name) is None for r in records)]
-    if report.get("verdict") == "pass" and summary["open_findings"]["errors"]:
+    open_errors = int(summary["open_findings"]["errors"])
+    if report.get("verdict") == "pass" and open_errors:
         # the rows follow the spec's own rules, but the design review left errors open: that is not a clean pass
         report["spec_verdict"], report["verdict"] = "pass", "review"
+    if open_errors and isinstance(report.get("overall"), (int, float)):
+        # a score of 1.0 beside a known open error reads as "nothing is wrong": each open error takes a tenth off, at most half
+        report["overall_before_open_findings"] = report["overall"]
+        report["overall"] = round(report["overall"] * (1.0 - min(0.5, 0.1 * open_errors)), 4)
     report.update(seed=seed, as_of=ctx.as_of.isoformat(), engine=spec.engine, generation_engine=spec.engine,
                   spec_revision=spec.revision, spec_assumptions=spec.assumptions, **summary)
     clock = spec.columns[spec.clock].column if spec.clock else None

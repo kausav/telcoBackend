@@ -72,7 +72,7 @@ SPEC_REFINE_MODE = os.getenv("SPEC_REFINE_MODE", "background").strip().lower()
 if SPEC_REFINE_MODE not in {"background", "inline", "off"}:
     SPEC_REFINE_MODE = "background"
 # The longest /scenario/generate waits for a spec that is still being designed before answering "not ready, retry".
-SPEC_GENERATE_WAIT_SECONDS = max(1, int(os.getenv("SPEC_GENERATE_WAIT_SECONDS", "240")))
+SPEC_GENERATE_WAIT_SECONDS = max(1, int(os.getenv("SPEC_GENERATE_WAIT_SECONDS", "300")))
 # How long one design is expected to take, draft and refinement together, counted from when it began. By default it is as long as a
 # request is willing to wait for a design (SPEC_GENERATE_WAIT_SECONDS), because a request waits for the design to settle and then
 # generates from the settled spec, so a repeat request gets the same data. No further model round is begun that is expected to end
