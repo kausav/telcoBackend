@@ -68,6 +68,12 @@ class GenerationSpecClaimModel:
         return cls.collection.find_one({"spec_key": spec_key, "expires_at": {"$gte": time.time()}}, {"_id": 1}) is not None
 
     @classmethod
+    def age(cls, spec_key: str) -> float | None:
+        """Seconds since the live claim on ``spec_key`` was taken, or None when nobody holds one."""
+        doc = cls.collection.find_one({"spec_key": spec_key, "expires_at": {"$gte": time.time()}}, {"started_at": 1})
+        return max(0.0, time.time() - float(doc.get("started_at") or time.time())) if doc else None
+
+    @classmethod
     def release(cls, spec_key: str, owner: str) -> None:
         cls.collection.delete_one({"spec_key": spec_key, "owner": owner})
 

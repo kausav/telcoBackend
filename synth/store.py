@@ -146,6 +146,16 @@ def release_remote(key: str) -> None:
         logger.warning("design claim for %s could not be released: %s: %s", key[:8], type(exc).__name__, exc)
 
 
+def claim_age(key: str | None) -> float | None:
+    """Seconds a live claim on ``key`` has been held (by any worker), or None."""
+    if not key:
+        return None
+    try:
+        return _claims().age(key)
+    except Exception:
+        return None
+
+
 def designing_elsewhere(key: str | None) -> bool:
     """True while a live claim on ``key`` exists (held by this process or another; callers check the local flight first)."""
     if not key:

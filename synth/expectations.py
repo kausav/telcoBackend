@@ -80,6 +80,11 @@ GUIDANCE
 - "state_shares" gives WIDE bands (at least 0.15 wide) for the outcome values of this scenario type, for example how common a
   failure, an acceptance or an escalation is. Use the exact values the column's allowed list gives (true or false for a yes/no column). Skip a column whose values
   you cannot judge. Never give a band for an identifier.
+- Real operating rules are expectations too. For the country and industry of the scenario, state as "holds" rules the limits that the
+  rails, channels, instruments and services named by the columns really enforce: a per-transaction cap, a minimum for a high-value
+  rail, whole denominations for cash, the fee that belongs to a fee type, a quota, a regulated contact window or opt-out. Condition
+  each on the column that names the kind (for example the payment mechanism) so the rule binds only the rows of that kind. Also state
+  that a party in a blocking state (frozen, closed, suppressed, opted out, barred) has no new outreach or activity after it began.
 - Prefer a few rules you are sure of (at most 30) over many guesses: a rule that is wrong rejects correct data. Do not write a rule
   for a column pair that has no real relation. Every rule needs a one-sentence "why" that is true for this scenario.
 - Do not restate a column's own definition (allowed values, ranges, formats): those are already checked. DO state what is true

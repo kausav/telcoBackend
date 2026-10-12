@@ -106,12 +106,13 @@ def _why(key: str | None, fallback: str) -> list[str]:
 
 
 class SpecNotReady(RuntimeError):
-    """The scenario's generation spec is still being designed; generating from it would have to wait longer than allowed."""
+    """The scenario's generation spec is still being designed or refined; generating from it now would give data that the next request replaces."""
 
-    def __init__(self, key: str | None, retry_after: int):
-        super().__init__("The generation spec for this scenario is still being designed. Retry in about "
-                         f"{retry_after} seconds; the design continues in the background.")
-        self.key, self.retry_after = key, retry_after
+    def __init__(self, key: str | None, retry_after: int, phase: str = "designing"):
+        verb = "refined" if phase == "refining" else "designed"
+        super().__init__(f"The generation spec for this scenario is still being {verb}. Retry in about "
+                         f"{retry_after} seconds; the work continues in the background.")
+        self.key, self.retry_after, self.phase = key, retry_after, phase
 
 
 RETRY_AFTER_SECONDS = 30
@@ -122,6 +123,7 @@ _REFINE_SCHEDULED: set[str] = set()                         # refinements that w
 _REFINE_REVISION: dict[str, int] = {}                        # the newest revision a running refinement has stored
 _REFINE_CHANGED = threading.Condition(_FLIGHT_LOCK)          # signalled when a refinement stores a revision or ends
 _REFINE_BACKOFF: dict[str, float] = {}
+_REFINE_STARTED: dict[str, float] = {}                       # key -> monotonic time its refinement was scheduled in this process
 REFINE_BACKOFF_SECONDS = 300.0
 _REFINE_PREFIX = "refine:"                                 # claim key of a refinement (see synth.store.claim_remote)
 
@@ -168,17 +170,29 @@ def refining(key: str | None) -> bool:
         return key in _REFINING or key in _REFINE_SCHEDULED
 
 
+def _refine_age(key: str) -> float:
+    """Seconds the refinement of ``key`` has been under way (in this process or, by its claim, in another worker)."""
+    with _FLIGHT_LOCK:
+        started = _REFINE_STARTED.get(key)
+    local = time.monotonic() - started if started is not None else None
+    remote = store.claim_age(_REFINE_PREFIX + key)
+    ages = [a for a in (local, remote) if a is not None]
+    return max(ages) if ages else 0.0
+
+
 def _after_refinement(key: str, spec: GenerationSpec, names: set[str], *, limit: float | None = None) -> GenerationSpec:
     """The spec to generate from: the settled one, once the refinement that is improving ``spec`` has ended.
 
-    A spec that is still being refined is not final, and data generated from it would differ from the data of the next request.
-    The refinement stops by its own budget (it begins no round that would end beyond it), so this waits for that end, and returns
-    what is stored then. ``limit`` is what is left of the request's own time allowance: if the refinement is still running when it
-    is spent, the best revision so far is used (and the description says that the spec is still being refined).
+    A spec that is still being refined is not final, and data generated from it would differ from the data of the next request
+    (and would still carry the errors the review found). So this waits for the end of the refinement for at most ``limit`` seconds
+    (what is left of the request's own allowance) and, if it is still running, raises ``SpecNotReady("refining")`` - the caller
+    asks again - unless the refinement has already run ``SPEC_SETTLE_SECONDS``, when the best revision so far is served.
     """
     if spec.reviewed:
         return spec
-    deadline = time.monotonic() + (SpecCompiler._budget() if limit is None else limit)
+    from config.runtime import SPEC_SETTLE_SECONDS
+
+    deadline = time.monotonic() + (min(SpecCompiler._budget(), 30.0) if limit is None else limit)
     with _REFINE_CHANGED:
         while key in _REFINING or key in _REFINE_SCHEDULED:
             remaining = deadline - time.monotonic()
@@ -188,7 +202,10 @@ def _after_refinement(key: str, spec: GenerationSpec, names: set[str], *, limit:
     while time.monotonic() < deadline and key not in _REFINING and store.designing_elsewhere(_REFINE_PREFIX + key):
         time.sleep(min(3.0, max(0.0, deadline - time.monotonic())))      # another worker is refining it: wait for its last revision
     latest = store.load(key, fresh=True)
-    return latest if latest is not None and names == set(latest.delivered.values()) else spec
+    latest = latest if latest is not None and names == set(latest.delivered.values()) else spec
+    if not latest.reviewed and (refining(key) or store.designing_elsewhere(_REFINE_PREFIX + key)) and _refine_age(key) < SPEC_SETTLE_SECONDS:
+        raise SpecNotReady(key, retry_after=RETRY_AFTER_SECONDS, phase="refining")
+    return latest
 
 
 def design_key(variables: list[dict[str, Any]], brief: dict[str, Any]) -> str | None:
@@ -267,6 +284,7 @@ def _refine_job(variables: list[dict[str, Any]], brief: dict[str, Any], key: str
         with _REFINE_CHANGED:
             _REFINING.discard(key)
             _REFINE_REVISION.pop(key, None)
+            _REFINE_STARTED.pop(key, None)
             _REFINE_CHANGED.notify_all()
         store.release_remote(_REFINE_PREFIX + key)
 
@@ -282,9 +300,11 @@ def _schedule_refinement(variables: list[dict[str, Any]], brief: dict[str, Any],
             return                                           # the reviewer could not be reached a moment ago
         if not (inline or mode == "inline"):
             _REFINE_SCHEDULED.add(key)
+            _REFINE_STARTED.setdefault(key, time.monotonic())
     if not store.claim_remote(_REFINE_PREFIX + key, _claim_seconds()):        # another worker is refining this spec already
         with _FLIGHT_LOCK:
             _REFINE_SCHEDULED.discard(key)
+            _REFINE_STARTED.pop(key, None)
         return
     if inline or mode == "inline":
         _refine_job(variables, brief, key, spec, compiler)
@@ -492,6 +512,10 @@ def generate(spec: GenerationSpec, variables: list[dict[str, Any]], *, count: in
     summary = _summary_keys(report, count, per_entity, len(records), spec.warnings, _confined(spec))
     # columns that carry no value on any row stay visible: the design left them empty because the scenario excludes the fact
     summary["empty_columns"] = [name for name in delivered.values() if records and all(r.get(name) is None for r in records)]
+    # columns that are empty on most rows are kind-specific facts (a deposit amount exists only on deposit rows): reported, not hidden
+    if records:
+        shares = {name: sum(1 for r in records if r.get(name) is None) / len(records) for name in delivered.values()}
+        summary["sparse_columns"] = {name: round(share, 3) for name, share in shares.items() if 0.5 <= share < 1.0}
     open_errors = int(summary["open_findings"]["errors"])
     if report.get("verdict") == "pass" and open_errors:
         # the rows follow the spec's own rules, but the design review left errors open: that is not a clean pass

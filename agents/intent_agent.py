@@ -594,7 +594,7 @@ def _compact_source_catalog_for_llm(
 # stand-in range (0-100, 0-1000). profile_values asks the model, once per scenario, what a real system of the industry and
 # country holds in each such field, checks the answer against the field's own contract and locks it, so the same scenario
 # always proposes the same values and generation needs no model call for these fields.
-PROFILE_VERSION = "value-profile-v2"
+PROFILE_VERSION = "value-profile-v3"
 CHUNK = 30                       # fields per model call
 WORKERS = 3                      # chunks asked at the same time
 MIN_VALUES = 4                   # fewer distinct usable values than this is no profile
@@ -634,6 +634,9 @@ Rules:
    put a calendar year, a date or the name of a real company, bank or brand inside them. A value that is itself a name (a bank, a
    card network, a payment scheme, a city) may be a real one, only in a field that holds exactly that kind of name.
 9. Text values never contain a calendar year or date that will go stale (no "2023", no "Jan-2024"), unless the field is a date.
+10. One letter-case convention across the whole list: values of code, type, status, channel and category fields are UPPER_SNAKE_CASE
+   (CASH_WITHDRAWAL, UPI_PAYMENT), unless the field's own description or allowed values show another style; names, places and
+   narratives keep natural case. Never mix the two styles for fields of the same kind.
 
 Return only JSON: {"fields": [{"name": "<exact field name>", "values": ["...", "..."]}, {"name": "<number field>", "min": 0, "max": 0}]}.
 Include every field you were given, once."""
@@ -716,9 +719,10 @@ def _usable_range(field: GeneratedSchemaField, low: Any, high: Any) -> dict[str,
 # models first, with the source name kept in their provenance; humanize_names then gives each a short business name, once per
 # set of fields, locks it, and the proposal carries the readable names from then on. Nothing downstream looks a field up by its
 # technical name: provenance (source_json_original_name, source_json_semantic_key, source_json_path) still leads back to the model.
-NAMES_VERSION = "readable-names-v1"
+NAMES_VERSION = "readable-names-v2"
 NAME_MAX_LEN = 48
 NAME_MIN_LEN = 3
+_MAX_WORD = 15                      # no ordinary word of a field name is longer (identification is 14)
 _NAME_OK = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _NAME_FILLER = {"field", "value", "data", "column", "attribute", "item", "thing", "info", "misc", "syn"}
 # Shorthand that standards and APIs use inside their tags. The model reads these too; this table is the fallback when it cannot be reached.
@@ -759,7 +763,10 @@ Rules:
 6. Use the same word for the same concept across the whole list ("transaction" everywhere, never txn in one and trx in another;
    "customer" or "party" consistently).
 7. Every readable name must be unique in the list, and must not be one of the names in "reserved".
-8. Do not change what the field means and do not invent meaning that the description and path do not support. If a name is
+8. Separate every word with an underscore (never glue words together such as currentaccountpayments) and correct obvious spelling
+   mistakes of the source (wihdrawal is withdrawal, depositsand is deposit and). Drop action and envelope words of an API
+   operation (update, create, initiate, execute, evaluate, request, response) when the field is the same fact without them.
+9. Do not change what the field means and do not invent meaning that the description and path do not support. If a name is
    already clear, return it unchanged. Never use filler such as field, value, data, column, attribute, item, syn, and never
    end a name in a number.
 
@@ -816,6 +823,8 @@ def _readable_ok(candidate: Any, taken: set[str]) -> str | None:
     if not (NAME_MIN_LEN <= len(text) <= NAME_MAX_LEN) or not _NAME_OK.match(text):
         return None
     parts = text.split("_")
+    if any(len(p) > _MAX_WORD for p in parts):                      # words run together: currentaccountpayments
+        return None
     # filler is a defect only when it is all the name says or the word it ends in ("bucket_remaining_value_amount" is fine)
     if all(p in _NAME_FILLER for p in parts) or parts[-1] in _NAME_FILLER or re.search(r"\d$", text) or _GENERIC.match(text):
         return None
@@ -850,6 +859,51 @@ def _name_signature(field: GeneratedSchemaField) -> dict[str, Any]:
         "dtype": field.dtype,
         "examples": [str(x)[:40] for x in list(examples)[:3]] if isinstance(examples, list) else [],
     }
+
+
+_OPERATION_WORDS = {"request", "response", "update", "create", "retrieve", "initiate", "execute", "evaluate", "control", "capture",
+                    "notify", "exchange", "grp", "hdr"}
+
+
+def _fact_key(name: str) -> tuple[str, ...]:
+    """The words of a technical name that say WHAT the value is: operation/envelope words, versions, plurals and repeats removed."""
+    words = [_ABBREVIATIONS.get(t, t) for t in _name_tokens(name) if t not in _OPERATION_WORDS and t not in _NOISE_TOKENS and not re.fullmatch(r"v\d+", t)]
+    words = [w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w for w in words]
+    out: list[str] = []
+    for w in reversed(words):
+        if w not in out:
+            out.append(w)
+    return tuple(reversed(out))
+
+
+def drop_wrapper_duplicates(fields: list[GeneratedSchemaField], keep: set[str] | None = None) -> tuple[list[GeneratedSchemaField], list[str]]:
+    """Remove a source field that is the same fact as another, differing only by the operation wrapper of its path.
+
+    ``current_account_update_payments_request_payments_payment_transaction_amount`` and ``current_account_payments_payment_transaction_amount``
+    are one amount seen through two API operations: both would be delivered as columns that must always agree. The one without
+    operation words stays. Never removed: the ``keep`` names, a field another field depends on, anything that is not source-backed.
+    """
+    keep_keys = {str(k).casefold() for k in (keep or set())}
+    referenced = {d for f in fields for d in (f.depends_on or [])}
+    for f in fields:
+        referenced |= {v for v in (f.params or {}).values() if isinstance(v, str)}
+    groups: dict[tuple, list[GeneratedSchemaField]] = {}
+    for f in fields:
+        if (f.provenance or {}).get("source_json_id") and f.name.casefold() not in keep_keys and f.name not in referenced:
+            key = _fact_key(f.name)
+            if len(key) >= 2:
+                groups.setdefault((key, f.dtype), []).append(f)
+    drop: set[str] = set()
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        # keep the plainest path: fewest operation words, then the shortest name
+        members.sort(key=lambda f: (sum(1 for t in _name_tokens(f.name) if t in _OPERATION_WORDS), len(f.name), f.name))
+        drop |= {f.name for f in members[1:]}
+    if not drop:
+        return fields, []
+    logger.info("[IntentAgent/Names] %d duplicate wrapper field(s) removed: %s", len(drop), ", ".join(sorted(drop)))
+    return [f for f in fields if f.name not in drop], sorted(drop)
 
 
 def rename_in_text(text: Any, mapping: dict[str, str]) -> Any:

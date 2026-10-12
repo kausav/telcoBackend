@@ -21,7 +21,7 @@ from core.json_domain_policy import source_manifest
 from core.variable_contract import rewrite_formula_names, validate_db_definition
 
 logger = logging.getLogger(__name__)
-from agents.intent_agent import NAMES_VERSION, GeminiIntentAgent
+from agents.intent_agent import NAMES_VERSION, GeminiIntentAgent, drop_wrapper_duplicates
 from agents.schema_compiler import SchemaCompiler
 from agents.data_generation_agent import FORMULA_FUNCTION_NAMES
 from config.runtime import PROPOSE_LLM_ADVISOR, SCHEMA_MAX_VARIABLES, SPEC_WARM_ON_PROPOSE
@@ -792,6 +792,7 @@ class AgenticSchemaWorkflow:
                 # The fields were compiled from the data models under their technical names. Now give them the short business
                 # names a person reads; the technical name stays in each field's provenance, and the entity key and the columns
                 # a DB variable depends on keep theirs.
+                schema.fields, _dropped = drop_wrapper_duplicates(schema.fields, keep={str(req.entity_key or "")} | set(forced))
                 schema.fields, _renames, names_complete = self._get_intent_agent().humanize_names(
                     schema.fields,
                     context={

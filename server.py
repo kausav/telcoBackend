@@ -77,6 +77,7 @@ def _clean_dict(d: dict) -> dict:
         cleaned[k] = v
     return cleaned
 
+from core.api_auth import api_token_middleware, log_startup as log_auth_startup, openapi_security
 from core.error_handlers import (
     http_exception_handler,
     request_validation_exception_handler,
@@ -91,6 +92,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Validate immutable model inputs and initialize mutable runtime state once per process."""
+    log_auth_startup()
     try:
         ping_mongodb()
         ensure_model_indexes()
@@ -169,11 +171,16 @@ def _custom_openapi():
                 },
             }
 
-    app.openapi_schema = schema
+    app.openapi_schema = openapi_security(schema)
     return app.openapi_schema
 
 
 app.openapi = _custom_openapi
+
+
+# Registered before the request-id middleware so it runs inside it (the 401 carries the request id) and inside CORS (the 401 carries
+# the CORS headers, so a browser shows the real error and not a blocked request).
+app.middleware("http")(api_token_middleware)
 
 
 @app.middleware("http")
@@ -191,7 +198,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Request-ID"],
 )
 
 # Compress large JSON generation/proposal responses to reduce transfer time without changing payload semantics.
@@ -1004,7 +1011,7 @@ async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
         return payload
     except SpecNotReady as exc:
         # The scenario's behaviour design is still running in the background: answer at once instead of holding the request.
-        raise HTTPException(503, detail={"error": str(exc), "retryAfterSeconds": exc.retry_after},
+        raise HTTPException(503, detail={"error": str(exc), "retryAfterSeconds": exc.retry_after, "phase": exc.phase},
                             headers={"Retry-After": str(exc.retry_after)}) from exc
     except ValueError as exc:
         raise HTTPException(400, detail={"error": str(exc)}) from exc

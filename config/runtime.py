@@ -39,6 +39,14 @@ CORS_ALLOW_ORIGINS = [
     if item.strip()
 ]
 
+# Static API token(s) used until a real auth flow exists. Comma-separated so a token can be rotated without downtime (old and new
+# both valid for a while). Empty = authentication is OFF (a warning is logged at startup). Sent by callers as
+# "Authorization: Bearer <token>" or "X-API-Key: <token>".
+API_STATIC_TOKENS = [t.strip() for t in os.getenv("API_STATIC_TOKENS", os.getenv("API_STATIC_TOKEN", "")).split(",") if t.strip()]
+# Paths that never need the token (liveness/readiness probes). The interactive docs are open unless this is set to true.
+API_AUTH_PUBLIC_PATHS = ("/", "/health", "/ready")
+API_AUTH_PROTECT_DOCS = os.getenv("API_AUTH_PROTECT_DOCS", "false").strip().lower() in {"1", "true", "yes", "on"}
+
 MAX_CSV_BYTES = int(os.getenv("MAX_CSV_BYTES", str(10 * 1024 * 1024)))
 INDUSTRY_SOURCE_MAX_JSON_BYTES = int(os.getenv("INDUSTRY_SOURCE_MAX_JSON_BYTES", str(8 * 1024 * 1024)))
 JSON_SOURCE_LLM_CATALOG_LIMIT = int(os.getenv("JSON_SOURCE_LLM_CATALOG_LIMIT", "1200"))
@@ -64,22 +72,25 @@ SPEC_LLM_TIMEOUT_MS = max(10000, int(os.getenv("SPEC_LLM_TIMEOUT_MS", "240000"))
 # designer. Turn off to design with the deterministic checks only.
 SPEC_REVIEW = os.getenv("SPEC_REVIEW", "true").strip().lower() in {"1", "true", "yes", "on"}
 # Total time one design may take across its repair rounds; once spent, the spec so far is rejected rather than waiting on.
-SPEC_COMPILE_BUDGET_SECONDS = max(30, int(os.getenv("SPEC_COMPILE_BUDGET_SECONDS", "600")))
+SPEC_COMPILE_BUDGET_SECONDS = max(30, int(os.getenv("SPEC_COMPILE_BUDGET_SECONDS", "900")))
 # background (default): the design (first spec, then its refinement) runs in the background, and a request that needs the spec waits
 # for it to settle, so every request for a scenario generates from the same final spec; inline: refinement runs in the caller's
 # thread; off: no refinement (the first verified spec is final).
 SPEC_REFINE_MODE = os.getenv("SPEC_REFINE_MODE", "background").strip().lower()
 if SPEC_REFINE_MODE not in {"background", "inline", "off"}:
     SPEC_REFINE_MODE = "background"
-# The longest /scenario/generate waits for a spec that is still being designed before answering "not ready, retry".
-SPEC_GENERATE_WAIT_SECONDS = max(1, int(os.getenv("SPEC_GENERATE_WAIT_SECONDS", "300")))
-# How long one design is expected to take, draft and refinement together, counted from when it began. By default it is as long as a
-# request is willing to wait for a design (SPEC_GENERATE_WAIT_SECONDS), because a request waits for the design to settle and then
-# generates from the settled spec, so a repeat request gets the same data. No further model round is begun that is expected to end
-# beyond it: a repair of the first spec that cannot be confined to its column, the patch made while the first spec is checked, and every
-# refinement round. A refinement round needs about a minute, so a window shorter than the first design plus one round never refines at all
-# and the errors the checks found stay open.
-SPEC_DESIGN_SECONDS = max(30, int(os.getenv("SPEC_DESIGN_SECONDS", str(SPEC_GENERATE_WAIT_SECONDS))))
+# How long ONE /scenario/generate request is held open for a spec that is still being designed or refined. It is short on purpose:
+# a design takes minutes (2 to 6 in practice), and a request held that long is cut off by clients and proxies long before. A request
+# that finds the spec unfinished answers 503 + Retry-After at once (the design carries on in the background) and the caller asks again.
+SPEC_GENERATE_WAIT_SECONDS = max(1, int(os.getenv("SPEC_GENERATE_WAIT_SECONDS", "20")))
+# How long one design may take, draft and refinement together, counted from when it began. No further model round is begun that is
+# expected to end beyond it: a repair of the first spec, the patch made while the first spec is checked, and every refinement round.
+# It is independent of the request wait above: nobody holds a request open for it, so it can be long enough for the reviewer's
+# findings to be repaired (a refinement round needs one to two minutes) instead of shipping with the errors still open.
+SPEC_DESIGN_SECONDS = max(30, int(os.getenv("SPEC_DESIGN_SECONDS", "720")))
+# A spec that is still being refined is not served (generate answers "refining, retry") until its refinement has run this long;
+# after that the best revision so far is served. The safety net for a refinement that never ends.
+SPEC_SETTLE_SECONDS = max(30, int(os.getenv("SPEC_SETTLE_SECONDS", "900")))
 # Start designing a proposal's spec in the background as soon as it is proposed (the person reviews it meanwhile).
 SPEC_WARM_ON_PROPOSE = os.getenv("SPEC_WARM_ON_PROPOSE", "true").strip().lower() in {"1", "true", "yes", "on"}
 
