@@ -7,16 +7,20 @@ answer. We therefore request plain JSON and validate it locally with Pydantic.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from core.agentic_models import ScenarioIntent
+from core.agentic_models import GeneratedSchemaField, ScenarioIntent
 from core.errors import LLMUpstreamError
 from core.llm_client import GeminiClient
 from core.json_domain_policy import is_json_grounded_domain
+from core.scenario_variable_store import get_selection_lock, lock_selection
+from synth.definitions import is_placeholder_only
 from core.industry_source_store import (
     catalog_for_request,
     normalize_lookup_key,
@@ -584,6 +588,120 @@ def _compact_source_catalog_for_llm(
     }
 
 
+# ---- value profiles ---------------------------------------------------------------------------------------------
+# Standards (BIAN, FIBO, ISO 20022, TM Forum, ...) list few example values, so a free-text field could only be generated as a
+# neutral SYN_<FIELD>_1234 token (stripped or rejected by the quality gates) and a number without declared bounds got a
+# stand-in range (0-100, 0-1000). profile_values asks the model, once per scenario, what a real system of the industry and
+# country holds in each such field, checks the answer against the field's own contract and locks it, so the same scenario
+# always proposes the same values and generation needs no model call for these fields.
+PROFILE_VERSION = "value-profile-v1"
+CHUNK = 30                       # fields per model call
+WORKERS = 3                      # chunks asked at the same time
+MIN_VALUES = 4                   # fewer distinct usable values than this is no profile
+MAX_VALUES = 20
+_GENERIC = re.compile(
+    r"^(?:syn[_\-\s]?\w*|sample\w*|test\w*|example\w*|dummy\w*|lorem.*|foo\w*|bar|baz|xxx+|n/?a|na|none|null|nil|unknown|"
+    r"string|value\s*\d*|text\s*\d*|type\s*[a-z0-9]|item\s*\d+|option\s*\d+|field\s*\d*|placeholder\w*|tbd|todo)$",
+    re.IGNORECASE,
+)
+
+SYSTEM_PROMPT = """You supply realistic values for fields of a synthetic-data schema, for any industry.
+
+Each field is either a text field ("kind": "text") or a number ("kind": "number"). For a text field, list the values a real,
+production system of the stated industry and country holds in it. For a number, give the range in which most real values lie
+("min" and "max", in the field's own unit: the country's currency for money, whole units for counts), not the extremes. Work from the field's name, its description, its source path (abbreviated tags such as Dbtr, PstlAdr, Nm are the
+standard's own shorthand: read them as the words they abbreviate) and the standard it comes from.
+
+Rules:
+1. Real, specific values only. Never a placeholder or generic token: no "Sample", "Test", "Example", "string", "N/A", "Unknown",
+   "Type A", "Value 1", "Lorem ipsum", "SYN_...", "XXX", and never the field's own name.
+2. The value must fit the field's meaning exactly. A name field holds realistic names for the country, an address line a real-looking
+   street address, a code field the codes of the code list the standard uses (say which list in your head, then give its codes), an
+   identifier field identifiers in the format real systems use, a free-text field short realistic text of the kind users enter.
+3. Honour every constraint given for the field: minLength / maxLength, format, and the country's conventions (language, currency,
+   phone, postal and ID formats).
+4. Give 8 to 20 distinct values. Mix common and less common ones, as real data would. Keep every value on one line.
+5. Stay consistent with the business scenario where the field's meaning allows it (a fraud-alert narrative reads differently from
+   a salary-credit narrative), but never invent values the field cannot hold.
+6. If you cannot tell what a field holds, return an empty list (text) or null min and max (number). That is better than a guess.
+7. For a number, min must be below max, and the range must be what a real system would hold (a retail payment is not 0-100, a
+   percentage is 0-100, a count of failed logins is small).
+
+Return only JSON: {"fields": [{"name": "<exact field name>", "values": ["...", "..."]}, {"name": "<number field>", "min": 0, "max": 0}]}.
+Include every field you were given, once."""
+
+
+def _is_number_target(field: GeneratedSchemaField) -> bool:
+    return str((field.params or {}).get("range_source") or "") == "default" and str(field.gen or "") in {"uniform", "uniform_int"}
+
+
+def _signature(field: GeneratedSchemaField) -> dict[str, Any]:
+    params = field.params or {}
+    prov = field.provenance or {}
+    return {
+        "name": field.name,
+        "kind": "number" if _is_number_target(field) else "text",
+        "description": (field.description or "")[:300],
+        "source_path": str(prov.get("source_json_path") or "")[:200],
+        "source_model": str(prov.get("source_json_model") or "")[:120],
+        "constraints": {k: params[k] for k in ("minLength", "maxLength", "min_length", "max_length", "format") if params.get(k) not in (None, "")},
+    }
+
+
+def _limits(field: GeneratedSchemaField) -> tuple[int, int]:
+    params = field.params or {}
+
+    def number(*keys: str) -> int | None:
+        for key in keys:
+            try:
+                value = int(float(params[key]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if value >= 0:
+                return value
+        return None
+
+    return number("minLength", "min_length") or 1, number("maxLength", "max_length") or 200
+
+
+def _usable(field: GeneratedSchemaField, raw: Any) -> list[str]:
+    """The values of ``raw`` that are real, distinct, one-line and inside the field's length contract."""
+    if not isinstance(raw, list):
+        return []
+    low, high = _limits(field)
+    key = re.sub(r"[^a-z0-9]+", "", field.name.lower())
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, (str, int, float)) or isinstance(item, bool):
+            continue
+        text = re.sub(r"\s+", " ", str(item)).strip()
+        folded = text.casefold()
+        if not text or folded in seen or not (low <= len(text) <= high):
+            continue
+        if _GENERIC.match(text) or re.sub(r"[^a-z0-9]+", "", folded) == key:
+            continue
+        seen.add(folded)
+        out.append(text)
+        if len(out) == MAX_VALUES:
+            break
+    return out if len(out) >= MIN_VALUES else []
+
+
+def _usable_range(field: GeneratedSchemaField, low: Any, high: Any) -> dict[str, float | int] | None:
+    """``{"min", "max"}`` when the model gave a finite range with min below max (whole numbers for an integer field)."""
+    try:
+        lo, hi = float(low), float(high)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(low, bool) or isinstance(high, bool) or not (abs(lo) < 1e15 and abs(hi) < 1e15) or lo >= hi:
+        return None
+    if str(field.dtype).lower() in {"integer", "int"}:
+        lo, hi = int(round(lo)), int(round(hi))
+        return {"min": lo, "max": hi} if lo < hi else None
+    return {"min": round(lo, 6), "max": round(hi, 6)}
+
+
 class GeminiIntentAgent:
     """Compatibility-named intent agent using Gemini JSON mode + local Pydantic validation.
 
@@ -877,6 +995,90 @@ class GeminiIntentAgent:
             intent.domain = domain_query
         return intent
 
+
+    @staticmethod
+    def profile_targets(fields: list[GeneratedSchemaField]) -> list[GeneratedSchemaField]:
+        return [f for f in fields if is_placeholder_only(f.model_dump()) or _is_number_target(f)]
+
+    def _ask_profiles(self, context: dict[str, Any], chunk: list[GeneratedSchemaField]) -> dict[str, Any]:
+        prompt = json.dumps({"context": context, "fields": [_signature(f) for f in chunk]}, ensure_ascii=False, indent=1)
+        reply = self._get_client().generate_json(SYSTEM_PROMPT, prompt, temperature=0.4)
+        rows = reply.get("fields") if isinstance(reply, dict) else reply
+        by_name = {f.name: f for f in chunk}
+        found: dict[str, Any] = {}
+        for row in rows or []:
+            if not isinstance(row, dict) or row.get("name") not in by_name:
+                continue
+            field = by_name[row["name"]]
+            if _is_number_target(field):
+                bounds = _usable_range(field, row.get("min"), row.get("max"))
+                if bounds:
+                    found[field.name] = bounds
+            else:
+                values = _usable(field, row.get("values"))
+                if values:
+                    found[field.name] = values
+        return found
+
+    def profile_values(self, fields: list[GeneratedSchemaField], *, context: dict[str, Any], scenario_id: str) -> tuple[list[GeneratedSchemaField], bool]:
+        """Give placeholder-only source fields model-authored, contract-checked, locked values: ``(fields, complete)``. ``complete`` is False when a model call failed, so the caller does not freeze the result."""
+        targets = self.profile_targets(fields)
+        if not targets:
+            return fields, True
+        digest = hashlib.sha256(json.dumps(
+            [PROFILE_VERSION, context, sorted((_signature(f) for f in targets), key=lambda s: s["name"])], sort_keys=True, ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        lock_key = f"{PROFILE_VERSION}:{digest}"
+        stored = None
+        try:
+            stored = get_selection_lock(lock_key)
+        except Exception as exc:                                  # an unreachable store must not stop a proposal
+            logger.warning("[IntentAgent/ValueProfile] lock store unavailable: %s: %s", type(exc).__name__, exc)
+        complete = True
+        if stored is None:
+            chunks = [targets[i:i + CHUNK] for i in range(0, len(targets), CHUNK)]
+            profiles: dict[str, Any] = {}
+
+            def run(chunk: list[GeneratedSchemaField]) -> dict[str, Any] | None:
+                try:
+                    return self._ask_profiles(context, chunk)
+                except Exception as exc:
+                    logger.warning("[IntentAgent/ValueProfile] model call for %d field(s) failed: %s: %s", len(chunk), type(exc).__name__, exc)
+                    return None
+
+            with ThreadPoolExecutor(max_workers=min(WORKERS, len(chunks))) as pool:
+                for answer in pool.map(run, chunks):
+                    if answer is None:
+                        complete = False
+                    else:
+                        profiles.update(answer)
+            if complete and profiles:
+                try:
+                    stored = lock_selection(lock_key, scenario_id, {"profiles": profiles})
+                except Exception as exc:
+                    logger.warning("[IntentAgent/ValueProfile] could not lock profiles: %s: %s", type(exc).__name__, exc)
+                    stored = {"profiles": profiles}
+            else:
+                stored = {"profiles": profiles}
+        profiles = (stored or {}).get("profiles") or {}
+        target_names = {f.name for f in targets}
+        enriched: list[GeneratedSchemaField] = []
+        filled = 0
+        for field in fields:
+            values = profiles.get(field.name)
+            if values and field.name in target_names:
+                params = dict(field.params or {})
+                if isinstance(values, dict):                          # a number: the range where real values lie
+                    params.update(min=values["min"], max=values["max"], range_source="value_profile")
+                else:
+                    params["source_examples"] = list(values)
+                provenance = dict(field.provenance or {})
+                provenance["value_profile"] = PROFILE_VERSION
+                field = field.model_copy(update={"params": params, "provenance": provenance})
+                filled += 1
+            enriched.append(field)
+        logger.info("[IntentAgent/ValueProfile] %d of %d placeholder-only field(s) given values", filled, len(targets))
+        return enriched, complete
 
 # Backward-compatible internal alias for older imports.
 PydanticAIIntentAgent = GeminiIntentAgent

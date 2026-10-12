@@ -360,6 +360,8 @@ class SchemaCompiler:
             if maximum < minimum:
                 maximum = minimum
             params = {"min": minimum, "max": maximum, "precision": 0}
+            if "minimum" not in spec and "maximum" not in spec and spec.get("exclusiveMinimum") is None and spec.get("exclusiveMaximum") is None:
+                params["range_source"] = "default"          # the source declares no bounds: the range is a stand-in a value profile replaces
             if spec.get("multipleOf") is not None:
                 params["multiple_of"] = spec["multipleOf"]
             return "uniform_int", "integer", params
@@ -398,6 +400,8 @@ class SchemaCompiler:
                 maximum = minimum
             precision = int(spec.get("precision") or 2) if str(spec.get("precision") or "").isdigit() else 2
             params = {"min": minimum, "max": maximum, "precision": max(0, min(8, precision))}
+            if "minimum" not in spec and "maximum" not in spec and spec.get("exclusiveMinimum") is None and spec.get("exclusiveMaximum") is None:
+                params["range_source"] = "default"          # the source declares no bounds: the range is a stand-in a value profile replaces
             if spec.get("multipleOf") is not None:
                 params["multiple_of"] = spec["multipleOf"]
             return "uniform", "float", params

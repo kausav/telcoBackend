@@ -770,8 +770,20 @@ class AgenticSchemaWorkflow:
                     if str(idea.name or "").strip().casefold() not in protected_name_set
                 ]
 
+            profiles_complete = True
             if json_grounded:
                 schema = compile_schema(pool_cap)
+                # Standards list few example values, so many fields would be generated as neutral tokens. Give each such field
+                # real values for this industry and country now, once, so every later run (and the fallback generator) has them.
+                schema.fields, profiles_complete = self._get_intent_agent().profile_values(
+                    schema.fields,
+                    context={
+                        "industry": req.industry_type, "domain": req.domain, "use_case": req.use_case,
+                        "scenario_type": req.scenario_type, "country": req.country, "business_scenario": prompt,
+                        "standards": sorted({str(s.get("name") or "") for s in source_sources if s.get("name")}),
+                    },
+                    scenario_id=requested_scenario_id,
+                )
             else:
                 # No JSON source exists for this pair. The only executable definitions allowed
                 # are the persisted MongoDB scenario variables; build the schema directly from
@@ -793,7 +805,8 @@ class AgenticSchemaWorkflow:
                     unresolved_items=[] if db_fields else ["No persisted MongoDB scenario variables are available."],
                     warnings=["No industry-standard JSON source is registered for this industry/domain pair; MongoDB scenario variables are the complete executable source."],
                 )
-            set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
+            if profiles_complete:                                      # an incomplete profile pass is retried by the next proposal
+                set_proposal(cache_key, {"intent": intent.model_dump(), "schema": schema.model_dump()})
 
         schema, variable_sources, raw_persisted_by_name = self._merge_persisted_variables(
             schema,
