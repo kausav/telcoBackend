@@ -42,7 +42,16 @@ CORS_ALLOW_ORIGINS = [
 # Static API token(s) used until a real auth flow exists. Comma-separated so a token can be rotated without downtime (old and new
 # both valid for a while). Empty = authentication is OFF (a warning is logged at startup). Sent by callers as
 # "Authorization: Bearer <token>" or "X-API-Key: <token>".
-API_STATIC_TOKENS = [t.strip() for t in os.getenv("API_STATIC_TOKENS", os.getenv("API_STATIC_TOKEN", "")).split(",") if t.strip()]
+# Temporary built-in token, used when API_STATIC_TOKENS is not set in the environment. It lives in the source, so
+# anyone with repository access can read it: replace it (set API_STATIC_TOKENS, e.g. from Secret Manager) before
+# real use. Set API_STATIC_TOKENS=off to switch authentication off (local development).
+DEFAULT_STATIC_API_TOKEN = "ing_gA66b4CpAjh0A7OEC6Bl5vhBoWFAn8RCgSHZwX2-"
+_raw_tokens = os.getenv("API_STATIC_TOKENS", os.getenv("API_STATIC_TOKEN", "")).strip()
+if not _raw_tokens:
+    _raw_tokens = DEFAULT_STATIC_API_TOKEN
+elif _raw_tokens.lower() in {"off", "none", "disabled"}:
+    _raw_tokens = ""
+API_STATIC_TOKENS = [t.strip() for t in _raw_tokens.split(",") if t.strip()]
 # Paths that never need the token (liveness/readiness probes). The interactive docs are open unless this is set to true.
 API_AUTH_PUBLIC_PATHS = ("/", "/health", "/ready")
 API_AUTH_PROTECT_DOCS = os.getenv("API_AUTH_PROTECT_DOCS", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -72,7 +81,7 @@ SPEC_LLM_TIMEOUT_MS = max(10000, int(os.getenv("SPEC_LLM_TIMEOUT_MS", "240000"))
 # designer. Turn off to design with the deterministic checks only.
 SPEC_REVIEW = os.getenv("SPEC_REVIEW", "true").strip().lower() in {"1", "true", "yes", "on"}
 # Total time one design may take across its repair rounds; once spent, the spec so far is rejected rather than waiting on.
-SPEC_COMPILE_BUDGET_SECONDS = max(30, int(os.getenv("SPEC_COMPILE_BUDGET_SECONDS", "900")))
+SPEC_COMPILE_BUDGET_SECONDS = max(30, int(os.getenv("SPEC_COMPILE_BUDGET_SECONDS", "1200")))
 # background (default): the design (first spec, then its refinement) runs in the background, and a request that needs the spec waits
 # for it to settle, so every request for a scenario generates from the same final spec; inline: refinement runs in the caller's
 # thread; off: no refinement (the first verified spec is final).

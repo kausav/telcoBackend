@@ -73,6 +73,11 @@ def _hour_of(dt: datetime, offset_minutes: float) -> int:
     return (dt + timedelta(minutes=offset_minutes)).hour
 
 
+def _weekday_of(dt: datetime, offset_minutes: float) -> int:
+    """Local day of the week, 0 = Monday ... 6 = Sunday, for a time shifted by ``offset_minutes`` from the time's own offset."""
+    return (dt + timedelta(minutes=offset_minutes)).weekday()
+
+
 def _add_days(dt: datetime, n: float) -> datetime:
     return dt + timedelta(days=n)
 
@@ -105,6 +110,7 @@ FUNCTIONS: dict[str, Callable[..., Any]] = {
     "is_none": lambda x: x is None,
     "distinct": _distinct, "pairs": _pairs, "strictly_increasing": _strictly_increasing, "non_decreasing": _non_decreasing, "all_after": _all_after,
     "min_gap_secs": _min_gap_secs, "hour_of": _empty_in_empty_out(_hour_of),
+    "weekday_of": _empty_in_empty_out(_weekday_of),
 }
 
 

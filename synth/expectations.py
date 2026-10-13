@@ -50,7 +50,8 @@ common for another; a fact that exists for one type can be absent for another).
 
 Use only the column ids you were given. Expressions are python-like over column ids and as_of (the moment the data is read;
 every recorded fact is earlier than as_of): operators + - * /  == != < <= > >=  and or not  is None / is not None  in / not in
-(a if c else b)  [lists]; functions abs min max round len lower upper text secs(a,b)=seconds(a-b) days(a,b) matches(regex,s).
+(a if c else b)  [lists]; functions abs min max round len lower upper text secs(a,b)=seconds(a-b) days(a,b) matches(regex,s)
+hour_of(dt,offset_minutes) weekday_of(dt,offset_minutes) (0 = Monday ... 6 = Sunday; the offset in minutes turns the time into the local clock, e.g. 330 for India).
 A column that can be empty must be guarded: "x is None or x > 0". No attribute access, comprehensions or lambda.
 
 OUTPUT: one JSON object, nothing else:
@@ -80,11 +81,20 @@ GUIDANCE
 - "state_shares" gives WIDE bands (at least 0.15 wide) for the outcome values of this scenario type, for example how common a
   failure, an acceptance or an escalation is. Use the exact values the column's allowed list gives (true or false for a yes/no column). Skip a column whose values
   you cannot judge. Never give a band for an identifier.
+- Columns that the standard keeps in different resources (the card shows "resource" and "source_field") but that record one fact of
+  one event - the amount of a payment block and the amount of the transaction that carries it - are meant to be equal: state it as
+  "holds" (equal when both have a value), so the pair is declared related and is not mistaken for a copy.
 - Real operating rules are expectations too. For the country and industry of the scenario, state as "holds" rules the limits that the
   rails, channels, instruments and services named by the columns really enforce: a per-transaction cap, a minimum for a high-value
   rail, whole denominations for cash, the fee that belongs to a fee type, a quota, a regulated contact window or opt-out. Condition
   each on the column that names the kind (for example the payment mechanism) so the rule binds only the rows of that kind. Also state
   that a party in a blocking state (frozen, closed, suppressed, opted out, barred) has no new outreach or activity after it began.
+- For EVERY value of a column that names a rail, channel, instrument or product (read its "allowed" list), ask what limit the country's
+  regulator or operator sets on it - a minimum or maximum amount, a window of hours, a settlement day, an eligibility - and state each one
+  you are sure of as a "holds" rule conditioned on that value. An amount range on the column is only the outer envelope: a value with a
+  floor (a high-value rail) must never be drawn below it, and a value with a cap never above it.
+- A fact that records a step finishing (posting, settlement, clearing, delivery) is empty whenever the outcome column says the step did
+  not succeed (failed, declined, rejected, cancelled, pending): state it as a "holds" rule on the outcome column.
 - Prefer a few rules you are sure of (at most 30) over many guesses: a rule that is wrong rejects correct data. Do not write a rule
   for a column pair that has no real relation. Every rule needs a one-sentence "why" that is true for this scenario.
 - Do not restate a column's own definition (allowed values, ranges, formats): those are already checked. DO state what is true

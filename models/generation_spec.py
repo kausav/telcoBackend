@@ -36,9 +36,15 @@ class GenerationSpecModel:
         return bool(result.modified_count)
 
     @classmethod
-    def set_review(cls, spec_key: str, warnings: list[str], reviewed: bool) -> None:
-        """Record the outcome of a review on the stored spec without changing its behaviour (or its revision)."""
-        cls.collection.update_one({"spec_key": spec_key}, {"$set": {"spec.warnings": warnings, "spec.reviewed": reviewed}})
+    def set_review(cls, spec_key: str, warnings: list[str], reviewed: bool, design: dict[str, Any] | None = None) -> None:
+        """Record the outcome of a review on the stored spec without changing its behaviour (or its revision).
+
+        ``design`` (when given) replaces the stored design notes, which is how what the refinement did (rounds, why it stopped)
+        stays visible to every worker and after a restart."""
+        changes: dict[str, Any] = {"spec.warnings": warnings, "spec.reviewed": reviewed}
+        if design is not None:
+            changes["spec.design"] = design
+        cls.collection.update_one({"spec_key": spec_key}, {"$set": changes})
 
 
 class GenerationSpecClaimModel:

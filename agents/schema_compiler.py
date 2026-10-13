@@ -36,6 +36,10 @@ def _tokens(value: str) -> list[str]:
 
 
 def _is_entity_catalog_row(spec: dict[str, Any]) -> bool:
+    # A field inside a repeating element of its model (a path through an array, "[]") repeats with the events the model records:
+    # it is never a fact of the entity, whatever the model is called. This reads the structure of the standard, not its vocabulary.
+    if "[]" in str(spec.get("path") or ""):
+        return False
     text = f"{spec.get('model','')} {spec.get('path','')}".lower()
     return any(token in text for token in ("customer", "account", "party", "subscriber", "member", "patient", "policyholder", "user", "profile")) and not any(
         token in text for token in ("transaction", "event", "order", "payment", "claim", "encounter", "visit")

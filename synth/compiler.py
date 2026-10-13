@@ -48,7 +48,7 @@ from synth.spec import EVAL_VARS, SPEC_VERSION, Emit, GenerationSpec, Invariant,
 
 logger = logging.getLogger(__name__)
 
-COMPILER_VERSION = 13
+COMPILER_VERSION = 15
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
 DRAFT_REPAIRED_WARNINGS = frozenset({"healed_empty_column", "shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
@@ -57,6 +57,7 @@ SOFT_IMMEDIATE = ("EMPTY ", "TARGET ")      # problems confined to their column 
 SOFT_LATE = ("DUPLICATE ", "INVARIANT ", "CONTRACT ", "FORMAT ", "PLACEHOLDER ", "FUTURE ", "RUNTIME ")   # confined once no round is left
 DRAFT_REPAIR_ROUNDS = 1                  # patch rounds for measured errors before a spec is first served (the refinement does the rest)
 REJECTED_PATCH_ALLOWANCE = 2
+REPAIR_PROBLEMS = 8                      # problems sent to the author in one patch: the most serious first; a patch that tries to fix everything breaks a check
 DRAFT_REVIEW_GRACE_SECONDS = 20          # how long a draft that has been repaired waits for the review that ran beside the repair
 PATCH_SECONDS = 45.0                     # the least a patch of a design is expected to take (the estimate before one has been measured)
 REVIEW_SECONDS = 20.0                    # what a review of a design is expected to take (the estimate for a refinement round besides its author call)
@@ -70,7 +71,11 @@ VERIFY_ROWS_PER_ENTITY = 6
 VERIFY_MAX_EVENTS = 12
 MODEL_ATTEMPTS = 3                       # one model call is tried this often when it fails for a reason that may pass
 MODEL_RETRY_PAUSE = (2.0, 6.0)
-_VERIFY_AS_OF = "2026-01-01T00:00:00+00:00"
+def _verify_as_of() -> str:
+    """The as_of of the verification simulation: the start of today, like the real clock (a fixed date goes stale and the spec is judged against the wrong 'now')."""
+    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
 _EVAL_HINT = " (invariants and targets can read only the supplied column ids, your latents, as_of, REF and P - not event_at, event_index, prev or first_event_at; use a column that records what you need)"
 _PLACEHOLDER = re.compile(r"^(SYN|EVENT)_[A-Z0-9_]+_\d{3,6}$")
 
@@ -163,7 +168,11 @@ WHAT YOU DECIDE
    difference real (an earlier event, a different party). A column that refers to the entity's own key or to its account (an
    account identifier, an "applies to account" or "owned asset" reference) is that key column's value, not a new identifier.
    Columns that look unrelated to the scenario are still modelled
-   realistically for it; they are never left to contradict the columns that matter.
+   realistically for it; they are never left to contradict the columns that matter. Columns the standard keeps in different
+   resources (see "resource" and "source_field") but that record ONE event - the amount of a payment block and the amount of the
+   transaction that carries it, the date of a deposit block and the date of its transaction - are that one fact: equal where both
+   exist, and the block of the kind that does not apply to the row is empty. Never nudge one of them by a few units, or shift it
+   by a day, to make them look different; a difference must be a real one (a fee that is itself a column, a later clearing date).
 9. Self-checks. Write at least one invariant for every causal, presence, state/flag, arithmetic and window rule you modelled
    (ordering of timestamps, state/flag agreement, presence rules, windows as entity-level invariants) - a rule without an
    invariant is not verified - and targets for the shares/medians your parameters imply for this scenario type. They are
@@ -196,7 +205,9 @@ WHAT YOU DECIDE
 13. Steps, snapshots and independent measures. The timestamps of different steps of one process (requested, confirmed,
    notified, shown, answered, converted) are different moments: each is drawn from the step before it with its own delay and is
    present only when that step happened; none is a single value kept for the entity's whole history, and a "last/latest X"
-   moment read at an event is derived from the entity's earlier events (prev) and is never later than that event. Two
+   moment read at an event is derived from the entity's earlier events (prev) and is never later than that event. A date or time
+   inside the block of an event (the payment date of a payment, the deposit date of a deposit) is that event's own moment: the same
+   day as the event's initiation or later, never earlier. Two
    dates of one entity (a profile date, a validity start) differ unless they really are one record. Two scores, ratings or
    measures about one subject (a credit score and a credit risk, an affinity and a propensity) are separate facts: each has its
    own latent and variation, never a constant minus the other; a label derived from a number (a frequency band from a count) is
@@ -242,7 +253,28 @@ WHAT YOU DECIDE
    instrument) first, then the amount, fee, cadence and eligibility from that kind's own limits; amounts of a capped kind stay
    under its cap, amounts of a kind that has a floor stay above it, cash is in whole denominations, a fee column agrees with its fee
    type and with the rail it was charged on, and a party that has opted out, been frozen, blocked or suppressed receives no
-   outreach and starts no new activity afterwards.
+   outreach and starts no new activity afterwards. Services that are staffed or batch-run have opening days and hours: a counter,
+   branch or agent service happens only on the days and hours that place is open (not on a weekly closure or a public holiday, not
+   at night), a cut-off or a settlement window follows the rail's own schedule. Enforce them with weekday_of(...) and hour_of(...)
+   on the event's time - a "when" that keeps a kind of event off the days it cannot happen, or the kind drawn from the days that
+   are possible - and prove them with an invariant. A fact that a column sets for the whole entity (a clearing rail, a channel, a
+   tier) is not a property of the entity when the rows of that entity use several (a different rail for each payment): give it
+   event scope and derive it from the kind of the event.
+21. Outcomes and durable facts.
+   - A fact that records a step finishing (posting, settlement, clearing, delivery, completion) exists only when the outcome says the
+     step succeeded: draw the outcome first, and leave every such column empty for a failed, declined, rejected, cancelled, reversed
+     or still-pending state. A fee that belongs to a fee type is zero, and has no fee name, when the type is exempt or waived; an
+     amount that includes a fee equals the kind-specific amount plus that fee, and only when a fee was charged.
+   - A fact about a durable relationship (ownership, control, jurisdiction, a legal form, a segment, a product held) is a fact of the
+     entity: entity scope, drawn once, the same on every event. It exists for an entity or it does not (draw a latent for that once per
+     entity); it never flickers between empty and filled from one event to the next.
+   - Columns that belong to alternative products of one account key (a current-account and a savings-account block, a prepaid and a
+     postpaid plan) are filled only for the product that key holds: draw the product once per entity (or per key) and let the other
+     product's columns stay empty on all of that key's events.
+   - When two columns classify the same event (a generic category and a kind-specific type, in the same resource or in two), they
+     come from the one kind latent through one mapping; they are never drawn separately.
+   - Cash is paid out in whole notes of the local denomination: round the amount of a cash withdrawal (for example round(x / 100) * 100)
+     and keep the generic amount of that transaction equal to it.
 
 THE LANGUAGE
 Expressions (python-like, safe subset). Variables: any column id or latent you declare (order is resolved automatically;
@@ -251,7 +283,8 @@ prev (the previous row of the same entity as a dict: prev['column'], or None on 
 parameters); REF['table'] (your "reference" tables).
 Operators: + - * /  == != < <= > >=  and or not  is None / is not None  in / not in  (a if cond else b)  [lists]  x[key].
 Functions: add_days(dt,n) add_secs(dt,n) secs(a,b)=seconds(a-b) days(a,b) text(x) lower(x) upper(x) int(x) float(x) abs min max
-round(x,n) len sigmoid(x) matches(regex,str)=whole-string regex match is_none(x) hour_of(dt,offset_minutes).
+round(x,n) len sigmoid(x) matches(regex,str)=whole-string regex match is_none(x) hour_of(dt,offset_minutes)
+weekday_of(dt,offset_minutes) (0 = Monday ... 6 = Sunday; the offset shifts the time to the local clock, e.g. 330 for India).
 Invariants and targets read the column ids, as_of, REF[...] and P[...] only (not event_at, event_index or prev).
 Entity-level invariants only (every column becomes a LIST over the entity's rows, oldest first): distinct(list)
 non_decreasing(list) strictly_increasing(list) min_gap_secs(list) and all_after(starts, ends[, applies]) = every row starts at or
@@ -358,6 +391,8 @@ def column_cards(base: Baseline, notes: dict[str, dict[str, Any]] | None = None)
         model = prov.get("source_json_model") or prov.get("model")
         if model:
             card["resource"] = str(model)
+        if v.get("technical_name") and v.get("technical_name") != cid:
+            card["source_field"] = str(v["technical_name"])          # what the standard calls it (the column name may be a business-friendly rename)
         allowed = params.get("choices") if isinstance(params.get("choices"), list) else None
         if allowed:
             card["allowed"] = allowed[:40] + ([f"... ({len(allowed)} in total)"] if len(allowed) > 40 else [])
@@ -439,10 +474,10 @@ def build_prompt(brief: dict[str, Any], base: Baseline, notes: dict[str, dict[st
             + json.dumps(context, ensure_ascii=False, separators=(",", ":")))
 
 
-def repair_prompt(first: str, overlay: dict[str, Any], problems: list[str]) -> str:
+def repair_prompt(first: str, overlay: dict[str, Any], problems: list[str], limit: int = 14) -> str:
     return (first + "\n\nYOUR CURRENT SPEC:\n" + json.dumps({k: v for k, v in overlay.items() if k not in ("healed", "expectations", "draft_review", "refinement", "timing")}, ensure_ascii=False, separators=(",", ":"))
             + "\n\nIT WAS SIMULATED AND CHECKED. THESE PROBLEMS MUST BE FIXED (the first ones are the most serious):\n- "
-            + "\n- ".join(problems[:14])
+            + "\n- ".join(problems[:limit])
             + "\n\nFix the root cause in the behaviour; do not remove an invariant or target merely to make it pass unless it is itself wrong. "
               "Return ONLY THE CHANGES as one JSON object, a patch to your current spec; everything you leave out stays exactly as it is:\n"
               ' - "columns", "latents", "invariants", "targets": entries to add or replace - a column or latent is replaced as a whole '
@@ -877,7 +912,7 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
     from synth.engines.rows import SpecRuntimeError
 
     engine = get_engine(spec.engine)
-    ctx = RunContext(seed=11, as_of=_VERIFY_AS_OF, tz_name=spec.timezone)
+    ctx = RunContext(seed=11, as_of=_verify_as_of(), tz_name=spec.timezone)
     try:
         rows = engine.simulate(spec, ctx, entities=entities, per_entity=1 if aggregational else per_entity, hints={})
     except SpecRuntimeError as exc:
@@ -980,8 +1015,12 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
         declared = set((expectations or {}).get("constants") or [])
         report["advice"] = (cadence_advice(spec, rows) + constant_advice(spec, rows, variables, declared) + sparse_advice(spec, rows)
                             + bound_advice(spec, rows) + inflight_advice(spec, rows) + shared_identifier_advice(spec, rows)
-                            + mirrored_advice(spec, rows, expectations) + counter_advice(spec, rows) + flag_state_advice(spec, rows)
+                            + mirrored_advice(spec, rows, expectations, _resource_owners(spec, variables)) + counter_advice(spec, rows)
+                            + flag_state_advice(spec, rows)
                             + near_constant_state_advice(spec, rows) + entity_stamp_advice(spec, rows)
+                            + future_date_advice(spec, rows, ctx.as_of) + target_absent_advice(report)
+                            + completion_after_failure_advice(spec, rows) + category_conflict_advice(spec, rows)
+                            + cash_denomination_advice(spec, rows) + entity_fact_scope_advice(spec, rows)
                             + expect.check(spec, rows, expectations, ctx.as_of))
         report["facts"] = shape_facts(spec, rows)
     return problems, report
@@ -1194,7 +1233,7 @@ def inflight_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[di
     """
     if not spec.clock or len(rows) < 100:
         return []
-    as_of = datetime.fromisoformat(_VERIFY_AS_OF)
+    as_of = datetime.fromisoformat(_verify_as_of())
     entity_level = set(getattr(spec, "entity_columns", []) or [])          # a customer's status is not the state of one event
     subject = _tokens(spec.delivered.get(spec.entity_column, "")) - {"id", "identifier", "key", "code", "number", "no", "ref"} \
         if spec.entity_column else set()                                  # customer_status is the life of the customer (customer_id), not of an event
@@ -1243,6 +1282,235 @@ def shared_identifier_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -
     return out[:2]
 
 
+# ---- checks that are measured on the rows and the same on every run (they decide a refinement round, the reviewer's opinion does not) ----
+_FORWARD_WORDS = frozenset({"expiry", "expiration", "expires", "expire", "due", "maturity", "matures", "next", "renewal", "scheduled", "planned",
+                            "target", "valid", "until", "effective", "deadline", "upcoming", "start", "begin", "begins", "end", "ends"})
+
+
+def future_date_advice(spec: GenerationSpec, rows: list[dict[str, Any]], as_of: datetime) -> list[dict[str, Any]]:
+    """Findings for a *date* column that records something already past but has values after as_of.
+
+    The hard check on moments covers date-times; a date (closed on, posted on) is judged the same way, except for
+    the ones whose names announce a plan (expiry, due, maturity, next, valid until...) and the ones the author lists in future_ok.
+    """
+    future_ok = set(spec.output.get("future_ok") or [])
+    out = []
+    for cid, name in spec.delivered.items():
+        if spec.columns[cid].dtype != "date" or cid in future_ok or _tokens(name) & _FORWARD_WORDS:
+            continue
+        values = [r[cid] for r in rows if isinstance(r.get(cid), datetime)]
+        late = [v for v in values if v > as_of]
+        if len(late) >= 2 and len(late) >= 0.02 * len(values):
+            out.append({"id": "future_date", "severity": "error", "columns": [name],
+                        "problem": f"{name} is later than the dataset's as_of ({as_of.date()}) on {len(late)} of {len(values)} rows, but it records something that has already happened.",
+                        "evidence": f"latest {max(late).date()}",
+                        "fix": "Bound the date by as_of (for example add_days(<its anchor>, min(delay, days(as_of, <anchor>)))), or leave the column empty "
+                               "when the fact has not happened yet; list it in future_ok only when it is a planned date."})
+    return out[:3]
+
+
+def target_absent_advice(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Findings for a target whose situation never occurs (observed 0, or a quarter of its floor) although the confidence band lets it pass."""
+    out = []
+    for t in (report.get("targets") or {}).get("results") or []:
+        low, observed, n = t.get("min"), t.get("observed"), t.get("n") or 0
+        if t.get("status") == "fail" or low is None or observed is None or n < 50 or low <= 0:
+            continue
+        if observed <= 0.25 * low:
+            out.append({"id": "target_absent", "severity": "error", "columns": [],
+                        "problem": f"The expectation '{t.get('id')}' ({t.get('description') or 'no description'}) asks for {t.get('min')}..{t.get('max')} but the simulation gives {observed}: the situation it describes does not occur.",
+                        "evidence": f"n={n}, observed {observed}",
+                        "fix": "Make the situation happen: give the columns it counts values (and a draw) that reach the band - or remove the target if the scenario does not need it."})
+    return out[:2]
+
+
+_COMPLETION_WORDS = frozenset({"posting", "posted", "settlement", "settled", "clearing", "cleared", "booked", "booking", "completion",
+                               "completed", "fulfilled", "delivered", "shipped", "disbursed", "disbursement"})
+_FAILED_WORDS = frozenset({"failed", "declined", "rejected", "cancelled", "canceled", "denied", "aborted", "voided", "bounced", "blocked",
+                           "expired", "reversed", "unsuccessful", "timeout"})
+
+
+def completion_after_failure_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for a completion fact (posting, settlement, delivery...) that is present on rows whose state says the step did not succeed.
+
+    The state and the fact must be about the same subject: they share a word of their names (payment_transaction_status and
+    transaction_posting_date), or the dataset has no other state column that could be the one.
+    """
+    if len(rows) < 60:
+        return []
+    states: list[tuple[str, str, list[dict[str, Any]]]] = []
+    for sid, sname in spec.delivered.items():
+        if spec.columns[sid].dtype not in ("string", "categorical") or sid == spec.clock or \
+                re.split(r"[^a-z0-9]+", sname.lower())[-1] not in _STATE_NAME_WORDS:
+            continue
+        failed = [r for r in rows if isinstance(r.get(sid), str)
+                  and (_value_words(r[sid]) & _FAILED_WORDS or _is_in_flight(r[sid])) and not (_value_words(r[sid]) & {"completed", "settled", "succeeded"})]
+        if len(failed) >= 3:
+            states.append((sid, sname, failed))
+    if not states:
+        return []
+    all_states = [n for sid, n in spec.delivered.items() if spec.columns[sid].dtype in ("string", "categorical")
+                  and re.split(r"[^a-z0-9]+", n.lower())[-1] in _STATE_NAME_WORDS]
+    out = []
+    for sid, sname, failed in states:
+        bad = []
+        for cid, name in spec.delivered.items():
+            if cid == sid or spec.columns[cid].dtype not in ("date", "datetime", "float", "integer") or not (_tokens(name) & _COMPLETION_WORDS):
+                continue
+            about = lambda state: bool((_tokens(name) & _tokens(state)) - _GENERIC_TOKENS - _STATE_NAME_WORDS)
+            if not about(sname) and not (len(all_states) == 1 and not any(about(n) for n in all_states)):
+                continue                                   # the state of another subject (a fraud case) says nothing about this step
+            present = sum(1 for r in failed if r.get(cid) is not None)
+            if present >= 0.5 * len(failed):
+                bad.append((name, present))
+        if bad:
+            states_seen = sorted({r[sid] for r in failed})[:4]
+            out.append({"id": "completion_after_failure", "severity": "error", "columns": [sname] + [n for n, _ in bad][:3],
+                        "problem": f"{', '.join(n for n, _ in bad[:3])} {'is' if len(bad) == 1 else 'are'} filled on rows whose {sname} is {states_seen} - a step that did not succeed has no completion to record.",
+                        "evidence": "; ".join(f"{n}: {c} of {len(failed)} such rows" for n, c in bad[:3]),
+                        "fix": f"Draw the outcome ({sname}) first and make {', '.join(n for n, _ in bad[:3])} empty (a 'when' that is false) for every failed, declined, cancelled or in-flight state."})
+    return out[:2]
+
+
+def _name_head(name: str) -> tuple[str, ...]:
+    """The last two words of a column name (channel_type of account_owner_channel_type): what kind of fact it is, without its role."""
+    return tuple([t for t in re.split(r"[^a-z0-9]+", name.lower()) if t][-2:])
+
+
+_PAIR_STOP = frozenset({"and", "or", "of", "the", "for", "to", "in", "on", "by", "with", "other", "others", "type", "kind"})
+
+
+def _pair_words(value: str) -> set[str]:
+    return {w for w in _value_words(value) if len(w) >= 3 and w not in _PAIR_STOP and not w.isdigit()}
+
+
+def category_conflict_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for two classifications of the same event that disagree (a generic category and a kind-specific type).
+
+    A value of one column that names its kind with a word only one value of the other column contains ("ATM Cash Withdrawal" and
+    "Cash & ATM") has a home there; rows that carry it with another value contradict the pair. Nothing about a domain is assumed:
+    only the words the two columns themselves use.
+    """
+    if len(rows) < 60:
+        return []
+    cats: dict[str, tuple[str, dict[str, set[str]]]] = {}
+    for cid, name in spec.delivered.items():
+        if spec.columns[cid].dtype not in ("string", "categorical") or cid in (spec.entity_column, spec.clock) or _tokens(name) & _ID_WORDS:
+            continue
+        values = {r[cid] for r in rows if isinstance(r.get(cid), str)}
+        if 2 <= len(values) <= 25 and all(len(v) <= 40 for v in values):
+            cats[cid] = (name, {v: _pair_words(v) for v in values})
+    found: dict[frozenset, tuple[int, dict[str, Any]]] = {}
+    for a, (aname, avals) in cats.items():
+        for b, (bname, bvals) in cats.items():
+            if a == b or _name_head(aname) == _name_head(bname):
+                continue                                   # the same kind of fact in two roles (the owner's channel, the recipient's channel) is two facts
+            owners: dict[str, set[str]] = {}
+            for v, words in bvals.items():
+                for w in words:
+                    owners.setdefault(w, set()).add(v)
+            home: dict[str, str] = {}
+            for v, words in avals.items():
+                targets = {next(iter(owners[w])) for w in words if len(owners.get(w, ())) == 1}
+                if len(targets) == 1:
+                    home[v] = next(iter(targets))
+            if not home:
+                continue
+            # a word shared by chance (a "risk" in two unrelated columns) is not a mapping: it counts only for a value that the
+            # rows mostly honour (at least 60% of its rows sit with the home value) and that some rows then break
+            by_value: dict[str, list[dict[str, Any]]] = {}
+            for r in rows:
+                if isinstance(r.get(a), str) and isinstance(r.get(b), str) and r[a] in home:
+                    by_value.setdefault(r[a], []).append(r)
+            together = [r for v, rs in by_value.items() if 0.6 <= sum(1 for r in rs if r[b] == home[v]) / len(rs) < 1.0 for r in rs]
+            wrong = [r for r in together if r[b] != home[r[a]]]
+            if len(wrong) >= 3 and len(wrong) >= 0.1 * len(together):
+                combos: dict[tuple[str, str], int] = {}
+                for r in wrong:
+                    combos[(r[a], r[b])] = combos.get((r[a], r[b]), 0) + 1
+                top = sorted(combos.items(), key=lambda kv: -kv[1])[:3]
+                key = frozenset((a, b))
+                if key not in found or len(wrong) > found[key][0]:
+                    found[key] = (len(wrong), {
+                        "id": "category_conflicts_kind", "severity": "error", "columns": [aname, bname],
+                        "problem": f"{aname} and {bname} describe the same event but disagree on {len(wrong)} of {len(together)} rows.",
+                        "evidence": "; ".join(f"{aname}={x!r} with {bname}={y!r} ({c} rows)" for (x, y), c in top),
+                        "fix": f"Draw the kind of the event once (a latent) and derive both {aname} and {bname} from it with one mapping, so a value of one never sits beside a value of the other that names a different kind."})
+    return [f for _, f in sorted(found.values(), key=lambda t: -t[0])][:2]
+
+
+_AMOUNT_WORDS = frozenset({"amount", "value"})
+_NOT_CASH_AMOUNT = frozenset({"balance", "fee", "charge", "limit", "interest", "tax", "total", "available", "cumulative", "rate", "count"})
+
+
+def cash_denomination_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for amounts of cash dispensed (ATM, cash withdrawal) that are not whole numbers: a machine pays out notes, not fractions."""
+    if len(rows) < 60:
+        return []
+    texts = [cid for cid in spec.delivered if spec.columns[cid].dtype in ("string", "categorical")]
+    cash_rows = []
+    for r in rows:
+        for cid in texts:
+            v = r.get(cid)
+            if isinstance(v, str) and len(v) <= 60:
+                w = _value_words(v)
+                if w & {"withdrawal", "withdrawn", "dispensed", "dispense", "payout"} and w & {"atm", "cash"}:
+                    cash_rows.append(r)
+                    break
+    if len(cash_rows) < 5:
+        return []
+    out = []
+    for cid, name in spec.delivered.items():
+        t = _tokens(name)
+        if spec.columns[cid].dtype != "float" or not (t & _AMOUNT_WORDS) or t & _NOT_CASH_AMOUNT or t & {"deposit", "credit", "payment", "salary", "receipt", "refund"}:
+            continue
+        values = [r[cid] for r in cash_rows if isinstance(r.get(cid), (int, float)) and not isinstance(r.get(cid), bool)]
+        if len(values) < 5:
+            continue
+        fractional = [v for v in values if abs(v - round(v)) > 1e-9]
+        if len(fractional) >= 0.5 * len(values):
+            out.append({"id": "cash_not_whole_notes", "severity": "error", "columns": [name],
+                        "problem": f"{name} has fractions of the currency unit on {len(fractional)} of {len(values)} cash withdrawals (for example {fractional[0]}), but cash is dispensed in whole notes.",
+                        "evidence": f"{len(cash_rows)} cash rows; {len(fractional)} with a fractional amount",
+                        "fix": "Round the amount of a cash withdrawal to the machine's note denomination (for example round(x / 100) * 100) and keep any generic amount that mirrors it equal."})
+    return out[:2]
+
+
+def entity_fact_scope_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for an event-scope column that is a fact of the entity: the same value on every event of nearly every entity.
+
+    When the column is also empty on some events and filled on others (a legal relationship that flickers), the record is impossible.
+    """
+    groups = _by_entity(spec, rows)
+    if len(groups) < 8:
+        return []
+    out = []
+    for cid, name in spec.delivered.items():
+        col = spec.columns[cid]
+        if col.kind != "event" or cid in (spec.entity_column, spec.clock) or col.dtype in ("datetime", "date", "boolean"):
+            continue
+        constant = mixed = eligible = 0
+        distinct: set[Any] = set()
+        for g in groups:
+            present = [r.get(cid) for r in g if r.get(cid) is not None]
+            if len(g) < 3 or len(present) < 2:
+                continue
+            eligible += 1
+            distinct.update(present)
+            if len(set(present)) == 1:
+                constant += 1
+                mixed += len(present) < len(g)
+        if eligible >= 8 and constant >= 0.95 * eligible and len(distinct) >= 3:
+            flicker = mixed >= 0.8 * constant
+            out.append({"id": "entity_fact_at_event_scope", "severity": "error" if flicker else "warn", "columns": [name],
+                        "problem": f"{name} has the same value on every event of {constant} of {eligible} entities, so it is a fact of the entity"
+                                   + (", yet it is empty on some events and filled on others - a durable fact does not appear and disappear between events." if flicker else "."),
+                        "evidence": f"{len(distinct)} distinct values over {eligible} entities",
+                        "fix": f"Give {name} entity scope (drawn once per entity, from an entity latent when it exists only for some entities)"
+                               + " and never alternate it between empty and filled across the entity's events." if flicker else f"Give {name} entity scope."})
+    return sorted(out, key=lambda f: f["severity"] != "error")[:3]
+
+
 _COUNTER_WORDS = {"retry", "retries", "attempt", "attempts", "resend", "resends", "redelivery"}
 
 
@@ -1259,7 +1527,20 @@ _ID_WORDS = {"id", "identifier", "code", "key", "number"}
 _LABEL_WORDS = {"name", "label", "title", "description"}
 
 
-def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]], expectations: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def _resource_owners(spec: GenerationSpec, variables: list[dict[str, Any]]) -> dict[str, str]:
+    """Column id -> the resource of the source model its variable comes from (only where the variable says)."""
+    by_name = {}
+    for v in variables or []:
+        if isinstance(v, dict) and v.get("name"):
+            prov = v.get("provenance") if isinstance(v.get("provenance"), dict) else {}
+            owner = prov.get("source_json_model") or prov.get("model")
+            if owner:
+                by_name[str(v["name"])] = str(owner)
+    return {cid: by_name[name] for cid, name in spec.delivered.items() if name in by_name}
+
+
+def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]], expectations: dict[str, Any] | None = None,
+                    owners: dict[str, str] | None = None) -> list[dict[str, Any]]:
     """Findings for two columns that say the same thing twice.
 
     Two categorical columns of the same kind (two statuses, two scores, two flags) where one is a function of the other, or two
@@ -1268,6 +1549,10 @@ def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]], expectatio
     (product_id and plan_name) are one fact written twice by design and are left alone, and so is a pair the expectations
     relate on purpose (a reason that follows its status, a flag that agrees with a state) - while a pair they declare separate is
     judged by ``synth.expectations.check`` as an error.
+
+    ``owners`` maps a column id to the resource of the source model it belongs to. Two numbers of DIFFERENT resources that are equal
+    are the same fact seen through two blocks of the data model (the amount of a payment and the amount of the transaction that
+    carries it) and are meant to agree, so equality is not a defect there; two moments, and two numbers of one resource, still are.
     """
     n = len(rows)
     if n < 100:
@@ -1334,6 +1619,8 @@ def mirrored_advice(spec: GenerationSpec, rows: list[dict[str, Any]], expectatio
                                       "evidence": "one value per entity", "fix": _MIRRORED_FIX}))
             pairs = [(r[a], r[b]) for r in rows if r.get(a) is not None and r.get(b) is not None]
             how = expect.same_fact(pairs) if len(pairs) >= 100 else None
+            if how == "identical" and not ta_time and (owners or {}).get(a) and (owners or {}).get(b) and owners[a] != owners[b]:
+                continue                                            # one measure under two resources of the source model: equal by design
             if how:
                 said = {"identical": "carry the same value", "sum": "add up to one constant", "difference": "differ by one constant"}.get(how)
                 if said:
@@ -1915,7 +2202,7 @@ def build_review_prompt(brief: dict[str, Any], base: Baseline, spec: GenerationS
     layouts = sorted({style_of(spec, c) or "RFC 3339" for c in spec.columns.values() if c.dtype == "datetime" and c.kind != "latent"})
     context: dict[str, Any] = {"scenario": scenario, "entity_column": spec.columns[spec.entity_column].column if spec.entity_column else None,
                                "clock_column": spec.columns[spec.clock].column if spec.clock else None, "currency": spec.currency,
-                               "timezone": spec.timezone, "as_of": _VERIFY_AS_OF,
+                               "timezone": spec.timezone, "as_of": _verify_as_of(),
                                "timestamp_layouts": layouts, "events_order": "oldest first"}
     if resources:
         context["source_resources"] = resources
@@ -1965,7 +2252,9 @@ def spec_key(brief: dict[str, Any], variables: list[dict[str, Any]]) -> str:
 MEASURED_FINDINGS = frozenset({"window_overlap", "constant_numeric_column", "near_constant_numeric_column", "near_empty_column",
                                "part_exceeds_bound", "stale_in_flight", "shared_identifier", "mirrored_columns", "counter_spacing",
                                "flag_contradicts_state", "near_constant_state", "near_complement", "entity_stamp_inside_history", "healed_empty_column",
-                               "healed_target", "healed_duplicate", "healed_invariant", "healed_column", "check"})
+                               "healed_target", "healed_duplicate", "healed_invariant", "healed_column", "check",
+                               "future_date", "target_absent", "completion_after_failure", "category_conflicts_kind",
+                               "cash_not_whole_notes", "entity_fact_at_event_scope"})
 
 
 def is_measured(finding: dict[str, Any]) -> bool:
@@ -2000,7 +2289,22 @@ def _accepts(candidate: list[dict[str, Any]], best: list[dict[str, Any]], *, tot
     measured = _measured_weight(candidate) - _measured_weight(best)
     if measured > 0:
         return total and measured <= 1 and _weight(candidate) - _weight(best) <= -3
-    return measured < 0 or (total and _weight(candidate) < _weight(best))
+    if measured < 0:
+        return True
+    if not total:
+        return False
+    if _weight(candidate) < _weight(best):
+        return True
+    # The reviewer names different things on every read and cannot name more than a few at a time: an issue on columns that nothing in
+    # the spec being improved was reported on is newly seen, not newly caused. What was known gets lighter and the total is hardly heavier:
+    # that is progress (the new issue is in the next round's findings).
+    return _known_weight(candidate, best) < _weight(best) and _weight(candidate) <= _weight(best) + 2
+
+
+def _known_weight(candidate: list[dict[str, Any]], best: list[dict[str, Any]]) -> int:
+    """The weight of the candidate's findings that were measured or that touch columns the best spec already had findings on."""
+    seen = {c for f in best for c in f.get("columns") or []}
+    return _weight([f for f in candidate if is_measured(f) or not f.get("columns") or seen & set(f["columns"])])
 
 
 _EXPECTATION_CACHE: dict[str, dict[str, Any]] = {}
@@ -2557,14 +2861,18 @@ class SpecCompiler:
                 stats["stopped"] = "good_enough"
                 break
             elapsed = drafting + time.monotonic() - started
+            # The design window counts from the start of the design. Two things may use the whole compile budget instead: the first
+            # round (a design slower than the window would never be repaired) and any round while an impossible record (an error) is
+            # still open - a spec that ships with errors the review found is worse than one that took longer.
+            open_errors = any(f.get("severity") == "error" for f in findings)
             if not self._round_fits(elapsed, first_author, review=True) and not (
-                    stats["author_calls"] == 0 and self._round_fits(elapsed, first_author, review=True, window=self._budget())):
-                stats["stopped"] = "time"                  # the window counts from the start of the design
+                    (stats["author_calls"] == 0 or open_errors) and self._round_fits(elapsed, first_author, review=True, window=self._budget())):
+                stats["stopped"] = "time"
                 break
             rounds += 1
             stats["author_calls"] += 1
             try:
-                rnd = self._round(base, brief, repair_prompt(first, overlay, [review_problem(f) for f in findings]), overlay,
+                rnd = self._round(base, brief, repair_prompt(first, overlay, [review_problem(f) for f in findings], REPAIR_PROBLEMS), overlay,
                                   expectations=expectations)
             except Exception as exc:
                 logger.warning("behaviour spec refinement: model unavailable (%s: %s)", type(exc).__name__, exc)

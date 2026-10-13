@@ -719,7 +719,7 @@ def _usable_range(field: GeneratedSchemaField, low: Any, high: Any) -> dict[str,
 # models first, with the source name kept in their provenance; humanize_names then gives each a short business name, once per
 # set of fields, locks it, and the proposal carries the readable names from then on. Nothing downstream looks a field up by its
 # technical name: provenance (source_json_original_name, source_json_semantic_key, source_json_path) still leads back to the model.
-NAMES_VERSION = "readable-names-v2"
+NAMES_VERSION = "readable-names-v3"
 NAME_MAX_LEN = 48
 NAME_MIN_LEN = 3
 _MAX_WORD = 15                      # no ordinary word of a field name is longer (identification is 14)
@@ -769,6 +769,11 @@ Rules:
 9. Do not change what the field means and do not invent meaning that the description and path do not support. If a name is
    already clear, return it unchanged. Never use filler such as field, value, data, column, attribute, item, syn, and never
    end a name in a number.
+
+10. Never add a role or direction word the source field does not carry (target, source, counterparty, beneficiary, sender,
+   receiver, origin, destination, payer, payee, debtor, creditor). Keep the relation the field states: "applies to account" or
+   "related account" is the account the record belongs to - account_reference_id, never target_account_id - and a field that
+   says "creditor account" keeps creditor.
 
 Return only JSON: {"fields": [{"name": "<current technical name, exactly as given>", "readable": "<new name>"}]}.
 Include every field you were given, once."""
@@ -845,6 +850,28 @@ def _fallback_name(field: GeneratedSchemaField, taken: set[str]) -> str:
     while f"{base}_{n}" in taken:
         n += 1
     return f"{base}_{n}" if _NAME_OK.match(f"{base}_{n}") else f"attribute_{n}"
+
+
+# Words that say WHO or WHERE FROM/TO. A rename may keep them but never introduce them: renaming "applies to account" as
+# "target account" turns the customer's own account into a counterparty and every column built on that name inherits the error.
+_ROLE_WORDS = frozenset({"target", "source", "counterparty", "beneficiary", "sender", "receiver", "origin", "originating", "destination",
+                         "payer", "payee", "debtor", "creditor", "remitter", "drawer", "drawee"})
+
+
+def _source_words(field: GeneratedSchemaField) -> set[str]:
+    """Every word the source field itself uses: its technical name (shorthand expanded), description, path and owner model."""
+    prov = field.provenance or {}
+    text = " ".join([str(field.name or ""), str(field.description or ""), str(prov.get("source_json_path") or ""),
+                     str(prov.get("source_json_model") or "")])
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)                  # appliesToAccount -> applies To Account
+    words = {t for t in _name_tokens(text)}
+    return words | {_ABBREVIATIONS.get(t, t) for t in words}
+
+
+def _invents_role(candidate: str, field: GeneratedSchemaField) -> bool:
+    """True when ``candidate`` carries a role or direction word that the source field does not."""
+    used = set(candidate.split("_")) & _ROLE_WORDS
+    return bool(used - _source_words(field))
 
 
 def _name_signature(field: GeneratedSchemaField) -> dict[str, Any]:
@@ -1366,6 +1393,10 @@ class GeminiIntentAgent:
         from_model = 0
         for field in targets:                                               # pass 1: accepted model names, first come first served
             candidate = _readable_ok(proposed.get(field.name), taken)
+            if candidate and _invents_role(candidate, field):
+                logger.info("[IntentAgent/Names] %s -> %s rejected: the name adds a role the source field does not state",
+                            field.name, candidate)
+                candidate = None
             if candidate:
                 mapping[field.name] = candidate
                 taken.add(candidate)

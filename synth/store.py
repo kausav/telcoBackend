@@ -80,7 +80,8 @@ def annotate(key: str, spec: GenerationSpec, warnings: list[str], reviewed: bool
              refinement: dict[str, Any] | None = None) -> GenerationSpec:
     """The same spec with the outcome of a review recorded on it (behaviour and revision unchanged).
 
-    ``refinement`` (what the improvement rounds did) is kept with the in-memory design so the report can show it."""
+    ``refinement`` (what the improvement rounds did) is kept with the design - in memory and in MongoDB - so the report shows it
+    on every worker and after a restart."""
     changes: dict[str, Any] = {"warnings": warnings, "reviewed": reviewed}
     if refinement:
         changes["design"] = {**(spec.design or {}), "refinement": refinement}
@@ -90,7 +91,7 @@ def annotate(key: str, spec: GenerationSpec, warnings: list[str], reviewed: bool
         if current is None or current[0].revision <= updated.revision:
             _SPECS[key] = (updated, time.monotonic())
     try:
-        _model().set_review(key, warnings, reviewed)
+        _model().set_review(key, warnings, reviewed, changes.get("design"))
     except Exception as exc:
         logger.warning("review of generation spec %s could not be stored in MongoDB: %s: %s", key, type(exc).__name__, exc)
     return updated
