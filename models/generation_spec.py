@@ -64,6 +64,12 @@ class GenerationSpecClaimModel:
             return False
 
     @classmethod
+    def touch(cls, spec_key: str, owner: str, ttl_seconds: float) -> bool:
+        """Extend the lease of the claim ``owner`` holds (the heartbeat of a live design); False when it no longer holds it."""
+        result = cls.collection.update_one({"spec_key": spec_key, "owner": owner}, {"$set": {"expires_at": time.time() + ttl_seconds}})
+        return bool(result.matched_count)
+
+    @classmethod
     def active(cls, spec_key: str) -> bool:
         return cls.collection.find_one({"spec_key": spec_key, "expires_at": {"$gte": time.time()}}, {"_id": 1}) is not None
 

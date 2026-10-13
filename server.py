@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
@@ -46,7 +47,7 @@ from core.json_domain_policy import is_json_grounded_domain
 from core.scenario_variable_store import upsert_recommended, get_recommended, set_user_variables, get_user_variables, get_user_variable_records, delete_user_variable
 from models.database import ping as ping_mongodb
 from models.model_registry import ensure_indexes as ensure_model_indexes
-from core.generation_service import build_generation_response
+from core.generation_service import build_generation_response, generation_status
 from synth.service import SpecNotReady
 from core.industry_source_store import (
     delete_source_document,
@@ -963,7 +964,28 @@ def _timestamp_sort_key(value):
     return dt.astimezone(timezone.utc)
 
 
-@app.post("/scenario/generate", response_model=GenerateResponse)
+@app.get("/scenario/{requested_scenario_id}/generation-status")
+async def scenario_generation_status(requested_scenario_id: str):
+    """Where the scenario's data design stands: ``ready`` | ``designing`` | ``refining`` | ``unavailable``. Never waits.
+
+    Poll this (every ``retryAfterSeconds``) after confirm; when it says ``ready``, one call to /scenario/generate returns the data.
+    Calling it also starts the design if nobody is running it.
+    """
+    try:
+        return await run_in_threadpool(generation_status, requested_scenario_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"error": str(exc)}) from exc
+
+
+@app.post(
+    "/scenario/generate",
+    response_model=GenerateResponse,
+    responses={202: {"description": "The data design for this scenario is still being built (status designing) or repaired (status refining). "
+                                    "Not an error: ask again after retryAfterSeconds, or poll GET /scenario/{id}/generation-status until ready.",
+                     "content": {"application/json": {"example": {"success": True, "status": "designing", "requestedScenarioId": "CBG-01",
+                                                                  "message": "The generation spec for this scenario is still being designed.",
+                                                                  "retryAfterSeconds": 30}}}}},
+)
 async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
     """Generate and return the complete validated dataset synchronously.
 
@@ -1010,9 +1032,15 @@ async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
         )
         return payload
     except SpecNotReady as exc:
-        # The scenario's behaviour design is still running in the background: answer at once instead of holding the request.
-        raise HTTPException(503, detail={"error": str(exc), "retryAfterSeconds": exc.retry_after, "phase": exc.phase},
-                            headers={"Retry-After": str(exc.retry_after)}) from exc
+        # The scenario's data design is still running in the background. That is not a failure: answer 202 Accepted at once
+        # (with Retry-After) instead of holding the request open or reporting a server error. The caller asks again, or polls
+        # GET /scenario/{id}/generation-status until it says "ready".
+        return JSONResponse(
+            status_code=202,
+            content={"success": True, "status": exc.phase, "requestedScenarioId": requested_scenario_id,
+                     "message": str(exc), "retryAfterSeconds": exc.retry_after},
+            headers={"Retry-After": str(exc.retry_after)},
+        )
     except ValueError as exc:
         raise HTTPException(400, detail={"error": str(exc)}) from exc
 

@@ -224,6 +224,30 @@ def _generate_from_spec(requested_scenario_id: str, scenario_context: dict[str, 
     return state, generated, resolution.report
 
 
+def generation_status(requested_scenario_id: str) -> dict[str, Any]:
+    """Where the scenario's data design stands, without waiting and without generating: ready | designing | refining | unavailable.
+
+    Asking also starts the design when nobody is running it, so a client can poll this until ``ready`` and then call generate once,
+    instead of calling generate and being told to come back.
+    """
+    from synth.service import SpecNotReady, resolve_spec
+
+    if not scenario_exists(requested_scenario_id):
+        raise ValueError(f"Unknown requested_scenario_id '{requested_scenario_id}'")
+    context = resolve_scenario_context(requested_scenario_id)
+    variables, _ = resolve_variables(requested_scenario_id) or ([], [])
+    out: dict[str, Any] = {"success": True, "requestedScenarioId": requested_scenario_id}
+    try:
+        resolution = resolve_spec(context, variables, wait_seconds=0)
+    except SpecNotReady as exc:
+        return {**out, "status": exc.phase, "retryAfterSeconds": exc.retry_after, "specKey": exc.key}
+    report = resolution.report or {}
+    if resolution.spec is None:
+        return {**out, "status": "unavailable", "specKey": resolution.key, "problems": report.get("problems") or []}
+    return {**out, "status": "ready", "specKey": resolution.key, "reviewed": bool(getattr(resolution.spec, "reviewed", False)),
+            "revision": getattr(resolution.spec, "revision", 0)}
+
+
 def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
     """Run the full generation + QA pipeline and build the API response payload."""
     requested_scenario_id = req_payload.get("requested_scenario_id")

@@ -122,6 +122,12 @@ def failure_reason(key: str | None) -> str:
 # means "no other worker known", which falls back to the process-local behaviour.
 _OWNER = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
 CLAIM_SECONDS = 900.0
+# A claim is a LEASE, not a reservation for the whole design: its owner renews it every HEARTBEAT_SECONDS while it works, so a
+# process that dies (a restart, a crash, a redeploy) leaves a claim that lapses within LEASE_SECONDS. A claim held for the whole
+# length of a design would make every request say "still being designed" for many minutes after a restart, with nobody designing.
+LEASE_SECONDS = 90.0
+HEARTBEAT_SECONDS = 30.0
+_BEATS: dict[str, threading.Event] = {}
 
 
 def _claims():
@@ -130,16 +136,48 @@ def _claims():
     return GenerationSpecClaimModel
 
 
+def _start_heartbeat(key: str, max_seconds: float) -> None:
+    stop = threading.Event()
+    with _LOCK:
+        previous = _BEATS.pop(key, None)
+        _BEATS[key] = stop
+    if previous is not None:
+        previous.set()
+
+    def beat() -> None:
+        began = time.monotonic()
+        while not stop.wait(HEARTBEAT_SECONDS):
+            if time.monotonic() - began > max_seconds:        # a design that outlives its longest possible length is lost: let the claim lapse
+                break
+            try:
+                if not _claims().touch(key, _OWNER, LEASE_SECONDS):
+                    break
+            except Exception as exc:
+                logger.warning("design claim for %s could not be renewed: %s: %s", key[:8], type(exc).__name__, exc)
+
+    threading.Thread(target=beat, name=f"claim-{key[:8]}", daemon=True).start()
+
+
 def claim_remote(key: str, ttl: float = CLAIM_SECONDS) -> bool:
-    """True when this process may design ``key``: nobody else holds a live claim (or the claims cannot be read)."""
+    """True when this process may design ``key``: nobody else holds a live claim (or the claims cannot be read).
+
+    ``ttl`` is the longest the claim is renewed for; the lease itself is short (see LEASE_SECONDS).
+    """
     try:
-        return _claims().claim(key, _OWNER, ttl)
+        if not _claims().claim(key, _OWNER, LEASE_SECONDS):
+            return False
     except Exception as exc:
         logger.warning("design claim for %s could not be taken: %s: %s", key[:8], type(exc).__name__, exc)
         return True
+    _start_heartbeat(key, ttl)
+    return True
 
 
 def release_remote(key: str) -> None:
+    with _LOCK:
+        stop = _BEATS.pop(key, None)
+    if stop is not None:
+        stop.set()
     try:
         _claims().release(key, _OWNER)
     except Exception as exc:
