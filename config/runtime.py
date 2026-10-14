@@ -99,7 +99,15 @@ SPEC_GENERATE_WAIT_SECONDS = max(1, int(os.getenv("SPEC_GENERATE_WAIT_SECONDS", 
 SPEC_DESIGN_SECONDS = max(30, int(os.getenv("SPEC_DESIGN_SECONDS", "720")))
 # A spec that is still being refined is not served (generate answers "refining, retry") until its refinement has run this long;
 # after that the best revision so far is served. The safety net for a refinement that never ends.
-SPEC_SETTLE_SECONDS = max(30, int(os.getenv("SPEC_SETTLE_SECONDS", "900")))
+SPEC_SETTLE_SECONDS = max(0, int(os.getenv("SPEC_SETTLE_SECONDS", "180")))
+# A spec whose first version has no open error (the deterministic checks found nothing impossible) is served at once, while its
+# refinement carries on; later requests for the same scenario then get the improved revision. Turn off to make every request wait
+# (up to SPEC_SETTLE_SECONDS) for the refinement to finish.
+SPEC_SERVE_EARLY = os.getenv("SPEC_SERVE_EARLY", "true").strip().lower() in {"1", "true", "yes", "on"}
+# The first spec is served as soon as it exists. The patch rounds that repair its measured errors before it is served may run only
+# while the design is younger than this, because each takes about as long as the first design: past it, the repair moves to the
+# background refinement and the caller is not kept waiting for it.
+SPEC_FIRST_SERVE_SECONDS = max(30, int(os.getenv("SPEC_FIRST_SERVE_SECONDS", "420")))
 # Start designing a proposal's spec in the background as soon as it is proposed (the person reviews it meanwhile).
 SPEC_WARM_ON_PROPOSE = os.getenv("SPEC_WARM_ON_PROPOSE", "true").strip().lower() in {"1", "true", "yes", "on"}
 

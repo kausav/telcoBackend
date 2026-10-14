@@ -48,7 +48,7 @@ from synth.spec import EVAL_VARS, SPEC_VERSION, Emit, GenerationSpec, Invariant,
 
 logger = logging.getLogger(__name__)
 
-COMPILER_VERSION = 15
+COMPILER_VERSION = 16
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
 DRAFT_REPAIRED_WARNINGS = frozenset({"healed_empty_column", "shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
@@ -273,6 +273,13 @@ WHAT YOU DECIDE
      product's columns stay empty on all of that key's events.
    - When two columns classify the same event (a generic category and a kind-specific type, in the same resource or in two), they
      come from the one kind latent through one mapping; they are never drawn separately.
+   - Two amounts that record the same money (the transaction's generic amount and the amount of the payment, deposit or withdrawal
+     block that carries it) are equal on every row; the only allowed difference is a fee that is itself a column and is filled on
+     that row. Never add a small unrecorded margin, and never draw the two amounts independently.
+   - A recurring payment or income of one entity (salary, pension, rent, instalment, subscription) keeps its amount: draw it once per
+     entity and vary it only by a few percent between occurrences.
+   - The date of something calculated from events (an alert, an insight, an assessment, a rating) is at or after those events, never
+     before them: derive it from the event time plus the delay of that step, bounded by as_of.
    - Cash is paid out in whole notes of the local denomination: round the amount of a cash withdrawal (for example round(x / 100) * 100)
      and keep the generic amount of that transaction equal to it.
 
@@ -1021,6 +1028,8 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
                             + future_date_advice(spec, rows, ctx.as_of) + target_absent_advice(report)
                             + completion_after_failure_advice(spec, rows) + category_conflict_advice(spec, rows)
                             + cash_denomination_advice(spec, rows) + entity_fact_scope_advice(spec, rows)
+                            + amount_agreement_advice(spec, rows) + recurring_amount_advice(spec, rows)
+                            + derived_date_order_advice(spec, rows)
                             + expect.check(spec, rows, expectations, ctx.as_of))
         report["facts"] = shape_facts(spec, rows)
     return problems, report
@@ -1509,6 +1518,167 @@ def entity_fact_scope_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -
                         "fix": f"Give {name} entity scope (drawn once per entity, from an entity latent when it exists only for some entities)"
                                + " and never alternate it between empty and filled across the entity's events." if flicker else f"Give {name} entity scope."})
     return sorted(out, key=lambda f: f["severity"] != "error")[:3]
+
+
+_FEE_WORDS = frozenset({"fee", "charge", "charges", "commission", "mdr", "tax", "gst", "levy", "surcharge"})
+_NOT_HUB_AMOUNT = frozenset({"balance", "limit", "interest", "available", "cumulative", "rate", "count", "total", "threshold", "minimum", "maximum"})
+
+
+def _is_amount(spec: GenerationSpec, cid: str, name: str) -> bool:
+    t = _tokens(name)
+    return spec.columns[cid].dtype in ("float", "integer") and bool(t & _AMOUNT_WORDS) and not t & (_NOT_HUB_AMOUNT | _FEE_WORDS)
+
+
+def amount_agreement_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for an amount that records the same money as the transaction's own amount but differs from it.
+
+    The hub is the amount column filled on the most rows (the transaction's generic amount); every other amount that is filled
+    together with it is either equal to it, or differs by a fee that is a column. A kind-specific amount that is equal to the hub for
+    the other kinds of event but not for this one, or that differs from it by a small unexplained margin (a fee nobody recorded), is
+    a defect: QA reads two amounts of one payment that disagree as a broken record.
+    """
+    if len(rows) < 60:
+        return []
+    amounts = {cid: name for cid, name in spec.delivered.items() if _is_amount(spec, cid, name)}
+    if len(amounts) < 2:
+        return []
+
+    def num(r: dict[str, Any], cid: str) -> float | None:
+        v = r.get(cid)
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    filled = {cid: sum(1 for r in rows if num(r, cid) is not None) for cid in amounts}
+    hub = max(amounts, key=lambda c: (filled[c], bool(_tokens(amounts[c]) & {"transaction"}), -len(amounts[c])))
+    fees = [cid for cid, name in spec.delivered.items()
+            if spec.columns[cid].dtype in ("float", "integer") and _tokens(name) & _FEE_WORDS]
+    pairs: dict[str, list[tuple[dict[str, Any], float, float]]] = {}
+    for cid in amounts:
+        if cid == hub:
+            continue
+        both = [(r, num(r, hub), num(r, cid)) for r in rows if num(r, hub) is not None and num(r, cid) is not None]
+        if len(both) >= 30:
+            pairs[cid] = both
+    equal_share = {cid: sum(1 for _, t, x in both if abs(t - x) <= 0.005) / len(both) for cid, both in pairs.items()}
+    convention = any(share >= 0.97 for share in equal_share.values())
+    out = []
+    for cid, both in pairs.items():
+        if equal_share[cid] >= 0.97:
+            continue
+        unequal = [(r, t, x) for r, t, x in both if abs(t - x) > 0.005]
+        explained = 0
+        for r, t, x in unequal:
+            if any((f := num(r, fee)) is not None and (abs(t - x - f) <= 0.011 or abs(x - t - f) <= 0.011) for fee in fees):
+                explained += 1
+        if explained >= 0.9 * len(unequal):
+            continue
+        small = sum(1 for _, t, x in unequal if abs(t - x) <= 0.05 * max(abs(t), abs(x), 1.0))
+        hidden_fee = len(unequal) >= 10 and small >= 0.9 * len(unequal)
+        if not (convention or hidden_fee):
+            continue
+        r0, t0, x0 = unequal[0]
+        out.append({"id": "amount_disagrees", "severity": "error", "columns": [amounts[cid], amounts[hub]],
+                    "problem": f"{amounts[cid]} and {amounts[hub]} record the same money but differ on {len(unequal)} of {len(both)} rows"
+                               + (" by a small margin that no fee column explains" if hidden_fee else "")
+                               + (f", while the other amounts of this transaction agree with {amounts[hub]}" if convention else "") + ".",
+                    "evidence": f"e.g. {amounts[cid]} {x0:g} vs {amounts[hub]} {t0:g}",
+                    "fix": f"Derive {amounts[cid]} from {amounts[hub]} (equal), or the larger from the smaller plus the fee column; never draw the two independently."})
+    return out[:3]
+
+
+_RECURRING_WORDS = frozenset({"salary", "payroll", "pension", "stipend", "wage", "wages", "annuity", "rent", "emi", "instalment", "installment"})
+
+
+def recurring_amount_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for a recurring payment or income (salary, pension, rent, instalment) whose amount swings between occurrences of one entity."""
+    if len(rows) < 60 or not spec.entity_column:
+        return []
+    texts = [cid for cid in spec.delivered if spec.columns[cid].dtype in ("string", "categorical")]
+    amounts = {cid: name for cid, name in spec.delivered.items() if _is_amount(spec, cid, name)}
+    if not amounts:
+        return []
+    hub = max(amounts, key=lambda c: (sum(1 for r in rows if isinstance(r.get(c), (int, float))), bool(_tokens(amounts[c]) & {"transaction"})))
+    by_kind: dict[tuple[str, str], dict[Any, list[float]]] = {}
+    for r in rows:
+        v = r.get(hub)
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
+            continue
+        for cid in texts:
+            val = r.get(cid)
+            if isinstance(val, str) and len(val) <= 60 and _value_words(val) & _RECURRING_WORDS:
+                by_kind.setdefault((cid, val), {}).setdefault(r.get(spec.entity_column), []).append(float(v))
+                break
+    out = []
+    for (cid, val), per_entity in by_kind.items():
+        repeated = [vs for vs in per_entity.values() if len(vs) >= 2]
+        if len(repeated) < 5:
+            continue
+        swinging = [vs for vs in repeated if max(vs) > 1.5 * min(vs)]
+        if len(swinging) >= 0.5 * len(repeated):
+            vs = swinging[0]
+            out.append({"id": "recurring_amount_unstable", "severity": "error" if len(swinging) >= 0.7 * len(repeated) else "warn",
+                        "columns": [amounts[hub], spec.delivered[cid]],
+                        "problem": f"The amount of '{val}' ({amounts[hub]}) differs by more than 50% between occurrences for {len(swinging)} of {len(repeated)} entities, "
+                                   "but a recurring payment or income keeps nearly the same amount.",
+                        "evidence": f"e.g. one entity: {', '.join(f'{x:g}' for x in vs[:4])}",
+                        "fix": "Draw the amount once per entity (an entity latent: its salary, its rent, its instalment) and vary it by a few percent per occurrence."})
+    return out[:2]
+
+
+_DERIVED_WORDS = frozenset({"insight", "alert", "assessment", "calculation", "calculated", "scoring", "rating", "review", "detection", "detected",
+                            "flagged", "evaluation", "evaluated", "analysis", "analysed", "analyzed", "computed", "scored", "risk"})
+
+
+def derived_date_order_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for the date of something calculated from events (an alert, an insight, an assessment) that is earlier than those events.
+
+    A value that varies within an entity belongs to its own event and cannot precede it; one value per entity summarises the entity's
+    activity and cannot precede the activity (the entity's latest event) by more than a day.
+    """
+    if not spec.clock or not spec.entity_column:
+        return []
+    groups = _by_entity(spec, rows)
+    if len(groups) < 8:
+        return []
+    out = []
+    for cid, name in spec.delivered.items():
+        if spec.columns[cid].dtype not in ("date", "datetime") or cid in (spec.clock, spec.entity_column):
+            continue
+        t = _tokens(name)
+        if not t & _DERIVED_WORDS or t & _FORWARD_WORDS:
+            continue
+        per_event = early = seen = 0
+        per_entity_early = per_entity_seen = 0
+        example = None
+        for g in groups:
+            last = max((r[spec.clock] for r in g if isinstance(r.get(spec.clock), datetime)), default=None)
+            values = [r.get(cid) for r in g if isinstance(r.get(cid), datetime)]
+            if not values or last is None:
+                continue
+            if len(set(values)) > 1:
+                for r in g:
+                    d, ev = r.get(cid), r.get(spec.clock)
+                    if isinstance(d, datetime) and isinstance(ev, datetime):
+                        seen += 1
+                        if d.date() < ev.date():
+                            early += 1
+                            example = example or (d, ev)
+            else:
+                per_entity_seen += 1
+                if (last.date() - values[0].date()).days > 1:
+                    per_entity_early += 1
+                    example = example or (values[0], last)
+        if seen >= 30 and early >= 3 and early >= 0.02 * seen:
+            out.append({"id": "derived_before_event", "severity": "error", "columns": [name],
+                        "problem": f"{name} is earlier than the event it belongs to on {early} of {seen} rows: something calculated from an event cannot be dated before it.",
+                        "evidence": f"e.g. {example[0].date()} vs event {example[1].date()}",
+                        "fix": f"Draw {name} at or after the event time (the event time plus the processing delay of that step), bounded by as_of."})
+        elif per_entity_seen >= 8 and per_entity_early >= 3 and per_entity_early >= 0.15 * per_entity_seen:
+            out.append({"id": "derived_before_event", "severity": "error" if per_entity_early >= 0.4 * per_entity_seen else "warn", "columns": [name],
+                        "problem": f"{name} is one date per entity, but it is earlier than the entity's own latest activity for {per_entity_early} of {per_entity_seen} entities: "
+                                   "a summary of activity cannot be dated before that activity.",
+                        "evidence": f"e.g. {example[0].date()} vs latest event {example[1].date()}",
+                        "fix": f"Draw {name} after the entity's last event (rollup of the latest event time plus a delay), or give it event scope so each value follows its own event."})
+    return out[:3]
 
 
 _COUNTER_WORDS = {"retry", "retries", "attempt", "attempts", "resend", "resends", "redelivery"}
@@ -2254,7 +2424,8 @@ MEASURED_FINDINGS = frozenset({"window_overlap", "constant_numeric_column", "nea
                                "flag_contradicts_state", "near_constant_state", "near_complement", "entity_stamp_inside_history", "healed_empty_column",
                                "healed_target", "healed_duplicate", "healed_invariant", "healed_column", "check",
                                "future_date", "target_absent", "completion_after_failure", "category_conflicts_kind",
-                               "cash_not_whole_notes", "entity_fact_at_event_scope"})
+                               "cash_not_whole_notes", "entity_fact_at_event_scope", "amount_disagrees", "recurring_amount_unstable",
+                               "derived_before_event"})
 
 
 def is_measured(finding: dict[str, Any]) -> bool:
@@ -2687,7 +2858,9 @@ class SpecCompiler:
         expectations = rnd.overlay.get("expectations") if isinstance(rnd.overlay.get("expectations"), dict) else None
 
         def affordable() -> bool:
-            return self._affordable(started)
+            from config.runtime import SPEC_FIRST_SERVE_SECONDS
+
+            return self._round_fits(time.monotonic() - started, window=min(self._design_window(), float(SPEC_FIRST_SERVE_SECONDS)))
 
         if not due(rnd) or not affordable():
             return rnd                                     # a slow design is served as it is; the refinement reviews and patches it next

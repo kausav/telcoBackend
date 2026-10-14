@@ -67,7 +67,8 @@ OUTPUT: one JSON object, nothing else:
   {"kind":"separate","columns":["id","id"],"why":"..."},               two columns that are different facts: neither is a relabelling, a copy, or an exact sum/difference complement of the other (two scores about one subject, two dates of one entity, two statuses of different stages)
   {"kind":"slow_state","column":"id","why":"..."}                      a status of the customer or account (lifecycle, standing, tier, restriction) that stays the same from one event to the next and changes only on a rare trigger; NOT the outcome of each event (a transaction's own status), which changes freely
  ],
- "state_shares": [{"column":"id","value":"one value of a status/outcome/stage column","min":0.0,"max":1.0}]
+ "state_shares": [{"column":"id","value":"one value of a status/outcome/stage column","min":0.0,"max":1.0}],
+ "trajectories": ["column ids whose value must CHANGE over the events of one entity because the scenario describes a progression"]
 }
 
 GUIDANCE
@@ -95,6 +96,21 @@ GUIDANCE
   floor (a high-value rail) must never be drawn below it, and a value with a cap never above it.
 - A fact that records a step finishing (posting, settlement, clearing, delivery) is empty whenever the outcome column says the step did
   not succeed (failed, declined, rejected, cancelled, pending): state it as a "holds" rule on the outcome column.
+- The scenario text (business scenario, business response, expected outcome, scenario type) is the catalogue's own statement of what
+  the data must show: read it for what is NORMAL and what is the EXCEPTION. A baseline, benchmark, legitimate, everyday or "normal
+  behaviour" scenario is mostly uneventful: every column that records an intervention or control decision (block, deny, reject,
+  hold, escalate, review, restrict, warn) gets a "state_shares" band that keeps those values rare (at most 0.05 each) and the
+  ordinary value (notify, allow, approve, pass) at 0.8 or more. A scenario about breaches, anomalies, fraud or deterioration
+  inverts that for the stage it describes.
+- When the scenario text describes a progression (behaviour that evolves, escalates, deteriorates, grows or is lost over time), list in
+  "trajectories" the columns that carry that progression (a risk rating or score, an alert or severity level, a stage, a balance).
+  A fact the scenario wants to evolve must not be fixed per entity. Do not list identifiers, segments or anything the entity keeps.
+- The date or time of something that is calculated from events (an alert, an insight, an assessment, a rating, a score, a review) is
+  not before the events it is calculated from: write an "order" rule between it and the time of the event it concerns.
+- Where a payment, deposit or withdrawal block repeats the amount of the transaction that carries it, they are the same money: state
+  that they are equal on every row where both exist ("holds"), and when a fee column exists, that the larger equals the smaller plus
+  that fee. A recurring credit or debit (salary, pension, rent, instalment, subscription) of one entity keeps nearly the same amount
+  from one occurrence to the next.
 - Prefer a few rules you are sure of (at most 30) over many guesses: a rule that is wrong rejects correct data. Do not write a rule
   for a column pair that has no real relation. Every rule needs a one-sentence "why" that is true for this scenario.
 - Do not restate a column's own definition (allowed values, ranges, formats): those are already checked. DO state what is true
@@ -199,6 +215,9 @@ def parse(raw: Any, columns: set[str], *, entity: str | None = None) -> dict[str
             shares.append({"column": column, "value": value, "min": round(lo, 3), "max": round(hi, 3)})
     if shares:
         out["state_shares"] = shares[:MAX_SHARES]
+    moving = [c for c in _ids(raw.get("trajectories"), columns) if c != entity]
+    if moving:
+        out["trajectories"] = sorted(set(moving))[:8]
     return out
 
 
@@ -495,7 +514,46 @@ def check(spec: GenerationSpec, rows: list[dict[str, Any]], expectations: dict[s
 
     out += _entity_facts(spec, rows, expectations)
     out += _state_shares(spec, rows, expectations)
+    out += _trajectories(spec, rows, expectations)
     return out
+
+
+TRAJECTORY_MIN_EVENTS = 3
+TRAJECTORY_MIN_ENTITIES = 10
+TRAJECTORY_MOVING_SHARE = 0.3             # at least this share of the entities must show a change for a column meant to evolve
+
+
+def _trajectories(spec: GenerationSpec, rows: list[dict[str, Any]], expectations: dict[str, Any]) -> list[dict[str, Any]]:
+    """Findings for a column the scenario wants to evolve (a risk rating that worsens, a stage that advances) that stays fixed per entity."""
+    columns = [c for c in expectations.get("trajectories") or [] if c in spec.delivered and c != spec.entity_column]
+    if not columns or not spec.entity_column:
+        return []
+    by_entity: dict[Any, list[dict[str, Any]]] = {}
+    for r in rows:
+        by_entity.setdefault(r.get(spec.entity_column), []).append(r)
+    out = []
+    for col in columns:
+        eligible = moving = 0
+        example: list[Any] = []
+        for g in by_entity.values():
+            ordered = sorted(g, key=lambda r: r.get(spec.clock) or datetime.min) if spec.clock else g
+            values = [r.get(col) for r in ordered if r.get(col) is not None]
+            if len(values) < TRAJECTORY_MIN_EVENTS:
+                continue
+            eligible += 1
+            if len({repr(v) for v in values}) > 1:
+                moving += 1
+            elif not example:
+                example = values[:4]
+        if eligible >= TRAJECTORY_MIN_ENTITIES and moving < TRAJECTORY_MOVING_SHARE * eligible:
+            name = spec.delivered[col]
+            out.append(_finding("trajectory", "error", [name],
+                                f"{name} is meant to evolve over the events of an entity (the scenario describes a progression) but it changes for only "
+                                f"{moving} of {eligible} entities; for the others it carries one value on every event.",
+                                f"e.g. one entity: {_short(example, 100)}",
+                                f"Make {name} event scope and drive it from each entity's own progression (a latent for its start, speed and "
+                                f"turning point, read through the event's position in time), so early events differ from late ones."))
+    return out[:3]
 
 
 def _entity_facts(spec: GenerationSpec, rows: list[dict[str, Any]], expectations: dict[str, Any]) -> list[dict[str, Any]]:
@@ -533,7 +591,8 @@ def _state_shares(spec: GenerationSpec, rows: list[dict[str, Any]], expectations
             continue
         share = sum(1 for v in present if str(v).lower() == item["value"].lower()) / len(present)
         if share < item["min"] - SHARE_TOLERANCE or share > item["max"] + SHARE_TOLERANCE:
-            out.append(_finding("state_share", "warn", [spec.delivered[col]],
+            far = share > item["max"] + 0.10 or share < item["min"] - 0.10
+            out.append(_finding("state_share", "error" if far else "warn", [spec.delivered[col]],
                                 f"{spec.delivered[col]} is '{item['value']}' on {share:.0%} of {len(present)} rows; for this scenario type it is expected "
                                 f"between {item['min']:.0%} and {item['max']:.0%}.",
                                 f"{len(present)} simulated rows",

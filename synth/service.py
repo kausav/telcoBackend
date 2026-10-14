@@ -180,6 +180,11 @@ def _refine_age(key: str) -> float:
     return max(ages) if ages else 0.0
 
 
+def _open_errors(spec: GenerationSpec) -> bool:
+    """True when the findings recorded on the spec include an error (an impossible record, not a matter of taste)."""
+    return any(str(w).startswith("error:") for w in getattr(spec, "warnings", None) or [])
+
+
 def _after_refinement(key: str, spec: GenerationSpec, names: set[str], *, limit: float | None = None) -> GenerationSpec:
     """The spec to generate from: the settled one, once the refinement that is improving ``spec`` has ended.
 
@@ -190,7 +195,12 @@ def _after_refinement(key: str, spec: GenerationSpec, names: set[str], *, limit:
     """
     if spec.reviewed:
         return spec
-    from config.runtime import SPEC_SETTLE_SECONDS
+    from config.runtime import SPEC_SERVE_EARLY, SPEC_SETTLE_SECONDS
+
+    if SPEC_SERVE_EARLY and not _open_errors(spec):
+        # nothing impossible is known about this spec: serve it now; the refinement carries on and the next request gets its result
+        latest = store.load(key)
+        return latest if latest is not None and names == set(latest.delivered.values()) and not _open_errors(latest) else spec
 
     deadline = time.monotonic() + (min(SpecCompiler._budget(), 30.0) if limit is None else limit)
     with _REFINE_CHANGED:
