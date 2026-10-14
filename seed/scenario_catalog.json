@@ -27,47 +27,56 @@
                     {
                       "scenarioId": "LB-01",
                       "scenarioType": "Normal",
-                      "businessScenario": "Model periodic prepaid top-up lifecycles with TMF 654 bucket reloads, nominal payment gateway settlement latency, and E.164 MSISDN validation."
+                      "businessScenario": "Model periodic prepaid top-up lifecycles with TMF 654 bucket reloads, nominal payment gateway settlement latency, and E.164 MSISDN validation.",
+                      "description": "Customer's prepaid balance reaches the low-balance threshold, gets a warning and tops up successfully through the normal channel."
                     },
                     {
                       "scenarioId": "LB-02",
                       "scenarioType": "Suppression",
-                      "businessScenario": "Enforce suppression rules for accounts with active contact fatigue flags, opt-out preferences, or pending auto-recharge schedules to prevent unwanted notifications."
+                      "businessScenario": "Enforce suppression rules for accounts with active contact fatigue flags, opt-out preferences, or pending auto-recharge schedules to prevent unwanted notifications.",
+                      "description": "Low balance is detected but no reminder is sent: the customer is opted out, already has an auto-recharge scheduled, or has been contacted too often."
                     },
                     {
                       "scenarioId": "LB-03",
                       "scenarioType": "Customer Declines",
-                      "businessScenario": "Simulate explicit top-up offer rejection via USSD/SMS with recorded decline telemetry and downstream churn hazard weighting."
+                      "businessScenario": "Simulate explicit top-up offer rejection via USSD/SMS with recorded decline telemetry and downstream churn hazard weighting.",
+                      "description": "Customer receives the low-balance top-up offer by USSD or SMS and explicitly declines it; the decline is recorded and raises churn risk."
                     },
                     {
                       "scenarioId": "LB-04",
                       "scenarioType": "No Response",
-                      "businessScenario": "Capture unacknowledged notification timeout events after low-balance warning pushes, scheduling grace-period reminder retries."
+                      "businessScenario": "Capture unacknowledged notification timeout events after low-balance warning pushes, scheduling grace-period reminder retries.",
+                      "description": "Customer gets the low-balance warning but never responds; the warning times out and a reminder is retried after a grace period."
                     },
                     {
                       "scenarioId": "LB-05",
                       "scenarioType": "Assisted",
-                      "businessScenario": "Orchestrate customer-care agent assisted reload flows with IVR verification, CSR ticket generation, and voucher token redemption."
+                      "businessScenario": "Orchestrate customer-care agent assisted reload flows with IVR verification, CSR ticket generation, and voucher token redemption.",
+                      "description": "Customer is helped by a care agent to reload: identity check by IVR, a support ticket is raised and a voucher is redeemed."
                     },
                     {
                       "scenarioId": "LB-06",
                       "scenarioType": "Failure",
-                      "businessScenario": "Simulate payment gateway timeout and card decline exceptions during reload triggers, creating TMF 632 billing alarm notifications."
+                      "businessScenario": "Simulate payment gateway timeout and card decline exceptions during reload triggers, creating TMF 632 billing alarm notifications.",
+                      "description": "Top-up attempt fails because the payment gateway times out or the card is declined, and a billing alarm is raised."
                     },
                     {
                       "scenarioId": "LB-07",
                       "scenarioType": "Exceptional",
-                      "businessScenario": "Synthesize edge-case ledger balance anomalies, sudden zero-credit drops during active voice calls, and overdraft protection triggers."
+                      "businessScenario": "Synthesize edge-case ledger balance anomalies, sudden zero-credit drops during active voice calls, and overdraft protection triggers.",
+                      "description": "Unusual balance behaviour: the ledger shows an anomaly or credit drops to zero during a live call and overdraft protection kicks in."
                     },
                     {
                       "scenarioId": "LB-08",
                       "scenarioType": "Duplicate Trigger",
-                      "businessScenario": "Detect and debounce concurrent automated top-up requests initiated within 30 seconds to prevent double bucket credits."
+                      "businessScenario": "Detect and debounce concurrent automated top-up requests initiated within 30 seconds to prevent double bucket credits.",
+                      "description": "The same automated top-up is triggered more than once within 30 seconds; duplicates are detected so the bucket is credited only once."
                     },
                     {
                       "scenarioId": "LB-09",
                       "scenarioType": "Concurrent Journey",
-                      "businessScenario": "Handle overlapping Low Balance warning during an in-flight Data Depletion or eSIM activation flow with priority resolution."
+                      "businessScenario": "Handle overlapping Low Balance warning during an in-flight Data Depletion or eSIM activation flow with priority resolution.",
+                      "description": "A low-balance warning arrives while the customer is already in a data-depletion or eSIM activation journey, and the system decides which comes first."
                     }
                   ]
                 },
@@ -85,52 +94,62 @@
                     {
                       "scenarioId": "DU-01",
                       "scenarioType": "Normal",
-                      "businessScenario": "Incorporate 3GPP 5G slice handoff logs into low-balance customer journey. Enforce TMF 654 quantity bucket depletion constraints with high churn hazard correlation."
+                      "businessScenario": "Incorporate 3GPP 5G slice handoff logs into low-balance customer journey. Enforce TMF 654 quantity bucket depletion constraints with high churn hazard correlation.",
+                      "description": "Subscriber uses up their data allowance on a 5G plan and is offered the standard upsell, with churn risk rising as the quota runs out."
                     },
                     {
                       "scenarioId": "DU-02",
                       "scenarioType": "Booster / Add-on",
-                      "businessScenario": "Synthesize on-demand 5G high-speed data booster purchase events triggered when cellular usage velocity breaches 80% quota threshold."
+                      "businessScenario": "Synthesize on-demand 5G high-speed data booster purchase events triggered when cellular usage velocity breaches 80% quota threshold.",
+                      "description": "Data usage speeds past 80% of the quota and the subscriber buys an on-demand high-speed data booster or add-on."
                     },
                     {
                       "scenarioId": "DU-03",
                       "scenarioType": "Better-Fit Plan",
-                      "businessScenario": "Analyze longitudinal monthly usage patterns to recommend higher-tier postpaid/unlimited tier plans based on predictive consumption modeling."
+                      "businessScenario": "Analyze longitudinal monthly usage patterns to recommend higher-tier postpaid/unlimited tier plans based on predictive consumption modeling.",
+                      "description": "Monthly usage shows the current plan no longer fits, so the subscriber is recommended a higher-tier or unlimited plan."
                     },
                     {
                       "scenarioId": "DU-04",
                       "scenarioType": "Suppression",
-                      "businessScenario": "Enforce marketing suppression rules for high-depletion subscribers on enterprise corporate APNs or active complaint holds."
+                      "businessScenario": "Enforce marketing suppression rules for high-depletion subscribers on enterprise corporate APNs or active complaint holds.",
+                      "description": "Heavy data users are held back from upsell messages because they are on an enterprise connection or have an open complaint."
                     },
                     {
                       "scenarioId": "DU-05",
                       "scenarioType": "Customer Declines / No Response",
-                      "businessScenario": "Record upsell prompt ignore and dismiss telemetry, evaluating subsequent throttle degradation and retention churn coefficients."
+                      "businessScenario": "Record upsell prompt ignore and dismiss telemetry, evaluating subsequent throttle degradation and retention churn coefficients.",
+                      "description": "Subscriber ignores or dismisses the upsell prompt; the effect on throttled speeds and on retention is recorded."
                     },
                     {
                       "scenarioId": "DU-06",
                       "scenarioType": "Assisted",
-                      "businessScenario": "Model retail store or hotline assisted upsell conversion with plan migration contracts and SIM profile updates."
+                      "businessScenario": "Model retail store or hotline assisted upsell conversion with plan migration contracts and SIM profile updates.",
+                      "description": "Upsell is completed with help from a retail store or the hotline, including the plan migration and SIM profile update."
                     },
                     {
                       "scenarioId": "DU-07",
                       "scenarioType": "Failure",
-                      "businessScenario": "Simulate billing rating engine transaction aborts during quota top-up purchases with compensatory quota rollback events."
+                      "businessScenario": "Simulate billing rating engine transaction aborts during quota top-up purchases with compensatory quota rollback events.",
+                      "description": "The purchase of extra data fails because the billing engine aborts the transaction, and the quota is rolled back as compensation."
                     },
                     {
                       "scenarioId": "DU-08",
                       "scenarioType": "Exceptional",
-                      "businessScenario": "Model extreme data depletion spikes from runaway tethering or background app anomalies breaching 100% quota in under 15 minutes."
+                      "businessScenario": "Model extreme data depletion spikes from runaway tethering or background app anomalies breaching 100% quota in under 15 minutes.",
+                      "description": "Data is used up abnormally fast (for example runaway tethering or a background app), exhausting 100% of the quota in under 15 minutes."
                     },
                     {
                       "scenarioId": "DU-09",
                       "scenarioType": "Repeated Depletion",
-                      "businessScenario": "Track recurring multi-cycle quota exhaustion within the same billing period, escalating subscriber to preferential VIP upsell tiers."
+                      "businessScenario": "Track recurring multi-cycle quota exhaustion within the same billing period, escalating subscriber to preferential VIP upsell tiers.",
+                      "description": "Subscriber exhausts their data quota again and again within one billing period and is moved to a premium (VIP) upsell tier."
                     },
                     {
                       "scenarioId": "DU-10",
                       "scenarioType": "Concurrent Journey",
-                      "businessScenario": "Reconcile simultaneous Data Depletion alert while subscriber is already in an unresolved Low Balance top-up state."
+                      "businessScenario": "Reconcile simultaneous Data Depletion alert while subscriber is already in an unresolved Low Balance top-up state.",
+                      "description": "A data-depletion alert arrives while the subscriber still has an unresolved low-balance top-up in progress, and the two are reconciled."
                     }
                   ]
                 },
@@ -147,32 +166,38 @@
                     {
                       "scenarioId": "CJ-01",
                       "scenarioType": "Single Journey",
-                      "businessScenario": "Isolate baseline single-trajectory execution guaranteeing zero side-effects on secondary BSS billing or provisioning queues."
+                      "businessScenario": "Isolate baseline single-trajectory execution guaranteeing zero side-effects on secondary BSS billing or provisioning queues.",
+                      "description": "One journey runs on its own for a subscriber, with no side effects on billing or provisioning for any other journey."
                     },
                     {
                       "scenarioId": "CJ-02",
                       "scenarioType": "Concurrent",
-                      "businessScenario": "Simulate concurrent lifecycle trajectories executing simultaneously across Low Balance top-up and Data Depletion upsell pipelines."
+                      "businessScenario": "Simulate concurrent lifecycle trajectories executing simultaneously across Low Balance top-up and Data Depletion upsell pipelines.",
+                      "description": "Low-balance top-up and data-depletion upsell journeys run for the same subscriber at the same time."
                     },
                     {
                       "scenarioId": "CJ-03",
                       "scenarioType": "Active Journey",
-                      "businessScenario": "Enforce state locks and mutex validation when a subscriber already possesses an in-flight uncommitted transaction."
+                      "businessScenario": "Enforce state locks and mutex validation when a subscriber already possesses an in-flight uncommitted transaction.",
+                      "description": "A new journey is blocked or held because the subscriber already has a transaction in progress."
                     },
                     {
                       "scenarioId": "CJ-04",
                       "scenarioType": "Duplicate",
-                      "businessScenario": "Generate deduplicated event streams resolving identical webhook triggers across OSS slice management and BSS ordering engines."
+                      "businessScenario": "Generate deduplicated event streams resolving identical webhook triggers across OSS slice management and BSS ordering engines.",
+                      "description": "The same trigger arrives twice from different systems and is collapsed into a single event."
                     },
                     {
                       "scenarioId": "CJ-05",
                       "scenarioType": "Situation Change",
-                      "businessScenario": "Model mid-journey tariff plan changes, line disconnection, or roaming handover altering ongoing fulfillment rules in real time."
+                      "businessScenario": "Model mid-journey tariff plan changes, line disconnection, or roaming handover altering ongoing fulfillment rules in real time.",
+                      "description": "Something changes mid-journey, such as a tariff plan change, line disconnection or roaming handover, and the journey adapts."
                     },
                     {
                       "scenarioId": "CJ-06",
                       "scenarioType": "No Clear Priority",
-                      "businessScenario": "Synthesize arbitration matrix resolving conflicting simultaneous journey triggers under TM Forum Open Digital Architecture priority rules."
+                      "businessScenario": "Synthesize arbitration matrix resolving conflicting simultaneous journey triggers under TM Forum Open Digital Architecture priority rules.",
+                      "description": "Several journeys are triggered at once with no clear winner, and a priority rule decides which one proceeds."
                     }
                   ]
                 }
@@ -211,12 +236,14 @@
                     {
                       "scenarioId": "CBG-01",
                       "scenarioType": "Everyday Banking",
-                      "businessScenario": "Generate realistic day-to-day banking activity including salary credits, bill payments, merchant purchases, ATM withdrawals, digital payments, and recurring transactions. Preserve normal spending behavior, transaction frequency, channel usage, and seasonal patterns.\n\nBusiness response: Establish baseline customer transaction behavior for fraud detection, AML monitoring, anomaly detection, and false-positive reduction.\n\nExpected outcome: High-quality synthetic transaction datasets representing legitimate banking activity that can serve as the benchmark population for fraud and AML analytics."
+                      "businessScenario": "Generate realistic day-to-day banking activity including salary credits, bill payments, merchant purchases, ATM withdrawals, digital payments, and recurring transactions. Preserve normal spending behavior, transaction frequency, channel usage, and seasonal patterns.\n\nBusiness response: Establish baseline customer transaction behavior for fraud detection, AML monitoring, anomaly detection, and false-positive reduction.\n\nExpected outcome: High-quality synthetic transaction datasets representing legitimate banking activity that can serve as the benchmark population for fraud and AML analytics.",
+                      "description": "Everyday banking baseline: salary credits, bill payments, card and digital spending, ATM withdrawals and recurring payments, showing a customer's normal behaviour."
                     },
                     {
                       "scenarioId": "CBG-02",
                       "scenarioType": "Customer Growth",
-                      "businessScenario": "Generate customer lifecycle journeys covering onboarding, KYC completion, account opening, product acquisition, balance growth, loan relationships, and evolving customer risk profiles. Maintain realistic relationships across customers, accounts, products, and financial activities over time.\n\nBusiness response: Support customer segmentation, relationship analytics, risk profiling, lifecycle modeling, and validation of fraud and AML controls across different customer maturity stages.\n\nExpected outcome: Relationship-aware synthetic datasets that accurately represent customer evolution, product adoption, and long-term banking relationships."
+                      "businessScenario": "Generate customer lifecycle journeys covering onboarding, KYC completion, account opening, product acquisition, balance growth, loan relationships, and evolving customer risk profiles. Maintain realistic relationships across customers, accounts, products, and financial activities over time.\n\nBusiness response: Support customer segmentation, relationship analytics, risk profiling, lifecycle modeling, and validation of fraud and AML controls across different customer maturity stages.\n\nExpected outcome: Relationship-aware synthetic datasets that accurately represent customer evolution, product adoption, and long-term banking relationships.",
+                      "description": "Customer growth over time: onboarding, KYC, account opening, new products, growing balances, loans and changing risk profile."
                     }
                   ]
                 },
@@ -234,12 +261,14 @@
                     {
                       "scenarioId": "RFC-01",
                       "scenarioType": "Risk Monitoring",
-                      "businessScenario": "Generate synthetic customer and account activity that evolves from normal behavior to increasingly suspicious behavior over time, including abnormal transaction volumes, unusual fund movement, high-risk counterparties, frequent cash transactions, and risk score deterioration. The dataset should model customer risk progression and trigger monitoring alerts based on behavioral changes.\n\nBusiness response: Enable risk monitoring systems, customer risk-rating models, and transaction monitoring platforms to identify emerging financial crime risks, assess customer risk profiles, and validate alert generation logic.\n\nExpected outcome: Synthetic datasets containing realistic customer risk evolution patterns that support risk-scoring model development, alert optimization, behavioral anomaly detection, and compliance monitoring."
+                      "businessScenario": "Generate synthetic customer and account activity that evolves from normal behavior to increasingly suspicious behavior over time, including abnormal transaction volumes, unusual fund movement, high-risk counterparties, frequent cash transactions, and risk score deterioration. The dataset should model customer risk progression and trigger monitoring alerts based on behavioral changes.\n\nBusiness response: Enable risk monitoring systems, customer risk-rating models, and transaction monitoring platforms to identify emerging financial crime risks, assess customer risk profiles, and validate alert generation logic.\n\nExpected outcome: Synthetic datasets containing realistic customer risk evolution patterns that support risk-scoring model development, alert optimization, behavioral anomaly detection, and compliance monitoring.",
+                      "description": "Customers whose behaviour turns suspicious over time: rising volumes, unusual fund movement, risky counterparties, cash activity and a worsening risk score that triggers alerts."
                     },
                     {
                       "scenarioId": "RFC-02",
                       "scenarioType": "AML Investigation",
-                      "businessScenario": "Generate synthetic networks of customers, accounts, counterparties, organizations, and transactions containing organized financial crime typologies such as mule account networks, structuring, layering, shell-company relationships, circular fund flows, and cross-entity money movement. The dataset should preserve multi-level relationships and transaction chains for graph-based investigation and AML analytics.\n\nBusiness response: Enable AML monitoring systems, graph analytics engines, financial crime investigation teams, and network detection models to identify suspicious fund flows, hidden relationships, beneficial ownership structures, and coordinated financial crime activities.\n\nExpected outcome: Relationship-rich synthetic datasets that support graph analytics, AML investigations, transaction monitoring validation, suspicious activity detection, and financial crime network identification."
+                      "businessScenario": "Generate synthetic networks of customers, accounts, counterparties, organizations, and transactions containing organized financial crime typologies such as mule account networks, structuring, layering, shell-company relationships, circular fund flows, and cross-entity money movement. The dataset should preserve multi-level relationships and transaction chains for graph-based investigation and AML analytics.\n\nBusiness response: Enable AML monitoring systems, graph analytics engines, financial crime investigation teams, and network detection models to identify suspicious fund flows, hidden relationships, beneficial ownership structures, and coordinated financial crime activities.\n\nExpected outcome: Relationship-rich synthetic datasets that support graph analytics, AML investigations, transaction monitoring validation, suspicious activity detection, and financial crime network identification.",
+                      "description": "Linked customers, accounts and companies moving money in organised crime patterns such as mule accounts, structuring, layering and circular flows, for network investigation."
                     }
                   ]
                 }

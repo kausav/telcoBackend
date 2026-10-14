@@ -75,7 +75,7 @@ def _flatten(request: CatalogImportRequest) -> dict[str, list[dict[str, Any]]]:
                         add("scenarios", {"scenario_id": scenario.scenarioId, "journey_id": journey_id, "use_case_id": case_id,
                                           "sub_domain_id": sub_id, "industry_id": industry_id, "name": scenario.scenarioType,
                                           "scenario_type": scenario.scenarioType, "active": scenario.active,
-                                          "business_scenario": scenario.businessScenario}, "scenario_id")
+                                          "business_scenario": scenario.businessScenario, "description": scenario.description}, "scenario_id")
     return rows
 
 
@@ -99,8 +99,29 @@ def seed_bundled() -> dict[str, int]:
     path = SEED_DIR / "scenario_catalog.json"
     if not path.is_file():
         return {}
-    counts = import_catalog(CatalogImportRequest.model_validate(json.loads(path.read_text(encoding="utf-8"))), overwrite=False)
-    return {f"catalog_{name}": value["created"] for name, value in counts.items() if value["created"]}
+    request = CatalogImportRequest.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    counts = import_catalog(request, overwrite=False)
+    inserted = {f"catalog_{name}": value["created"] for name, value in counts.items() if value["created"]}
+    filled = _backfill_descriptions(request)
+    if filled:
+        inserted["catalog_scenario_descriptions"] = filled
+    return inserted
+
+
+def _backfill_descriptions(request: CatalogImportRequest) -> int:
+    """Give the scenarios that exist without a description the bundled one; a description someone wrote or edited is never replaced."""
+    empty = {"$or": [{"description": {"$exists": False}}, {"description": None}, {"description": ""}]}
+    filled = 0
+    for industry in request.industries:
+        for sub in industry.subDomains:
+            for case in sub.useCases:
+                for journey in case.journeys:
+                    for scenario in journey.scenarios:
+                        if scenario.description:
+                            result = ScenarioCatalogModel.collection.update_one({"scenario_id": scenario.scenarioId, **empty},
+                                                                               {"$set": {"description": scenario.description}})
+                            filled += result.modified_count
+    return filled
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -121,7 +142,8 @@ def _journey(row: dict[str, Any]) -> dict[str, Any]:
 
 def _scenario(row: dict[str, Any]) -> dict[str, Any]:
     return {"scenarioId": row["scenario_id"], "scenarioType": row["scenario_type"], "label": f"{row['scenario_id']}: {row['scenario_type']}",
-            "order": int(row.get("order") or 0), "businessScenario": row.get("business_scenario")}
+            "order": int(row.get("order") or 0), "businessScenario": row.get("business_scenario"),
+            "description": row.get("description")}
 
 
 def _children(parent_model: Any, parent_id: str, child_model: Any, build: Any) -> list[dict[str, Any]]:

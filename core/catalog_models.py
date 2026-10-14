@@ -18,6 +18,7 @@ class ScenarioIn(_Strict):
     scenarioId: str = Field(pattern=_ID, description="The requestedScenarioId used by /scenario/propose, for example LB-01")
     scenarioType: str = Field(min_length=1, max_length=100)
     businessScenario: str | None = Field(default=None, max_length=12000)
+    description: str | None = Field(default=None, max_length=600, description="One or two plain sentences the UI shows to explain what the scenario is about")
     active: bool = True
 
 
@@ -98,6 +99,7 @@ class CatalogScenario(BaseModel):
     label: str = Field(description="What the dropdown shows, for example 'LB-01: Normal'")
     order: int = 0
     businessScenario: str | None = None
+    description: str | None = Field(default=None, description="Plain-language explanation of the scenario for the UI (not what /scenario/propose uses)")
 
 
 class CatalogScenarioList(BaseModel):
