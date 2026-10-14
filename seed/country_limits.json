@@ -1,0 +1,31 @@
+[
+  {
+    "country": "IN",
+    "currency": "INR",
+    "cash_denomination": 100,
+    "note": "Per-transaction scheme limits of the Indian payment rails. Banks may set lower customer limits. Edit or replace this document in MongoDB (collection country_operating_limits); the application never overwrites it.",
+    "rails": [
+      {"id": "upi", "label": "UPI", "aliases": ["upi"], "kind": "instant_transfer", "max_amount": 100000, "fee": 0,
+       "note": "Per transaction; some categories (for example tax payments) allow more. Person-to-person UPI carries no fee."},
+      {"id": "imps", "label": "IMPS", "aliases": ["imps"], "kind": "instant_transfer", "max_amount": 500000},
+      {"id": "neft", "label": "NEFT", "aliases": ["neft"], "kind": "batch_transfer",
+       "note": "No scheme minimum or maximum; individual banks may set their own."},
+      {"id": "rtgs", "label": "RTGS", "aliases": ["rtgs"], "kind": "high_value_transfer", "min_amount": 200000,
+       "note": "Minimum per transaction; no scheme maximum."},
+      {"id": "atm_cash", "label": "ATM cash withdrawal", "aliases": ["atm"], "kind": "cash", "max_amount": 20000,
+       "note": "Typical per-transaction cap of an ATM; each bank and card sets its own. Dispensed in whole notes."}
+    ]
+  },
+  {
+    "country": "GB",
+    "currency": "GBP",
+    "cash_denomination": 10,
+    "note": "Scheme limits of the UK payment rails. Banks may set lower limits. Edit or replace this document in MongoDB (collection country_operating_limits); the application never overwrites it.",
+    "rails": [
+      {"id": "faster_payments", "label": "Faster Payments", "aliases": ["faster payments", "fps"], "kind": "instant_transfer", "max_amount": 1000000,
+       "note": "Scheme maximum per payment; banks set their own, often lower, limits."},
+      {"id": "chaps", "label": "CHAPS", "aliases": ["chaps"], "kind": "high_value_transfer", "note": "No upper transaction limit."},
+      {"id": "bacs", "label": "Bacs", "aliases": ["bacs"], "kind": "batch_transfer", "note": "Batch scheme, three working days."}
+    ]
+  }
+]

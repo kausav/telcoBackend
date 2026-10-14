@@ -228,7 +228,7 @@ def build(variables: list[dict[str, Any]], *, brief: dict[str, Any]) -> Baseline
     ordered = order_entries(entries, soft=True)
     spec = GenerationSpec(
         source="definitions",
-        scenario={k: brief.get(k) for k in ("industry", "domain", "country", "use_case", "scenario_type", "type_of_data") if brief.get(k)},
+        scenario={k: brief.get(k) for k in ("industry", "domain", "country", "use_case", "scenario_type", "type_of_data", "country_limits") if brief.get(k)},
         entity_column=alias[entity_name] if entity_name else None,
         clock=alias[clock] if clock else None,
         columns=columns,

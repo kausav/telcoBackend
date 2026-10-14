@@ -6,6 +6,8 @@ provider failure does not trigger repeated outbound diagnostic requests.
 """
 from __future__ import annotations
 
+from config import constants as _constants
+
 import ipaddress
 import logging
 import os
@@ -39,27 +41,27 @@ def _validate_ip(value: str | None) -> str | None:
 def get_public_egress_ip(*, force_refresh: bool = False) -> str | None:
     """Return the public egress IP visible to external services.
 
-    ``PUBLIC_EGRESS_IP`` may be set explicitly in deployment configuration. This
+    ``PUBLIC_EGRESS_IP`` may be set explicitly in ``config/constants.py``. This
     is preferred because it avoids an outbound diagnostic call and is appropriate
     when the platform already knows its Cloud NAT/static egress address.
 
     Otherwise the value is detected through a tiny external IP echo service and
     cached for ``PUBLIC_EGRESS_IP_CACHE_TTL_SECONDS``.
     """
-    configured = _validate_ip(os.getenv("PUBLIC_EGRESS_IP"))
+    configured = _validate_ip(_constants.PUBLIC_EGRESS_IP or None)
     if configured:
         return configured
 
     global _cached_ip, _cached_at
     now = time.monotonic()
-    ttl = max(30.0, float(os.getenv("PUBLIC_EGRESS_IP_CACHE_TTL_SECONDS", str(_DEFAULT_TTL))))
+    ttl = max(30.0, float(_constants.PUBLIC_EGRESS_IP_CACHE_TTL_SECONDS))
 
     with _lock:
         if not force_refresh and _cached_ip and (now - _cached_at) < ttl:
             return _cached_ip
 
-        url = os.getenv("PUBLIC_EGRESS_IP_URL", _DEFAULT_URL).strip() or _DEFAULT_URL
-        timeout = max(0.5, float(os.getenv("PUBLIC_EGRESS_IP_TIMEOUT_SECONDS", str(_DEFAULT_TIMEOUT))))
+        url = str(_constants.PUBLIC_EGRESS_IP_URL).strip() or _DEFAULT_URL
+        timeout = max(0.5, float(_constants.PUBLIC_EGRESS_IP_TIMEOUT_SECONDS))
 
         try:
             request = Request(url, headers={"User-Agent": "telco-agentic-sdg/2"})

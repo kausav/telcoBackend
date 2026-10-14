@@ -26,6 +26,7 @@ import os
 import logging
 import math
 import re
+from collections import Counter
 import statistics
 import threading
 import time
@@ -48,7 +49,7 @@ from synth.spec import EVAL_VARS, SPEC_VERSION, Emit, GenerationSpec, Invariant,
 
 logger = logging.getLogger(__name__)
 
-COMPILER_VERSION = 16
+COMPILER_VERSION = 17
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
 DRAFT_REPAIRED_WARNINGS = frozenset({"healed_empty_column", "shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
@@ -63,12 +64,13 @@ PATCH_SECONDS = 45.0                     # the least a patch of a design is expe
 REVIEW_SECONDS = 20.0                    # what a review of a design is expected to take (the estimate for a refinement round besides its author call)
 GOOD_ENOUGH_WEIGHT = 1                   # refinement stops once at most one minor finding is left
 SCENARIO_KEYS = ("industry", "domain", "country", "use_case", "scenario_type", "business_scenario", "business_response",
-                 "expected_outcome", "type_of_data", "entity_key")
+                 "expected_outcome", "type_of_data", "entity_key", "country_limits")
 REVIEW_ENTITIES = 5
 REVIEW_EVENTS = 8
 VERIFY_ENTITIES = 60
 VERIFY_ROWS_PER_ENTITY = 6
 VERIFY_MAX_EVENTS = 12
+MIN_CALL_SECONDS = 15.0                  # a model call is not begun with less time than this left in its window
 MODEL_ATTEMPTS = 3                       # one model call is tried this often when it fails for a reason that may pass
 MODEL_RETRY_PAUSE = (2.0, 6.0)
 def _verify_as_of() -> str:
@@ -241,7 +243,11 @@ WHAT YOU DECIDE
    differ by a fee that is itself a column.
 17. A story over time (normal turning suspicious, growth, depletion, a customer being lost) is a trajectory of each entity with its
    own start, speed and persona, not the same step at the same position for every entity. Its early phase looks like the ordinary
-   activity of that persona (the amounts, channels and cadence of everyday life) before anything changes.
+   activity of that persona (the amounts, channels and cadence of everyday life) before anything changes. Each entity has its own
+   turning point and its own sizes: an amount never takes the same value at the same event position for most entities, and an alert
+   or a change of state never happens at the same event position for most entities (measured).
+   Amounts of payments, deposits and withdrawals come from a continuous distribution around the entity's own typical size, never from a
+   short list of values that every entity reuses (measured).
 18. A moment that records a fact is drawn from the clock and the delays of the process. The time of generation (as_of) is never
    the value of a business fact, and a column holding the same moment on every row of every entity is wrong.
 19. Facts that end a life (closed, terminated, released, expired) exist only for the rows in that state, and activity of the same
@@ -273,15 +279,41 @@ WHAT YOU DECIDE
      product's columns stay empty on all of that key's events.
    - When two columns classify the same event (a generic category and a kind-specific type, in the same resource or in two), they
      come from the one kind latent through one mapping; they are never drawn separately.
-   - Two amounts that record the same money (the transaction's generic amount and the amount of the payment, deposit or withdrawal
-     block that carries it) are equal on every row; the only allowed difference is a fee that is itself a column and is filled on
-     that row. Never add a small unrecorded margin, and never draw the two amounts independently.
-   - A recurring payment or income of one entity (salary, pension, rent, instalment, subscription) keeps its amount: draw it once per
-     entity and vary it only by a few percent between occurrences.
+   - Two amounts that record the same money MOVEMENT (the transaction's generic amount and the amount of the payment, deposit,
+     withdrawal or transfer block that carries it) are equal on every row; the only allowed difference is a fee that is itself a
+     column and is filled on that row. Never add a small unrecorded margin, and never draw the two amounts independently. This holds
+     only for the amount of one movement of money. A capital, sweep, lien, hold, limit, balance, accrual or other amount that belongs
+     to the account, the party or an arrangement is a different fact: it is not the transaction amount, it is drawn once per entity
+     (or per arrangement) and changes only when what it measures changes.
+   - Income credited to an entity (a salary credit, a pension, an annuity) and an instalment it owes (an EMI, a loan or lease
+     instalment) keep their amount: draw it once per entity and vary it only by a few percent between occurrences. Payments that
+     different payees receive from one entity (a company paying its employees or suppliers) are different people's amounts and may
+     differ.
    - The date of something calculated from events (an alert, an insight, an assessment, a rating) is at or after those events, never
      before them: derive it from the event time plus the delay of that step, bounded by as_of.
    - Cash is paid out in whole notes of the local denomination: round the amount of a cash withdrawal (for example round(x / 100) * 100)
      and keep the generic amount of that transaction equal to it.
+22. Balances. A balance (account balance, available balance) is the running result of the money that moves through the entity: the
+   balance after an event is the balance before it plus the event's amount for a credit or minus it for a debit (and minus the fee
+   column when one was charged). Make it an event column that reads the previous row - (prev['<balance column>'] if prev is not None
+   else <opening balance>) with the opening balance drawn once per entity from a distribution that fits the segment - and take the
+   sign from the kind of the event (the kind latent). A balance is never drawn independently of the amounts, and never fixed per
+   entity when the entity has events that move money. A debit is limited by the balance unless the account has an overdraft.
+   A statement's opening and closing balance follow the same events of their period. This is measured: between two consecutive
+   events the balance changes by the later event's amount.
+23. Linked parties. When the scenario is about a network, ring, group, common owner or shared counterparty (mule accounts, shell
+   companies, related parties, a household, shared devices or addresses), the entities are not independent: a column that names
+   another party (an owner, a controlling party, a counterparty, a beneficiary, a linked account, a device) draws its identifier from
+   a pool that many entities share, with the "pool" sampler - {"type":"pool","name":"owners","prefix":"..","digits":8,"ratio":0.3}.
+   The pool has "ratio" members per entity (0.3: each member is used by about three entities) and a few members are hubs. A party
+   is never invented fresh for each entity when the scenario says parties are shared. Use one pool name for every column that
+   names the same kind of party, so that the same identifier appears where the same party appears.
+24. Country limits. "country_limits" (inside scenario, when present) are the stored operating limits of the scenario's country,
+   in its currency: for each payment rail the words that name it ("aliases"), its floor "min_amount", its cap "max_amount" and
+   its fixed "fee" (0 means free), and the "cash_denomination" of the notes a cash machine dispenses. They are facts, not
+   suggestions, and they are measured on the simulated rows: draw the rail (the kind) first, then an amount between its floor and
+   its cap, the fee its rule gives, and cash in multiples of the denomination. A rail with no limit stored for it is bounded by
+   what you know of the real rail. When "country_limits" is absent, use what you know of the country's real rules (rule 20).
 
 THE LANGUAGE
 Expressions (python-like, safe subset). Variables: any column id or latent you declare (order is resolved automatically;
@@ -291,7 +323,7 @@ parameters); REF['table'] (your "reference" tables).
 Operators: + - * /  == != < <= > >=  and or not  is None / is not None  in / not in  (a if cond else b)  [lists]  x[key].
 Functions: add_days(dt,n) add_secs(dt,n) secs(a,b)=seconds(a-b) days(a,b) text(x) lower(x) upper(x) int(x) float(x) abs min max
 round(x,n) len sigmoid(x) matches(regex,str)=whole-string regex match is_none(x) hour_of(dt,offset_minutes)
-weekday_of(dt,offset_minutes) (0 = Monday ... 6 = Sunday; the offset shifts the time to the local clock, e.g. 330 for India).
+weekday_of(dt,offset_minutes) (0 = Monday ... 6 = Sunday; the offset shifts the time to the local clock, e.g. 330 for UTC+5:30).
 Invariants and targets read the column ids, as_of, REF[...] and P[...] only (not event_at, event_index or prev).
 Entity-level invariants only (every column becomes a LIST over the entity's rows, oldest first): distinct(list)
 non_decreasing(list) strictly_increasing(list) min_gap_secs(list) and all_after(starts, ends[, applies]) = every row starts at or
@@ -313,6 +345,7 @@ Samplers - an emit gives either "expr" or "sample":
 {"type":"lognormal","median":m,"sigma":s,"min":lo,"max":hi}     skewed positive amounts, delays; add "cast":"int" for integers
 {"type":"time_shift","anchor":"<column>","direction":"before"|"after","seconds":[lo,hi]}   also "minutes":{lognormal spec} "days":{lognormal spec}
 {"type":"id","prefix":"AB","digits":8,"registry":"name"}        unique ids (use the id format the definition gives)
+{"type":"pool","name":"owners","prefix":"AB","digits":8,"ratio":0.3,"min_size":3,"skew":0.6}   an id drawn from a pool that all entities share (rule 23); members = entities x ratio
 {"type":"template","parts":[{"const":"TX-"},{"digits":6}],"registry":"name"}
 {"type":"switch","by":"<expr>","cases":{"key":<sampler>,...}}   a different sampler per value of another column
 {"type":"rollup","fn":"first|last|min|max|sum|mean|count|any|all|distinct","of":"<expr on one event row>","where":"<expr>|null"}
@@ -1029,7 +1062,8 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
                             + completion_after_failure_advice(spec, rows) + category_conflict_advice(spec, rows)
                             + cash_denomination_advice(spec, rows) + entity_fact_scope_advice(spec, rows)
                             + amount_agreement_advice(spec, rows) + recurring_amount_advice(spec, rows)
-                            + derived_date_order_advice(spec, rows)
+                            + derived_date_order_advice(spec, rows) + sequence_clone_advice(spec, rows) + amount_table_advice(spec, rows)
+                            + running_balance_advice(spec, rows) + rail_limit_advice(spec, rows)
                             + expect.check(spec, rows, expectations, ctx.as_of))
         report["facts"] = shape_facts(spec, rows)
     return problems, report
@@ -1468,7 +1502,8 @@ def cash_denomination_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -
                     break
     if len(cash_rows) < 5:
         return []
-    out = []
+    den = _cash_denomination(spec)
+    hits: list[tuple[str, int, int, float]] = []
     for cid, name in spec.delivered.items():
         t = _tokens(name)
         if spec.columns[cid].dtype != "float" or not (t & _AMOUNT_WORDS) or t & _NOT_CASH_AMOUNT or t & {"deposit", "credit", "payment", "salary", "receipt", "refund"}:
@@ -1476,13 +1511,34 @@ def cash_denomination_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -
         values = [r[cid] for r in cash_rows if isinstance(r.get(cid), (int, float)) and not isinstance(r.get(cid), bool)]
         if len(values) < 5:
             continue
-        fractional = [v for v in values if abs(v - round(v)) > 1e-9]
+        fractional = [v for v in values if abs(v / den - round(v / den)) * den > 1e-6]
         if len(fractional) >= 0.5 * len(values):
-            out.append({"id": "cash_not_whole_notes", "severity": "error", "columns": [name],
-                        "problem": f"{name} has fractions of the currency unit on {len(fractional)} of {len(values)} cash withdrawals (for example {fractional[0]}), but cash is dispensed in whole notes.",
-                        "evidence": f"{len(cash_rows)} cash rows; {len(fractional)} with a fractional amount",
-                        "fix": "Round the amount of a cash withdrawal to the machine's note denomination (for example round(x / 100) * 100) and keep any generic amount that mirrors it equal."})
-    return out[:2]
+            hits.append((name, len(fractional), len(values), fractional[0]))
+    if not hits:
+        return []
+    # One finding that names every affected amount, the transaction's generic amount first: a finding per column would be cut to the
+    # first few and leave the column that matters (the generic amount every other amount mirrors) unnamed.
+    hits.sort(key=lambda h: (not _tokens(h[0]) & {"transaction"}, len(h[0])))
+    names = [h[0] for h in hits]
+    name, bad, total, example = hits[0]
+    example_den = f"{den:g}" if den > 1 else "100"
+    return [{"id": "cash_not_whole_notes", "severity": "error", "columns": names,
+             "problem": f"{', '.join(names)} {'has' if len(names) == 1 else 'have'} "
+                        + (f"amounts that are not multiples of {den:g}" if den > 1 else "fractions of the currency unit")
+                        + f" on cash withdrawals (for example {name} {example} on {bad} of {total}), but cash is dispensed in whole notes"
+                        + (f" of {den:g}." if den > 1 else "."),
+             "evidence": f"{len(cash_rows)} cash rows; {bad} of {total} with a fractional {name}",
+             "fix": f"Round the amount of a cash withdrawal to the machine's note denomination (for example round(x / {example_den}) * {example_den}) in {name}"
+                    + (" and in every amount that mirrors it (" + ", ".join(names[1:]) + ")" if len(names) > 1 else "") + ", so they stay equal."}]
+
+
+def _cash_denomination(spec: GenerationSpec) -> float:
+    """The smallest note a cash machine dispenses in the scenario's country (from its stored limits); 1 when none is stored."""
+    try:
+        value = float(((getattr(spec, "scenario", None) or {}).get("country_limits") or {}).get("cash_denomination") or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+    return value if value > 0 else 1.0
 
 
 def entity_fact_scope_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1521,12 +1577,35 @@ def entity_fact_scope_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -
 
 
 _FEE_WORDS = frozenset({"fee", "charge", "charges", "commission", "mdr", "tax", "gst", "levy", "surcharge"})
-_NOT_HUB_AMOUNT = frozenset({"balance", "limit", "interest", "available", "cumulative", "rate", "count", "total", "threshold", "minimum", "maximum"})
+_NOT_HUB_AMOUNT = frozenset({"balance", "limit", "interest", "available", "cumulative", "rate", "count", "total", "threshold", "minimum", "maximum",
+                             "capital", "sweep", "lien", "hold", "accrual", "accrued", "opening", "closing", "reserve", "collateral", "exposure",
+                             "turnover", "income", "outstanding", "sanctioned", "quota", "budget", "target", "average"})
+# Amounts of ONE movement of money. Only these describe the same money as the transaction's own amount.
+_MOVEMENT_WORDS = frozenset({"transaction", "payment", "deposit", "withdrawal", "transfer", "debit", "credit", "remittance", "settlement",
+                             "disbursement", "repayment", "purchase", "refund", "payout", "receipt", "transmission"})
 
 
 def _is_amount(spec: GenerationSpec, cid: str, name: str) -> bool:
     t = _tokens(name)
     return spec.columns[cid].dtype in ("float", "integer") and bool(t & _AMOUNT_WORDS) and not t & (_NOT_HUB_AMOUNT | _FEE_WORDS)
+
+
+def _varies_within_entity(groups: list[list[dict[str, Any]]], cid: str) -> bool:
+    """True when the column takes different values on the events of most entities (a fact of the event, not of the entity)."""
+    varying = eligible = 0
+    for g in groups:
+        present = [r.get(cid) for r in g if isinstance(r.get(cid), (int, float)) and not isinstance(r.get(cid), bool)]
+        if len(present) >= 2:
+            eligible += 1
+            varying += len(set(present)) > 1
+    return eligible >= 5 and varying >= 0.5 * eligible
+
+
+def _movement_amounts(spec: GenerationSpec, rows: list[dict[str, Any]]) -> dict[str, str]:
+    """The amounts that record one movement of money and change from event to event within an entity."""
+    groups = _by_entity(spec, rows) if spec.entity_column else []
+    return {cid: name for cid, name in spec.delivered.items()
+            if _is_amount(spec, cid, name) and _tokens(name) & _MOVEMENT_WORDS and (not groups or _varies_within_entity(groups, cid))}
 
 
 def amount_agreement_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1539,7 +1618,7 @@ def amount_agreement_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) ->
     """
     if len(rows) < 60:
         return []
-    amounts = {cid: name for cid, name in spec.delivered.items() if _is_amount(spec, cid, name)}
+    amounts = _movement_amounts(spec, rows)
     if len(amounts) < 2:
         return []
 
@@ -1585,7 +1664,11 @@ def amount_agreement_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) ->
     return out[:3]
 
 
-_RECURRING_WORDS = frozenset({"salary", "payroll", "pension", "stipend", "wage", "wages", "annuity", "rent", "emi", "instalment", "installment"})
+# Income an entity receives keeps its size; so does an instalment it owes. A business paying salaries or rent to many payees does not:
+# those are other people's amounts. So income counts only on a row that credits the entity.
+_RECURRING_INCOME = frozenset({"salary", "payroll", "pension", "stipend", "wage", "wages", "annuity"})
+_RECURRING_OWED = frozenset({"emi", "instalment", "installment"})
+_CREDIT_WORDS = frozenset({"credit", "credited", "deposit", "inward", "incoming", "received", "receipt"})
 
 
 def recurring_amount_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1593,7 +1676,7 @@ def recurring_amount_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) ->
     if len(rows) < 60 or not spec.entity_column:
         return []
     texts = [cid for cid in spec.delivered if spec.columns[cid].dtype in ("string", "categorical")]
-    amounts = {cid: name for cid, name in spec.delivered.items() if _is_amount(spec, cid, name)}
+    amounts = {cid: name for cid, name in spec.delivered.items() if _is_amount(spec, cid, name) and _tokens(name) & _MOVEMENT_WORDS}
     if not amounts:
         return []
     hub = max(amounts, key=lambda c: (sum(1 for r in rows if isinstance(r.get(c), (int, float))), bool(_tokens(amounts[c]) & {"transaction"})))
@@ -1602,9 +1685,17 @@ def recurring_amount_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) ->
         v = r.get(hub)
         if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
             continue
+        words_of_row = set()
         for cid in texts:
             val = r.get(cid)
-            if isinstance(val, str) and len(val) <= 60 and _value_words(val) & _RECURRING_WORDS:
+            if isinstance(val, str) and len(val) <= 60:
+                words_of_row |= _value_words(val)
+        for cid in texts:
+            val = r.get(cid)
+            if not isinstance(val, str) or len(val) > 60:
+                continue
+            w = _value_words(val)
+            if (w & _RECURRING_OWED) or ((w & _RECURRING_INCOME) and (words_of_row & _CREDIT_WORDS)):
                 by_kind.setdefault((cid, val), {}).setdefault(r.get(spec.entity_column), []).append(float(v))
                 break
     out = []
@@ -1678,6 +1769,242 @@ def derived_date_order_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) 
                                    "a summary of activity cannot be dated before that activity.",
                         "evidence": f"e.g. {example[0].date()} vs latest event {example[1].date()}",
                         "fix": f"Draw {name} after the entity's last event (rollup of the latest event time plus a delay), or give it event scope so each value follows its own event."})
+    return out[:3]
+
+
+SEQUENCE_MIN_ENTITIES = 8
+SEQUENCE_MAX_POSITIONS = 12
+
+
+def sequence_clone_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for entities that all follow the same script: the same value at the same position of their history.
+
+    Real entities have their own start, speed and turning point (rule 17). Two signs of one script for everybody are measured: an
+    amount that takes the same value at the same event position for most entities (a ladder of amounts everyone climbs), and a column
+    that changes (or is first filled) at the same position, after the first events, for most entities that change it (the alert that
+    always fires at the seventh event).
+    """
+    groups = [g for g in _by_entity(spec, rows) if len(g) >= 5]
+    if len(groups) < SEQUENCE_MIN_ENTITIES:
+        return []
+    out: list[dict[str, Any]] = []
+    positions = min(SEQUENCE_MAX_POSITIONS, max(len(g) for g in groups))
+    for cid, name in _movement_amounts(spec, rows).items():
+        tested = cloned = 0
+        modes: set[float] = set()
+        example = None
+        for k in range(positions):
+            values = [round(float(g[k][cid]), 2) for g in groups
+                      if len(g) > k and isinstance(g[k].get(cid), (int, float)) and not isinstance(g[k].get(cid), bool)]
+            if len(values) < SEQUENCE_MIN_ENTITIES:
+                continue
+            tested += 1
+            top = Counter(values).most_common(1)[0]
+            if top[1] >= 0.6 * len(values):
+                cloned += 1
+                modes.add(top[0])
+                example = example or (k + 1, top[0], top[1], len(values))
+        if tested >= 4 and cloned >= max(3, 0.5 * tested) and len(modes) >= 2:
+            out.append({"id": "sequence_clone", "severity": "error" if cloned >= 0.75 * tested else "warn", "columns": [name],
+                        "problem": f"{name} takes the same value at the same position of the history for most entities (at {cloned} of {tested} positions): "
+                                   "every entity follows the same ladder of amounts.",
+                        "evidence": f"e.g. event {example[0]}: {example[1]:g} for {example[2]} of {example[3]} entities",
+                        "fix": f"Draw {name} from the entity's own persona (its typical size, spread and growth, from an entity latent) and the kind of each event, "
+                               "not from the event's position; each entity has its own sizes."})
+    for cid, name in spec.delivered.items():
+        col = spec.columns[cid]
+        if col.kind != "event" or cid in (spec.entity_column, spec.clock) or col.dtype in ("datetime", "date"):
+            continue
+        turns: list[int] = []
+        for g in groups:
+            first = g[0].get(cid)
+            for k in range(1, len(g)):
+                v = g[k].get(cid)
+                if (v is None) != (first is None) or (v is not None and v != first):
+                    turns.append(k)
+                    break
+        if len(turns) < SEQUENCE_MIN_ENTITIES or len(turns) < 0.5 * len(groups):
+            continue
+        at, count = Counter(turns).most_common(1)[0]
+        if at >= 2 and count >= 0.7 * len(turns):
+            out.append({"id": "sequence_clone", "severity": "error" if count >= 0.9 * len(turns) and len(turns) >= 0.8 * len(groups) else "warn",
+                        "columns": [name],
+                        "problem": f"{name} changes at event {at + 1} for {count} of the {len(turns)} entities that change it: every entity turns at the same position of its history.",
+                        "evidence": f"turning event per entity: {dict(sorted(Counter(turns).items())[:6])}",
+                        "fix": f"Give each entity its own turning point (a latent drawn per entity, for example from a lognormal or uniform over the history) and let {name} change when "
+                               "the entity's position passes it; some entities never turn."})
+    return out[:3]
+
+
+def amount_table_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for the amount of a money movement that every entity draws from one small table of values.
+
+    The sizes of real payments, deposits and withdrawals spread continuously and differ from one entity to the next; a dozen distinct
+    amounts that most entities reuse mean that a short list of sizes was drawn from, whatever the entity. Measured on movement amounts
+    only (a catalogue price is a table by nature and is not a movement).
+    """
+    if not spec.entity_column or len(rows) < 60:
+        return []
+    out = []
+    for cid, name in _movement_amounts(spec, rows).items():
+        by_value: dict[float, set[Any]] = {}
+        uses: Counter = Counter()
+        filled = 0
+        for r in rows:
+            v = r.get(cid)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                filled += 1
+                uses[round(float(v), 2)] += 1
+                by_value.setdefault(round(float(v), 2), set()).add(r.get(spec.entity_column))
+        entities = set().union(*by_value.values()) if by_value else set()
+        if filled < 60 or len(entities) < SEQUENCE_MIN_ENTITIES or len(by_value) < 3:
+            continue
+        reused = sum(uses[v] for v, who in by_value.items() if len(who) >= 3)          # rows whose amount another two entities also have
+        if len(by_value) <= min(40, 0.2 * filled) and reused >= 0.9 * filled:
+            out.append({"id": "amount_table", "severity": "warn", "columns": [name],
+                        "problem": f"{name} takes only {len(by_value)} distinct values over {filled} rows, and {reused} of the rows carry a value that three or more entities share: "
+                                   "the amounts come from one short table shared by everybody.",
+                        "evidence": f"e.g. {', '.join(f'{v:g}' for v in sorted(by_value)[:5])}",
+                        "fix": f"Draw {name} from a continuous distribution (lognormal around the entity's own typical size, from an entity latent, shifted by the kind of the event) "
+                               "and round it only to the unit that is real for the kind (for example whole notes for cash)."})
+    return out[:2]
+
+
+_BALANCE_SKIP = frozenset({"statement", "starting", "opening", "ending", "closing", "average", "avg", "minimum", "maximum", "threshold", "limit",
+                           "target", "required", "interest", "initial", "previous", "prior", "cumulative"})
+BALANCE_MIN_TRANSITIONS = 60
+BALANCE_RUNNING_SHARE = 0.3
+
+
+def running_balance_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for a balance that does not move with the money that moves through the entity's account.
+
+    A balance after an event is the balance before it plus or minus that event's amount (and its fee). Between two consecutive events
+    of one entity the balance must therefore change by the amount of the later event; a balance drawn on its own, or fixed per entity,
+    does not.
+    """
+    groups = [g for g in _by_entity(spec, rows) if len(g) >= 3]
+    if len(groups) < 8:
+        return []
+    amounts = _movement_amounts(spec, rows)
+    if not amounts:
+        return []
+    order = sorted(amounts, key=lambda c: (-sum(1 for r in rows if isinstance(r.get(c), (int, float))), not _tokens(amounts[c]) & {"transaction"}))
+    fees = [cid for cid, name in spec.delivered.items() if spec.columns[cid].dtype in ("float", "integer") and _tokens(name) & _FEE_WORDS]
+
+    def num(r: dict[str, Any], cid: str) -> float | None:
+        v = r.get(cid)
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    out = []
+    for cid, name in spec.delivered.items():
+        t = _tokens(name)
+        if spec.columns[cid].dtype not in ("float", "integer") or "balance" not in t or t & _BALANCE_SKIP:
+            continue
+        total = matched = static = 0
+        example = None
+        for g in groups:
+            for before, after in zip(g, g[1:]):
+                b0, b1 = num(before, cid), num(after, cid)
+                moved = next((m for m in (num(after, a) for a in order) if m is not None), None)
+                if b0 is None or b1 is None or moved is None:
+                    continue
+                total += 1
+                change = abs(b1 - b0)
+                if change <= 0.005:
+                    static += 1
+                charges = [f for f in (num(after, fee) for fee in fees) if f is not None]
+                if any(abs(change - (moved + extra)) <= 0.011 or abs(change - abs(moved - extra)) <= 0.011 for extra in [0.0] + charges):
+                    matched += 1
+                elif example is None:
+                    example = (b0, b1, moved)
+        if total >= BALANCE_MIN_TRANSITIONS and matched < BALANCE_RUNNING_SHARE * total:
+            frozen = static >= 0.8 * total
+            out.append({"id": "balance_not_running", "severity": "error" if matched < 0.1 * total else "warn", "columns": [name, amounts[order[0]]],
+                        "problem": f"{name} "
+                                   + ("does not change between the events of an entity" if frozen else "does not move by the amount of the event")
+                                   + f": between consecutive events it changes by that event's amount on only {matched} of {total} steps.",
+                        "evidence": (f"e.g. balance {example[0]:g} then {example[1]:g} after an amount of {example[2]:g}" if example else f"{static} of {total} steps with no change"),
+                        "fix": f"Make {name} an event-scope running balance: balance = (prev['{name}'] if prev is not None else an opening balance drawn once per entity) "
+                               f"plus the event's amount for a credit or minus it for a debit (the sign comes from the kind latent of the event), minus any fee column; "
+                               "a debit larger than the balance is not drawn unless the account has an overdraft."})
+    return out[:2]
+
+
+RAIL_MIN_ROWS = 3
+# A fee that is charged on the account over a period (accrued, annual, monthly, maintenance, a service package) is not the fee of one payment.
+_NOT_RAIL_FEE = frozenset({"rate", "percent", "percentage", "accrual", "accrued", "annual", "monthly", "quarterly", "maintenance", "service", "services", "waived"})
+
+
+def rail_limit_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for amounts and fees that break the stored operating limits of a payment rail of the scenario's country.
+
+    The limits (``spec.scenario["country_limits"]``, read from MongoDB) say which words name a rail and what its floor, cap and fee are.
+    A row names a rail when the words of one of its text values contain a rail's aliases; its movement amounts must lie inside the rail's
+    limits, and the fee columns must be zero on a rail that is free.
+    """
+    limits = (getattr(spec, "scenario", None) or {}).get("country_limits") or {}
+    rails = [r for r in limits.get("rails") or [] if isinstance(r, dict) and r.get("aliases")]
+    if not rails or len(rows) < 30:
+        return []
+    texts = [(cid, name) for cid, name in spec.delivered.items() if spec.columns[cid].dtype in ("string", "categorical")]
+    amounts = _movement_amounts(spec, rows)
+    fee_cols = {cid: name for cid, name in spec.delivered.items()
+                if spec.columns[cid].dtype in ("float", "integer") and _tokens(name) & _FEE_WORDS and not _tokens(name) & _NOT_RAIL_FEE}
+    seen: dict[str, int] = {}
+    found: dict[tuple[str, str], list[Any]] = {}
+    via: dict[str, str] = {}
+    for r in rows:
+        words: set[str] = set()
+        owner: dict[str, str] = {}
+        for cid, name in texts:
+            v = r.get(cid)
+            if isinstance(v, str) and len(v) <= 60:
+                w = _value_words(v)
+                words |= w
+                for x in w:
+                    owner.setdefault(x, name)
+        hit = [rail for rail in rails if any(set(a.split()) <= words for a in rail["aliases"])]
+        if len(hit) != 1:
+            continue
+        rail = hit[0]
+        rid = str(rail.get("id") or rail["aliases"][0])
+        seen[rid] = seen.get(rid, 0) + 1
+        via.setdefault(rid, owner.get(rail["aliases"][0].split()[0], texts[0][1] if texts else ""))
+        values = [(amounts[cid], float(r[cid])) for cid in amounts if isinstance(r.get(cid), (int, float)) and not isinstance(r.get(cid), bool)]
+        if rail.get("max_amount") is not None:
+            over = [(n, v) for n, v in values if v > rail["max_amount"] + 1e-9]
+            if over:
+                found.setdefault((rid, "above the cap"), []).append(over[0])
+        if rail.get("min_amount") is not None:
+            under = [(n, v) for n, v in values if v < rail["min_amount"] - 1e-9]
+            if under:
+                found.setdefault((rid, "below the floor"), []).append(under[0])
+        if rail.get("fee") is not None and float(rail["fee"]) == 0.0:
+            paid = [(fee_cols[cid], float(r[cid])) for cid in fee_cols if isinstance(r.get(cid), (int, float)) and not isinstance(r.get(cid), bool) and r[cid] > 0.005]
+            if paid:
+                found.setdefault((rid, "charged a fee"), []).append(paid[0])
+    out = []
+    by_id = {str(r.get("id") or r["aliases"][0]): r for r in rails}
+    for (rid, what), hits in sorted(found.items(), key=lambda kv: -len(kv[1])):
+        total = seen.get(rid, 0)
+        if len(hits) < RAIL_MIN_ROWS or len(hits) < 0.03 * total:
+            continue
+        rail = by_id[rid]
+        label = rail.get("label") or rid
+        if what == "above the cap":
+            rule = f"a cap of {rail['max_amount']:g}"
+        elif what == "below the floor":
+            rule = f"a floor of {rail['min_amount']:g}"
+        else:
+            rule = "no fee"
+        col, value = hits[0]
+        out.append({"id": "rail_limit_violated", "severity": "error", "columns": [col] + ([via[rid]] if via.get(rid) else []),
+                    "problem": f"{label} has {rule} in this country, but {len(hits)} of {total} {label} rows are {what}" if what != "charged a fee"
+                               else f"{label} is free in this country, but {len(hits)} of {total} {label} rows are charged a fee",
+                    "evidence": f"e.g. {col} {value:g} on a {label} row",
+                    "fix": f"Draw the rail first, then the amount and fee from that rail's own limits ({rule}): a rail with a floor is never drawn below it, a rail with a cap never above it, "
+                           "a free rail has a fee of 0 (and no fee name). Condition the amount on the kind latent, for example by a switch on the rail."})
     return out[:3]
 
 
@@ -2425,7 +2752,7 @@ MEASURED_FINDINGS = frozenset({"window_overlap", "constant_numeric_column", "nea
                                "healed_target", "healed_duplicate", "healed_invariant", "healed_column", "check",
                                "future_date", "target_absent", "completion_after_failure", "category_conflicts_kind",
                                "cash_not_whole_notes", "entity_fact_at_event_scope", "amount_disagrees", "recurring_amount_unstable",
-                               "derived_before_event"})
+                               "derived_before_event", "sequence_clone", "balance_not_running", "rail_limit_violated", "amount_table"})
 
 
 def is_measured(finding: dict[str, Any]) -> bool:
@@ -2521,6 +2848,7 @@ class SpecCompiler:
     def __init__(self, llm: Any | None = None, *, max_repairs: int = MAX_REPAIR_ROUNDS, review: bool | None = None,
                  refine_rounds: int = MAX_REFINE_ROUNDS):
         self._llm = llm
+        self._injected = llm is not None                     # a model client handed in (a test, another provider) is used as it is
         self.max_repairs = max_repairs
         self.refine_rounds = refine_rounds
         self._review = review
@@ -2569,24 +2897,48 @@ class SpecCompiler:
 
     def _review_issues(self, brief: dict[str, Any], base: Baseline, spec: GenerationSpec, records: list[dict[str, Any]],
                        notes: dict[str, dict[str, Any]] | None, resources: dict[str, str] | None,
-                       facts: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+                       facts: dict[str, Any] | None, deadline: float | None = None) -> list[dict[str, Any]] | None:
         """The reviewer's findings, or None when the reviewer could not be consulted (which never blocks a spec)."""
         try:
-            raw = self._generate(REVIEW_PROMPT, build_review_prompt(brief, base, spec, records, notes, resources, facts), attempts=2)
+            raw = self._generate(REVIEW_PROMPT, build_review_prompt(brief, base, spec, records, notes, resources, facts), attempts=2, deadline=deadline)
         except Exception as exc:
             logger.warning("behaviour spec review unavailable (%s: %s)", type(exc).__name__, exc)
             return None
         return parse_review(raw)
 
-    def _generate(self, system: str, prompt: str, *, attempts: int = MODEL_ATTEMPTS) -> Any:
-        """One model call; a transient failure (overload, rate limit, timeout, a reply that is not JSON) is tried again."""
+    def _call_client(self, deadline: float | None) -> Any:
+        """The model client; with a ``deadline`` (monotonic seconds) one whose timeout never runs past it."""
+        if deadline is None:
+            return self._client()
+        left = deadline - time.monotonic()
+        if self._injected and left >= MIN_CALL_SECONDS:
+            return self._llm
+        if left < MIN_CALL_SECONDS:
+            raise TimeoutError(f"the time allowed for this design is spent ({left:.0f}s left)")
+        from config.runtime import SPEC_LLM_TIMEOUT_MS
+
+        if left * 1000.0 >= SPEC_LLM_TIMEOUT_MS or self._injected:
+            return self._client()
+        from core.llm_client import GeminiClient
+
+        return GeminiClient(timeout_ms=int(left * 1000.0))
+
+    def _generate(self, system: str, prompt: str, *, attempts: int = MODEL_ATTEMPTS, deadline: float | None = None) -> Any:
+        """One model call; a transient failure (overload, rate limit, timeout, a reply that is not JSON) is tried again.
+
+        ``deadline`` (a ``time.monotonic()`` instant) bounds the call and its retries: an attempt gets only the time that is left, and
+        none is made when too little is, so a slow provider cannot stretch one design far past the window it was given.
+        """
         for attempt in range(1, attempts + 1):
+            client = self._call_client(deadline)
             try:
-                return self._client().generate_json(system_instruction=system, user_prompt=prompt, temperature=0.0)
+                return client.generate_json(system_instruction=system, user_prompt=prompt, temperature=0.0)
             except Exception as exc:
                 if attempt >= attempts or _permanent(exc):
                     raise
                 pause = MODEL_RETRY_PAUSE[min(attempt - 1, len(MODEL_RETRY_PAUSE) - 1)]
+                if deadline is not None and time.monotonic() + pause + MIN_CALL_SECONDS > deadline:
+                    raise
                 logger.warning("behaviour spec model call failed (%s: %s); attempt %d of %d, again in %.0fs",
                                type(exc).__name__, _short(str(exc), 160), attempt, attempts, pause)
                 time.sleep(pause)
@@ -2613,10 +2965,10 @@ class SpecCompiler:
         return best
 
     def _round(self, base: Baseline, brief: dict[str, Any], prompt: str, current: dict[str, Any] | None, *,
-               final: bool = False, expectations: Any = None) -> _Round:
+               final: bool = False, expectations: Any = None, deadline: float | None = None) -> _Round:
         """One model call (a full spec, or a patch of ``current``), merged, checked and, where that is safe, healed."""
         called = time.monotonic()
-        raw = self._generate(SYSTEM_PROMPT, prompt)
+        raw = self._generate(SYSTEM_PROMPT, prompt, deadline=deadline)
         self._author_seconds = time.monotonic() - called
         if callable(expectations):                          # still being written beside this call: it is needed only now
             expectations = expectations()
@@ -2632,7 +2984,8 @@ class SpecCompiler:
             rnd = self._heal_cadence(base, brief, rnd)
         return rnd
 
-    def _expectations(self, base: Baseline, brief: dict[str, Any], notes: dict[str, dict[str, Any]] | None) -> dict[str, Any] | None:
+    def _expectations(self, base: Baseline, brief: dict[str, Any], notes: dict[str, dict[str, Any]] | None,
+                      deadline: float | None = None) -> dict[str, Any] | None:
         """The independent expectations of the scenario, or None when the model could not be asked (which never blocks a spec).
 
         What is asked depends only on the scenario and the column definitions, so a design that is repeated (a failed attempt tried
@@ -2646,7 +2999,7 @@ class SpecCompiler:
         if cached is not None:
             return copy.deepcopy(cached)
         try:
-            raw = self._generate(expect.EXPECTATION_PROMPT, prompt, attempts=2)
+            raw = self._generate(expect.EXPECTATION_PROMPT, prompt, attempts=2, deadline=deadline)
         except Exception as exc:
             logger.warning("behaviour expectations unavailable (%s: %s)", type(exc).__name__, _short(str(exc), 160))
             return None
@@ -2839,7 +3192,8 @@ class SpecCompiler:
         return findings, review
 
     def _repair_measured(self, base: Baseline, brief: dict[str, Any], first: str, rnd: _Round, started: float,
-                         notes: dict[str, dict[str, Any]] | None = None, resources: dict[str, str] | None = None) -> _Round:
+                         notes: dict[str, dict[str, Any]] | None = None, resources: dict[str, str] | None = None,
+                         hard: float | None = None) -> _Round:
         """Patch rounds for the errors the checks measured on a spec that passed, before the spec is first served.
 
         Measured errors (a column that never varies, an in-flight state on old events, a relation the independent expectations
@@ -2868,7 +3222,7 @@ class SpecCompiler:
         thread = None
         if self.reviewing():
             def read() -> None:
-                reviewed["issues"] = self._review_issues(brief, base, rnd.spec, rnd.records, notes, resources, rnd.report.get("facts"))
+                reviewed["issues"] = self._review_issues(brief, base, rnd.spec, rnd.records, notes, resources, rnd.report.get("facts"), hard)
 
             thread = threading.Thread(target=read, name="draft-review", daemon=True)
             thread.start()
@@ -2880,7 +3234,7 @@ class SpecCompiler:
             calls += 1
             try:
                 cand = self._round(base, brief, repair_prompt(first, rnd.overlay, [review_problem(f) for f in before] + extra), rnd.overlay,
-                                   expectations=expectations)
+                                   expectations=expectations, deadline=hard)
             except Exception as exc:
                 logger.warning("behaviour spec draft repair skipped (%s: %s)", type(exc).__name__, exc)
                 break
@@ -2898,7 +3252,10 @@ class SpecCompiler:
                      if (f["id"], tuple(f["columns"])) not in known][:4]
             logger.info("behaviour spec draft repair kept the spec it had (%d finding(s) to repair)", len(before))
         if thread is not None:
-            thread.join(timeout=DRAFT_REVIEW_GRACE_SECONDS if rnd.spec is not first_spec else None)
+            # A review that ran beside an unchanged spec is worth waiting for, but never past the design's deadline (its own call is cut
+            # there); one that ran beside a repair is stale and gets only a short grace.
+            left = max(1.0, hard - time.monotonic()) if hard is not None else None
+            thread.join(timeout=DRAFT_REVIEW_GRACE_SECONDS if rnd.spec is not first_spec else left)
             if isinstance(reviewed.get("issues"), list):
                 rnd.overlay["draft_review"] = {"issues": reviewed["issues"], "stale": rnd.spec is not first_spec}
         rnd.overlay["timing"] = {"repair_calls": calls}
@@ -2917,12 +3274,15 @@ class SpecCompiler:
         except SpecBuildError as exc:
             return CompileResult(None, "rejected", [str(exc)])
         started = time.monotonic()
+        from config.runtime import SPEC_DRAFT_HARD_SECONDS
+
+        hard = started + float(SPEC_DRAFT_HARD_SECONDS)          # no model call of the first design runs past this instant
         written: dict[str, Any] = {}
 
         def write() -> None:
             began = time.monotonic()
             try:
-                written["value"] = self._expectations(base, brief, notes)
+                written["value"] = self._expectations(base, brief, notes, hard)
             except Exception:                              # the expectations never block a design
                 logger.exception("behaviour expectations could not be written")
                 written["value"] = None
@@ -2932,7 +3292,7 @@ class SpecCompiler:
         writer.start()
 
         def expected() -> dict[str, Any] | None:
-            writer.join()
+            writer.join(timeout=max(1.0, hard - time.monotonic() + 5.0))      # its own call is cut at the deadline; never wait past it
             return written.get("value")
 
         first = build_prompt(brief, base, notes, resources, None)
@@ -2946,16 +3306,19 @@ class SpecCompiler:
             try:
                 drafted += 1
                 rnd = self._round(base, brief, prompt, current, final=round_no == self.max_repairs,
-                                  expectations=expectations if resolved else expected)
+                                  expectations=expectations if resolved else expected, deadline=hard)
             except Exception as exc:                      # no key, provider outage, timeout, invalid JSON
                 logger.warning("behaviour spec draft: model unavailable (%s: %s)", type(exc).__name__, exc)
+                if round_no and rnd is not None and rnd.overlay:   # an earlier round produced a design: keep what works of it (below)
+                    drafted -= 1
+                    break
                 return CompileResult(None, "unavailable", [f"{type(exc).__name__}: {_short(str(exc), 240)}"], round_no)
             if not resolved:                               # from here on the author is shown what is expected of the scenario
                 expectations, resolved = expected(), True
                 first = build_prompt(brief, base, notes, resources, expectations)
             if rnd.spec is not None:
                 authored = time.monotonic() - started
-                rnd = self._repair_measured(base, brief, first, rnd, started, notes, resources)
+                rnd = self._repair_measured(base, brief, first, rnd, started, notes, resources, hard)
                 rnd.report.update(rounds=round_no, problems=0)
                 repaired = (rnd.overlay.get("timing") or {}).get("repair_calls", 0) if isinstance(rnd.overlay.get("timing"), dict) else 0
                 rnd.overlay["timing"] = {"expectations": written.get("seconds"), "first_design": round(authored, 1),

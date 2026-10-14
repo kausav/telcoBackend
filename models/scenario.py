@@ -9,7 +9,7 @@ from models.database import get_database
 
 
 class ScenarioModel:
-    collection = get_database()[collection_name("MONGODB_SCENARIOS_COLLECTION", "scenarios")]
+    collection = get_database()[collection_name("scenarios")]
 
     @classmethod
     def ensure_indexes(cls) -> None:

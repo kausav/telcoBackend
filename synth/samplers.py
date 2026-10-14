@@ -15,6 +15,8 @@ This module holds mechanism only: there are no vocabularies, prefixes, numbers o
     {"type": "id",        "prefix": "", "digits": 8, "registry": "<name>",             # unique per run
                           "stable_by": "<expression>", "format_hint": true,            # one id per entity and key
                           "unique": false}                                              # ids may repeat across rows
+    {"type": "pool",      "name": "<pool>", "prefix": "", "digits": 8,                  # ids shared by many entities
+                          "ratio": 0.3, "min_size": 3, "skew": 0.6}                    # members = entities x ratio; skew > 0: a few hubs
     {"type": "template",  "parts": [{"const": ..} | {"choice": [..]} | {"choice_ref": ".."} | {"digits": n}],
                           "registry": "<name>"}
     {"type": "lognormal", "median": m, "sigma": s, "min": a, "max": b}
@@ -34,12 +36,14 @@ This module holds mechanism only: there are no vocabularies, prefixes, numbers o
 """
 from __future__ import annotations
 
+import math
+import random
 from datetime import timedelta
 from typing import Any
 
 from synth.expr import Expr
 
-TYPES = {"const", "expr", "choice", "id", "template", "lognormal", "beta_scaled", "uniform_int", "uniform", "bernoulli",
+TYPES = {"const", "expr", "choice", "id", "pool", "template", "lognormal", "beta_scaled", "uniform_int", "uniform", "bernoulli",
          "time_shift", "switch", "definition", "after_parents", "rollup"}
 ROLLUP_FNS = ("first", "last", "min", "max", "sum", "mean", "count", "any", "all", "distinct")
 _EXPR_KEYS = {"expr", "by", "filter", "scale", "round", "stable_by", "of", "where"}
@@ -49,7 +53,7 @@ def is_rollup(sample: Any) -> bool:
     """True for a sampler that summarises the entity's own events (computed after them, never drawn)."""
     return isinstance(sample, dict) and sample.get("type") == "rollup"
 _CASTS = {"int": lambda v: int(round(float(v))), "float": float}
-_NUMERIC_KEYS = {"uniform_int": ("low", "high"), "uniform": ("low", "high", "round"), "bernoulli": ("p",)}
+_NUMERIC_KEYS = {"uniform_int": ("low", "high"), "uniform": ("low", "high", "round"), "bernoulli": ("p",), "pool": ("ratio", "min_size", "skew")}
 
 
 def sampler_names(spec: dict[str, Any]) -> set[str]:
@@ -101,7 +105,7 @@ def validate(spec: Any, where: str) -> None:
         raise SamplerError(f"{where}: sampler needs a 'type' in {sorted(TYPES)}")
     kind = spec["type"]
     need = {
-        "const": ["value"], "expr": ["expr"], "id": ["digits"], "template": ["parts"], "lognormal": ["median", "sigma"],
+        "const": ["value"], "expr": ["expr"], "id": ["digits"], "pool": ["name", "digits"], "template": ["parts"], "lognormal": ["median", "sigma"],
         "beta_scaled": ["alpha", "beta", "scale"], "uniform_int": ["low", "high"], "uniform": ["low", "high"],
         "bernoulli": ["p"], "time_shift": ["anchor", "direction"],
         "switch": ["by", "cases"], "choice": [], "definition": ["gen"], "after_parents": ["parents"], "rollup": ["fn"],
@@ -183,6 +187,8 @@ class Sampler:
             return self._choice(spec, env, rt)
         if kind == "id":
             return self._id(spec, env, rt, concept)
+        if kind == "pool":
+            return self._pool(spec, env, rt)
         if kind == "template":
             return ctx.unique(spec.get("registry", concept), lambda: "".join(self._part(p, rt) for p in spec["parts"]))
         if kind == "lognormal":
@@ -265,6 +271,33 @@ class Sampler:
             return rt.memo[key]
         return rt.ctx.unique(spec.get("registry", concept), make)
 
+    def _pool(self, spec: dict[str, Any], env: dict[str, Any], rt: "Runtime") -> str:
+        """An identifier from a pool that every entity of the run draws from, so several entities share the same party.
+
+        Used for facts that link entities (a common owner, controlling party, counterparty, beneficiary, device or address). The pool
+        has ``ratio`` members per entity (at least ``min_size``) and is built once per run, from the run's seed, so it is the same
+        for every draw and independent of the order the entities are drawn in. ``skew`` > 0 makes a few members much more popular.
+        """
+        name = str(spec["name"])
+        pool = rt.pools.get(name)
+        if pool is None:
+            ratio = float(self._num(spec.get("ratio", 0.3), env) or 0.3)
+            floor = int(self._num(spec.get("min_size", 3), env) or 3)
+            size = max(floor, 2, int(math.ceil(max(1, rt.entities) * max(ratio, 0.0))))
+            prefix, digits = str(spec.get("prefix", "")), int(spec["digits"])
+            private = random.Random(f"{rt.ctx.seed}|pool|{name}")
+            lo, hi = (10 ** (digits - 1) if digits > 1 else 0), 10 ** digits
+            members: list[str] = []
+            seen: set[str] = set()
+            while len(members) < size and len(seen) < hi - lo:
+                member = f"{prefix}{private.randrange(lo, hi):0{digits}d}"
+                if member not in seen:
+                    seen.add(member)
+                    members.append(member)
+            skew = max(0.0, float(self._num(spec.get("skew", 0.6), env) or 0.0))
+            pool = rt.pools[name] = (members, [1.0 / ((i + 1) ** skew) for i in range(len(members))])
+        return rt.ctx.weighted(pool[0], pool[1])
+
     def _part(self, part: dict[str, Any], rt: "Runtime") -> str:
         if "const" in part:
             return str(part["const"])
@@ -328,6 +361,8 @@ class Runtime:
     def __init__(self, ctx: Any, reference: dict[str, Any], hints: dict[str, Any]):
         self.ctx, self.reference, self.hints = ctx, reference, hints
         self.memo: dict[tuple, Any] = {}
+        self.pools: dict[str, tuple[list[str], list[float]]] = {}      # shared-party pools, built on first use
+        self.entities = 1                                              # how many entities this run draws (sizes the pools)
         self.entity_index = 0
 
     def ref_path(self, dotted: str) -> Any:

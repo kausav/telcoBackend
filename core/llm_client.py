@@ -6,6 +6,8 @@ normalized into a stable application error contract.
 """
 from __future__ import annotations
 
+from config import constants as _constants
+
 import json
 import logging
 import os
@@ -122,13 +124,13 @@ class GeminiClient:
         except ImportError as exc:
             raise RuntimeError("google-genai is required. Install requirements.txt.") from exc
 
-        key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        key = api_key or os.getenv("GEMINI_API_KEY")
         if not key:
-            raise EnvironmentError("Set GEMINI_API_KEY or GOOGLE_API_KEY before starting the service.")
+            raise EnvironmentError("Set GEMINI_API_KEY before starting the service.")
 
-        self.model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-        timeout_ms = max(1000, int(timeout_ms if timeout_ms else os.getenv("GEMINI_TIMEOUT_MS", "60000")))
-        retry_attempts = max(1, min(6, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "1"))))
+        self.model = _constants.GEMINI_MODEL
+        timeout_ms = max(1000, int(timeout_ms if timeout_ms else _constants.GEMINI_TIMEOUT_MS))
+        retry_attempts = max(1, min(6, int(_constants.GEMINI_RETRY_ATTEMPTS)))
         retry_options = types.HttpRetryOptions(
             attempts=retry_attempts,
             initial_delay=1.0,

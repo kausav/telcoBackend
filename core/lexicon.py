@@ -15,6 +15,8 @@ Without a lexicon, matching falls back to exact tokens. A database failure is tr
 """
 from __future__ import annotations
 
+from config import constants as _constants
+
 import logging
 import os
 import time
@@ -36,7 +38,7 @@ class Lexicon:
 
 
 def _documents(industry_key: str) -> list[dict[str, Any]]:
-    ttl = float(os.getenv("DOMAIN_LEXICON_CACHE_SECONDS", "60"))
+    ttl = float(_constants.DOMAIN_LEXICON_CACHE_SECONDS)
     now = time.monotonic()
     hit = _CACHE.get(industry_key)
     if hit is not None and now - hit[0] < ttl:
@@ -50,7 +52,7 @@ def _documents(industry_key: str) -> list[dict[str, Any]]:
         from models.database import get_database
 
         ensure_seeded()
-        cursor = get_database()[collection_name("MONGODB_DOMAIN_LEXICON_COLLECTION", "domain_lexicon")].find(
+        cursor = get_database()[collection_name("domain_lexicon")].find(
             {"industry_key": {"$in": wanted}}, {"_id": 0}
         )
         rows = [row for row in cursor if isinstance(row, dict)]

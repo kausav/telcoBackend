@@ -8,7 +8,7 @@ from models.database import get_database
 
 
 class ScenarioUserVariableModel:
-    collection = get_database()[collection_name("MONGODB_USER_VARIABLES_COLLECTION", "scenario_user_variables")]
+    collection = get_database()[collection_name("user_variables")]
 
     @classmethod
     def ensure_indexes(cls) -> None:

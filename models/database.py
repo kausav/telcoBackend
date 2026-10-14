@@ -16,8 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 # config.runtime is imported. Loading here prevents an accidental localhost fallback.
 load_dotenv(ROOT / ".env", override=False)
 
-DEFAULT_URI = "mongodb://localhost:27017"
-DEFAULT_DB_NAME = "telco_scenario_db"
+from config import constants as _c
+
+DEFAULT_URI = _c.MONGODB_DEFAULT_URI
+DEFAULT_DB_NAME = _c.MONGODB_DEFAULT_DB_NAME
 
 
 def _normalize_mongodb_uri(uri: str) -> str:
@@ -32,14 +34,6 @@ def _normalize_mongodb_uri(uri: str) -> str:
     return uri.replace(r"\:", ":").replace(r"\@", "@")
 
 
-def _env_int(name: str, default: int) -> int:
-    value = os.getenv(name, str(default)).strip()
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer") from exc
-
-
 @lru_cache(maxsize=1)
 def get_client() -> MongoClient:
     uri = _normalize_mongodb_uri(os.getenv("MONGODB_URI", DEFAULT_URI).strip())
@@ -47,11 +41,11 @@ def get_client() -> MongoClient:
         raise RuntimeError("MONGODB_URI is required")
     return MongoClient(
         uri,
-        serverSelectionTimeoutMS=_env_int("MONGODB_SERVER_SELECTION_TIMEOUT_MS", 5000),
-        connectTimeoutMS=_env_int("MONGODB_CONNECT_TIMEOUT_MS", 5000),
-        socketTimeoutMS=_env_int("MONGODB_SOCKET_TIMEOUT_MS", 10000),
+        serverSelectionTimeoutMS=_c.MONGODB_SERVER_SELECTION_TIMEOUT_MS,
+        connectTimeoutMS=_c.MONGODB_CONNECT_TIMEOUT_MS,
+        socketTimeoutMS=_c.MONGODB_SOCKET_TIMEOUT_MS,
         retryWrites=True,
-        appname=os.getenv("MONGODB_APP_NAME", "telco-agentic-sdg"),
+        appname=_c.MONGODB_APP_NAME,
     )
 
 

@@ -1,5 +1,7 @@
 """Small process-local caches for immutable runtime artifacts."""
 from __future__ import annotations
+
+from config import constants as _constants
 from collections import OrderedDict
 from threading import RLock
 from time import monotonic
@@ -7,8 +9,8 @@ from typing import Any
 import os
 
 _LOCK = RLock()
-_MAX_ITEMS = max(16, int(os.getenv("RUNTIME_CACHE_MAX_ITEMS", "256")))
-_PROPOSAL_TTL = max(30, int(os.getenv("PROPOSAL_CACHE_TTL_SECONDS", "1800")))
+_MAX_ITEMS = max(16, _constants.RUNTIME_CACHE_MAX_ITEMS)
+_PROPOSAL_TTL = max(30, _constants.PROPOSAL_CACHE_TTL_SECONDS)
 _SCHEMA: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
 _ORCHESTRATOR: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
 _PROPOSAL: OrderedDict[tuple, tuple[float, dict[str, Any]]] = OrderedDict()

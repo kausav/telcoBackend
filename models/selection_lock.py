@@ -11,7 +11,7 @@ from models.database import get_database
 
 
 class SelectionLockModel:
-    collection = get_database()[collection_name("MONGODB_SELECTION_LOCKS_COLLECTION", "scenario_selection_locks")]
+    collection = get_database()[collection_name("selection_locks")]
 
     @classmethod
     def ensure_indexes(cls) -> None:

@@ -84,7 +84,7 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <li><b>Honest quality flags.</b> If defects remain, the response says so (<code>quality_target_met=false</code>, <code>open_findings</code>) instead of claiming success.</li>
 <li><b>Scenario type changes behaviour.</b> <code>scenarioType</code> is part of the brief and of the spec key, so different types produce different specs and different data.</li>
 <li><b>Root-cause fixes.</b> No per-column or per-industry special cases. Industry knowledge enters through the source documents and the variable definitions.</li>
-<li><b>Small configuration surface.</b> Three required environment variables; every other variable is optional and has a default.</li>
+<li><b>Small configuration surface.</b> Four environment variables (Gemini key, MongoDB URI and database name, API token); every other setting is a constant in <code>config/constants.py</code>.</li>
 </ul>
 
 <h2 id="layers">2. Layers and components</h2>
@@ -172,8 +172,9 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <tr><td><code>conversations</code>, <code>chat_messages</code></td><td>Agentic chat state.</td></tr>
 <tr><td><code>scenario_feedback</code></td><td>User feedback on generated scenarios.</td></tr>
 <tr><td><code>domain_lexicon</code></td><td>Seeded vocabulary (from <code>seed/domain_lexicon.json</code>).</td></tr>
+<tr><td><code>country_operating_limits</code></td><td>One document per country: the floor, cap and fee of each payment rail and the cash denomination (seeded from <code>seed/country_limits.json</code> for countries that have no document; never overwritten). Fed to the design model and measured on the simulated rows.</td></tr>
 </table></div>
-<p>Collection names are configurable; the table lists the defaults. Database: <code>MONGODB_DB_NAME</code> (default <code>telco_scenario_db</code>).</p>
+<p>Collection names are constants (<code>COLLECTIONS</code> in <code>config/constants.py</code>); the table lists them. Database: <code>MONGODB_DB_NAME</code> (default <code>telco_scenario_db</code>).</p>
 
 <h2 id="api">4. API</h2>
 <div class="tblwrap"><table>
@@ -187,6 +188,7 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <tr><td>GET</td><td><code>/industry-sources</code>, <code>/industry-sources/{id}</code></td><td>List or read industry sources.</td></tr>
 <tr><td>POST</td><td><code>/industry-sources/upload</code></td><td>Upload source files. Form fields: <code>industryType</code>, <code>domain</code>, repeated multipart <code>file</code>.</td></tr>
 <tr><td>PATCH / DELETE</td><td><code>/industry-sources/{id}</code></td><td>Update or delete a source.</td></tr>
+<tr><td>GET / PUT / DELETE</td><td><code>/country-limits</code>, <code>/country-limits/{country}</code></td><td>List, read, store (replace) or delete the payment-rail limits of a country (<code>rails[]</code> with <code>aliases</code>, <code>min_amount</code>, <code>max_amount</code>, <code>fee</code>; <code>currency</code>; <code>cash_denomination</code>). A country is a code (<code>IN</code>) or its name. Specs designed afterwards use the new limits.</td></tr>
 <tr><td>POST</td><td><code>/scenario/import-csv</code></td><td>Create a scenario from a CSV of variable definitions.</td></tr>
 <tr><td>POST</td><td><code>/scenario/propose</code></td><td>Propose a scenario (schema, variables, brief). Warms the design.</td></tr>
 <tr><td>POST</td><td><code>/scenario/confirm</code></td><td>Confirm a proposal and pin its spec.</td></tr>
@@ -244,7 +246,7 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <tr><td>rollups</td><td>Per-entity aggregates over events (totals, counts, latest value).</td></tr>
 <tr><td>invariants</td><td>Hard rules every row must satisfy (for example amount &le; limit).</td></tr>
 <tr><td>targets</td><td>Distribution targets (share of a category, mean of a measure).</td></tr>
-<tr><td>samplers</td><td>Seeded draws: choices with weights, ranges, normal, lognormal, dates, ids.</td></tr>
+<tr><td>samplers</td><td>Seeded draws: choices with weights, ranges, normal, lognormal, dates, ids, and <code>pool</code> (an id drawn from a pool that all entities of the run share: members = entities &times; ratio, so several entities point at one party).</td></tr>
 </table></div>
 
 <h3>Expression language (<code>synth/expr.py</code>)</h3>
@@ -277,6 +279,8 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <li><code>entity_facts</code>, <code>constants</code> &mdash; things true of an entity or constant across its rows.</li>
 <li><code>rules</code>: <code>present_iff</code>, <code>order</code>, <code>at_most</code>, <code>determined_by</code>, <code>holds</code>, <code>separate</code>, <code>slow_state</code>.</li>
 <li><code>state_shares</code> &mdash; expected share of each state value.</li>
+<li><code>trajectories</code> &mdash; columns that must change over an entity's events because the scenario describes a progression.</li>
+<li><code>shared_parties</code> &mdash; columns that name another party the scenario says is shared between entities (a network); measured as the share of entities whose party another entity also has.</li>
 </ul>
 <p>Findings from it have ids starting <code>expected_</code>. The result is cached by <code>sha256(PROMPT_HASH + prompt)</code> and stored in <code>overlay["expectations"]</code>. Guidance in its prompt: when two columns merely agree in direction (for example a rating and a score), state a band or an order relation, never an exact formula.</p>
 
@@ -291,6 +295,19 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <tr><td>CONTRACT, FORMAT</td><td>Column rule or format violated.</td><td>Healed at final: column reverts to its definition draw.</td></tr>
 <tr><td>PLACEHOLDER, FUTURE</td><td>Placeholder text, or a time after <code>asOf</code>.</td><td>Healed at final.</td></tr>
 <tr><td>RUNTIME</td><td>Expression failed to evaluate.</td><td>Healed at final.</td></tr>
+</table></div>
+<p>Measured advice (ids in <code>MEASURED_FINDINGS</code>) is computed on the simulated rows. Added in compiler 16&ndash;17:</p>
+<div class="tblwrap"><table>
+<tr><th>Id</th><th>Measures</th></tr>
+<tr><td><code>amount_disagrees</code></td><td>Two amounts of one money movement (transaction amount and its payment/deposit/withdrawal block) that differ without a fee column explaining it. Only movement amounts that vary within an entity count: capital, sweep, lien, limit, balance and accrual amounts are other facts.</td></tr>
+<tr><td><code>recurring_amount_unstable</code></td><td>Income credited to an entity (salary, pension) or an instalment (EMI) whose amount swings between occurrences. A business paying many payees is not covered.</td></tr>
+<tr><td><code>cash_not_whole_notes</code></td><td>Cash withdrawals that are not multiples of the stored cash denomination (whole units when none is stored). One finding names every affected amount, the generic transaction amount first.</td></tr>
+<tr><td><code>derived_before_event</code></td><td>The date of something calculated from events (alert, insight, rating) that precedes the events.</td></tr>
+<tr><td><code>sequence_clone</code></td><td>The same amount at the same event position for most entities (a ladder), or a column that changes at the same position for most entities that change it (the alert that always fires at the seventh event).</td></tr>
+<tr><td><code>amount_table</code></td><td>A money-movement amount drawn from a short table (few distinct values, shared by three or more entities).</td></tr>
+<tr><td><code>balance_not_running</code></td><td>A balance that does not change by the amount of the later event between consecutive events (or does not change at all).</td></tr>
+<tr><td><code>rail_limit_violated</code></td><td>A row naming a payment rail (by its stored aliases) with an amount above its cap or below its floor, or a fee on a free rail.</td></tr>
+<tr><td><code>expected_shared_parties</code>, <code>expected_trajectory</code></td><td>From the independent expectations (see above).</td></tr>
 </table></div>
 <p>Advisory <em>advice</em> never blocks. Examples: value polarity (a state named <code>no_&hellip;</code> or <code>not_&hellip;</code> must not behave like its opposite; negating words adjacent to the step are recognised) and in-flight advice, which skips columns whose tokens overlap the entity column's tokens.</p>
 
@@ -310,12 +327,13 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 </ol>
 
 <h3>Design window and cost model</h3>
-<p>The design has an expected duration, <code>SPEC_DESIGN_SECONDS</code> (default 90), counted from design start. A further round is started only if it is expected to finish inside that window:</p>
+<p>The design has an expected duration, <code>SPEC_DESIGN_SECONDS</code> (default 720), counted from design start. A further round is started only if it is expected to finish inside that window:</p>
 <pre><code>expected = max(author_seconds_seen, first_author_seconds, PATCH_SECONDS=45)
            + (REVIEW_SECONDS=20  if a reviewer read is included)
 fits     = spent + expected &lt;= window</code></pre>
 <p>Draft rounds after the first and the inline repair use the same test. When the window is spent, soft problems are healed by quarantine and the design stops, so the call returns a settled spec instead of overrunning.</p>
-<div class="warn"><b>Trade-off.</b> A first model call alone can take 17&ndash;100 s, and a draft 50&ndash;126 s. With a 90 s window most designs end at draft level plus confined defects, and some report open errors with <code>quality_target_met=false</code>. Raising <code>SPEC_DESIGN_SECONDS</code> buys accuracy at the price of a longer first call.</div>
+<p><b>Bounds on the first design.</b> Three limits keep the first design from running long. (1) Repair rounds before the first serve run only inside <code>SPEC_FIRST_SERVE_SECONDS</code> (420). (2) Every model call of the first design &mdash; author, expectations, repair, draft review &mdash; gets a deadline at <code>SPEC_DRAFT_HARD_SECONDS</code> (480): a call is given only the time that is left (its timeout is cut to fit), none is begun with less than 15 s left, and retries stop at the deadline. A review that ran beside an unchanged spec is waited for only until that deadline. (3) A first design that cannot be completed in time is reported as unavailable; generation then serves the definitions-only fallback (<code>quality_target_met=false</code>) and the design is retried shortly afterwards. A first spec with no open error is served at once (<code>SPEC_SERVE_EARLY</code>) while refinement continues; one with open errors is refined for at most <code>SPEC_SETTLE_SECONDS</code> (180) before it is served.</p>
+<div class="warn"><b>Trade-off.</b> Raising <code>SPEC_DRAFT_HARD_SECONDS</code> or <code>SPEC_FIRST_SERVE_SECONDS</code> buys accuracy at the price of a longer first call.</div>
 
 <h3>Settle semantics (<code>synth/service.py</code>)</h3>
 <ul>
@@ -330,7 +348,7 @@ fits     = spent + expected &lt;= window</code></pre>
 <tr><td>Propose / confirm</td><td>Variable resolution; design starts in background.</td><td>Do not wait for the design.</td></tr>
 <tr><td>Design</td><td>LLM calls (author, patch, review). Expectations run in parallel.</td><td>Bounded by <code>SPEC_DESIGN_SECONDS</code>.</td></tr>
 <tr><td>Generate (spec ready)</td><td>Row engine plus validation.</td><td>200 rows well under 1 s; repeat calls about 0.7 s (observed).</td></tr>
-<tr><td>Generate (spec in flight)</td><td>Waits for the design to settle.</td><td>Up to <code>SPEC_GENERATE_WAIT_SECONDS</code> (240).</td></tr>
+<tr><td>Generate (spec in flight)</td><td>Waits for the design to settle.</td><td>Up to <code>SPEC_GENERATE_WAIT_SECONDS</code> (20).</td></tr>
 </table></div>
 <ul>
 <li>Latency is dominated by model calls, not by generation.</li>
@@ -368,39 +386,24 @@ fits     = spent + expected &lt;= window</code></pre>
 <div class="note"><b>Fallback.</b> If no verified spec is available, generate still returns data using the definitions alone (<code>definitions_legacy</code>), and says so with <code>quality_target_met=false</code>. It does not return 503 or 202 for that case.</div>
 
 <h2 id="config">12. Configuration</h2>
-<h3>Required</h3>
+<p>The service reads exactly four values from the environment. They are secrets or belong to one deployment. Everything else is a constant in <code>config/constants.py</code>; change it there and redeploy.</p>
 <div class="tblwrap"><table>
-<tr><th>Variable</th><th>Value</th></tr>
+<tr><th>Variable</th><th>Meaning</th></tr>
 <tr><td><code>GEMINI_API_KEY</code></td><td>Gemini API key.</td></tr>
-<tr><td><code>MONGODB_URI</code></td><td><code>mongodb://localhost:27017</code></td></tr>
-<tr><td><code>MONGODB_DB_NAME</code></td><td><code>telco_scenario_db</code></td></tr>
+<tr><td><code>MONGODB_URI</code></td><td>MongoDB connection string.</td></tr>
+<tr><td><code>MONGODB_DB_NAME</code></td><td>Database name (default <code>telco_scenario_db</code> when empty).</td></tr>
+<tr><td><code>API_STATIC_TOKENS</code></td><td>Static API token(s), comma-separated so a token can be rotated. Unset: every protected request is refused. <code>off</code>: authentication disabled (development only).</td></tr>
 </table></div>
-<h3>Optional (defaults shown)</h3>
+<h3>Constants (<code>config/constants.py</code>)</h3>
 <div class="tblwrap"><table>
-<tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
-<tr><td><code>GEMINI_MODEL</code></td><td>gemini-3.8-flash</td><td>Model used for all LLM calls.</td></tr>
-<tr><td><code>SPEC_DESIGN_SECONDS</code></td><td>90</td><td>Expected duration of a design; no further round starts if it would not finish inside it.</td></tr>
-<tr><td><code>SPEC_GENERATE_WAIT_SECONDS</code></td><td>240</td><td>How long a generate request waits for an in-flight design.</td></tr>
-<tr><td><code>SPEC_LLM_TIMEOUT_MS</code></td><td>240000</td><td>Timeout for one spec LLM call.</td></tr>
-<tr><td><code>SPEC_COMPILE_BUDGET_SECONDS</code></td><td>600</td><td>Hard ceiling for a compile.</td></tr>
-<tr><td><code>SPEC_REVIEW</code></td><td>true</td><td>Enable the reviewer read.</td></tr>
-<tr><td><code>SPEC_REFINE_MODE</code></td><td>background</td><td><code>background</code>: design runs in the background and a request waits for it to settle; <code>inline</code>; <code>off</code>.</td></tr>
-<tr><td><code>SPEC_WARM_ON_PROPOSE</code></td><td>true</td><td>Start the design at propose, import and confirm.</td></tr>
-<tr><td><code>MIN_LOGIC_QUALITY_PERCENT</code></td><td>90</td><td>Quality gate for the scorer.</td></tr>
-<tr><td><code>SCHEMA_MAX_VARIABLES</code></td><td>60</td><td>Cap on variables per scenario.</td></tr>
-<tr><td><code>SCHEMA_MIN_VARIABLE_SCORE</code></td><td>42</td><td>Minimum score for a recommended variable.</td></tr>
-<tr><td><code>PROPOSE_LLM_ADVISOR</code></td><td>true</td><td>LLM reviewer in propose.</td></tr>
-<tr><td><code>MAX_CSV_BYTES</code></td><td>10 MiB</td><td>CSV import size limit.</td></tr>
-<tr><td><code>INDUSTRY_SOURCE_MAX_JSON_BYTES</code></td><td>8 MiB</td><td>Industry source size limit.</td></tr>
-<tr><td><code>JSON_SOURCE_LLM_CATALOG_LIMIT</code>, <code>JSON_SOURCE_LLM_FIELDS_PER_MODEL</code></td><td>1200, 12</td><td>How much of a source catalogue is sent to the LLM.</td></tr>
-<tr><td><code>SOURCE_CATALOG_CACHE_TTL_SECONDS</code></td><td>60</td><td>Source catalogue cache.</td></tr>
-<tr><td><code>OPEN_BOUND_SPAN_INT</code>, <code>OPEN_BOUND_SPAN_FLOAT</code></td><td>30, 500</td><td>Span for open-ended numeric bounds.</td></tr>
-<tr><td><code>GENERATION_MAX_ATTEMPTS_PER_RECORD</code></td><td>8</td><td>Retries per record when a row violates a rule.</td></tr>
-<tr><td><code>AGENTIC_REQUIRE_CLEAN_RECORDS</code>, <code>AGENTIC_REQUIRE_EXACT_RECORD_COUNT</code></td><td>true</td><td>Strict output requirements.</td></tr>
-<tr><td><code>AGENTIC_LLM_QA_MODE</code></td><td>off</td><td>Optional LLM QA pass.</td></tr>
-<tr><td><code>RUNTIME_DATA_DIR</code>, <code>CORS_ALLOW_ORIGINS</code></td><td>runtime_data, &hellip;</td><td>Local data directory and CORS list.</td></tr>
+<tr><th>Group</th><th>Examples</th></tr>
+<tr><td>Gemini</td><td><code>GEMINI_MODEL</code>, <code>GEMINI_TIMEOUT_MS</code>, <code>GEMINI_RETRY_ATTEMPTS</code></td></tr>
+<tr><td>MongoDB</td><td>timeouts, app name, <code>COLLECTIONS</code> (all collection names), <code>DRAFT_TTL_SECONDS</code></td></tr>
+<tr><td>HTTP</td><td><code>CORS_ALLOW_ORIGINS</code>, public paths, <code>RUNTIME_DATA_DIR</code>, upload size limits</td></tr>
+<tr><td>Proposal</td><td><code>SCHEMA_MAX_VARIABLES</code>, <code>PROPOSE_LLM_ADVISOR</code>, catalogue limits and caches</td></tr>
+<tr><td>Generation spec</td><td><code>SPEC_DESIGN_SECONDS</code>, <code>SPEC_FIRST_SERVE_SECONDS</code>, <code>SPEC_SETTLE_SECONDS</code>, <code>SPEC_COMPILE_BUDGET_SECONDS</code>, <code>SPEC_REVIEW</code>, <code>SPEC_REFINE_MODE</code>, <code>SPEC_SERVE_EARLY</code>, <code>SPEC_WARM_ON_PROPOSE</code></td></tr>
+<tr><td>Generation and quality</td><td><code>MIN_LOGIC_QUALITY_PERCENT</code>, <code>GENERATION_MAX_ATTEMPTS_PER_RECORD</code>, QA modes</td></tr>
 </table></div>
-<p>Collection names have defaults and can be overridden. Removed settings (no longer read): <code>SPEC_REFINE_BUDGET_SECONDS</code>, <code>SPEC_DRAFT_REPAIR_SECONDS</code>, <code>SPEC_GENERATE_REFINE_WAIT_SECONDS</code>.</p>
 
 <h2 id="failures">13. Failure modes and fallbacks</h2>
 <div class="tblwrap"><table>
@@ -429,12 +432,14 @@ fits     = spent + expected &lt;= window</code></pre>
 <div class="tblwrap"><table>
 <tr><th>Path</th><th>Role</th></tr>
 <tr><td><code>server.py</code></td><td>FastAPI app and routes.</td></tr>
-<tr><td><code>config/runtime.py</code></td><td>Environment-driven settings.</td></tr>
+<tr><td><code>config/constants.py</code></td><td>Every non-secret setting (the only file to edit for a setting).</td></tr>
+<tr><td><code>config/runtime.py</code></td><td>Reads the four environment variables and re-exports the constants.</td></tr>
 <tr><td><code>config/country_metadata.py</code></td><td>Country-level reference data.</td></tr>
 <tr><td><code>agents/</code></td><td>Intent, schema and data-generation agents; orchestrator; schema compiler.</td></tr>
 <tr><td><code>core/agentic_workflow.py</code></td><td>Propose / confirm flow.</td></tr>
 <tr><td><code>core/generation_service.py</code></td><td>Generate gate, spec resolution, response, legacy fallback.</td></tr>
 <tr><td><code>core/csv_scenario.py</code></td><td>CSV import.</td></tr>
+<tr><td><code>core/country_limits.py</code>, <code>models/country_limit.py</code>, <code>seed/country_limits.json</code></td><td>Payment-rail limits per country: read (cached, last-good on a database failure, bundled start set), stored, and seeded.</td></tr>
 <tr><td><code>core/scenario_variable_store.py</code>, <code>industry_source_store.py</code></td><td>Variable and source persistence.</td></tr>
 <tr><td><code>core/variable_contract.py</code>, <code>definition_audit.py</code>, <code>variable_quality.py</code>, <code>variable_semantics.py</code></td><td>Variable validation and quality.</td></tr>
 <tr><td><code>core/llm_client.py</code></td><td>Gemini client.</td></tr>
@@ -466,10 +471,15 @@ fits     = spent + expected &lt;= window</code></pre>
 <tr><td>Null propagation in <code>expr</code></td><td>Fixed designs rejected by <code>NoneType + float</code>.</td></tr>
 <tr><td>Polarity check understands negating words</td><td>Fewer false findings on states like <code>no_default</code>.</td></tr>
 <tr><td>In-flight advice skips entity-identity columns</td><td>Fewer false findings on id-like columns.</td></tr>
+<tr><td>Four environment variables; all other settings in <code>config/constants.py</code></td><td>Secrets and deployment values stay out of the code; everything else is changed in one reviewed file.</td></tr>
+<tr><td>Country operating limits in MongoDB (<code>country_operating_limits</code>, <code>/country-limits</code>)</td><td>Rail floors, caps, fees and the cash denomination are data about a country, not code: the model is given them and the checks measure them, for any country.</td></tr>
+<tr><td>Measured checks for sequence clones, amount tables, running balances and rail limits; <code>pool</code> sampler; <code>shared_parties</code> expectation</td><td>Entities that all follow one script, balances that do not move with the money, and networks with no shared party were the defects the last QA runs still showed.</td></tr>
+<tr><td>Narrower amount and recurring-amount checks; one cash finding</td><td>The first versions flagged capital/sweep/lien amounts, a company paying salaries, and named the wrong cash column.</td></tr>
+<tr><td>Hard deadline for every model call of the first design</td><td>One slow provider call could stretch a first design past 10 minutes.</td></tr>
 <tr><td>Removed settings</td><td><code>SPEC_REFINE_BUDGET_SECONDS</code>, <code>SPEC_DRAFT_REPAIR_SECONDS</code>, <code>SPEC_GENERATE_REFINE_WAIT_SECONDS</code>.</td></tr>
 </table></div>
 
 </main>
-<footer><div class="wrap">Architecture reflects <code>COMPILER_VERSION = 9</code>, engine <code>event_rows/v1</code>.</div></footer>
+<footer><div class="wrap">Architecture reflects <code>COMPILER_VERSION = 17</code>, engine <code>event_rows/v1</code>.</div></footer>
 </body>
 </html>

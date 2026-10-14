@@ -8,6 +8,8 @@ to turn this off.
 """
 from __future__ import annotations
 
+from config import constants as _constants
+
 import json
 import logging
 import os
@@ -20,8 +22,9 @@ logger = logging.getLogger(__name__)
 
 SEED_DIR = Path(__file__).resolve().parent.parent / "seed"
 _SETS = (
-    # file, collection env var, default collection, fields that identify a document
-    ("domain_lexicon.json", "MONGODB_DOMAIN_LEXICON_COLLECTION", "domain_lexicon", ("industry_key",)),
+    # file, key in config.constants.COLLECTIONS, default collection name, fields that identify a document
+    ("domain_lexicon.json", "domain_lexicon", "domain_lexicon", ("industry_key",)),
+    ("country_limits.json", "country_limits", "country_operating_limits", ("country",)),
 )
 _RETRY_SECONDS = 30.0
 _LOCK = threading.Lock()
@@ -47,7 +50,7 @@ def status() -> dict[str, Any]:
 
 def ensure_seeded() -> None:
     """Insert the bundled defaults that MongoDB lacks. Cheap after the first success; never raises."""
-    if _state["done"] or os.getenv("SEED_REFERENCE_DATA", "1").strip().lower() in {"0", "false", "no"}:
+    if _state["done"] or not _constants.SEED_REFERENCE_DATA:
         return
     with _LOCK:
         if _state["done"] or time.monotonic() < _state["next_try"]:
@@ -75,7 +78,7 @@ def _seed() -> dict[str, int]:
         path = SEED_DIR / filename
         if not path.is_file():
             continue
-        collection = database[collection_name(env_name, default)]
+        collection = database[collection_name(env_name)]
         count = 0
         for document in json.loads(path.read_text(encoding="utf-8")):
             key = {field: document[field] for field in identity}

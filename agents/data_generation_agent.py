@@ -5,6 +5,8 @@ validates them through an internal QA layer. Implemented as a 2-node
 LangGraph subgraph: generate -> qa_validate.
 """
 from __future__ import annotations
+
+from config import constants as _constants
 import json
 import logging
 import math
@@ -91,7 +93,7 @@ _NUMERIC_DTYPES = {"int", "integer", "float", "decimal", "number", "numeric"}
 
 # Optional LLM QA configuration.  Deterministic QA remains the default; these
 # constants are only used when QA_LLM_MODE=full is explicitly enabled.
-_CHUNK = max(1, int(os.getenv("QA_LLM_CHUNK_SIZE", "10")))
+_CHUNK = max(1, _constants.QA_LLM_CHUNK_SIZE)
 _QA_SYSTEM = """You are the final QA validator for generated synthetic data.
 
 Validate every supplied record against the FULL confirmed scenario contract, official source
@@ -315,7 +317,7 @@ def _semantic_string(var: dict, rec: dict) -> str | None:
     if "phone" in n or "mobile" in n or "msisdn" in n or ("number" in d and ("mobile" in d or "phone" in d)):
         # Country is request-scoped. The generator receives it through the internal execution
         # context so a US/GB/etc. request never silently falls back to India's +91 prefix.
-        country = str(p.get("country") or rec.get("__country__") or "").strip().upper()
+        country = str(rec.get("__country__") or p.get("country") or "").strip().upper()
         country_code = str((COUNTRY_BASE.get(country) or COUNTRY_BASE.get("GLOBAL") or {}).get("phone_country_code") or "").strip()
         if country_code:
             return _e164_phone({"country_codes": [country_code]}, rec)
@@ -3658,7 +3660,7 @@ class DataGenerationAgent:
 
         deterministic_checked = list(checked)
 
-        qa_mode = (llm_mode or os.getenv("QA_LLM_MODE", "off")).strip().lower()
+        qa_mode = (llm_mode or _constants.QA_LLM_MODE).strip().lower()
         llm_fixes = 0
         llm_issues = 0
         preserved_dropped_records = 0

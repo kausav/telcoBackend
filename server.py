@@ -623,6 +623,74 @@ def remove_industry_source(source_id: str):
     return {"success": True, "sourceId": source_id, "deleted": True}
 
 
+class CountryRail(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str | None = Field(None, description="Short id of the rail, for example upi")
+    label: str | None = Field(None, description="Display name of the rail")
+    aliases: list[str] = Field(..., min_length=1, description="Words by which a column value names the rail (whole words, case-insensitive)")
+    kind: str | None = None
+    min_amount: float | None = Field(None, description="Floor of one transaction on this rail (a high-value rail), in the country's currency")
+    max_amount: float | None = Field(None, description="Cap of one transaction on this rail, in the country's currency")
+    fee: float | None = Field(None, description="Fixed fee on this rail; 0 means the rail is free")
+    note: str | None = None
+
+
+class CountryLimitsRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    currency: str | None = Field(None, description="ISO 4217 code the amounts are in")
+    cash_denomination: float | None = Field(None, description="Smallest note an ATM dispenses; cash withdrawals are multiples of it")
+    note: str | None = None
+    rails: list[CountryRail] = Field(default_factory=list)
+
+
+@app.get("/country-limits")
+def list_country_limits():
+    """The countries whose payment-rail limits (floors, caps, fees, cash denomination) are stored."""
+    from models.country_limit import CountryLimitModel
+
+    return {"success": True, "countries": CountryLimitModel.list_all()}
+
+
+@app.get("/country-limits/{country}")
+def get_country_limits(country: str):
+    """The payment-rail limits used when a scenario is proposed for ``country`` (a code such as IN, or its name)."""
+    from core import country_limits
+
+    found = country_limits.for_country(country)
+    if not found:
+        raise HTTPException(404, detail={"error": f"No payment-rail limits are stored for '{country}'"})
+    return {"success": True, "limits": found}
+
+
+@app.put("/country-limits/{country}")
+def put_country_limits(country: str, req: CountryLimitsRequest):
+    """Store (replace) the payment-rail limits of a country. Specs designed for that country afterwards use them."""
+    from core import country_limits
+    from models.country_limit import CountryLimitModel
+
+    code = country_limits.country_code(country)
+    if not code:
+        raise HTTPException(400, detail={"error": f"'{country}' is not a country code or a known country name"})
+    document = req.model_dump(exclude_none=True)
+    if not country_limits.clean({**document, "country": code}):
+        raise HTTPException(400, detail={"error": "The document holds no usable rail (every rail needs aliases, and min_amount may not exceed max_amount)"})
+    CountryLimitModel.put(code, document)
+    country_limits.clear_cache()
+    return {"success": True, "country": code, "limits": country_limits.for_country(code)}
+
+
+@app.delete("/country-limits/{country}")
+def delete_country_limits(country: str):
+    from core import country_limits
+    from models.country_limit import CountryLimitModel
+
+    code = country_limits.country_code(country)
+    if not code or not CountryLimitModel.delete(code):
+        raise HTTPException(404, detail={"error": f"No payment-rail limits are stored for '{country}'"})
+    country_limits.clear_cache()
+    return {"success": True, "country": code, "deleted": True}
+
+
 def _catalog_lookup(read, *args):
     """Run a catalog read; an id that is not in the catalog is a 404 and not an empty dropdown."""
     try:

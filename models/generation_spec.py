@@ -9,7 +9,7 @@ from models.database import get_database
 
 
 class GenerationSpecModel:
-    collection = get_database()[collection_name("MONGODB_GENERATION_SPECS_COLLECTION", "generation_specs")]
+    collection = get_database()[collection_name("generation_specs")]
 
     @classmethod
     def ensure_indexes(cls) -> None:
@@ -50,7 +50,7 @@ class GenerationSpecModel:
 class GenerationSpecClaimModel:
     """Who is designing (or refining) a spec right now, across every worker process: one short-lived document per key."""
 
-    collection = get_database()[collection_name("MONGODB_GENERATION_SPEC_CLAIMS_COLLECTION", "generation_spec_claims")]
+    collection = get_database()[collection_name("generation_spec_claims")]
 
     @classmethod
     def ensure_indexes(cls) -> None:

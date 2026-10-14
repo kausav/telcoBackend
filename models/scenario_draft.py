@@ -9,11 +9,11 @@ from models._helpers import collection_name
 from models.database import get_database
 
 
-DRAFT_TTL_SECONDS = int(os.getenv("DRAFT_TTL_SECONDS", "86400"))
+from config.constants import DRAFT_TTL_SECONDS
 
 
 class ScenarioDraftModel:
-    collection = get_database()[collection_name("MONGODB_DRAFTS_COLLECTION", "scenario_drafts")]
+    collection = get_database()[collection_name("drafts")]
 
     @classmethod
     def ensure_indexes(cls) -> None:

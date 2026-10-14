@@ -98,14 +98,9 @@ def _utc_now() -> datetime:
 
 
 def _env_max_bytes() -> int:
-    import os
+    from config.constants import INDUSTRY_SOURCE_MAX_JSON_BYTES
 
-    raw = os.getenv("INDUSTRY_SOURCE_MAX_JSON_BYTES", str(DEFAULT_MAX_BYTES)).strip()
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise RuntimeError("INDUSTRY_SOURCE_MAX_JSON_BYTES must be an integer") from exc
-    return max(1024, value)
+    return max(1024, int(INDUSTRY_SOURCE_MAX_JSON_BYTES))
 
 
 def _sha256_bytes(raw: bytes) -> str:

@@ -7,6 +7,8 @@ answer. We therefore request plain JSON and validate it locally with Pydantic.
 """
 from __future__ import annotations
 
+from config import constants as _constants
+
 import hashlib
 import json
 import logging
@@ -978,7 +980,7 @@ class GeminiIntentAgent:
     """
 
     def __init__(self, api_key: str | None = None):
-        self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+        self.model_name = _constants.GEMINI_MODEL
         self._api_key = api_key
         self._client: GeminiClient | None = None
 

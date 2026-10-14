@@ -60,6 +60,14 @@ def make_brief(source: dict[str, Any]) -> dict[str, Any]:
     brief = {k: source.get(k) for k in BRIEF_KEYS}
     brief["industry"] = source.get("industry") or source.get("industry_type")
     brief["events_per_entity"] = source.get("records_per_user")       # what the history is designed to hold (not part of the spec's identity)
+    try:
+        from core import country_limits
+
+        found = country_limits.for_country(brief.get("country"))
+        if found:
+            brief["country_limits"] = found                                    # part of the spec's identity: new limits, new design
+    except Exception as exc:                                           # the limits are an aid; a design without them is still valid
+        logger.warning("country limits not added to the brief: %s: %s", type(exc).__name__, exc)
     return {k: (str(v).strip() if isinstance(v, str) else v) for k, v in brief.items() if v not in (None, "")}
 
 

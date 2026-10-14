@@ -1,7 +1,7 @@
 """Static API-token authentication (a stop-gap until a real login flow exists).
 
 Callers send the token as ``Authorization: Bearer <token>`` or ``X-API-Key: <token>``. Tokens come from the environment
-(``API_STATIC_TOKENS``, comma-separated for rotation); with none configured authentication is off. Probes (``/health``, ``/ready``)
+(``API_STATIC_TOKENS``, comma-separated for rotation); with none configured every protected request is refused, and ``off`` switches authentication off. Probes (``/health``, ``/ready``)
 and CORS preflight requests never need a token. A token is never logged and is compared in constant time.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ import logging
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from config.runtime import API_AUTH_PROTECT_DOCS, API_AUTH_PUBLIC_PATHS, API_STATIC_TOKENS
+from config.runtime import API_AUTH_DISABLED, API_AUTH_PROTECT_DOCS, API_AUTH_PUBLIC_PATHS, API_STATIC_TOKENS
 from core.error_handlers import _json_response
 from core.errors import ErrorCode
 
@@ -30,7 +30,7 @@ _VALID = [_digest(t) for t in API_STATIC_TOKENS]
 
 
 def enabled() -> bool:
-    return bool(_VALID)
+    return not API_AUTH_DISABLED
 
 
 def presented_token(request: Request) -> str:
@@ -69,10 +69,12 @@ async def api_token_middleware(request: Request, call_next):
 
 
 def log_startup() -> None:
-    if enabled():
+    if API_AUTH_DISABLED:
+        logger.warning("API authentication is OFF (API_STATIC_TOKENS=off): do not run like this outside local development")
+    elif _VALID:
         logger.info("API authentication: static token required (%d token(s) configured)", len(_VALID))
     else:
-        logger.warning("API authentication is OFF: set API_STATIC_TOKENS to require a token on every request")
+        logger.error("API_STATIC_TOKENS is not set: authentication is ON and no token is accepted, so every protected request is refused")
 
 
 def openapi_security(schema: dict) -> dict:

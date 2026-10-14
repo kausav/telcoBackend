@@ -7,7 +7,7 @@ from models.database import get_database
 
 class IndustrySourceModel:
     collection = get_database()[
-        collection_name("MONGODB_INDUSTRY_SOURCES_COLLECTION", "industry_source_documents")
+        collection_name("industry_sources")
     ]
 
     @classmethod

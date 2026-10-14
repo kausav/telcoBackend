@@ -134,6 +134,7 @@ class EventRows:
                  entities: int, per_entity: int, hints: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         run = _Run(spec, ctx, self.reference_view(spec, ctx), hints or {})
         rows: list[dict[str, Any]] = []
+        run.rt.entities = entities
         for index in range(entities):
             run.rt.entity_index = index
             rows.extend(run.entity_rows(per_entity))

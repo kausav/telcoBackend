@@ -51,7 +51,7 @@ common for another; a fact that exists for one type can be absent for another).
 Use only the column ids you were given. Expressions are python-like over column ids and as_of (the moment the data is read;
 every recorded fact is earlier than as_of): operators + - * /  == != < <= > >=  and or not  is None / is not None  in / not in
 (a if c else b)  [lists]; functions abs min max round len lower upper text secs(a,b)=seconds(a-b) days(a,b) matches(regex,s)
-hour_of(dt,offset_minutes) weekday_of(dt,offset_minutes) (0 = Monday ... 6 = Sunday; the offset in minutes turns the time into the local clock, e.g. 330 for India).
+hour_of(dt,offset_minutes) weekday_of(dt,offset_minutes) (0 = Monday ... 6 = Sunday; the offset in minutes turns the time into the local clock, e.g. 330 for UTC+5:30).
 A column that can be empty must be guarded: "x is None or x > 0". No attribute access, comprehensions or lambda.
 
 OUTPUT: one JSON object, nothing else:
@@ -68,7 +68,8 @@ OUTPUT: one JSON object, nothing else:
   {"kind":"slow_state","column":"id","why":"..."}                      a status of the customer or account (lifecycle, standing, tier, restriction) that stays the same from one event to the next and changes only on a rare trigger; NOT the outcome of each event (a transaction's own status), which changes freely
  ],
  "state_shares": [{"column":"id","value":"one value of a status/outcome/stage column","min":0.0,"max":1.0}],
- "trajectories": ["column ids whose value must CHANGE over the events of one entity because the scenario describes a progression"]
+ "trajectories": ["column ids whose value must CHANGE over the events of one entity because the scenario describes a progression"],
+ "shared_parties": ["column ids that name ANOTHER party (an owner, controlling party, counterparty, beneficiary, linked account, device) which the scenario says is shared between entities"]
 }
 
 GUIDANCE
@@ -105,6 +106,10 @@ GUIDANCE
 - When the scenario text describes a progression (behaviour that evolves, escalates, deteriorates, grows or is lost over time), list in
   "trajectories" the columns that carry that progression (a risk rating or score, an alert or severity level, a stage, a balance).
   A fact the scenario wants to evolve must not be fixed per entity. Do not list identifiers, segments or anything the entity keeps.
+- When the scenario is about a network, ring, group, common owner or shared counterparty (mule accounts, shell companies, related
+  parties, a household), list in "shared_parties" the columns that name the other party: several entities must point at the same
+  party. Leave it empty when the scenario is about independent customers. "country_limits" in the scenario (when present) are the
+  stored floors, caps and fees of the country's payment rails: write no rule that contradicts them.
 - The date or time of something that is calculated from events (an alert, an insight, an assessment, a rating, a score, a review) is
   not before the events it is calculated from: write an "order" rule between it and the time of the event it concerns.
 - Where a payment, deposit or withdrawal block repeats the amount of the transaction that carries it, they are the same money: state
@@ -218,6 +223,9 @@ def parse(raw: Any, columns: set[str], *, entity: str | None = None) -> dict[str
     moving = [c for c in _ids(raw.get("trajectories"), columns) if c != entity]
     if moving:
         out["trajectories"] = sorted(set(moving))[:8]
+    linked = [c for c in _ids(raw.get("shared_parties"), columns) if c != entity]
+    if linked:
+        out["shared_parties"] = sorted(set(linked))[:6]
     return out
 
 
@@ -515,7 +523,39 @@ def check(spec: GenerationSpec, rows: list[dict[str, Any]], expectations: dict[s
     out += _entity_facts(spec, rows, expectations)
     out += _state_shares(spec, rows, expectations)
     out += _trajectories(spec, rows, expectations)
+    out += _shared_parties(spec, rows, expectations)
     return out
+
+
+SHARED_MIN_ENTITIES = 10
+SHARED_MIN_SHARE = 0.3                    # at least this share of the entities must point at a party that another entity points at too
+
+
+def _shared_parties(spec: GenerationSpec, rows: list[dict[str, Any]], expectations: dict[str, Any]) -> list[dict[str, Any]]:
+    """Findings for a column naming a party the scenario says is shared (a network) when almost every entity has a party of its own."""
+    columns = [c for c in expectations.get("shared_parties") or [] if c in spec.delivered and c != spec.entity_column]
+    if not columns or not spec.entity_column:
+        return []
+    out = []
+    for col in columns:
+        owners: dict[Any, set[Any]] = {}
+        for r in rows:
+            value = r.get(col)
+            if value is not None:
+                owners.setdefault(value, set()).add(r.get(spec.entity_column))
+        entities = set().union(*owners.values()) if owners else set()
+        if len(entities) < SHARED_MIN_ENTITIES:
+            continue
+        sharing = {e for who in owners.values() if len(who) > 1 for e in who}
+        if len(sharing) < SHARED_MIN_SHARE * len(entities):
+            name = spec.delivered[col]
+            out.append(_finding("shared_parties", "error", [name],
+                                f"{name} names a party that the scenario says is shared between entities, but only {len(sharing)} of {len(entities)} entities "
+                                f"point at a party that another entity also has ({len(owners)} distinct parties).",
+                                f"{len(owners)} distinct values for {len(entities)} entities",
+                                f"Draw {name} from a pool shared by all entities - the pool sampler with a ratio of about 0.3 members per entity (use the same pool "
+                                "name for every column that names the same kind of party) - so that several entities share one party."))
+    return out[:3]
 
 
 TRAJECTORY_MIN_EVENTS = 3

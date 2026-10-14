@@ -6,6 +6,7 @@ from models.scenario_user_variable import ScenarioUserVariableModel
 from models.industry_source import IndustrySourceModel
 from models.selection_lock import SelectionLockModel
 from models.generation_spec import GenerationSpecModel
+from models.country_limit import CountryLimitModel
 from models.catalog import CATALOG_MODELS
 
 ALL_MODELS = (
@@ -16,6 +17,7 @@ ALL_MODELS = (
     IndustrySourceModel,
     SelectionLockModel,
     GenerationSpecModel,
+    CountryLimitModel,
     *CATALOG_MODELS,
 )
 
