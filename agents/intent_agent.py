@@ -23,6 +23,7 @@ from core.llm_client import GeminiClient
 from core.json_domain_policy import is_json_grounded_domain
 from core.scenario_variable_store import get_selection_lock, lock_selection
 from synth.definitions import is_placeholder_only
+from synth.sequence import assign as assign_sequence
 from core.industry_source_store import (
     catalog_for_request,
     normalize_lookup_key,
@@ -1417,6 +1418,126 @@ class GeminiIntentAgent:
         logger.info("[IntentAgent/Names] %d of %d field(s) renamed (%d by the model)", len(mapping), len(targets), from_model)
         return apply_renames(fields, mapping), mapping, complete
 
+
+    def sequence_variables(self, variables: list[dict[str, Any]], *, context: dict[str, Any], scenario_id: str, entity_key: str | None,
+                           existing: list[str] | None = None) -> tuple[list[dict[str, Any]], bool]:
+        """Give every variable its place in the delivered data: ``(variables in order, each with a sequence, complete)``.
+
+        The model orders the columns from their meaning; the order is locked per distinct set of variables, so the same proposal always
+        reads the same. Hard rules (a column after the columns it reads, a start before its end) are enforced on the answer, and a
+        column the model left out is placed by the story order. A number a person or a definition already gave is kept. ``complete`` is
+        False when the model could not be reached or answered too little: the deterministic story order is used and nothing is locked.
+
+        ``existing`` names the columns that are already in order (a proposal being confirmed): only the others are placed.
+        """
+        items = [v for v in variables if isinstance(v, dict) and v.get("name")]
+        names = [str(v["name"]) for v in items]
+        if len(items) < 2:
+            return assign_sequence(variables, entity_key=entity_key), True
+        fixed = [n for n in (existing or []) if n in set(names)]
+        new_names = {n for n in names if n not in set(fixed)} if fixed else set()
+        if fixed and not new_names:
+            return assign_sequence(variables, entity_key=entity_key, fit=True), True
+        by_name = {str(v["name"]): v for v in items}
+        listing = ([by_name[n] for n in fixed] + [by_name[n] for n in names if n in new_names]) if fixed else items
+        signatures = [_sequence_signature(v, entity_key, new=(str(v["name"]) in new_names) if fixed else None) for v in listing]
+        digest = hashlib.sha256(json.dumps(
+            [SEQUENCE_VERSION, {k: context.get(k) for k in ("industry", "domain", "use_case", "scenario_type")}, entity_key,
+             signatures if fixed else sorted(signatures, key=lambda s: s["name"])], sort_keys=True, ensure_ascii=False, default=str,
+        ).encode("utf-8")).hexdigest()
+        lock_key = f"{SEQUENCE_VERSION}:{digest}"
+        stored = None
+        try:
+            stored = get_selection_lock(lock_key)
+        except Exception as exc:                                  # an unreachable store must not stop a proposal
+            logger.warning("[IntentAgent/Sequence] lock store unavailable: %s: %s", type(exc).__name__, exc)
+        order: list[str] | None = None
+        complete = True
+        if stored is not None:
+            order = [str(n) for n in ((stored or {}).get("order") or [])]
+        else:
+            prompt = json.dumps({"context": {k: context.get(k) for k in ("industry", "domain", "use_case", "country", "scenario_type")},
+                                 "columns": signatures}, ensure_ascii=False, indent=1)
+            try:
+                reply = self._get_client().generate_json(SEQUENCE_PROMPT, prompt, temperature=0.2)
+                rows = reply.get("order") if isinstance(reply, dict) else reply
+                known = set(names)
+                order = [n for n in dict.fromkeys(str(r) for r in (rows or []) if isinstance(r, str)) if n in known]
+                if len(order) < SEQUENCE_MIN_COVERAGE * len(names):
+                    logger.warning("[IntentAgent/Sequence] the model named %d of %d column(s); using the story order", len(order), len(names))
+                    order, complete = None, False
+            except Exception as exc:
+                complete = False
+                order = None
+                logger.warning("[IntentAgent/Sequence] model call for %d column(s) failed: %s: %s", len(names), type(exc).__name__, exc)
+        if order is not None and fixed:
+            # the columns already in order keep their order; each new one goes after the column the model put before it
+            keep = [n for n in fixed]
+            for name in [n for n in order if n in new_names]:
+                before = next((p for p in reversed(order[:order.index(name)]) if p in keep), None)
+                keep.insert(keep.index(before) + 1 if before is not None else 0, name)
+            order = keep
+        if stored is None and complete and order is not None:
+            try:
+                lock_selection(lock_key, scenario_id, {"order": order})
+            except Exception as exc:
+                logger.warning("[IntentAgent/Sequence] could not lock the order: %s: %s", type(exc).__name__, exc)
+        placed = assign_sequence(variables, entity_key=entity_key, preferred=order, fit=bool(fixed))
+        logger.info("[IntentAgent/Sequence] %d column(s) ordered by %s", len(names), "the model" if order is not None else "the story order")
+        return placed, complete
+
+
+# ---- column order ------------------------------------------------------------------------------------------------
+# Where a column sits in the delivered data. The intent agent decides it, once per set of variables, from what each column means (its
+# description, its type, whether it describes the party or one event, what it reads), so a CSV made from the data tells a story from
+# left to right. The answer is locked like the names are; ``synth.sequence`` only enforces the hard rules on it (a column after the
+# columns it reads, a start before its end) and orders by itself when the model cannot be reached.
+SEQUENCE_VERSION = "column-order-v1"
+SEQUENCE_MIN_COVERAGE = 0.8          # share of the columns a reply must name before it is believed and locked
+
+SEQUENCE_PROMPT = """You order the columns of a synthetic dataset so that a person who reads it as a CSV, from left to right, can follow
+the story of the data.
+
+You get the columns. Each has its "name", data "type", "scope" ("entity": a fact about the main party or what it holds, the same on
+every row of that party; "event": it changes with each row, each transaction or event), a short "description", the columns it reads
+("depends_on", when it is computed from others) and "is_key" for the column that identifies the main party.
+
+Order them as the story is told:
+1. Who. The identifier of the main party first (the column with "is_key"), then the identifiers of what that party holds or owns
+   (accounts, contracts, products, devices), each before the identifiers of what happens to it.
+2. Facts about the party and about what it holds: names, types, segments, limits, attributes that do not change from row to row.
+3. When it started and ended: the dates of the party or of what it holds, a start always before its end (opening before closing,
+   effective before expiry).
+4. Then each event, one row: its own identifier, then its dates and times in the order things happen (it begins, is carried out, is
+   processed or posted, ends), then what kind of event it is (type, category, channel, mechanism, purpose, counterparty), then its
+   numbers (the amount, then fees, charges and taxes, then the balance or total that results), and last how it ended (status,
+   outcome, decision, flags, reasons).
+5. A column computed from others ("depends_on") always comes after the columns it reads.
+6. Keep columns that belong together next to each other (everything about the same counterparty, address, device or limit).
+
+Decide from the descriptions and the meaning, not only from the names: names can be unfamiliar or abbreviated. Never drop, rename or
+invent a column. Some columns may be marked "new": the other columns are already in a good order, listed in that order; keep their
+order and put each new column where it belongs in the story.
+
+Return only JSON: {"order": ["<name exactly as given>", ...]} naming every column exactly once."""
+
+
+def _sequence_signature(variable: dict[str, Any], entity_key: str | None, *, new: bool | None = None) -> dict[str, Any]:
+    scope = str(variable.get("scope") or "").lower()
+    row: dict[str, Any] = {
+        "name": str(variable.get("name")),
+        "type": str(variable.get("dtype") or "string"),
+        "scope": "entity" if scope == "entity" or str(variable.get("name")) == entity_key else "event",
+        "description": " ".join(str(variable.get("description") or "").split())[:160],
+    }
+    deps = [str(d) for d in (variable.get("depends_on") or []) if d]
+    if deps:
+        row["depends_on"] = deps[:8]
+    if entity_key and str(variable.get("name")) == entity_key:
+        row["is_key"] = True
+    if new:
+        row["new"] = True
+    return row
 
 # Backward-compatible internal alias for older imports.
 PydanticAIIntentAgent = GeminiIntentAgent

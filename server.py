@@ -107,7 +107,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.13.0",
+    version="2.14.0",
     lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse},
@@ -892,6 +892,22 @@ def confirm_scenario_route(req: ConfirmRequest):
             if label and not variable.get("source"):
                 variable["source"] = label
         added_sources = {str(n).strip().casefold(): "USER_ADDED" for n, lab in variable_sources.items() if lab == "USER_ADDED"}
+        # A variable the reviewer added is placed by the intent agent, like every proposed one (unless the reviewer gave a number).
+        given = {str(item.get("name") or "").strip().casefold() for item in req.add if isinstance(item, dict) and item.get("sequence") is not None}
+        to_place = [str(v.get("name")) for v in variables if str(v.get("name") or "").strip().casefold() in added_sources
+                    and str(v.get("name") or "").strip().casefold() not in given]
+        if to_place:
+            settled = [str(v.get("name")) for v in variables if str(v.get("name")) not in to_place]
+            variables = [{k: x for k, x in v.items() if k != "sequence"} if str(v.get("name")) in to_place else v for v in variables]
+            variables = get_agentic_workflow().order_columns(
+                variables,
+                context={"industry": draft.get("industry_type"), "domain": draft.get("domain"), "use_case": draft.get("use_case"),
+                         "country": draft.get("country"), "scenario_type": draft.get("scenario_type")},
+                scenario_id=str(draft.get("requested_scenario_id") or draft.get("scenario_id") or ""),
+                entity_key=draft.get("entity_key"),
+                existing=settled,
+            )
+            field_order = [str(v.get("name")) for v in variables if v.get("name")]
     else:
         variables=[dict(v) for v in draft.get("variables",[]) if isinstance(v,dict)]
         by_name={str(v.get("name")):v for v in variables if v.get("name")}

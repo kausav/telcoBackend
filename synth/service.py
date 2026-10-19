@@ -514,8 +514,8 @@ def resolve_spec(context: dict[str, Any], variables: list[dict[str, Any]], *, wa
 
 # ------------------------------------------------------------------------------------------------------------------
 def column_sequence(spec: GenerationSpec, variables: list[dict[str, Any]], delivered: dict[str, str]) -> list[str]:
-    """The delivered column names in the order of the data's story: a ``sequence`` on a variable first, else the story order
-    (``synth.sequence``) of the party, what it holds, its facts, its dates (a start before its end) and then each event."""
+    """The delivered column names in the order of the data's story: the ``sequence`` the intent agent gave each variable (or a person set),
+    and for a column without one the story order (``synth.sequence``) of the party, what it holds, its facts, its dates and each event."""
     from synth.sequence import story_order
 
     by_name = {str(v.get("name")): v for v in variables if isinstance(v, dict) and v.get("name")}
@@ -525,7 +525,7 @@ def column_sequence(spec: GenerationSpec, variables: list[dict[str, Any]], deliv
     entity = spec.columns[spec.entity_column].column if spec.entity_column else None
     clock = spec.columns[spec.clock].column if spec.clock else None
     try:
-        ordered = story_order(definitions, entity_key=entity, kinds=kinds, clock=clock)
+        ordered = story_order(definitions, entity_key=entity, kinds=kinds, clock=clock, fit=True)   # the numbers the intent agent gave stand; a column without one slots in beside them
     except Exception:                                   # the order is presentation: never let it stop a generation
         logger.exception("column order could not be computed; using the approved order")
         ordered = names

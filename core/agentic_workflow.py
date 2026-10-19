@@ -39,6 +39,23 @@ class AgenticSchemaWorkflow:
         self._intent_agent: GeminiIntentAgent | None = None
         self.compiler = SchemaCompiler()
 
+    def order_columns(self, variables: list[dict[str, Any]], *, context: dict[str, Any], scenario_id: str, entity_key: str | None,
+                      existing: list[str] | None = None) -> list[dict[str, Any]]:
+        """Each variable with its place in the delivered data, decided by the intent agent from what the columns mean.
+
+        Falls back to the story order of ``synth.sequence`` when the advisor is off or the model cannot be reached, so a proposal never
+        fails for want of an order.
+        """
+        if PROPOSE_LLM_ADVISOR:
+            try:
+                ordered, _complete = self._get_intent_agent().sequence_variables(
+                    variables, context=context, scenario_id=scenario_id, entity_key=entity_key, existing=existing)
+                return ordered
+            except Exception as exc:
+                logger.warning("[AgenticSchemaWorkflow] the model could not order the columns (%s: %s); using the story order",
+                               type(exc).__name__, exc)
+        return assign_sequence(variables, entity_key=entity_key, fit=bool(existing))
+
     def _get_intent_agent(self) -> GeminiIntentAgent:
         if self._intent_agent is None:
             self._intent_agent = GeminiIntentAgent(api_key=self._api_key)
@@ -862,7 +879,14 @@ class AgenticSchemaWorkflow:
                 variable["source"] = "LLM_GENERATED"
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
         entity_key = self._entity_key(req.entity_key, field_order, type_of_data)
-        variables = assign_sequence(variables, entity_key=entity_key)         # every variable carries its place in the data's story
+        # every variable carries its place in the data's story: the intent agent orders the columns from what they mean
+        variables = self.order_columns(
+            variables,
+            context={"industry": req.industry_type, "domain": req.domain, "use_case": req.use_case, "country": req.country,
+                     "scenario_type": req.scenario_type},
+            scenario_id=requested_scenario_id,
+            entity_key=entity_key,
+        )
         field_order = [str(v.get("name")) for v in variables if v.get("name")]
         variable_source_ids = {}
         for field in schema.fields:
@@ -1057,6 +1081,15 @@ class AgenticSchemaWorkflow:
                 + "; ".join(blocking_unresolved)
             )
 
+        # The proposal's order was decided by the intent agent and lives on the draft's variables; the schema fields do not carry it.
+        proposed_sequence = {
+            str(item.get("name")).strip().casefold(): item.get("sequence")
+            for item in draft_variables
+            if isinstance(item.get("sequence"), int) and not isinstance(item.get("sequence"), bool)
+        }
+        for field in schema.fields:
+            if field.sequence is None and field.name.strip().casefold() in proposed_sequence:
+                field.sequence = proposed_sequence[field.name.strip().casefold()]
         fields_by_name = {field.name: field for field in schema.fields}
         mandatory_entity_fields = {str(draft.get("entity_key") or "").strip()} - {""}
         delete_set = {str(name).strip() for name in delete if str(name).strip()}
@@ -1189,7 +1222,8 @@ class AgenticSchemaWorkflow:
 
         if draft.get("type_of_data") == "transactional" and draft.get("entity_key") not in field_order:
             raise ValueError("HITL changes would remove the transactional entity key")
-        variables = assign_sequence(variables, entity_key=str(draft.get("entity_key") or "").strip() or None)   # a new column gets its place
+        # a column added here gets a place beside the proposal's order (the confirm route asks the intent agent to place it)
+        variables = assign_sequence(variables, entity_key=str(draft.get("entity_key") or "").strip() or None, fit=bool(proposed_sequence))
         field_order = [str(v.get("name")) for v in variables if v.get("name")]
         return variables, field_order, draft_source_by_name, draft_db_names
 
