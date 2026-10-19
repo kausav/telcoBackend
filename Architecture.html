@@ -191,7 +191,7 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <tr><td>GET / PUT / DELETE</td><td><code>/country-limits</code>, <code>/country-limits/{country}</code></td><td>List, read, store (replace) or delete the payment-rail limits of a country (<code>rails[]</code> with <code>aliases</code>, <code>min_amount</code>, <code>max_amount</code>, <code>fee</code>; <code>currency</code>; <code>cash_denomination</code>). A country is a code (<code>IN</code>) or its name. Specs designed afterwards use the new limits.</td></tr>
 <tr><td>POST</td><td><code>/scenario/import-csv</code></td><td>Create a scenario from a CSV of variable definitions.</td></tr>
 <tr><td>POST</td><td><code>/scenario/propose</code></td><td>Propose a scenario (schema, variables, brief). Warms the design.</td></tr>
-<tr><td>POST</td><td><code>/scenario/confirm</code></td><td>Confirm a proposal and pin its spec.</td></tr>
+<tr><td>POST</td><td><code>/scenario/confirm</code></td><td>Confirm a proposal and pin its spec. Optional <code>add</code> (new variables: <code>name</code>, <code>dtype</code>, <code>gen</code>; optional <code>params, formula, depends_on, nullable, description, scope, sequence</code>), <code>edit</code> and <code>delete</code>; see <i>Review at confirm</i>.</td></tr>
 <tr><td>POST</td><td><code>/scenario/generate</code></td><td>Return rows plus the validation report.</td></tr>
 </table></div>
 
@@ -279,8 +279,16 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <li>Every variable may carry <code>sequence</code> (smaller comes first). <code>scenario/propose</code> and the CSV import give every variable one (10, 20, 30, &hellip; so a column can be inserted between two); a number a person writes always wins, and a CSV definition may carry a <code>sequence</code> column.</li>
 <li>Without a number the story order applies: (1) entity identifiers, party &rarr; what it holds &rarr; what happens to it; (2) entity facts; (3) entity dates, a start before its end; (4) event identifiers, the transaction's own id first; (5) event dates, start &rarr; the event &rarr; its processing &rarr; its end; (6) type, category, channel, purpose; (7) amount &rarr; fees &rarr; balance; (8) status, outcome, flags.</li>
 <li>A column that reads another (<code>depends_on</code>) comes after it; a <i>start</i>/<i>end</i> pair that differs only by that word, and dates the schema relates (parent &rarr; child), keep their order.</li>
-<li>The UI shows the number in a <b>Seq</b> column of the schema table; a reviewer can change it before approving, and the changes go to <code>scenario/confirm</code> as <code>edit</code> entries (<code>{"name":"...","changes":{"sequence":15}}</code>). Unlike other edits this is allowed for DB-owned variables too, because it changes no value.</li>
+<li>The reviewer is never asked for a number: the system places every column, and the schema table shows the resulting position (<b>#</b>). An optional <b>Sequence</b> field in the variable dialog overrides it; the change goes to <code>scenario/confirm</code> as an <code>edit</code> entry (<code>{"name":"...","changes":{"sequence":15}}</code>) and is allowed for DB-owned variables too, because it changes no value. A variable added at confirmation is placed by the story order like any other.</li>
 <li>The order is presentation only: it is not part of the spec key, so changing a sequence never redesigns a spec. <code>scenario/generate</code> applies it to <code>fields</code>, to the entity block and to every record. Entity facts stay in the entity block and event columns in <code>records</code>, each in sequence order.</li>
+</ul>
+<h3>Review at confirm (add, edit, delete)</h3>
+<p>The schema table has an <b>Add variable</b> button and an <b>Edit</b> button on every row; both open one dialog. What may change follows who owns the variable:</p>
+<ul>
+<li><b>Added by the reviewer</b> (<code>add</code>): needs <code>name</code> (letters, digits, underscore), <code>dtype</code> and a supported <code>gen</code>. It is checked like a database definition (<code>validate_db_definition</code>: dtype against generator and against name conventions such as <code>_flag</code>, <code>_amount</code>, <code>_date</code>), its formula must parse and may read only columns that stay, and its name must not repeat another column or one removed in the same request. It is labelled <code>USER_ADDED</code>, so the generation gate accepts it, and it is placed by the story order. Because the column set changed, the spec is designed afresh.</li>
+<li><b>Proposed, application-owned</b> (<code>edit</code>): <code>description</code>, <code>nullable</code>, the parameters it already has, and <code>sequence</code>. Name, type and generator are fixed.</li>
+<li><b>Owned by the database</b>: only <code>sequence</code>. Its definition is changed in the database, or the variable is deleted.</li>
+<li>A variable the reviewer added and then removes in the UI is simply not sent. Once the schema is approved the dialog and the Add button are disabled (the draft is consumed); run the pipeline again to change variables.</li>
 </ul>
 <h3>Independent expectations (<code>synth/expectations.py</code>)</h3>
 <p>A separate LLM call sees only the scenario brief and the column cards. It never sees the author's overlay, so it cannot grade its own homework. It answers in a closed vocabulary:</p>
@@ -491,6 +499,7 @@ fits     = spent + expected &lt;= window</code></pre>
 <tr><td>Hard deadline for every model call of the first design</td><td>One slow provider call could stretch a first design past 10 minutes.</td></tr>
 <tr><td>Automatic (model-free) repair of running balances, debits larger than the balance, summary dates and rail limits; two author repair rounds before the first serve; one kind latent drives type, mechanism and purpose</td><td>The author model left these measured errors open in one repair round in all four QA runs (15, 10, 3 and 1 open errors), although the cure is exact and follows from the data.</td></tr>
 <tr><td>Column <code>sequence</code> on variables and the story order of the delivered columns</td><td>QA reads the data as a CSV: customer before account, a start before its end, then the event, its amounts and its outcome. The stored order was the database's (alphabetical by key).</td></tr>
+<tr><td>Add and edit variables at confirm (<code>USER_ADDED</code>, validated like DB definitions); the system sets the sequence, the UI no longer asks for it</td><td>The review step could only delete. A reviewer needs to add a column of their own and fix a description or a value list, without typing a position.</td></tr>
 <tr><td>Removed settings</td><td><code>SPEC_REFINE_BUDGET_SECONDS</code>, <code>SPEC_DRAFT_REPAIR_SECONDS</code>, <code>SPEC_GENERATE_REFINE_WAIT_SECONDS</code>.</td></tr>
 </table></div>
 

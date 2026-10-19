@@ -110,7 +110,7 @@ def _require_generation_source(
             source_id = str(provenance.get("source_json_id") or variable_source_ids.get(key) or "").strip()
             # Confirmed agentic source-backed fields are allowed either by the preserved
             # source label or the preserved source document id. DB overlays remain allowed.
-            if source in {"MONGODB_JSON", "DB_RECOMMENDED", "USER_SELECTED"} or source_id:
+            if source in {"MONGODB_JSON", "DB_RECOMMENDED", "USER_SELECTED", "USER_ADDED"} or source_id:
                 continue
             # Derived columns are computed by the application itself (a scenario-semantics decision such as a
             # suppression flag), so they are not LLM output.
@@ -175,7 +175,7 @@ def _require_generation_source(
             normalized_source = str(row.get("source") or variable_sources.get(key) or "").strip().upper()
             if normalized_source == "MONGODB_JSON" and source_id and source_id not in active_source_ids:
                 missing_sources.add(source_id)
-            elif normalized_source not in {"MONGODB_JSON", "DB_RECOMMENDED", "USER_SELECTED"} and name.casefold() not in scenario_variable_names and not source_id:
+            elif normalized_source not in {"MONGODB_JSON", "DB_RECOMMENDED", "USER_SELECTED", "USER_ADDED"} and name.casefold() not in scenario_variable_names and not source_id:
                 unknown.append(name)
         if missing_sources:
             raise ValueError(

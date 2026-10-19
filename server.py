@@ -107,7 +107,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.12.0",
+    version="2.13.0",
     lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse},
@@ -251,7 +251,7 @@ class ConfirmRequest(BaseModel):
     })
 
     draft_id: str
-    add: list[dict] = Field(default_factory=list, description="Optional new variable definitions for legacy/imported drafts; leave empty for agentic proposals")
+    add: list[dict] = Field(default_factory=list, description="Optional new variables: name, dtype, gen (required) and params, formula, depends_on, nullable, description, scope. Where the column sits is set by the system (story order) unless a sequence is given")
     edit: list[VariableEdit] = Field(default_factory=list, description="Optional HITL edits to existing variables")
     delete: list[str] = Field(default_factory=list, description="Optional variable names to delete")
     feedback: str | None = Field(default=None, description="Accepted for compatibility; feedback is not stored")
@@ -876,6 +876,7 @@ def confirm_scenario_route(req: ConfirmRequest):
         raise HTTPException(404,detail={"error":f"Unknown or expired draft_id '{req.draft_id}'"})
 
     variable_sources = {}
+    added_sources: dict[str, str] = {}
     db_variable_names = set()
     if draft.get("agentic"):
         try:
@@ -890,6 +891,7 @@ def confirm_scenario_route(req: ConfirmRequest):
             label = variable_sources.get(str(variable.get("name") or "").strip().casefold())
             if label and not variable.get("source"):
                 variable["source"] = label
+        added_sources = {str(n).strip().casefold(): "USER_ADDED" for n, lab in variable_sources.items() if lab == "USER_ADDED"}
     else:
         variables=[dict(v) for v in draft.get("variables",[]) if isinstance(v,dict)]
         by_name={str(v.get("name")):v for v in variables if v.get("name")}
@@ -923,7 +925,7 @@ def confirm_scenario_route(req: ConfirmRequest):
         # without modifying DB-owned variable definitions.
         "variable_sources": {
             str(name).strip().casefold(): str(source).strip().upper()
-            for name, source in (draft.get("variable_sources") or {}).items()
+            for name, source in {**(draft.get("variable_sources") or {}), **added_sources}.items()
             if str(name).strip() and str(source).strip()
         },
         "db_variable_names": sorted(str(name).strip().casefold() for name in (draft.get("db_variable_names") or []) if str(name).strip()),

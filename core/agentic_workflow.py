@@ -18,7 +18,7 @@ from core.dynamic_scenarios import new_draft_id, save_draft
 from core.runtime_cache import get_proposal, set_proposal
 from core.scenario_variable_store import get_recommended, get_selection_lock, get_user_variables, lock_selection
 from core.json_domain_policy import source_manifest
-from core.variable_contract import rewrite_formula_names, validate_db_definition
+from core.variable_contract import clean_formula, rewrite_formula_names, validate_db_definition
 
 logger = logging.getLogger(__name__)
 from agents.intent_agent import NAMES_VERSION, GeminiIntentAgent, drop_wrapper_duplicates
@@ -939,6 +939,66 @@ class AgenticSchemaWorkflow:
             logger.exception("generation spec warm-up could not be started")
             return None
 
+    # What a reviewer may state for a variable added at confirmation. Everything else (provenance, required, source) is set by the system.
+    _ADDED_KEYS = frozenset({"name", "dtype", "description", "gen", "params", "depends_on", "nullable", "formula", "scope", "sequence"})
+    _ADDED_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+    @staticmethod
+    def _reviewer_field(item: dict[str, Any], taken: set[str]) -> GeneratedSchemaField:
+        """A variable the reviewer adds at confirmation, checked with the same structural contract as a persisted definition.
+
+        ``taken`` holds the lower-cased names of the columns that stay (and of those added before this one). Where the column sits
+        is not asked of the reviewer: unless ``sequence`` is given, ``synth.sequence`` places it by the story of the data.
+        """
+        from core.generator_contracts import SUPPORTED_GENERATORS
+
+        unknown = sorted(set(item) - AgenticSchemaWorkflow._ADDED_KEYS)
+        if unknown:
+            raise ValueError(f"A new variable cannot state {unknown}; allowed: {sorted(AgenticSchemaWorkflow._ADDED_KEYS)}")
+        name = str(item.get("name") or "").strip()
+        if not AgenticSchemaWorkflow._ADDED_NAME.match(name):
+            raise ValueError(f"Variable name '{name}' must start with a letter or underscore and use only letters, digits and underscores (max 64)")
+        if name.casefold() in taken:
+            raise ValueError(f"Variable '{name}' already exists; edit it instead of adding it again")
+        gen = str(item.get("gen") or "").strip().lower()
+        if gen not in SUPPORTED_GENERATORS:
+            raise ValueError(f"Variable '{name}' needs a generator, one of: {', '.join(sorted(SUPPORTED_GENERATORS))}")
+        params = item.get("params") if item.get("params") is not None else {}
+        if not isinstance(params, dict):
+            raise ValueError(f"Parameters of '{name}' must be an object")
+        if "nullable" in item and not isinstance(item["nullable"], bool):
+            raise ValueError(f"nullable of '{name}' must be true or false")
+        position = item.get("sequence")
+        if position is not None and (isinstance(position, bool) or not isinstance(position, int) or position < 0):
+            raise ValueError(f"sequence of '{name}' must be a whole number of zero or more")
+        depends = [str(d).strip() for d in (item.get("depends_on") or []) if str(d).strip()]
+        formula = item.get("formula")
+        if isinstance(formula, str) and formula.strip():
+            formula = clean_formula(formula, depends)
+            try:
+                tree = ast.parse(str(formula), mode="eval")
+            except SyntaxError as exc:
+                raise ValueError(f"The formula of '{name}' cannot be read: {exc.msg}") from exc
+            called = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            read = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} - called - {"prev", "True", "False", "None"}
+            read -= set(FORMULA_FUNCTION_NAMES)
+            depends += sorted(read - set(depends))
+        else:
+            formula = None
+        unknown_deps = sorted(d for d in set(depends) if d.casefold() not in taken)
+        if unknown_deps:
+            raise ValueError(f"Variable '{name}' depends on columns that are not in the schema: {unknown_deps}")
+        definition = {
+            "name": name, "dtype": str(item.get("dtype") or "string").strip().lower(), "gen": gen, "params": params,
+            "description": str(item.get("description") or "")[:1000], "depends_on": depends, "nullable": bool(item.get("nullable", False)),
+            "formula": formula, "scope": item.get("scope") or "transaction", "sequence": position, "required": False,
+            "provenance": {"added_by": "reviewer"},
+        }
+        try:
+            return GeneratedSchemaField.model_validate(validate_db_definition(definition))
+        except ValueError as exc:
+            raise ValueError(str(exc).replace("MongoDB variable", "Variable").replace("MongoDB scenario variable", "Variable")) from exc
+
     @staticmethod
     def validate_hitl_changes(
         draft: dict[str, Any],
@@ -1008,13 +1068,20 @@ class AgenticSchemaWorkflow:
             if fields_by_name[name].required:
                 raise ValueError(f"HITL cannot delete required field '{name}'")
 
+        # A reviewer may add a variable of their own. It joins the schema as USER_ADDED (executable like any other, but not owned
+        # by the database), is checked against the columns that remain, and is placed by the story order unless it states a sequence.
+        taken = {name.strip().casefold() for name in fields_by_name if name not in delete_set}
+        removed = {name.casefold() for name in delete_set}
         for item in add:
-            name = str(item.get("name") or "").strip()
-            if not name:
-                raise ValueError("Agentic HITL additions require an existing field name")
-            if name not in fields_by_name:
-                raise ValueError(f"Agentic HITL cannot add field '{name}' because it is not in the proposed MongoDB source-backed schema")
-            raise ValueError(f"Agentic HITL cannot add duplicate field '{name}'; revise existing fields instead")
+            if not isinstance(item, dict):
+                raise ValueError("A new variable must be an object")
+            if str(item.get("name") or "").strip().casefold() in removed:
+                raise ValueError(f"Variable '{item.get('name')}' is removed in the same request; keep it and edit it instead of re-adding it")
+            field = AgenticSchemaWorkflow._reviewer_field(item, taken)
+            taken.add(field.name.casefold())
+            schema.fields.append(field)
+            fields_by_name[field.name] = field
+            draft_source_by_name[field.name.strip().casefold()] = "USER_ADDED"
 
         allowed_override_keys = {"nullable", "description", "params", "sequence"}
         applied_edits: dict[str, dict[str, Any]] = {}
