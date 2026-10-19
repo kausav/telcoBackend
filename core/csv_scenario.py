@@ -1291,6 +1291,13 @@ def parse_definition_csv(csv_text: str, type_of_data: str | None = None) -> tupl
             "name":name,"dtype":dtype,"description":row.get("description",""),"gen":gen,
             "params":params,"depends_on":depends_on,"nullable":row.get("nullable","").lower() in _TRUE_STRINGS,
         }
+        position=row.get("sequence","").strip()
+        if position:                                    # the optional `sequence` column: where this column sits in the delivered data
+            try:
+                variable["sequence"]=int(float(position))
+                if variable["sequence"]<0: raise ValueError
+            except ValueError:
+                raise ValueError(f"Row {row_number} ('{name}'): sequence must be a whole number of zero or more, got '{position}'")
         normalized_formula=_coerce_formula_text(formula) if formula else ""
         if normalized_formula:
             variable["formula"]=normalized_formula

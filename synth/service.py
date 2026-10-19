@@ -513,6 +513,25 @@ def resolve_spec(context: dict[str, Any], variables: list[dict[str, Any]], *, wa
 
 
 # ------------------------------------------------------------------------------------------------------------------
+def column_sequence(spec: GenerationSpec, variables: list[dict[str, Any]], delivered: dict[str, str]) -> list[str]:
+    """The delivered column names in the order of the data's story: a ``sequence`` on a variable first, else the story order
+    (``synth.sequence``) of the party, what it holds, its facts, its dates (a start before its end) and then each event."""
+    from synth.sequence import story_order
+
+    by_name = {str(v.get("name")): v for v in variables if isinstance(v, dict) and v.get("name")}
+    names = list(delivered.values())
+    definitions = [by_name.get(n) or {"name": n, "dtype": spec.columns[cid].dtype} for cid, n in delivered.items()]
+    kinds = {n: ("entity" if spec.columns[cid].kind == "entity" else "event") for cid, n in delivered.items()}
+    entity = spec.columns[spec.entity_column].column if spec.entity_column else None
+    clock = spec.columns[spec.clock].column if spec.clock else None
+    try:
+        ordered = story_order(definitions, entity_key=entity, kinds=kinds, clock=clock)
+    except Exception:                                   # the order is presentation: never let it stop a generation
+        logger.exception("column order could not be computed; using the approved order")
+        ordered = names
+    return ordered + [n for n in names if n not in set(ordered)]
+
+
 def generate(spec: GenerationSpec, variables: list[dict[str, Any]], *, count: int, per_entity: int,
              seed: int | None = None, as_of: Any = None) -> SpecGeneration:
     delivered = spec.delivered
@@ -527,6 +546,8 @@ def generate(spec: GenerationSpec, variables: list[dict[str, Any]], *, count: in
     parsed, parse_errors = parse_columns(records, spec, delivered)
     report = score_rows(spec, parsed, engine.reference_view(spec, ctx), columns=set(delivered), parse_errors=parse_errors,
                         contract=build_contract(variables, delivered, spec.scenario.get("country")))
+    order = column_sequence(spec, variables, delivered)
+    records = [{name: r[name] for name in order if name in r} for r in records]
     summary = _summary_keys(report, count, per_entity, len(records), spec.warnings, _confined(spec))
     # columns that carry no value on any row stay visible: the design left them empty because the scenario excludes the fact
     summary["empty_columns"] = [name for name in delivered.values() if records and all(r.get(name) is None for r in records)]
@@ -545,7 +566,9 @@ def generate(spec: GenerationSpec, variables: list[dict[str, Any]], *, count: in
     report.update(seed=seed, as_of=ctx.as_of.isoformat(), engine=spec.engine, generation_engine=spec.engine,
                   spec_revision=spec.revision, spec_assumptions=spec.assumptions, **summary)
     clock = spec.columns[spec.clock].column if spec.clock else None
-    return SpecGeneration(records=records, fields=list(records[0]) if records else [], entity_columns=spec.entity_columns,
+    entity_names = set(spec.entity_columns)
+    return SpecGeneration(records=records, fields=list(records[0]) if records else list(order),
+                          entity_columns=[n for n in order if n in entity_names],
                           clock_column=clock, validation_report=report)
 
 

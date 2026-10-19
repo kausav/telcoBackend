@@ -107,7 +107,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.10.0",
+    version="2.12.0",
     lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse},
@@ -815,6 +815,11 @@ def import_scenario_csv(
             )
     else:
         entityKey = None
+
+    from synth.sequence import assign as assign_sequence
+
+    variables = assign_sequence(variables, entity_key=entityKey)           # each variable carries its place in the data's story
+    field_order = [str(v.get("name")) for v in variables if v.get("name")]
 
     draft_id = new_draft_id()
     draft = {

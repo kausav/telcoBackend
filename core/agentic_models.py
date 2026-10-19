@@ -92,6 +92,9 @@ class GeneratedSchemaField(BaseModel):
     formula: str | None = None
     scope: Literal["entity", "transaction", "event", "derived"] = "transaction"
     useCase: str | None = Field(default=None, max_length=300)
+    # Where this column sits in the delivered data (smaller comes first). Left empty, the column is placed by the story order of
+    # ``synth.sequence`` (party, what it holds, its dates start before end, then each event); a number given here always wins.
+    sequence: int | None = Field(default=None, ge=0)
     provenance: dict[str, Any] = Field(default_factory=dict)
 
 

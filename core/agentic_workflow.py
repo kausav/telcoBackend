@@ -26,6 +26,7 @@ from agents.schema_compiler import SchemaCompiler
 from agents.data_generation_agent import FORMULA_FUNCTION_NAMES
 from config.runtime import PROPOSE_LLM_ADVISOR, SCHEMA_MAX_VARIABLES, SPEC_WARM_ON_PROPOSE
 from core.variable_semantics import variable_semantic_aliases
+from synth.sequence import assign as assign_sequence
 from core.industry_source_store import normalize_industry_key, normalize_lookup_key, semantic_exclusion_aliases, catalog_for_request
 from core.output_equivalence import output_equivalence_signature
 
@@ -861,6 +862,8 @@ class AgenticSchemaWorkflow:
                 variable["source"] = "LLM_GENERATED"
         type_of_data = self._infer_type_of_data(req.type_of_data, schema)
         entity_key = self._entity_key(req.entity_key, field_order, type_of_data)
+        variables = assign_sequence(variables, entity_key=entity_key)         # every variable carries its place in the data's story
+        field_order = [str(v.get("name")) for v in variables if v.get("name")]
         variable_source_ids = {}
         for field in schema.fields:
             provenance = field.provenance if isinstance(field.provenance, dict) else {}
@@ -1013,7 +1016,7 @@ class AgenticSchemaWorkflow:
                 raise ValueError(f"Agentic HITL cannot add field '{name}' because it is not in the proposed MongoDB source-backed schema")
             raise ValueError(f"Agentic HITL cannot add duplicate field '{name}'; revise existing fields instead")
 
-        allowed_override_keys = {"nullable", "description", "params"}
+        allowed_override_keys = {"nullable", "description", "params", "sequence"}
         applied_edits: dict[str, dict[str, Any]] = {}
         for item in edit:
             name = item.name if hasattr(item, "name") else str(item.get("name") or "")
@@ -1021,7 +1024,8 @@ class AgenticSchemaWorkflow:
             if name not in fields_by_name:
                 raise ValueError(f"HITL cannot edit unknown agentic field '{name}'")
             key = name.strip().casefold()
-            if draft_source_by_name.get(key) in {"DB_RECOMMENDED", "USER_SELECTED"} and changes:
+            # `sequence` only says where the column sits in the delivered data: it changes no value, so it may be set on every variable
+            if draft_source_by_name.get(key) in {"DB_RECOMMENDED", "USER_SELECTED"} and set(changes) - {"sequence"}:
                 raise ValueError(
                     f"MongoDB variable '{name}' is authoritative and cannot be renamed or edited; "
                     "change its DB definition instead"
@@ -1032,6 +1036,11 @@ class AgenticSchemaWorkflow:
             target = fields_by_name[name]
             if "nullable" in changes and not isinstance(changes["nullable"], bool):
                 raise ValueError(f"HITL nullable override for '{name}' must be boolean")
+            if "sequence" in changes:
+                position = changes["sequence"]
+                if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+                    raise ValueError(f"HITL sequence for '{name}' must be a whole number of zero or more")
+                target.sequence = position
             if "description" in changes:
                 target.description = str(changes["description"])[:1000]
             if "nullable" in changes:
@@ -1094,6 +1103,8 @@ class AgenticSchemaWorkflow:
             if draft_source_by_name.get(key) in {"DB_RECOMMENDED", "USER_SELECTED"} and key in draft_raw_by_name:
                 data = dict(draft_raw_by_name[key])
                 changes = applied_edits.get(key) or {}
+                if "sequence" in changes:
+                    data["sequence"] = changes["sequence"]
                 if "description" in changes:
                     data["description"] = field.description
                 if "nullable" in changes:
@@ -1111,6 +1122,8 @@ class AgenticSchemaWorkflow:
 
         if draft.get("type_of_data") == "transactional" and draft.get("entity_key") not in field_order:
             raise ValueError("HITL changes would remove the transactional entity key")
+        variables = assign_sequence(variables, entity_key=str(draft.get("entity_key") or "").strip() or None)   # a new column gets its place
+        field_order = [str(v.get("name")) for v in variables if v.get("name")]
         return variables, field_order, draft_source_by_name, draft_db_names
 
 _WORKFLOW_SINGLETONS: dict[str, AgenticSchemaWorkflow] = {}

@@ -196,7 +196,7 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 </table></div>
 
 <h3>CSV variable format</h3>
-<p>Columns: <code>name, dtype, gen, params, depends_on, nullable, formula, description</code>. <code>params</code> is a JSON object (for example <code>{"choices":[true,false],"weights":[0.18,0.82]}</code>); typed values such as booleans must go through JSON so they are not read as strings. Entity-scope variables come first, then event-scope variables.</p>
+<p>Columns: <code>name, dtype, gen, params, depends_on, nullable, formula, description</code> and the optional <code>sequence</code> (a whole number; see <i>Column sequence</i> below). <code>params</code> is a JSON object (for example <code>{"choices":[true,false],"weights":[0.18,0.82]}</code>); typed values such as booleans must go through JSON so they are not read as strings. Entity-scope variables come first, then event-scope variables.</p>
 
 <h2 id="lifecycle">5. Scenario lifecycle</h2>
 <svg viewBox="0 0 1040 330" role="img" aria-label="Lifecycle">
@@ -273,6 +273,15 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <text class="mute" x="10" y="220">It returns blocking problems, advisory advice, facts and quarantine notes.</text>
 </svg>
 
+<h3>Column sequence (<code>synth/sequence.py</code>)</h3>
+<p>The columns of a dataset are delivered in the order of its story, so a CSV made from the response reads from left to right: <b>who</b> (the party), <b>what it holds</b> (account, contract), the facts about them, <b>when it started and ended</b>, then each event &mdash; its identifier, its moments in time, its kind, its amounts and how it ended.</p>
+<ul>
+<li>Every variable may carry <code>sequence</code> (smaller comes first). <code>scenario/propose</code> and the CSV import give every variable one (10, 20, 30, &hellip; so a column can be inserted between two); a number a person writes always wins, and a CSV definition may carry a <code>sequence</code> column.</li>
+<li>Without a number the story order applies: (1) entity identifiers, party &rarr; what it holds &rarr; what happens to it; (2) entity facts; (3) entity dates, a start before its end; (4) event identifiers, the transaction's own id first; (5) event dates, start &rarr; the event &rarr; its processing &rarr; its end; (6) type, category, channel, purpose; (7) amount &rarr; fees &rarr; balance; (8) status, outcome, flags.</li>
+<li>A column that reads another (<code>depends_on</code>) comes after it; a <i>start</i>/<i>end</i> pair that differs only by that word, and dates the schema relates (parent &rarr; child), keep their order.</li>
+<li>The UI shows the number in a <b>Seq</b> column of the schema table; a reviewer can change it before approving, and the changes go to <code>scenario/confirm</code> as <code>edit</code> entries (<code>{"name":"...","changes":{"sequence":15}}</code>). Unlike other edits this is allowed for DB-owned variables too, because it changes no value.</li>
+<li>The order is presentation only: it is not part of the spec key, so changing a sequence never redesigns a spec. <code>scenario/generate</code> applies it to <code>fields</code>, to the entity block and to every record. Entity facts stay in the entity block and event columns in <code>records</code>, each in sequence order.</li>
+</ul>
 <h3>Independent expectations (<code>synth/expectations.py</code>)</h3>
 <p>A separate LLM call sees only the scenario brief and the column cards. It never sees the author's overlay, so it cannot grade its own homework. It answers in a closed vocabulary:</p>
 <ul>
@@ -451,6 +460,7 @@ fits     = spent + expected &lt;= window</code></pre>
 <tr><td><code>synth/baseline.py</code></td><td>Baseline spec from definitions; merge of overlay.</td></tr>
 <tr><td><code>synth/compiler.py</code></td><td>Design: draft, verify, repair, quarantine, refine.</td></tr>
 <tr><td><code>synth/expectations.py</code></td><td>Independent expectations.</td></tr>
+<tr><td><code>synth/sequence.py</code></td><td>Column order: explicit <code>sequence</code>, else the story order.</td></tr>
 <tr><td><code>synth/autofix.py</code></td><td>Model-free repairs of measured defects (running balance, debit limit, summary dates, rail limits).</td></tr>
 <tr><td><code>synth/service.py</code></td><td>resolve_spec, settle, generate, response summary.</td></tr>
 <tr><td><code>synth/store.py</code></td><td>Spec persistence and cache.</td></tr>
@@ -480,6 +490,7 @@ fits     = spent + expected &lt;= window</code></pre>
 <tr><td>Narrower amount and recurring-amount checks; one cash finding</td><td>The first versions flagged capital/sweep/lien amounts, a company paying salaries, and named the wrong cash column.</td></tr>
 <tr><td>Hard deadline for every model call of the first design</td><td>One slow provider call could stretch a first design past 10 minutes.</td></tr>
 <tr><td>Automatic (model-free) repair of running balances, debits larger than the balance, summary dates and rail limits; two author repair rounds before the first serve; one kind latent drives type, mechanism and purpose</td><td>The author model left these measured errors open in one repair round in all four QA runs (15, 10, 3 and 1 open errors), although the cure is exact and follows from the data.</td></tr>
+<tr><td>Column <code>sequence</code> on variables and the story order of the delivered columns</td><td>QA reads the data as a CSV: customer before account, a start before its end, then the event, its amounts and its outcome. The stored order was the database's (alphabetical by key).</td></tr>
 <tr><td>Removed settings</td><td><code>SPEC_REFINE_BUDGET_SECONDS</code>, <code>SPEC_DRAFT_REPAIR_SECONDS</code>, <code>SPEC_GENERATE_REFINE_WAIT_SECONDS</code>.</td></tr>
 </table></div>
 

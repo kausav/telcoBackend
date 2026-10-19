@@ -218,7 +218,7 @@ def _generate_from_spec(requested_scenario_id: str, scenario_context: dict[str, 
         entity_key=scenario_context.get("entity_key"), scenario_context=dict(scenario_context))
     state.raw_records = list(generated.records)
     state.final_records = list(generated.records)
-    state.field_order = [name for name in field_order if name in generated.fields] or list(generated.fields)
+    state.field_order = list(generated.fields)                       # the story order of the columns (explicit `sequence` first)
     generated.validation_report["generation_spec"] = resolution.report
     state.validation_report = generated.validation_report
     return state, generated, resolution.report
