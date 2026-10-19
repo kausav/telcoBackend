@@ -1461,8 +1461,9 @@ class GeminiIntentAgent:
             try:
                 reply = self._get_client().generate_json(SEQUENCE_PROMPT, prompt, temperature=0.2)
                 rows = reply.get("order") if isinstance(reply, dict) else reply
-                known = set(names)
-                order = [n for n in dict.fromkeys(str(r) for r in (rows or []) if isinstance(r, str)) if n in known]
+                # the model may change the case or the spacing of a name: it is matched on its letters and digits, answered with the real name
+                real = {_name_key(n): n for n in names}
+                order = list(dict.fromkeys(real[k] for k in (_name_key(r) for r in (rows or []) if isinstance(r, str)) if k in real))
                 if len(order) < SEQUENCE_MIN_COVERAGE * len(names):
                     logger.warning("[IntentAgent/Sequence] the model named %d of %d column(s); using the story order", len(order), len(names))
                     order, complete = None, False
@@ -1520,6 +1521,10 @@ invent a column. Some columns may be marked "new": the other columns are already
 order and put each new column where it belongs in the story.
 
 Return only JSON: {"order": ["<name exactly as given>", ...]} naming every column exactly once."""
+
+
+def _name_key(name: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name).casefold())
 
 
 def _sequence_signature(variable: dict[str, Any], entity_key: str | None, *, new: bool | None = None) -> dict[str, Any]:

@@ -260,8 +260,14 @@ def _plan(variables: Iterable[dict[str, Any]], *, entity_key: str | None, kinds:
                 effective[n] = last + 1 if last is not None else max(0, min(explicit.values()) - 1)
                 last = effective[n]
     else:
+        # a number someone gave is a place on the same scale as the automatic ones (10, 20, ...): 1 is before everything
         effective = {n: explicit.get(n, (p + 1) * SEQUENCE_STEP) for p, n in enumerate(story)}
     order = sorted(story, key=lambda n: (effective[n], story.index(n)))
+    # The numbers must grow along the order and never repeat, or a reader that sorts by them would reorder the columns (two columns
+    # given the same number, a given number landing on an automatic one). The order stands; the columns are then numbered in steps.
+    values = [effective[n] for n in order]
+    if any(b <= a for a, b in zip(values, values[1:])):
+        effective = {n: (p + 1) * SEQUENCE_STEP for p, n in enumerate(order)}
     return order, effective
 
 
@@ -270,16 +276,15 @@ def assign(variables: list[dict[str, Any]], *, entity_key: str | None = None, ki
     """The variables in order, each carrying a ``sequence`` (one given by a person is kept; the others are numbered 10, 20, ...).
 
     The order is the story order, or ``preferred`` (the intent agent's) with the hard rules enforced; with ``fit`` the variables that
-    have no number are slotted next to the numbered ones instead of renumbering everything.
+    have no number are slotted next to the numbered ones instead of being numbered on the automatic scale. The numbers returned always
+    grow along the order and never repeat: when the given ones would break that, the order stands and every column is renumbered in steps.
     """
     order, effective = _plan(variables, entity_key=entity_key, kinds=kinds, clock=clock, preferred=preferred, fit=fit)
     by_name = {str(v["name"]): v for v in variables if isinstance(v, dict) and v.get("name")}
     out: list[dict[str, Any]] = []
-    for position, name in enumerate(order):
+    for name in order:
         item = dict(by_name[name])
-        given = item.get("sequence")
-        if isinstance(given, bool) or not isinstance(given, (int, float)):
-            item["sequence"] = effective[name] if fit else (position + 1) * SEQUENCE_STEP
+        item["sequence"] = effective[name]                  # strictly increasing along the order, so sorting by it never reorders
         out.append(item)
     out += [dict(v) for v in variables if not (isinstance(v, dict) and v.get("name"))]
     return out

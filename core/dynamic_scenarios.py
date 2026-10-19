@@ -65,8 +65,10 @@ def resolve_variables(requested_scenario_id: str) -> tuple[list[dict[str, Any]],
     # industry vocabulary. The generation service performs the fail-closed source gate before
     # execution, so reaching this branch with no DB variables is treated as empty.
     recommended_fallback = []
-    if not source_available:
-        recommended_fallback = [dict(v) for v in get_recommended(requested_scenario_id, scenario_version) if isinstance(v, dict)]
+    # The confirmed variables are what the reviewer approved: their edits, deletions, additions and the column order the intent
+    # agent decided (``sequence``). The database rows stand in only for a scenario that has no confirmed variables of its own.
+    if not source_available and not raw_variables:
+        recommended_fallback =[dict(v) for v in get_recommended(requested_scenario_id, scenario_version) if isinstance(v, dict)]
         if recommended_fallback:
             raw_variables = recommended_fallback
             source_policy = "scenario_variables"

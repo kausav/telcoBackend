@@ -107,7 +107,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.14.0",
+    version="2.14.1",
     lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse},
