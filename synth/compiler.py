@@ -49,14 +49,15 @@ from synth.spec import EVAL_VARS, SPEC_VERSION, Emit, GenerationSpec, Invariant,
 
 logger = logging.getLogger(__name__)
 
-COMPILER_VERSION = 17
+COMPILER_VERSION = 18
 MAX_REPAIR_ROUNDS = 2
 MAX_REFINE_ROUNDS = 6
 DRAFT_REPAIRED_WARNINGS = frozenset({"healed_empty_column", "shared_identifier", "near_constant_numeric_column", "mirrored_columns", "part_exceeds_bound",
                                      "near_constant_state", "entity_stamp_inside_history", "expected_state_share"})
 SOFT_IMMEDIATE = ("EMPTY ", "TARGET ")      # problems confined to their column at once (the column loses its condition, the target goes)
 SOFT_LATE = ("DUPLICATE ", "INVARIANT ", "CONTRACT ", "FORMAT ", "PLACEHOLDER ", "FUTURE ", "RUNTIME ")   # confined once no round is left
-DRAFT_REPAIR_ROUNDS = 1                  # patch rounds for measured errors before a spec is first served (the refinement does the rest)
+DRAFT_REPAIR_ROUNDS = 2                  # patch rounds for measured errors before a spec is first served (each is skipped when the time left cannot afford it)
+AUTOFIX_STEPS = 6                        # automatic (model-free) repairs tried on one design; each is kept only when the checks find it better
 REJECTED_PATCH_ALLOWANCE = 2
 REPAIR_PROBLEMS = 8                      # problems sent to the author in one patch: the most serious first; a patch that tries to fix everything breaks a check
 DRAFT_REVIEW_GRACE_SECONDS = 20          # how long a draft that has been repaired waits for the review that ran beside the repair
@@ -240,7 +241,10 @@ WHAT YOU DECIDE
    is a small everyday sum; a salary credit is a month of income; an ATM withdrawal stays below the usual per-transaction
    limit): a column's declared range is the envelope the values must stay inside, not the part to aim at - use the part of it that is
    real for each kind. The generic amount of a transaction and its kind-specific amount describe the same money: they are equal, or
-   differ by a fee that is itself a column.
+   differ by a fee that is itself a column. Every column that names the kind of one event - its type, category, sub-category,
+   mechanism or channel, purpose and direction (money in or out) - comes from that ONE kind latent, through a table keyed by the kind
+   (a "switch" or a "choice" with "by": "<kind>"); two of them drawn separately disagree (a salary credit paid by ATM cash, a
+   card payment whose mechanism is a bank transfer), and that is measured.
 17. A story over time (normal turning suspicious, growth, depletion, a customer being lost) is a trajectory of each entity with its
    own start, speed and persona, not the same step at the same position for every entity. Its early phase looks like the ordinary
    activity of that persona (the amounts, channels and cadence of everyday life) before anything changes. Each entity has its own
@@ -298,7 +302,9 @@ WHAT YOU DECIDE
    column when one was charged). Make it an event column that reads the previous row - (prev['<balance column>'] if prev is not None
    else <opening balance>) with the opening balance drawn once per entity from a distribution that fits the segment - and take the
    sign from the kind of the event (the kind latent). A balance is never drawn independently of the amounts, and never fixed per
-   entity when the entity has events that move money. A debit is limited by the balance unless the account has an overdraft.
+   entity when the entity has events that move money. A debit is limited by the balance unless the account has an overdraft:
+   draw the debit at most as large as the balance that is there (min(amount, 0.9 * prev balance)), never post it in full and clamp the
+   balance. The compiler repairs a balance that is clearly not running, but a balance you write well is better than one it rewrites.
    A statement's opening and closing balance follow the same events of their period. This is measured: between two consecutive
    events the balance changes by the later event's amount.
 23. Linked parties. When the scenario is about a network, ring, group, common owner or shared counterparty (mule accounts, shell
@@ -1063,13 +1069,20 @@ def verify(spec: GenerationSpec, variables: list[dict[str, Any]], *, entities: i
                             + cash_denomination_advice(spec, rows) + entity_fact_scope_advice(spec, rows)
                             + amount_agreement_advice(spec, rows) + recurring_amount_advice(spec, rows)
                             + derived_date_order_advice(spec, rows) + sequence_clone_advice(spec, rows) + amount_table_advice(spec, rows)
-                            + running_balance_advice(spec, rows) + rail_limit_advice(spec, rows)
+                            + running_balance_advice(spec, rows) + overdraw_advice(spec, rows) + rail_limit_advice(spec, rows)
                             + expect.check(spec, rows, expectations, ctx.as_of))
         report["facts"] = shape_facts(spec, rows)
     return problems, report
 
 
 # ------------------------------------------------------------------------------------------------------------------
+def simulate_rows(spec: GenerationSpec) -> list[dict[str, Any]]:
+    """The raw rows (column id -> value) of the simulation that ``verify`` measures, for the repairs that read the data itself."""
+    per_entity = max(2, min(VERIFY_MAX_EVENTS, int(spec.timeline.get("events") or VERIFY_ROWS_PER_ENTITY)))
+    ctx = RunContext(seed=11, as_of=_verify_as_of(), tz_name=spec.timezone)
+    return get_engine(spec.engine).simulate(spec, ctx, entities=VERIFY_ENTITIES, per_entity=per_entity, hints={})
+
+
 MAX_FACT_COLUMNS = 14
 
 
@@ -1931,6 +1944,54 @@ def running_balance_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> 
     return out[:2]
 
 
+OVERDRAW_MIN_STEPS = 30
+OVERDRAW_SHARE = 0.05
+
+
+def overdraw_advice(spec: GenerationSpec, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Findings for a balance that cannot pay what is taken from it: it goes below zero, or sticks at a floor while the amount is larger.
+
+    A debit larger than the balance is refused (or reduced) by a real account; it is not posted in full while the balance is clamped.
+    Measured on the steps of one entity: a balance below zero, or the same lowest balance value reached again and again by steps
+    whose amount is larger than the balance that was there.
+    """
+    groups = [g for g in _by_entity(spec, rows) if len(g) >= 3]
+    amounts = _movement_amounts(spec, rows)
+    if len(groups) < 8 or not amounts:
+        return []
+    order = sorted(amounts, key=lambda c: (-sum(1 for r in rows if isinstance(r.get(c), (int, float))), not _tokens(amounts[c]) & {"transaction"}))
+    out = []
+    for cid, name in spec.delivered.items():
+        t = _tokens(name)
+        if spec.columns[cid].dtype not in ("float", "integer") or "balance" not in t or t & _BALANCE_SKIP:
+            continue
+        values = [float(r[cid]) for r in rows if isinstance(r.get(cid), (int, float)) and not isinstance(r.get(cid), bool)]
+        if len(values) < OVERDRAW_MIN_STEPS:
+            continue
+        floor = min(values)
+        total = bad = 0
+        example = None
+        for g in groups:
+            for before, after in zip(g, g[1:]):
+                b0, b1 = before.get(cid), after.get(cid)
+                moved = next((float(m) for m in (after.get(a) for a in order) if isinstance(m, (int, float)) and not isinstance(m, bool)), None)
+                if not isinstance(b0, (int, float)) or not isinstance(b1, (int, float)) or moved is None:
+                    continue
+                total += 1
+                short = b1 < -0.005 or (abs(b1 - floor) <= 0.005 and moved > b0 + 0.01 and abs(b1 - b0) < moved - 0.011)
+                if short:
+                    bad += 1
+                    example = example or (b0, moved, b1)
+        if total >= OVERDRAW_MIN_STEPS and bad >= OVERDRAW_SHARE * total:
+            out.append({"id": "debit_exceeds_balance", "severity": "error" if bad >= 0.15 * total else "warn", "columns": [name, amounts[order[0]]],
+                        "problem": f"{name} cannot pay what is taken from it: on {bad} of {total} steps the amount is larger than the balance that was there "
+                                   "and the balance goes below zero or is held at a floor.",
+                        "evidence": f"e.g. balance {example[0]:g}, amount {example[1]:g}, balance after {example[2]:g}",
+                        "fix": f"A debit larger than the balance is not drawn (draw it at most as large as prev['{name}'] unless the account has an overdraft); "
+                               "never clamp the balance while the amount stays."})
+    return out[:2]
+
+
 RAIL_MIN_ROWS = 3
 # A fee that is charged on the account over a period (accrued, annual, monthly, maintenance, a service package) is not the fee of one payment.
 _NOT_RAIL_FEE = frozenset({"rate", "percent", "percentage", "accrual", "accrued", "annual", "monthly", "quarterly", "maintenance", "service", "services", "waived"})
@@ -2752,7 +2813,7 @@ MEASURED_FINDINGS = frozenset({"window_overlap", "constant_numeric_column", "nea
                                "healed_target", "healed_duplicate", "healed_invariant", "healed_column", "check",
                                "future_date", "target_absent", "completion_after_failure", "category_conflicts_kind",
                                "cash_not_whole_notes", "entity_fact_at_event_scope", "amount_disagrees", "recurring_amount_unstable",
-                               "derived_before_event", "sequence_clone", "balance_not_running", "rail_limit_violated", "amount_table"})
+                               "derived_before_event", "sequence_clone", "balance_not_running", "rail_limit_violated", "amount_table", "debit_exceeds_balance"})
 
 
 def is_measured(finding: dict[str, Any]) -> bool:
@@ -2982,6 +3043,8 @@ class SpecCompiler:
             rnd = self._heal_soft(base, brief, rnd, final=final)
         elif any(f["id"] == "window_overlap" for f in rnd.report.get("advice") or []):
             rnd = self._heal_cadence(base, brief, rnd)
+        if rnd.spec is not None:
+            rnd = self._heal_measured(base, brief, rnd)
         return rnd
 
     def _expectations(self, base: Baseline, brief: dict[str, Any], notes: dict[str, dict[str, Any]] | None,
@@ -3128,6 +3191,50 @@ class SpecCompiler:
                 current.report["advice"] = notes + list(current.report.get("advice") or [])
                 current.overlay["healed"] = notes             # kept with the design so the refinement knows what to model properly
                 return current
+        return rnd
+
+    def _heal_measured(self, base: Baseline, brief: dict[str, Any], rnd: _Round) -> _Round:
+        """Repair, without the author model, the measured defects whose cure follows from the data (see ``synth.autofix``).
+
+        Each repair edits the overlay, runs every check again and is kept only when the measured findings get lighter and nothing measured
+        gets worse. What cannot be repaired this way is left to the author's repair rounds, which then have less to do.
+        """
+        from synth import autofix
+
+        tried: set[tuple[str, tuple[str, ...]]] = set()
+        done: list[str] = []
+        for _ in range(AUTOFIX_STEPS):
+            if rnd.spec is None:
+                break
+            advice = rnd.report.get("advice") or []
+            # what limits an amount comes first, so that the cap a balance puts on a debit is the last word on it
+            todo = sorted((f for f in advice if f["id"] in autofix.FIXERS and (f["id"], tuple(f["columns"])) not in tried),
+                          key=lambda f: list(autofix.FIXERS).index(f["id"]))
+            if not todo:
+                break
+            finding = todo[0]
+            tried.add((finding["id"], tuple(finding["columns"])))
+            try:
+                rows = simulate_rows(rnd.spec)
+                limits = {c["column"]: c for c in build_contract([base.variables[x] | {"name": rnd.spec.columns[x].column} for x in rnd.spec.delivered
+                                                                  if x in base.variables], rnd.spec.delivered, rnd.spec.scenario.get("country"))
+                          if "min" in c or "max" in c}
+                fixed = autofix.apply(rnd.spec, rows, rnd.overlay, finding, limits)
+                if fixed is None:
+                    continue
+                cand = self._verified(base, brief, fixed[0])
+            except Exception:
+                logger.exception("automatic repair of %s could not be tried", finding["id"])
+                continue
+            if cand.spec is not None and _accepts(cand.report.get("advice") or [], advice):
+                logger.info("automatic repair kept: %s", fixed[1])
+                done.append(fixed[1])
+                rnd = cand
+            else:
+                logger.info("automatic repair of %s not kept (%s)", finding["id"],
+                            f"rejected: {_short(cand.problems[0], 160)}" if cand.spec is None and cand.problems else "no better")
+        if done:
+            rnd.overlay["autofixed"] = (rnd.overlay.get("autofixed") or []) + done
         return rnd
 
     def _heal_cadence(self, base: Baseline, brief: dict[str, Any], rnd: _Round) -> _Round:

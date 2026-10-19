@@ -296,7 +296,7 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <tr><td>PLACEHOLDER, FUTURE</td><td>Placeholder text, or a time after <code>asOf</code>.</td><td>Healed at final.</td></tr>
 <tr><td>RUNTIME</td><td>Expression failed to evaluate.</td><td>Healed at final.</td></tr>
 </table></div>
-<p>Measured advice (ids in <code>MEASURED_FINDINGS</code>) is computed on the simulated rows. Added in compiler 16&ndash;17:</p>
+<p>Measured advice (ids in <code>MEASURED_FINDINGS</code>) is computed on the simulated rows. Added in compiler 16&ndash;18:</p>
 <div class="tblwrap"><table>
 <tr><th>Id</th><th>Measures</th></tr>
 <tr><td><code>amount_disagrees</code></td><td>Two amounts of one money movement (transaction amount and its payment/deposit/withdrawal block) that differ without a fee column explaining it. Only movement amounts that vary within an entity count: capital, sweep, lien, limit, balance and accrual amounts are other facts.</td></tr>
@@ -307,6 +307,7 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <tr><td><code>amount_table</code></td><td>A money-movement amount drawn from a short table (few distinct values, shared by three or more entities).</td></tr>
 <tr><td><code>balance_not_running</code></td><td>A balance that does not change by the amount of the later event between consecutive events (or does not change at all).</td></tr>
 <tr><td><code>rail_limit_violated</code></td><td>A row naming a payment rail (by its stored aliases) with an amount above its cap or below its floor, or a fee on a free rail.</td></tr>
+<tr><td><code>debit_exceeds_balance</code></td><td>A balance below zero, or held at its lowest value while the amount that was taken is larger than the balance that was there (a debit posted in full and the balance clamped).</td></tr>
 <tr><td><code>expected_shared_parties</code>, <code>expected_trajectory</code></td><td>From the independent expectations (see above).</td></tr>
 </table></div>
 <p>Advisory <em>advice</em> never blocks. Examples: value polarity (a state named <code>no_&hellip;</code> or <code>not_&hellip;</code> must not behave like its opposite; negating words adjacent to the step are recognised) and in-flight advice, which skips columns whose tokens overlap the entity column's tokens.</p>
@@ -321,7 +322,8 @@ footer{padding:30px 16px;color:var(--mute);font-size:13px}
 <h3>Repair, quarantine and refinement</h3>
 <ol>
 <li><b>Draft.</b> Author call, merge, verify. Structural problems are retried; soft problems go to quarantine as soon as the next round would not fit the window.</li>
-<li><b>Repair.</b> <code>_repair_measured</code> asks the author for a patch that targets measured problems only (up to <code>MAX_REPAIR_ROUNDS=2</code>), accepted only through the acceptance rule.</li>
+<li><b>Automatic repair</b> (<code>_heal_measured</code>, <code>synth/autofix.py</code>), after every author round and without a model call, for the measured defects whose cure follows from the data: a balance that is not running becomes <i>previous balance &plusmn; amount &minus; fee</i> with an opening balance per entity and debits limited to what the balance holds; a debit larger than the balance is reduced; a summary date that precedes the entity's activity becomes a rollup (the day after the latest event) and an event date is never earlier than its event; amounts and fees are folded inside the cap and floor of the payment rail the row names. Which events are credits is read from the data (the words of a category column, or the guards of the deposit-named amount columns); when the data does not say, nothing is changed. Each repair is kept only when every check runs again and the measured findings are lighter (<code>_accepts</code>), so it cannot make a design worse.</li>
+<li><b>Repair.</b> <code>_repair_measured</code> asks the author for a patch that targets the measured problems that are left (up to <code>DRAFT_REPAIR_ROUNDS=2</code> before the first serve, each skipped when the time left cannot afford it), accepted only through the acceptance rule.</li>
 <li><b>Quarantine</b> (<code>_heal_soft</code>). A defect is confined to one column instead of discarding the design. Notes <code>healed_*</code> are stored in <code>overlay["healed"]</code> and surfaced as <code>confined_defects</code>.</li>
 <li><b>Refine.</b> A reviewer reads the spec, then patch rounds (up to <code>MAX_REFINE_ROUNDS=6</code>, rejected patches allowed <code>REJECTED_PATCH_ALLOWANCE=2</code>) run only while a round fits the window. The reviewer is skipped when no round could fit.</li>
 </ol>
@@ -449,6 +451,7 @@ fits     = spent + expected &lt;= window</code></pre>
 <tr><td><code>synth/baseline.py</code></td><td>Baseline spec from definitions; merge of overlay.</td></tr>
 <tr><td><code>synth/compiler.py</code></td><td>Design: draft, verify, repair, quarantine, refine.</td></tr>
 <tr><td><code>synth/expectations.py</code></td><td>Independent expectations.</td></tr>
+<tr><td><code>synth/autofix.py</code></td><td>Model-free repairs of measured defects (running balance, debit limit, summary dates, rail limits).</td></tr>
 <tr><td><code>synth/service.py</code></td><td>resolve_spec, settle, generate, response summary.</td></tr>
 <tr><td><code>synth/store.py</code></td><td>Spec persistence and cache.</td></tr>
 <tr><td><code>synth/spec.py</code>, <code>expr.py</code>, <code>samplers.py</code>, <code>clock.py</code></td><td>Spec model, expression language, seeded draws, timeline.</td></tr>
@@ -476,10 +479,11 @@ fits     = spent + expected &lt;= window</code></pre>
 <tr><td>Measured checks for sequence clones, amount tables, running balances and rail limits; <code>pool</code> sampler; <code>shared_parties</code> expectation</td><td>Entities that all follow one script, balances that do not move with the money, and networks with no shared party were the defects the last QA runs still showed.</td></tr>
 <tr><td>Narrower amount and recurring-amount checks; one cash finding</td><td>The first versions flagged capital/sweep/lien amounts, a company paying salaries, and named the wrong cash column.</td></tr>
 <tr><td>Hard deadline for every model call of the first design</td><td>One slow provider call could stretch a first design past 10 minutes.</td></tr>
+<tr><td>Automatic (model-free) repair of running balances, debits larger than the balance, summary dates and rail limits; two author repair rounds before the first serve; one kind latent drives type, mechanism and purpose</td><td>The author model left these measured errors open in one repair round in all four QA runs (15, 10, 3 and 1 open errors), although the cure is exact and follows from the data.</td></tr>
 <tr><td>Removed settings</td><td><code>SPEC_REFINE_BUDGET_SECONDS</code>, <code>SPEC_DRAFT_REPAIR_SECONDS</code>, <code>SPEC_GENERATE_REFINE_WAIT_SECONDS</code>.</td></tr>
 </table></div>
 
 </main>
-<footer><div class="wrap">Architecture reflects <code>COMPILER_VERSION = 17</code>, engine <code>event_rows/v1</code>.</div></footer>
+<footer><div class="wrap">Architecture reflects <code>COMPILER_VERSION = 18</code>, engine <code>event_rows/v1</code>.</div></footer>
 </body>
 </html>
