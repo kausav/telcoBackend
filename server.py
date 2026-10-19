@@ -107,7 +107,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.14.1",
+    version="2.14.2",
     lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse},
@@ -305,14 +305,14 @@ class IndustrySourceResponse(BaseModel):
 
 @app.get("/")
 def root():
-    """Liveness check."""
-    return {"success": True, "status": "ok"}
+    """Liveness check; ``version`` says which build is running."""
+    return {"success": True, "status": "ok", "version": app.version}
 
 
 @app.get("/health")
 def health():
-    """Liveness check; does not depend on external providers."""
-    return {"status": "ok"}
+    """Liveness check; does not depend on external providers. ``version`` says which build is running."""
+    return {"status": "ok", "version": app.version}
 
 
 @app.get("/ready")
