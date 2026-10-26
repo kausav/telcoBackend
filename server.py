@@ -107,7 +107,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Telco Agentic SDG",
-    version="2.14.2",
+    version="2.14.2+er-poc",
     lifespan=lifespan,
     responses={
         400: {"model": ErrorResponse},
@@ -200,10 +200,17 @@ app.add_middleware(
     allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Request-ID"],
+    # So a browser can read the download's file name (the ER zip export) and quote the request id when reporting a problem.
+    expose_headers=["Content-Disposition", "X-Request-ID"],
 )
 
 # Compress large JSON generation/proposal responses to reduce transfer time without changing payload semantics.
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+
+# ER-model proof of concept (branch feature/er-model-poc): GET /er/samples, POST /er/validate, /er/generate, /er/export.
+# Standard library only, no database and no model call; the API-token middleware above protects these routes like any other.
+from er.api import router as er_router  # noqa: E402
+app.include_router(er_router)
 
 
 class GenerateRequest(BaseModel):

@@ -1,0 +1,63 @@
+{
+  "name": "Telecom: customers, accounts, family groups, lines and usage",
+  "description": "A customer has 1 to 4 accounts. Some accounts form a family group (one main account supporting up to 5 member accounts). Each account has lines, each line is on a plan and has usage records.",
+  "seed": 42,
+  "entities": [
+    {"name": "plan", "key": "plan_id", "count": 5, "columns": [
+      {"name": "plan_id", "gen": {"type": "id", "prefix": "PLN", "digits": 3}},
+      {"name": "plan_name", "gen": {"type": "id", "prefix": "Plan-", "digits": 2}},
+      {"name": "monthly_fee", "gen": {"type": "float", "min": 9, "max": 79, "round": 2}},
+      {"name": "data_gb", "gen": {"type": "int", "min": 2, "max": 200}}
+    ]},
+    {"name": "customer", "key": "customer_id", "count": 40, "columns": [
+      {"name": "customer_id", "gen": {"type": "id", "prefix": "C", "digits": 6}},
+      {"name": "segment", "gen": {"type": "choice", "weights": {"consumer": 0.7, "business": 0.3}}},
+      {"name": "country", "gen": {"type": "choice", "values": ["IN", "GB", "DE", "US"]}},
+      {"name": "created_at", "gen": {"type": "date", "start": "2021-01-01", "end": "2024-06-30"}},
+      {"name": "account_count", "gen": {"type": "const", "value": 0}}
+    ]},
+    {"name": "account", "key": "account_id", "columns": [
+      {"name": "account_id", "gen": {"type": "id", "prefix": "A", "digits": 6}},
+      {"name": "opened_at", "gen": {"type": "date", "start": "2021-01-01", "end": "2025-06-30"}},
+      {"name": "status", "gen": {"type": "choice", "weights": {"active": 0.8, "closed": 0.2}}},
+      {"name": "country", "gen": {"type": "const", "value": "XX"}},
+      {"name": "billing_day", "gen": {"type": "int", "min": 1, "max": 28}}
+    ]},
+    {"name": "line", "key": "line_id", "columns": [
+      {"name": "line_id", "gen": {"type": "id", "prefix": "L", "digits": 7}},
+      {"name": "msisdn", "gen": {"type": "digits", "length": 10, "prefix": "9", "unique": true}},
+      {"name": "activated_at", "gen": {"type": "date", "start": "2021-01-01", "end": "2025-09-30"}},
+      {"name": "status", "gen": {"type": "choice", "weights": {"active": 0.75, "suspended": 0.05, "closed": 0.2}}},
+      {"name": "total_usage_mb", "gen": {"type": "const", "value": 0}},
+      {"name": "usage_events", "gen": {"type": "const", "value": 0}}
+    ]},
+    {"name": "usage", "key": "usage_id", "columns": [
+      {"name": "usage_id", "gen": {"type": "id", "prefix": "U", "digits": 8}},
+      {"name": "usage_date", "gen": {"type": "date", "start": "2021-01-01", "end": "2025-12-31"}},
+      {"name": "data_mb", "gen": {"type": "int", "min": 0, "max": 5000}},
+      {"name": "voice_min", "gen": {"type": "int", "min": 0, "max": 600}},
+      {"name": "charge", "gen": {"type": "float", "min": 0, "max": 60, "round": 2}}
+    ]}
+  ],
+  "relationships": [
+    {"name": "customer_accounts", "type": "one_to_many", "parent": "customer", "child": "account",
+     "children": {"min": 1, "max": 4, "weights": {"1": 0.5, "2": 0.3, "3": 0.15, "4": 0.05}}},
+    {"name": "account_group", "type": "group", "entity": "account", "fk": "parent_account_id", "share": 0.15,
+     "members": {"min": 1, "max": 5}},
+    {"name": "account_lines", "type": "one_to_many", "parent": "account", "child": "line", "children": {"min": 1, "max": 3}},
+    {"name": "line_plan", "type": "many_to_one", "parent": "plan", "child": "line", "skew": 0.6},
+    {"name": "line_usage", "type": "one_to_many", "parent": "line", "child": "usage", "children": {"min": 2, "max": 6}}
+  ],
+  "constraints": [
+    {"type": "date_not_before_parent", "relationship": "customer_accounts", "column": "opened_at", "parent_column": "created_at"},
+    {"type": "same_as_parent", "relationship": "customer_accounts", "column": "country", "parent_column": "country"},
+    {"type": "date_not_before_parent", "relationship": "account_group", "column": "opened_at", "parent_column": "opened_at"},
+    {"type": "status_follows_parent", "relationship": "account_group", "column": "status", "parent_column": "status", "when": "closed", "set": "closed"},
+    {"type": "date_not_before_parent", "relationship": "account_lines", "column": "activated_at", "parent_column": "opened_at", "max_days_after": 400},
+    {"type": "status_follows_parent", "relationship": "account_lines", "column": "status", "parent_column": "status", "when": "closed", "set": "closed"},
+    {"type": "date_not_before_parent", "relationship": "line_usage", "column": "usage_date", "parent_column": "activated_at", "max_days_after": 400},
+    {"type": "aggregate", "relationship": "customer_accounts", "parent_column": "account_count", "fn": "count"},
+    {"type": "aggregate", "relationship": "line_usage", "parent_column": "total_usage_mb", "child_column": "data_mb", "fn": "sum"},
+    {"type": "aggregate", "relationship": "line_usage", "parent_column": "usage_events", "fn": "count"}
+  ]
+}

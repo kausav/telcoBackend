@@ -1,0 +1,49 @@
+{
+  "name": "Retail banking: customers and accounts (many-to-many), branches and transactions",
+  "description": "An account has one or two holders and a customer can hold several accounts, so the link is many-to-many through account_holder. Each account sits in a branch and has transactions.",
+  "seed": 7,
+  "entities": [
+    {"name": "branch", "key": "branch_id", "count": 6, "columns": [
+      {"name": "branch_id", "gen": {"type": "id", "prefix": "BR", "digits": 3}},
+      {"name": "city", "gen": {"type": "choice", "values": ["Mumbai", "Pune", "Delhi", "Chennai", "Kolkata", "Bengaluru"]}},
+      {"name": "opened_on", "gen": {"type": "date", "start": "2005-01-01", "end": "2020-12-31"}}
+    ]},
+    {"name": "customer", "key": "customer_id", "count": 60, "columns": [
+      {"name": "customer_id", "gen": {"type": "id", "prefix": "CUS", "digits": 6}},
+      {"name": "segment", "gen": {"type": "choice", "weights": {"retail": 0.8, "premium": 0.15, "corporate": 0.05}}},
+      {"name": "joined_on", "gen": {"type": "date", "start": "2015-01-01", "end": "2024-12-31"}},
+      {"name": "kyc_status", "gen": {"type": "choice", "weights": {"verified": 0.9, "pending": 0.1}}}
+    ]},
+    {"name": "account", "key": "account_id", "count": 70, "columns": [
+      {"name": "account_id", "gen": {"type": "id", "prefix": "ACC", "digits": 8}},
+      {"name": "account_type", "gen": {"type": "choice", "weights": {"savings": 0.6, "current": 0.3, "fixed_deposit": 0.1}}},
+      {"name": "currency", "gen": {"type": "choice", "weights": {"INR": 0.9, "USD": 0.1}}},
+      {"name": "opened_on", "gen": {"type": "date", "start": "2016-01-01", "end": "2025-06-30"}},
+      {"name": "txn_count", "gen": {"type": "const", "value": 0}},
+      {"name": "total_txn_amount", "gen": {"type": "const", "value": 0}}
+    ]},
+    {"name": "account_holder", "key": "holder_id", "columns": [
+      {"name": "holder_id", "gen": {"type": "id", "prefix": "HLD", "digits": 7}},
+      {"name": "linked_on", "gen": {"type": "date", "start": "2016-01-01", "end": "2025-06-30"}}
+    ]},
+    {"name": "transaction", "key": "txn_id", "columns": [
+      {"name": "txn_id", "gen": {"type": "id", "prefix": "TXN", "digits": 9}},
+      {"name": "txn_date", "gen": {"type": "date", "start": "2016-01-01", "end": "2025-12-31"}},
+      {"name": "txn_type", "gen": {"type": "choice", "weights": {"credit": 0.45, "debit": 0.55}}},
+      {"name": "amount", "gen": {"type": "float", "min": 1, "max": 5000, "round": 2}},
+      {"name": "channel", "gen": {"type": "choice", "values": ["branch", "atm", "online", "mobile"]}}
+    ]}
+  ],
+  "relationships": [
+    {"name": "account_branch", "type": "many_to_one", "parent": "branch", "child": "account", "skew": 0.5},
+    {"name": "account_holders", "type": "many_to_many", "left": "customer", "right": "account", "through": "account_holder",
+     "left_fk": "customer_id", "right_fk": "account_id", "per_right": {"min": 1, "max": 2, "weights": {"1": 0.7, "2": 0.3}},
+     "cover_left": true},
+    {"name": "account_transactions", "type": "one_to_many", "parent": "account", "child": "transaction", "children": {"min": 0, "max": 8}}
+  ],
+  "constraints": [
+    {"type": "date_not_before_parent", "relationship": "account_transactions", "column": "txn_date", "parent_column": "opened_on", "max_days_after": 365},
+    {"type": "aggregate", "relationship": "account_transactions", "parent_column": "txn_count", "fn": "count"},
+    {"type": "aggregate", "relationship": "account_transactions", "parent_column": "total_txn_amount", "child_column": "amount", "fn": "sum"}
+  ]
+}
