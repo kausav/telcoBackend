@@ -1,0 +1,65 @@
+{
+  "name": "Retail sales: snowflake schema (one fact table, three levels of dimensions)",
+  "description": "A sale is the fact table. Each sale points at a store, a product and a customer. Those dimensions are normalised into sub-dimensions: store -> city -> region, product -> category -> department, customer -> segment. Every link is a many-to-one lookup, which is what makes the shape a snowflake.",
+  "seed": 11,
+  "entities": [
+    {"name": "region", "key": "region_id", "count": 4, "columns": [
+      {"name": "region_id", "gen": {"type": "id", "prefix": "REG", "digits": 2}},
+      {"name": "region_name", "gen": {"type": "choice", "values": ["North", "South", "East", "West"]}}
+    ]},
+    {"name": "city", "key": "city_id", "count": 12, "columns": [
+      {"name": "city_id", "gen": {"type": "id", "prefix": "CTY", "digits": 3}},
+      {"name": "city_name", "gen": {"type": "choice", "values": ["Mumbai", "Pune", "Delhi", "Chennai", "Kolkata", "Bengaluru", "Jaipur", "Lucknow"]}},
+      {"name": "tier", "gen": {"type": "choice", "weights": {"1": 0.4, "2": 0.4, "3": 0.2}}}
+    ]},
+    {"name": "store", "key": "store_id", "count": 25, "columns": [
+      {"name": "store_id", "gen": {"type": "id", "prefix": "STR", "digits": 3}},
+      {"name": "format", "gen": {"type": "choice", "weights": {"hypermarket": 0.2, "supermarket": 0.5, "express": 0.3}}},
+      {"name": "opened_on", "gen": {"type": "date", "start": "2010-01-01", "end": "2024-06-30"}}
+    ]},
+    {"name": "department", "key": "department_id", "count": 5, "columns": [
+      {"name": "department_id", "gen": {"type": "id", "prefix": "DEP", "digits": 2}},
+      {"name": "department_name", "gen": {"type": "choice", "values": ["Grocery", "Electronics", "Apparel", "Home", "Beauty"]}}
+    ]},
+    {"name": "category", "key": "category_id", "count": 15, "columns": [
+      {"name": "category_id", "gen": {"type": "id", "prefix": "CAT", "digits": 3}},
+      {"name": "category_name", "gen": {"type": "choice", "values": ["Snacks", "Beverages", "Phones", "Laptops", "Shirts", "Shoes", "Kitchen", "Decor", "Skincare"]}}
+    ]},
+    {"name": "product", "key": "product_id", "count": 80, "columns": [
+      {"name": "product_id", "gen": {"type": "id", "prefix": "PRD", "digits": 4}},
+      {"name": "list_price", "gen": {"type": "float", "min": 20, "max": 5000, "round": 2}},
+      {"name": "units_sold", "gen": {"type": "const", "value": 0}}
+    ]},
+    {"name": "customer_segment", "key": "segment_id", "count": 4, "columns": [
+      {"name": "segment_id", "gen": {"type": "id", "prefix": "SEG", "digits": 2}},
+      {"name": "segment_name", "gen": {"type": "choice", "values": ["Budget", "Regular", "Premium", "Corporate"]}}
+    ]},
+    {"name": "customer", "key": "customer_id", "count": 300, "columns": [
+      {"name": "customer_id", "gen": {"type": "id", "prefix": "CUS", "digits": 6}},
+      {"name": "joined_on", "gen": {"type": "date", "start": "2018-01-01", "end": "2024-12-31"}},
+      {"name": "orders_count", "gen": {"type": "const", "value": 0}}
+    ]},
+    {"name": "sale", "key": "sale_id", "count": 2000, "columns": [
+      {"name": "sale_id", "gen": {"type": "id", "prefix": "SAL", "digits": 7}},
+      {"name": "sold_on", "gen": {"type": "date", "start": "2024-01-01", "end": "2025-12-31"}},
+      {"name": "quantity", "gen": {"type": "int", "min": 1, "max": 10}},
+      {"name": "unit_price", "gen": {"type": "float", "min": 20, "max": 5000, "round": 2}},
+      {"name": "payment", "gen": {"type": "choice", "weights": {"upi": 0.5, "card": 0.35, "cash": 0.15}}}
+    ]}
+  ],
+  "relationships": [
+    {"name": "city_region", "type": "many_to_one", "parent": "region", "child": "city", "skew": 0.3},
+    {"name": "store_city", "type": "many_to_one", "parent": "city", "child": "store", "skew": 0.5},
+    {"name": "category_department", "type": "many_to_one", "parent": "department", "child": "category"},
+    {"name": "product_category", "type": "many_to_one", "parent": "category", "child": "product", "skew": 0.4},
+    {"name": "customer_segment_link", "type": "many_to_one", "parent": "customer_segment", "child": "customer", "fk": "segment_id"},
+    {"name": "sale_store", "type": "many_to_one", "parent": "store", "child": "sale", "skew": 0.6},
+    {"name": "sale_product", "type": "many_to_one", "parent": "product", "child": "sale", "skew": 0.8},
+    {"name": "sale_customer", "type": "many_to_one", "parent": "customer", "child": "sale", "skew": 0.5}
+  ],
+  "constraints": [
+    {"type": "date_not_before_parent", "relationship": "sale_store", "column": "sold_on", "parent_column": "opened_on", "max_days_after": 4000},
+    {"type": "aggregate", "relationship": "sale_product", "parent_column": "units_sold", "child_column": "quantity", "fn": "sum"},
+    {"type": "aggregate", "relationship": "sale_customer", "parent_column": "orders_count", "fn": "count"}
+  ]
+}

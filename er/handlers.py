@@ -46,7 +46,7 @@ def failure(status: int, errors: list[str], warnings: list[str] | None = None) -
     }
 
 
-SAMPLE_ORDER = ("telecom_family", "banking_holders")           # shown first, in this order; any other sample follows alphabetically
+SAMPLE_ORDER = ("telecom_family", "banking_holders", "retail_snowflake")         # shown first, in this order; any other sample follows alphabetically
 
 
 def _samples() -> dict[str, dict[str, Any]]:
