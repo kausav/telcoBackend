@@ -78,6 +78,7 @@ def _clean_dict(d: dict) -> dict:
         cleaned[k] = v
     return cleaned
 
+from core.path_prefix import StripPrefixMiddleware
 from core.ui_static import mount_ui, serve_index_if_browser
 from core.api_auth import api_token_middleware, log_startup as log_auth_startup, openapi_security
 from core.error_handlers import (
@@ -1145,3 +1146,7 @@ async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
 # Single-container deployment: serve the built web UI from this process when one is installed (UI_DIR, default /app/ui). Registered
 # last so no API route can be shadowed; a no-op when the folder is absent, as in local development and the API-only image.
 mount_ui(app)
+
+# Optional path prefix (URL_PREFIX=/source) for a shared load balancer that routes one path to this app. Added last so it is the
+# outermost wrapper and strips the prefix before any other middleware (including the token check) sees the request. No-op when unset.
+app.add_middleware(StripPrefixMiddleware)

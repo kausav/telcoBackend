@@ -6,6 +6,9 @@ the server behaves exactly as before, so local development and the API-only imag
 What is served (all of it public: the page has to load before it can send a token):
   * ``/``                  the UI when the caller asks for HTML (a browser); the JSON liveness answer otherwise
   * ``/assets/...``        the build's fingerprinted files, cached for a year
+  * ``/source``            the UI again, for deployments where a load balancer or a bookmark opens the app under that address;
+                           the list is ``UI_PAGE_PATHS`` (comma-separated, default ``/source``). A path that already belongs
+                           to an API route is never taken over.
   * ``/<file>``            each file at the top level of the folder (favicon, logo, ...), found once at start-up
   * ``/runtime-config.js`` settings for the page, read from the environment at request time, so they can differ per environment
                            without rebuilding the image: every ``VITE_*`` variable of the running service, e.g.
@@ -42,6 +45,18 @@ _SECURITY_HEADERS = {
 }
 
 _top_level: set[str] = set()      # "/favicon.svg" and so on, filled by mount_ui
+_pages: set[str] = set()          # extra addresses that show the UI ("/source"), filled by mount_ui
+
+
+def _page_paths() -> list[str]:
+    raw = os.getenv("UI_PAGE_PATHS")
+    items = ["/source"] if raw is None else [x.strip() for x in raw.split(",")]
+    paths = []
+    for item in items:
+        path = "/" + item.strip("/") if item.strip("/") else ""
+        if path and path not in paths:
+            paths.append(path)
+    return paths
 
 
 def available() -> bool:
@@ -50,9 +65,9 @@ def available() -> bool:
 
 def is_ui_path(path: str) -> bool:
     """True for the addresses that serve the page itself, which need no token. Always False when no UI is installed."""
-    if not _top_level and not available():
+    if not _top_level and not _pages and not available():
         return False
-    return path == CONFIG_PATH or path in _top_level or path.startswith(ASSETS_PREFIX + "/")
+    return path == CONFIG_PATH or path in _top_level or path in _pages or path.startswith(ASSETS_PREFIX + "/")
 
 
 def wants_html(request: Request) -> bool:
@@ -109,6 +124,14 @@ def mount_ui(app: FastAPI) -> bool:
             continue
         _top_level.add("/" + name)
         app.add_api_route("/" + name, _file_endpoint(entry), methods=["GET"], include_in_schema=False)
+
+    taken = {getattr(route, "path", None) for route in app.routes}
+    for path in _page_paths():
+        if path in taken or path == CONFIG_PATH or path.startswith(ASSETS_PREFIX + "/") or path == ASSETS_PREFIX:
+            logger.warning("UI_PAGE_PATHS: %s already belongs to another route, not serving the UI there", path)
+            continue
+        _pages.add(path)
+        app.add_api_route(path, lambda: index_response(), methods=["GET"], include_in_schema=False)
 
     if "VITE_API_TOKEN" not in runtime_settings():
         logger.warning("No VITE_API_TOKEN (or UI_API_TOKEN) is set: the page will not send a token, so it only works while API authentication is off")

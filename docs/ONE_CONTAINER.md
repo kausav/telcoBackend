@@ -19,6 +19,7 @@ The UI is a single page with no URL routes of its own, so the server needs no ca
 |---|---|
 | `UI_DIR` (or `STATIC_DIR`) | Folder with the built UI (`/app/ui` in `Dockerfile.combined`). |
 | `VITE_API_HOST`, `VITE_API_TOKEN`, `VITE_DEFAULT_COUNTRY`, `VITE_PLATFORM_URL` | Frontend settings, sent to the page. `VITE_API_HOST=same-origin` makes it call this server. `VITE_API_TOKEN` must be one of `API_STATIC_TOKENS`; unset, the page sends none and works only while authentication is off. |
+| `UI_PAGE_PATHS` | Extra addresses that also show the UI, comma-separated (default `/source`, for a load balancer or bookmark that opens the app there). A path that already belongs to an API route is never taken over. |
 | `UI_API_TOKEN` | Older name for `VITE_API_TOKEN`; still accepted. |
 
 ## Security note
@@ -26,6 +27,6 @@ The VITE_* values, including the token, are given to everyone who can load the p
 page. For real data, put an identity check (IAP, a load balancer, a VPN) in front of the whole service. The deploy commands that accompany this change explain the options.
 
 ## Checks
-`test_ui_static.py` (27 checks; delivered with the optional extras, run it from the backend folder; no database or network) drives the real token middleware with a throw-away UI folder: the page and its files
+`test_ui_static.py` (33 checks; delivered with the optional extras, run it from the backend folder; no database or network) drives the real token middleware with a throw-away UI folder: the page and its files
 load without a token, every API route still returns 401 without one, dot-files and path traversal are refused, and nothing becomes public
 when no UI is installed.
