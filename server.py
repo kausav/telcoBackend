@@ -78,6 +78,7 @@ def _clean_dict(d: dict) -> dict:
         cleaned[k] = v
     return cleaned
 
+from core.ui_static import mount_ui, serve_index_if_browser
 from core.api_auth import api_token_middleware, log_startup as log_auth_startup, openapi_security
 from core.error_handlers import (
     http_exception_handler,
@@ -304,8 +305,11 @@ class IndustrySourceResponse(BaseModel):
 
 
 @app.get("/")
-def root():
-    """Liveness check; ``version`` says which build is running."""
+def root(request: Request):
+    """Liveness check; ``version`` says which build is running. A browser gets the web UI instead when one is installed."""
+    page = serve_index_if_browser(request)
+    if page is not None:
+        return page
     return {"success": True, "status": "ok", "version": app.version}
 
 
@@ -1136,3 +1140,8 @@ async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
         raise HTTPException(400, detail={"error": str(exc)}) from exc
 
 
+
+
+# Single-container deployment: serve the built web UI from this process when one is installed (UI_DIR, default /app/ui). Registered
+# last so no API route can be shadowed; a no-op when the folder is absent, as in local development and the API-only image.
+mount_ui(app)

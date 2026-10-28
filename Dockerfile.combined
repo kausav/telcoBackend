@@ -1,0 +1,60 @@
+# One container for the whole product: the FastAPI backend also serves the built web UI (see core/ui_static.py).
+#
+# The UI source lives in a separate repository, so it is passed in as a named build context rather than copied in by hand:
+#
+#   docker buildx build --pull --build-context ui=../telcoFrontend -f Dockerfile.combined -t <image> .
+#
+# Run that from the backend folder (the main context). The UI folder is read through explicit COPY lines below, so a .env or
+# node_modules that happens to sit in it can never reach the image.
+
+# ---- 1. web UI build (Node is used here only and is not shipped) ----
+FROM node:22-alpine AS ui-build
+WORKDIR /ui
+COPY --from=ui package.json package-lock.json ./
+RUN npm ci
+COPY --from=ui index.html tsconfig.json vite.config.ts ./
+COPY --from=ui src ./src
+COPY --from=ui public ./public
+# The page and the API share one address, so the UI sends its requests to the page's own origin. Nothing secret is compiled in;
+# the API token and any other VITE_* setting reach the page at run time through /runtime-config.js (set them on the service).
+ENV VITE_API_HOST=same-origin
+RUN npm run build
+
+# ---- 2. Python dependencies (compilers exist only in this stage) ----
+FROM cgr.dev/chainguard/wolfi-base:latest AS deps
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN apk add --no-cache python-3.13 py3.13-pip build-base
+WORKDIR /app
+COPY requirements.txt .
+RUN python3.13 -m pip install --target=/app/deps -r requirements.txt
+
+# ---- 3. runtime: python only, no compilers, no Node, no nginx ----
+FROM cgr.dev/chainguard/wolfi-base:latest
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/deps \
+    UI_DIR=/app/ui
+
+RUN apk add --no-cache python-3.13
+
+WORKDIR /app
+COPY --from=deps /app/deps /app/deps
+COPY --chown=65532:65532 . .
+COPY --from=ui-build --chown=65532:65532 /ui/dist /app/ui
+
+# Stop the build if an environment file got into the image. Secrets are supplied at run time (Cloud Run secrets), never baked in.
+RUN for f in /app/.env /app/.env.*; do \
+      if [ -e "$f" ] && [ "${f##*/}" != ".env.example" ]; then echo "Refusing to build: $f would put secrets in the image" >&2; exit 1; fi; \
+    done \
+ && test -f /app/ui/index.html
+
+# The app creates /app/runtime_data at start-up, so the non-root user must be able to write there.
+RUN mkdir -p /app/runtime_data && chown 65532:65532 /app /app/runtime_data
+
+USER 65532:65532
+# Cloud Run injects PORT (8080); locally it falls back to 8000.
+EXPOSE 8080
+
+CMD ["/bin/sh", "-c", "exec python3.13 -m uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}"]

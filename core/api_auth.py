@@ -2,7 +2,7 @@
 
 Callers send the token as ``Authorization: Bearer <token>`` or ``X-API-Key: <token>``. Tokens come from the environment
 (``API_STATIC_TOKENS``, comma-separated for rotation); with none configured every protected request is refused, and ``off`` switches authentication off. Probes (``/health``, ``/ready``)
-and CORS preflight requests never need a token. A token is never logged and is compared in constant time.
+and CORS preflight requests never need a token, nor do the web UI's own files when the server also serves the UI (core/ui_static.py). A token is never logged and is compared in constant time.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from config.runtime import API_AUTH_DISABLED, API_AUTH_PROTECT_DOCS, API_AUTH_PUBLIC_PATHS, API_STATIC_TOKENS
 from core.error_handlers import _json_response
 from core.errors import ErrorCode
+from core.ui_static import is_ui_path
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ def needs_token(request: Request) -> bool:
     if not enabled() or request.method == "OPTIONS":
         return False
     path = request.url.path.rstrip("/") or "/"
-    if path in API_AUTH_PUBLIC_PATHS:
+    if path in API_AUTH_PUBLIC_PATHS or is_ui_path(path):      # is_ui_path: the page and its files (only when a UI is installed)
         return False
     if path in DOC_PATHS and not API_AUTH_PROTECT_DOCS:
         return False
