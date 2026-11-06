@@ -81,6 +81,10 @@ def _require_generation_source(
     source_policy = str(scenario_context.get("source_policy") or "").strip()
     agentic = bool(scenario_context.get("agentic"))
 
+    # A scenario defined by the person's own CSV: the approved variables are the contract, whatever the industry/domain has registered.
+    if source_policy == "csv_import":
+        return
+
     # Agentic JSON-grounded schemas are already source-bounded and persisted as confirmed
     # executable fields. Verify provenance labels only; do not require the current registry to
     # contain the same source_id. This prevents confirmed scenarios from breaking after an

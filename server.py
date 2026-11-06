@@ -41,7 +41,7 @@ from core.runtime_cache import clear_scenario
 from core.agentic_models import CsvImportResponse, ScenarioImportResponse, ScenarioProposeRequest
 from core.csv_scenario import infer_type_of_data, parse_definition_csv
 from config.country_metadata import COUNTRY_BASE
-from config.runtime import CORS_ALLOW_ORIGINS, MAX_CSV_BYTES, INDUSTRY_SOURCE_MAX_JSON_BYTES
+from config.runtime import CORS_ALLOW_ORIGINS, CSV_IMPORT_ALLOW_SOURCE_BACKED, MAX_CSV_BYTES, INDUSTRY_SOURCE_MAX_JSON_BYTES
 from core.agentic_workflow import AgenticSchemaWorkflow, get_agentic_workflow
 from core.json_domain_policy import is_json_grounded_domain
 from core.scenario_variable_store import upsert_recommended, get_recommended, set_user_variables, get_user_variables, get_user_variable_records, delete_user_variable
@@ -782,10 +782,11 @@ def import_scenario_csv(
 
     This path remains intentionally separate from /scenario/propose so clients can
     choose between an explicit CSV schema definition and agentic schema proposal.
-    A domain backed by registered source documents is source-locked, so CSV cannot become a
-    second variable source for it.
+    A CSV is accepted for a domain backed by registered source documents too (CSV_IMPORT_ALLOW_SOURCE_BACKED in
+    config/constants.py): the uploaded variables are the schema the person approves, and the scenario is marked
+    source_policy "csv_import" so generation does not hold them to the industry source boundary.
     """
-    if is_json_grounded_domain(domain, industryType):
+    if not CSV_IMPORT_ALLOW_SOURCE_BACKED and is_json_grounded_domain(domain, industryType):
         raise HTTPException(status_code=400, detail={
             "error": "This JSON-source-backed industry/domain cannot be defined through CSV. "
                      "Use the active MongoDB industry source documents."})
@@ -848,6 +849,7 @@ def import_scenario_csv(
         "records_per_user": 10,
         "agentic": False,
         "source": "csv_import",
+        "source_policy": "csv_import",
     }
     # A CSV definition is as much a source of truth as an industry document: the model designs how its columns behave
     # together for this scenario (verified against the CSV's own allowed values, ranges and patterns), once, here.

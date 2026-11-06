@@ -43,6 +43,9 @@ API_AUTH_PUBLIC_PATHS = ("/", "/health", "/ready")                       # never
 API_AUTH_PROTECT_DOCS = False                                            # True: the interactive docs need the token as well
 RUNTIME_DATA_DIR = "runtime_data"                                        # relative to the project root, or absolute
 MAX_CSV_BYTES = 10 * 1024 * 1024
+# True: a CSV schema upload is accepted for every industry/domain, including those that have registered MongoDB source documents
+# (the uploaded variables are then the approved schema). False: refuse CSV for source-backed domains, as before.
+CSV_IMPORT_ALLOW_SOURCE_BACKED = True
 INDUSTRY_SOURCE_MAX_JSON_BYTES = 8 * 1024 * 1024
 SEED_REFERENCE_DATA = True                                               # insert the bundled catalog / lexicon rows MongoDB lacks
 DOMAIN_LEXICON_CACHE_SECONDS = 60
