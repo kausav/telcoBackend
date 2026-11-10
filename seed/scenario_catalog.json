@@ -280,6 +280,930 @@
         }
       ],
       "description": "BIAN, FIBO and ISO 20022 banking data models"
+    },
+    {
+      "id": "trust-safety",
+      "name": "Trust & Safety",
+      "description": "Content-moderation policy rulebooks: rules, decisions, escalations and enforcement",
+      "subDomains": [
+        {
+          "name": "Spam & Deceptive Practices",
+          "description": "Fake engagement, impersonation, misleading metadata, external links, scams and re-uploads of removed content",
+          "useCases": [
+            {
+              "name": "Fake Engagement",
+              "proposeValue": "Fake Engagement",
+              "description": "Moderation cases for the Fake Engagement policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Fake Engagement",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-FE-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Fake Engagement policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (12 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 12 Fake Engagement rules."
+                    },
+                    {
+                      "scenarioId": "TS-FE-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Fake Engagement policy, drawn from only the rules whose outcome is a violation or an escalation (7 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 7 Fake Engagement rules."
+                    },
+                    {
+                      "scenarioId": "TS-FE-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Fake Engagement policy, drawn from only the rules whose outcome is that the content is allowed (5 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 5 Fake Engagement rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Impersonation",
+              "proposeValue": "Impersonation",
+              "description": "Moderation cases for the Impersonation policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Impersonation",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-IMP-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Impersonation policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (17 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 17 Impersonation rules."
+                    },
+                    {
+                      "scenarioId": "TS-IMP-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Impersonation policy, drawn from only the rules whose outcome is a violation or an escalation (9 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 9 Impersonation rules."
+                    },
+                    {
+                      "scenarioId": "TS-IMP-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Impersonation policy, drawn from only the rules whose outcome is that the content is allowed (8 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 8 Impersonation rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Misleading Metadata",
+              "proposeValue": "Misleading Metadata",
+              "description": "Moderation cases for the Misleading Metadata policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Misleading Metadata",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-MM-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Misleading Metadata policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (16 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 16 Misleading Metadata rules."
+                    },
+                    {
+                      "scenarioId": "TS-MM-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Misleading Metadata policy, drawn from only the rules whose outcome is a violation or an escalation (8 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 8 Misleading Metadata rules."
+                    },
+                    {
+                      "scenarioId": "TS-MM-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Misleading Metadata policy, drawn from only the rules whose outcome is that the content is allowed (8 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 8 Misleading Metadata rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "External Links Policy",
+              "proposeValue": "External Links Policy",
+              "description": "Moderation cases for the External Links Policy policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "External Links Policy",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-EL-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the External Links Policy policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (56 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 56 External Links Policy rules."
+                    },
+                    {
+                      "scenarioId": "TS-EL-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the External Links Policy policy, drawn from only the rules whose outcome is a violation or an escalation (39 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 39 External Links Policy rules."
+                    },
+                    {
+                      "scenarioId": "TS-EL-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the External Links Policy policy, drawn from only the rules whose outcome is that the content is allowed (17 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 17 External Links Policy rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Scams & Financially Deceptive Content",
+              "proposeValue": "Scams & Financially Deceptive Content",
+              "description": "Moderation cases for the Scams & Financially Deceptive Content policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Scams & Financially Deceptive Content",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-SCAM-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Scams & Financially Deceptive Content policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (72 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 72 Scams & Financially Deceptive Content rules."
+                    },
+                    {
+                      "scenarioId": "TS-SCAM-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Scams & Financially Deceptive Content policy, drawn from only the rules whose outcome is a violation or an escalation (40 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 40 Scams & Financially Deceptive Content rules."
+                    },
+                    {
+                      "scenarioId": "TS-SCAM-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Scams & Financially Deceptive Content policy, drawn from only the rules whose outcome is that the content is allowed (32 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 32 Scams & Financially Deceptive Content rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Previously Removed Content",
+              "proposeValue": "Previously Removed Content",
+              "description": "Moderation cases for the Previously Removed Content policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Previously Removed Content",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-PRC-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Previously Removed Content policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (29 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 29 Previously Removed Content rules."
+                    },
+                    {
+                      "scenarioId": "TS-PRC-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Previously Removed Content policy, drawn from only the rules whose outcome is a violation or an escalation (20 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 20 Previously Removed Content rules."
+                    },
+                    {
+                      "scenarioId": "TS-PRC-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Previously Removed Content policy, drawn from only the rules whose outcome is that the content is allowed (9 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 9 Previously Removed Content rules."
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Child Safety",
+          "description": "Absolute prohibitions, age-restricted and educational context, and family content involving minors",
+          "useCases": [
+            {
+              "name": "Child Safety",
+              "proposeValue": "Child Safety",
+              "description": "Moderation cases for the Child Safety policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Child Safety",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-CS-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Child Safety policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (100 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 100 Child Safety rules."
+                    },
+                    {
+                      "scenarioId": "TS-CS-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Child Safety policy, drawn from only the rules whose outcome is a violation or an escalation (80 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 80 Child Safety rules."
+                    },
+                    {
+                      "scenarioId": "TS-CS-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Child Safety policy, drawn from only the rules whose outcome is that the content is allowed (20 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 20 Child Safety rules."
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Sensitive Content",
+          "description": "Nudity and sexual content, self-harm and suicide, and eating disorders",
+          "useCases": [
+            {
+              "name": "Nudity & Sexual Content",
+              "proposeValue": "Nudity & Sexual Content",
+              "description": "Moderation cases for the Nudity & Sexual Content policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Nudity & Sexual Content",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-NSC-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Nudity & Sexual Content policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (18 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 18 Nudity & Sexual Content rules."
+                    },
+                    {
+                      "scenarioId": "TS-NSC-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Nudity & Sexual Content policy, drawn from only the rules whose outcome is a violation or an escalation (11 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 11 Nudity & Sexual Content rules."
+                    },
+                    {
+                      "scenarioId": "TS-NSC-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Nudity & Sexual Content policy, drawn from only the rules whose outcome is that the content is allowed (7 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 7 Nudity & Sexual Content rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Self-Harm & Suicide",
+              "proposeValue": "Self-Harm & Suicide",
+              "description": "Moderation cases for the Self-Harm & Suicide policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Self-Harm & Suicide",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-SHS-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Self-Harm & Suicide policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (10 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 10 Self-Harm & Suicide rules."
+                    },
+                    {
+                      "scenarioId": "TS-SHS-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Self-Harm & Suicide policy, drawn from only the rules whose outcome is a violation or an escalation (7 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 7 Self-Harm & Suicide rules."
+                    },
+                    {
+                      "scenarioId": "TS-SHS-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Self-Harm & Suicide policy, drawn from only the rules whose outcome is that the content is allowed (3 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 3 Self-Harm & Suicide rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Eating Disorders",
+              "proposeValue": "Eating Disorders",
+              "description": "Moderation cases for the Eating Disorders policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Eating Disorders",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-ED-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Eating Disorders policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (20 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 20 Eating Disorders rules."
+                    },
+                    {
+                      "scenarioId": "TS-ED-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Eating Disorders policy, drawn from only the rules whose outcome is a violation or an escalation (13 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 13 Eating Disorders rules."
+                    },
+                    {
+                      "scenarioId": "TS-ED-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Eating Disorders policy, drawn from only the rules whose outcome is that the content is allowed (7 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 7 Eating Disorders rules."
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Violent & Hateful Content",
+          "description": "Violent extremism, hate speech, harassment, dangerous content and violent criminal organisations",
+          "useCases": [
+            {
+              "name": "Violent Extremism & Terrorism",
+              "proposeValue": "Violent Extremism & Terrorism",
+              "description": "Moderation cases for the Violent Extremism & Terrorism policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Violent Extremism & Terrorism",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-VET-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Violent Extremism & Terrorism policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (26 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 26 Violent Extremism & Terrorism rules."
+                    },
+                    {
+                      "scenarioId": "TS-VET-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Violent Extremism & Terrorism policy, drawn from only the rules whose outcome is a violation or an escalation (23 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 23 Violent Extremism & Terrorism rules."
+                    },
+                    {
+                      "scenarioId": "TS-VET-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Violent Extremism & Terrorism policy, drawn from only the rules whose outcome is that the content is allowed (3 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 3 Violent Extremism & Terrorism rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Hate Speech",
+              "proposeValue": "Hate Speech",
+              "description": "Moderation cases for the Hate Speech policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Hate Speech",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-HS-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Hate Speech policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (1016 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 1016 Hate Speech rules."
+                    },
+                    {
+                      "scenarioId": "TS-HS-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Hate Speech policy, drawn from only the rules whose outcome is a violation or an escalation (680 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 680 Hate Speech rules."
+                    },
+                    {
+                      "scenarioId": "TS-HS-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Hate Speech policy, drawn from only the rules whose outcome is that the content is allowed (336 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 336 Hate Speech rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Harassment & Cyberbullying",
+              "proposeValue": "Harassment & Cyberbullying",
+              "description": "Moderation cases for the Harassment & Cyberbullying policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Harassment & Cyberbullying",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-HR-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Harassment & Cyberbullying policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (23 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 23 Harassment & Cyberbullying rules."
+                    },
+                    {
+                      "scenarioId": "TS-HR-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Harassment & Cyberbullying policy, drawn from only the rules whose outcome is a violation or an escalation (16 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 16 Harassment & Cyberbullying rules."
+                    },
+                    {
+                      "scenarioId": "TS-HR-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Harassment & Cyberbullying policy, drawn from only the rules whose outcome is that the content is allowed (7 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 7 Harassment & Cyberbullying rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Harmful or Dangerous Content",
+              "proposeValue": "Harmful or Dangerous Content",
+              "description": "Moderation cases for the Harmful or Dangerous Content policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Harmful or Dangerous Content",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-HDC-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Harmful or Dangerous Content policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (27 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 27 Harmful or Dangerous Content rules."
+                    },
+                    {
+                      "scenarioId": "TS-HDC-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Harmful or Dangerous Content policy, drawn from only the rules whose outcome is a violation or an escalation (18 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 18 Harmful or Dangerous Content rules."
+                    },
+                    {
+                      "scenarioId": "TS-HDC-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Harmful or Dangerous Content policy, drawn from only the rules whose outcome is that the content is allowed (9 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 9 Harmful or Dangerous Content rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Violent Criminal Organizations",
+              "proposeValue": "Violent Criminal Organizations",
+              "description": "Moderation cases for the Violent Criminal Organizations policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Violent Criminal Organizations",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-VCO-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Violent Criminal Organizations policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (42 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 42 Violent Criminal Organizations rules."
+                    },
+                    {
+                      "scenarioId": "TS-VCO-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Violent Criminal Organizations policy, drawn from only the rules whose outcome is a violation or an escalation (39 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 39 Violent Criminal Organizations rules."
+                    },
+                    {
+                      "scenarioId": "TS-VCO-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Violent Criminal Organizations policy, drawn from only the rules whose outcome is that the content is allowed (3 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 3 Violent Criminal Organizations rules."
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Misinformation",
+          "description": "Medical and health, electoral and civic, and conspiracy-theory misinformation",
+          "useCases": [
+            {
+              "name": "Medical & Health Misinformation",
+              "proposeValue": "Medical & Health Misinformation",
+              "description": "Moderation cases for the Medical & Health Misinformation policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Medical & Health Misinformation",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-MED-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Medical & Health Misinformation policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (150 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 150 Medical & Health Misinformation rules."
+                    },
+                    {
+                      "scenarioId": "TS-MED-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Medical & Health Misinformation policy, drawn from only the rules whose outcome is a violation or an escalation (67 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 67 Medical & Health Misinformation rules."
+                    },
+                    {
+                      "scenarioId": "TS-MED-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Medical & Health Misinformation policy, drawn from only the rules whose outcome is that the content is allowed (83 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 83 Medical & Health Misinformation rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Electoral & Civic Misinformation",
+              "proposeValue": "Electoral & Civic Misinformation",
+              "description": "Moderation cases for the Electoral & Civic Misinformation policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Electoral & Civic Misinformation",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-ELEC-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Electoral & Civic Misinformation policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (101 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 101 Electoral & Civic Misinformation rules."
+                    },
+                    {
+                      "scenarioId": "TS-ELEC-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Electoral & Civic Misinformation policy, drawn from only the rules whose outcome is a violation or an escalation (54 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 54 Electoral & Civic Misinformation rules."
+                    },
+                    {
+                      "scenarioId": "TS-ELEC-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Electoral & Civic Misinformation policy, drawn from only the rules whose outcome is that the content is allowed (47 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 47 Electoral & Civic Misinformation rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Conspiracy Theories",
+              "proposeValue": "Conspiracy Theories",
+              "description": "Moderation cases for the Conspiracy Theories policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Conspiracy Theories",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-CON-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Conspiracy Theories policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (59 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 59 Conspiracy Theories rules."
+                    },
+                    {
+                      "scenarioId": "TS-CON-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Conspiracy Theories policy, drawn from only the rules whose outcome is a violation or an escalation (31 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 31 Conspiracy Theories rules."
+                    },
+                    {
+                      "scenarioId": "TS-CON-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Conspiracy Theories policy, drawn from only the rules whose outcome is that the content is allowed (28 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 28 Conspiracy Theories rules."
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Regulated Goods & Services",
+          "description": "Firearms, drugs, alcohol and tobacco, gambling and counterfeit goods",
+          "useCases": [
+            {
+              "name": "Firearms & Weapons",
+              "proposeValue": "Firearms & Weapons",
+              "description": "Moderation cases for the Firearms & Weapons policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Firearms & Weapons",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-FW-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Firearms & Weapons policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (24 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 24 Firearms & Weapons rules."
+                    },
+                    {
+                      "scenarioId": "TS-FW-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Firearms & Weapons policy, drawn from only the rules whose outcome is a violation or an escalation (13 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 13 Firearms & Weapons rules."
+                    },
+                    {
+                      "scenarioId": "TS-FW-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Firearms & Weapons policy, drawn from only the rules whose outcome is that the content is allowed (11 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 11 Firearms & Weapons rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Drugs & Controlled Substances",
+              "proposeValue": "Drugs & Controlled Substances",
+              "description": "Moderation cases for the Drugs & Controlled Substances policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Drugs & Controlled Substances",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-DRUG-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Drugs & Controlled Substances policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (10 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 10 Drugs & Controlled Substances rules."
+                    },
+                    {
+                      "scenarioId": "TS-DRUG-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Drugs & Controlled Substances policy, drawn from only the rules whose outcome is a violation or an escalation (7 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 7 Drugs & Controlled Substances rules."
+                    },
+                    {
+                      "scenarioId": "TS-DRUG-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Drugs & Controlled Substances policy, drawn from only the rules whose outcome is that the content is allowed (3 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 3 Drugs & Controlled Substances rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Alcohol & Tobacco",
+              "proposeValue": "Alcohol & Tobacco",
+              "description": "Moderation cases for the Alcohol & Tobacco policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Alcohol & Tobacco",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-AT-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Alcohol & Tobacco policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (12 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 12 Alcohol & Tobacco rules."
+                    },
+                    {
+                      "scenarioId": "TS-AT-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Alcohol & Tobacco policy, drawn from only the rules whose outcome is a violation or an escalation (10 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 10 Alcohol & Tobacco rules."
+                    },
+                    {
+                      "scenarioId": "TS-AT-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Alcohol & Tobacco policy, drawn from only the rules whose outcome is that the content is allowed (2 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 2 Alcohol & Tobacco rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Gambling",
+              "proposeValue": "Gambling",
+              "description": "Moderation cases for the Gambling policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Gambling",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-GAM-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Gambling policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (20 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 20 Gambling rules."
+                    },
+                    {
+                      "scenarioId": "TS-GAM-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Gambling policy, drawn from only the rules whose outcome is a violation or an escalation (15 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 15 Gambling rules."
+                    },
+                    {
+                      "scenarioId": "TS-GAM-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Gambling policy, drawn from only the rules whose outcome is that the content is allowed (5 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 5 Gambling rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Counterfeit & Fraudulent Goods",
+              "proposeValue": "Counterfeit & Fraudulent Goods",
+              "description": "Moderation cases for the Counterfeit & Fraudulent Goods policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Counterfeit & Fraudulent Goods",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-CFG-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Counterfeit & Fraudulent Goods policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (17 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 17 Counterfeit & Fraudulent Goods rules."
+                    },
+                    {
+                      "scenarioId": "TS-CFG-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Counterfeit & Fraudulent Goods policy, drawn from only the rules whose outcome is a violation or an escalation (12 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 12 Counterfeit & Fraudulent Goods rules."
+                    },
+                    {
+                      "scenarioId": "TS-CFG-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Counterfeit & Fraudulent Goods policy, drawn from only the rules whose outcome is that the content is allowed (5 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 5 Counterfeit & Fraudulent Goods rules."
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Privacy & Intellectual Property",
+          "description": "Doxxing and copyright",
+          "useCases": [
+            {
+              "name": "Doxxing",
+              "proposeValue": "Doxxing",
+              "description": "Moderation cases for the Doxxing policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Doxxing",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-DOX-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Doxxing policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (35 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 35 Doxxing rules."
+                    },
+                    {
+                      "scenarioId": "TS-DOX-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Doxxing policy, drawn from only the rules whose outcome is a violation or an escalation (23 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 23 Doxxing rules."
+                    },
+                    {
+                      "scenarioId": "TS-DOX-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Doxxing policy, drawn from only the rules whose outcome is that the content is allowed (12 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 12 Doxxing rules."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Copyright & Intellectual Property",
+              "proposeValue": "Copyright & Intellectual Property",
+              "description": "Moderation cases for the Copyright & Intellectual Property policy, generated from the rulebook.",
+              "journeys": [
+                {
+                  "name": "Moderation cases",
+                  "dataTypes": [
+                    "aggregational"
+                  ],
+                  "industryType": "Trust & Safety",
+                  "domain": "Copyright & Intellectual Property",
+                  "scenarios": [
+                    {
+                      "scenarioId": "TS-IP-MIX",
+                      "scenarioType": "Balanced mix",
+                      "businessScenario": "Generate moderation cases for the Copyright & Intellectual Property policy, drawn from every rule of the policy, so violations, permitted content and exceptions all appear (6 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Balanced mix: 6 Copyright & Intellectual Property rules."
+                    },
+                    {
+                      "scenarioId": "TS-IP-VIOL",
+                      "scenarioType": "Violations only",
+                      "businessScenario": "Generate moderation cases for the Copyright & Intellectual Property policy, drawn from only the rules whose outcome is a violation or an escalation (4 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Violations only: 4 Copyright & Intellectual Property rules."
+                    },
+                    {
+                      "scenarioId": "TS-IP-ALLOW",
+                      "scenarioType": "Permitted content and exceptions",
+                      "businessScenario": "Generate moderation cases for the Copyright & Intellectual Property policy, drawn from only the rules whose outcome is that the content is allowed (2 rules). Each case pairs a rule with a synthetic post and ticket and the outcome the rulebook gives it: decision, escalation and enforcement action.\n\nBusiness response: Give reviewers, QA and classifier teams a realistic, rulebook-consistent set of cases to train on, calibrate against and test.\n\nExpected outcome: A labelled set of moderation cases whose decisions can be traced to a rule and section of the policy.",
+                      "description": "Permitted content and exceptions: 2 Copyright & Intellectual Property rules."
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
     }
   ]
 }

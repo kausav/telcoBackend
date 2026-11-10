@@ -24,6 +24,7 @@ from core.pipeline import run_pipeline
 from core.state import WorkflowState
 from core.industry_source_store import list_source_documents
 from core.scenario_variable_store import get_recommended
+from core import trust_safety
 
 logger = logging.getLogger(__name__)
 
@@ -239,8 +240,10 @@ def generation_status(requested_scenario_id: str) -> dict[str, Any]:
     if not scenario_exists(requested_scenario_id):
         raise ValueError(f"Unknown requested_scenario_id '{requested_scenario_id}'")
     context = resolve_scenario_context(requested_scenario_id)
-    variables, _ = resolve_variables(requested_scenario_id) or ([], [])
     out: dict[str, Any] = {"success": True, "requestedScenarioId": requested_scenario_id}
+    if context.get("source_policy") == trust_safety.SOURCE_POLICY:
+        return {**out, "status": "ready", "specKey": None, "reviewed": True, "revision": 0}      # the rulebook is the design: nothing to wait for
+    variables, _ = resolve_variables(requested_scenario_id) or ([], [])
     try:
         resolution = resolve_spec(context, variables, wait_seconds=0)
     except SpecNotReady as exc:
@@ -250,6 +253,25 @@ def generation_status(requested_scenario_id: str) -> dict[str, Any]:
         return {**out, "status": "unavailable", "specKey": resolution.key, "problems": report.get("problems") or []}
     return {**out, "status": "ready", "specKey": resolution.key, "reviewed": bool(getattr(resolution.spec, "reviewed", False)),
             "revision": getattr(resolution.spec, "revision", 0)}
+
+
+def _build_trust_safety_response(requested_scenario_id: str, draft_id: str | None, scenario_context: dict[str, Any], *, count: int,
+                                 seed: int | None, as_of: Any, include_text: bool) -> dict[str, Any]:
+    """Trust & Safety: moderation cases from the rulebook (see core/trust_safety.py). The rulebook is the source boundary, so the
+    industry-source and generation-spec steps do not apply. The confirmed columns decide which columns come back."""
+    _variables, field_order = resolve_variables(requested_scenario_id) or ([], [])
+    out = trust_safety.generate_cases(scenario_context, count=count, seed=seed, as_of=as_of, include_text=include_text,
+                                      columns=list(field_order) or None)
+    meta = resolve_scenario_meta(requested_scenario_id) or {}
+    total = len(out["records"])
+    return {
+        "success": True,
+        "scenario_id": str(meta.get("requested_scenario_id") or requested_scenario_id),
+        "requested_scenario_id": str(meta.get("requested_scenario_id") or requested_scenario_id),
+        "typeOfData": "aggregational", "entityKey": None, "totalCount": total, "recordsPerUser": 1, "draft_id": draft_id,
+        "scenario_label": meta.get("label", requested_scenario_id), "fields": out["fields"], "total_records": total,
+        "validation_report": out["report"], "records": out["records"], "errors": [], "record_errors": [],
+    }
 
 
 def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
@@ -275,6 +297,9 @@ def build_generation_response(req_payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Unknown requested_scenario_id '{requested_scenario_id}'")
 
     scenario_context = resolve_scenario_context(requested_scenario_id)
+    if scenario_context.get("source_policy") == trust_safety.SOURCE_POLICY:
+        return _build_trust_safety_response(requested_scenario_id, draft_id, scenario_context, count=count, seed=seed, as_of=as_of,
+                                            include_text=bool(req_payload.get("includePostText", True)))
     _require_generation_source(requested_scenario_id, scenario_context)
     with generation_seed(seed):
         spec_state, spec_generated, spec_report = _generate_from_spec(

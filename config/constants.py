@@ -47,6 +47,11 @@ MAX_CSV_BYTES = 10 * 1024 * 1024
 # (the uploaded variables are then the approved schema). False: refuse CSV for source-backed domains, as before.
 CSV_IMPORT_ALLOW_SOURCE_BACKED = True
 INDUSTRY_SOURCE_MAX_JSON_BYTES = 8 * 1024 * 1024
+# Trust & Safety: synthetic post text is written by Gemini in batches. One run writes text for at most this many cases (the request
+# stays synchronous); a larger run must switch the text off. The decision columns have no such limit.
+TRUST_SAFETY_TEXT_MAX_CASES = 300
+TRUST_SAFETY_TEXT_BATCH = 12                    # cases written per Gemini request
+TRUST_SAFETY_TEXT_WORKERS = 4                   # Gemini requests in flight at once
 SEED_REFERENCE_DATA = True                                               # insert the bundled catalog / lexicon rows MongoDB lacks
 DOMAIN_LEXICON_CACHE_SECONDS = 60
 COUNTRY_LIMITS_CACHE_SECONDS = 60                                        # how long a country's rail limits are kept before MongoDB is read again

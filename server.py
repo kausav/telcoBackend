@@ -41,6 +41,7 @@ from core.runtime_cache import clear_scenario
 from core.agentic_models import CsvImportResponse, ScenarioImportResponse, ScenarioProposeRequest
 from core.csv_scenario import infer_type_of_data, parse_definition_csv
 from config.country_metadata import COUNTRY_BASE
+from core import trust_safety
 from config.runtime import CORS_ALLOW_ORIGINS, CSV_IMPORT_ALLOW_SOURCE_BACKED, MAX_CSV_BYTES, INDUSTRY_SOURCE_MAX_JSON_BYTES
 from core.agentic_workflow import AgenticSchemaWorkflow, get_agentic_workflow
 from core.json_domain_policy import is_json_grounded_domain
@@ -216,6 +217,7 @@ class GenerateRequest(BaseModel):
     recordsPerUser: int = Field(10, ge=1, le=10, description="Number of most-recent historical records returned per user for a transactional scenario")
     seed: int | None = Field(None, ge=0, le=2_147_483_647, description="Optional deterministic generation seed for reproducible synthetic-data runs")
     as_of: str | None = Field(None, alias="asOf", max_length=40, description="Optional ISO-8601 reference time (\"now\") for generation; with a seed it makes a run exactly reproducible")
+    includePostText: bool = Field(True, description="Trust & Safety scenarios only: also write a synthetic post for each case (needs Gemini; limited to a few hundred cases per run). False returns the decision columns only. Ignored by every other industry.")
 
 
 class GenerateResponse(BaseModel):
@@ -967,7 +969,10 @@ def confirm_scenario_route(req: ConfirmRequest):
     # Pin the verified generation spec for exactly these variables: the proposal's own spec when nothing changed, that
     # spec narrowed when columns were removed, a fresh design when columns were added. If none can be designed the
     # scenario is still confirmed and generation says so in its report.
-    spec_report = _prepare_generation_spec(variables, meta, hint_key=draft.get("generation_spec_key"))
+    if meta["source_policy"] == trust_safety.SOURCE_POLICY:
+        spec_report = {"status": "not_applicable", "spec_key": None, "note": "Trust & Safety cases are generated from the rulebook, not from a designed spec."}
+    else:
+        spec_report = _prepare_generation_spec(variables, meta, hint_key=draft.get("generation_spec_key"))
     meta["generation_spec_key"] = spec_report.get("spec_key")
     try:
         scenario_id, scenario_id_reassigned = confirm_scenario(
@@ -1006,6 +1011,9 @@ async def propose_scenario(req: ScenarioProposeRequest):
     """
     started = perf_counter()
     try:
+        if trust_safety.is_trust_safety_industry(req.industry_type):
+            # The rulebook, not a model, defines these columns: no Gemini call, no industry source documents needed.
+            return await run_in_threadpool(trust_safety.build_draft, req)
         result = await run_in_threadpool(get_agentic_workflow().propose, req)
         logger.info("[Latency] /scenario/propose scenario=%s elapsed_ms=%.1f", req.requested_scenario_id, (perf_counter() - started) * 1000.0)
         return result
@@ -1116,6 +1124,7 @@ async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
             "recordsPerUser": req.recordsPerUser,
             "seed": req.seed,
             "asOf": req.as_of,
+            "includePostText": req.includePostText,
         })
         # build_generation_response performs the domain-level generation and QA checks.
         # Returning the plain payload lets FastAPI apply the declared GenerateResponse contract
