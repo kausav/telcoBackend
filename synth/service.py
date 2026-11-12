@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.observability import propagate_context
+
 from synth import store
 from synth.clock import RunContext
 from synth.compiler import CompileResult, SpecCompiler, finalize, finding_text, restrict, spec_key, verify
@@ -327,7 +329,7 @@ def _schedule_refinement(variables: list[dict[str, Any]], brief: dict[str, Any],
     if inline or mode == "inline":
         _refine_job(variables, brief, key, spec, compiler)
         return
-    threading.Thread(target=_refine_job, args=(list(variables), dict(brief), key, spec, compiler), name=f"refine-{key[:8]}", daemon=True).start()
+    threading.Thread(target=propagate_context(_refine_job), args=(list(variables), dict(brief), key, spec, compiler), name=f"refine-{key[:8]}", daemon=True).start()
 
 
 def _design_claimed(variables: list[dict[str, Any]], brief: dict[str, Any], key: str, hint_key: str | None,
@@ -415,7 +417,7 @@ def warm_spec(variables: list[dict[str, Any]], brief: dict[str, Any], *, hint_ke
             _release(key)
             return key
         try:
-            threading.Thread(target=_background, args=(list(variables), dict(brief), key, hint_key), name=f"spec-{key[:8]}", daemon=True).start()
+            threading.Thread(target=propagate_context(_background), args=(list(variables), dict(brief), key, hint_key), name=f"spec-{key[:8]}", daemon=True).start()
         except Exception:
             _release(key)
             store.release_remote(key)

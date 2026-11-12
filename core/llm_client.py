@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+from time import perf_counter
 from typing import Any
 
 from dotenv import load_dotenv
@@ -141,6 +142,20 @@ class GeminiClient:
         self._types = types
         self._client = genai.Client(api_key=key, http_options=http_options)
 
+    def _log_success(self, kind: str, started: float) -> None:
+        elapsed_ms = round((perf_counter() - started) * 1000.0, 1)
+        logger.info("Gemini %s call ok: model=%s elapsed_ms=%.0f", kind, self.model, elapsed_ms,
+                    extra={"event": "llm_call", "provider": "Google Gemini", "model": self.model, "kind": kind, "elapsed_ms": elapsed_ms})
+
+    def _log_failure(self, kind: str, exc: Exception, started: float) -> None:
+        """WARNING (with the traceback): whether this ends the request is decided by the caller, and a request that does fail is
+        logged once at ERROR by the error handler. The prompt and the response are never logged."""
+        elapsed_ms = round((perf_counter() - started) * 1000.0, 1)
+        logger.warning("Gemini %s call failed: model=%s elapsed_ms=%.0f %s: %s", kind, self.model, elapsed_ms, type(exc).__name__,
+                       _safe_provider_error(exc)[:500], exc_info=exc,
+                       extra={"event": "llm_call_failed", "provider": "Google Gemini", "model": self.model, "kind": kind,
+                              "elapsed_ms": elapsed_ms, "upstream_status": _extract_status_code(exc)})
+
     def generate_text(
         self,
         system_instruction: str,
@@ -151,6 +166,7 @@ class GeminiClient:
         config_kwargs: dict[str, Any] = {"system_instruction": system_instruction}
         if not self.model.startswith("gemini-3"):
             config_kwargs["temperature"] = temperature
+        started = perf_counter()
         try:
             response = self._client.models.generate_content(
                 model=self.model,
@@ -158,13 +174,14 @@ class GeminiClient:
                 contents=user_prompt,
             )
         except Exception as exc:
-            logger.exception("Gemini text request failed")
+            self._log_failure("text", exc, started)
             raise LLMUpstreamError(
                 f"Gemini text request failed: {type(exc).__name__}: {_safe_provider_error(exc)}",
                 provider="Google Gemini",
                 model=self.model,
                 status_code=_extract_status_code(exc),
             ) from exc
+        self._log_success("text", started)
         return (response.text or "").strip()
 
     def generate_json(
@@ -180,6 +197,7 @@ class GeminiClient:
         if not self.model.startswith("gemini-3"):
             config_kwargs["temperature"] = temperature
 
+        started = perf_counter()
         try:
             response = self._client.models.generate_content(
                 model=self.model,
@@ -187,7 +205,7 @@ class GeminiClient:
                 contents=user_prompt,
             )
         except Exception as exc:
-            logger.exception("Gemini JSON request failed")
+            self._log_failure("json", exc, started)
             raise LLMUpstreamError(
                 f"Gemini JSON request failed: {type(exc).__name__}: {_safe_provider_error(exc)}",
                 provider="Google Gemini",
@@ -195,6 +213,7 @@ class GeminiClient:
                 status_code=_extract_status_code(exc),
             ) from exc
 
+        self._log_success("json", started)
         text = (response.text or "").strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()

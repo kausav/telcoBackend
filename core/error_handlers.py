@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from core.errors import ErrorCode, LLMUpstreamError, build_error_response, error_code_for_status
 from core.network_diagnostics import get_public_egress_ip
+from core.observability import bind, mark_error_logged
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ def _safe_upstream_diagnostics(detail: Any) -> dict[str, Any]:
 def _json_response(request: Request, status_code: int, code: ErrorCode, message: str, details: Any | None = None) -> JSONResponse:
     """Serialize the canonical error model and preserve the request id in a header."""
     request_id = get_request_id(request)
+    bind(error_code=getattr(code, "value", str(code)), error_status=status_code)
     payload = build_error_response(
         code=code,
         message=message,
@@ -96,11 +98,15 @@ async def llm_upstream_exception_handler(request: Request, exc: LLMUpstreamError
         details["upstream_status_code"] = exc.status_code
 
     logger.error(
-        "LLM upstream failure [request_id=%s provider=%s model=%s public_egress_ip=%s]",
-        get_request_id(request),
+        "LLM upstream failure: %s %s provider=%s model=%s upstream_status=%s",
+        request.method,
+        request.url.path,
         exc.provider,
         exc.model or "unknown",
-        public_ip or "unknown",
+        exc.status_code or "-",
+        exc_info=exc,
+        extra={"event": "llm_upstream_failure", "provider": exc.provider, "model": exc.model or "unknown",
+               "upstream_status": exc.status_code, "public_egress_ip": public_ip or "unknown"},
     )
     return _json_response(
         request,
@@ -116,10 +122,29 @@ def _is_retryable(exc: HTTPException) -> bool:
     return exc.status_code == 503 and isinstance(exc.detail, dict) and "retryAfterSeconds" in exc.detail
 
 
+def _log_http_exception(request: Request, exc: HTTPException, message: str) -> None:
+    """Write the reason a request was refused. The client may be told less (5xx detail is hidden); the log keeps the original text.
+
+    5xx is ERROR with the traceback (one ERROR per real fault, which is what alerts count); 4xx is WARNING, an unknown path INFO.
+    """
+    status = exc.status_code
+    fields = {"event": "http_error", "error_status": status}
+    text = message[:500]
+    if status >= 500 and not _is_retryable(exc):
+        logger.error("%s %s -> %d %s", request.method, request.url.path, status, text, exc_info=exc, extra=fields)
+    elif status >= 500:
+        logger.info("%s %s -> %d %s (retryable)", request.method, request.url.path, status, text, extra=fields)
+    elif status == 404:
+        logger.info("%s %s -> 404 %s", request.method, request.url.path, text, extra=fields)
+    elif status >= 400:
+        logger.warning("%s %s -> %d %s", request.method, request.url.path, status, text, extra=fields)
+
+
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     """Normalize application and FastAPI HTTP exceptions."""
     code = error_code_for_status(exc.status_code)
     message, details = _normalize_http_detail(exc.detail)
+    _log_http_exception(request, exc, message)
 
     # Preserve redacted provider diagnostics for upstream failures.
     if exc.status_code == 502:
@@ -147,6 +172,9 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
             }
         )
 
+    summary = "; ".join(f"{d['field'] or 'body'}: {d['message']}" for d in details[:10])
+    logger.warning("%s %s -> 422 validation failed: %s", request.method, request.url.path, summary[:500],
+                   extra={"event": "validation_error", "error_status": 422, "invalid_fields": [d["field"] for d in details[:20]]})
     return _json_response(
         request,
         422,
@@ -158,14 +186,16 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Catch unexpected exceptions without exposing internal implementation details."""
-    request_id = get_request_id(request)
-    logger.exception(
-        "Unhandled API error [request_id=%s] %s %s",
-        request_id,
+    logger.error(
+        "Unhandled %s on %s %s: %s",
+        type(exc).__name__,
         request.method,
         request.url.path,
+        str(exc)[:500],
         exc_info=exc,
+        extra={"event": "unhandled_exception", "error_status": 500},
     )
+    mark_error_logged()
     return _json_response(
         request,
         500,

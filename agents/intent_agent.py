@@ -20,6 +20,7 @@ from typing import Any
 from core.agentic_models import GeneratedSchemaField, ScenarioIntent
 from core.errors import LLMUpstreamError
 from core.llm_client import GeminiClient
+from core.observability import propagate_context
 from core.json_domain_policy import is_json_grounded_domain
 from core.scenario_variable_store import get_selection_lock, lock_selection
 from synth.definitions import is_placeholder_only
@@ -1317,7 +1318,7 @@ class GeminiIntentAgent:
                     return None
 
             with ThreadPoolExecutor(max_workers=min(WORKERS, len(chunks))) as pool:
-                for answer in pool.map(run, chunks):
+                for answer in pool.map(propagate_context(run), chunks):     # keeps the request's trace id on log lines written in the workers
                     if answer is None:
                         complete = False
                     else:

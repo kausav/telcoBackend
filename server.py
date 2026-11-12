@@ -1,7 +1,6 @@
 from __future__ import annotations
 import logging
 import re
-import uuid
 from time import perf_counter
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -14,6 +13,10 @@ from starlette.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Literal
+
+from core.observability import TraceContextMiddleware, bind, configure_logging, log_startup_banner
+
+configure_logging()      # before the rest of the app is imported, so even start-up messages are structured and carry the trace fields
 
 from core import catalog_store
 from core.catalog_models import (
@@ -95,6 +98,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Validate immutable model inputs and initialize mutable runtime state once per process."""
+    log_startup_banner(logger)
     log_auth_startup()
     try:
         ping_mongodb()
@@ -181,20 +185,12 @@ def _custom_openapi():
 app.openapi = _custom_openapi
 
 
-# Registered before the request-id middleware so it runs inside it (the 401 carries the request id) and inside CORS (the 401 carries
+# Registered first, so it runs inside the trace middleware (the 401 carries the request id) and inside CORS (the 401 carries
 # the CORS headers, so a browser shows the real error and not a blocked request).
 app.middleware("http")(api_token_middleware)
 
 
-@app.middleware("http")
-async def request_id_middleware(request: Request, call_next):
-    """Assign one bounded correlation id to every request and return it to the client."""
-    incoming = str(request.headers.get("X-Request-ID") or "").strip()
-    request_id = incoming if 1 <= len(incoming) <= 128 and re.fullmatch(r"[A-Za-z0-9._:-]+", incoming) else str(uuid.uuid4())
-    request.state.request_id = request_id
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
+# The request id / trace id middleware (core.observability.TraceContextMiddleware) is added last, below, so it is the outermost layer.
 
 
 app.add_middleware(
@@ -202,6 +198,7 @@ app.add_middleware(
     allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Request-ID"],
+    expose_headers=["X-Request-ID", "X-Trace-ID"],
 )
 
 # Compress large JSON generation/proposal responses to reduce transfer time without changing payload semantics.
@@ -879,6 +876,7 @@ def import_scenario_csv(
 def confirm_scenario_route(req: ConfirmRequest):
     """HITL approval boundary: approve/edit the draft and persist it for /scenario/generate."""
     draft=get_draft(req.draft_id)
+    bind(draft_id=req.draft_id)
     if draft is None:
         raise HTTPException(404,detail={"error":f"Unknown or expired draft_id '{req.draft_id}'"})
 
@@ -978,6 +976,9 @@ def confirm_scenario_route(req: ConfirmRequest):
     invalidate_scenario(scenario_id)
     clear_scenario(scenario_id)
     pop_draft(req.draft_id)
+    bind(scenario_id=scenario_id)
+    logger.info("Scenario confirmed: scenario=%s variables=%d reassigned=%s", scenario_id, len(variables), bool(scenario_id_reassigned),
+                extra={"event": "scenario_confirmed"})
     return ConfirmResponse(
         success=True,
         scenario_id=scenario_id,
@@ -1005,9 +1006,12 @@ async def propose_scenario(req: ScenarioProposeRequest):
     can reuse the same HITL review screen and call /scenario/confirm unchanged.
     """
     started = perf_counter()
+    bind(scenario_id=req.requested_scenario_id)
     try:
         result = await run_in_threadpool(get_agentic_workflow().propose, req)
-        logger.info("[Latency] /scenario/propose scenario=%s elapsed_ms=%.1f", req.requested_scenario_id, (perf_counter() - started) * 1000.0)
+        elapsed_ms = (perf_counter() - started) * 1000.0
+        logger.info("[Latency] /scenario/propose scenario=%s elapsed_ms=%.1f", req.requested_scenario_id, elapsed_ms,
+                    extra={"event": "propose_done", "elapsed_ms": round(elapsed_ms, 1)})
         return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
@@ -1108,6 +1112,7 @@ async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
         raise HTTPException(400, detail={"error": f"Unknown requested scenario '{requested_scenario_id}'"})
 
     started = perf_counter()
+    bind(scenario_id=requested_scenario_id)
     try:
         payload = await run_in_threadpool(build_generation_response, {
             "requested_scenario_id": requested_scenario_id,
@@ -1121,12 +1126,14 @@ async def generate_scenario(req: GenerateRequest) -> GenerateResponse:
         # Returning the plain payload lets FastAPI apply the declared GenerateResponse contract
         # for response validation, filtering, and JSON serialization. This is the supported
         # FastAPI path for response_model endpoints and avoids a deprecated custom JSON response class.
+        elapsed_ms = (perf_counter() - started) * 1000.0
         logger.info(
             "[Latency] /scenario/generate scenario=%s records=%d fields=%d elapsed_ms=%.1f",
             requested_scenario_id,
             int(payload.get("total_records", 0) or 0),
             len(payload.get("fields") or []),
-            (perf_counter() - started) * 1000.0,
+            elapsed_ms,
+            extra={"event": "generate_done", "records": int(payload.get("total_records", 0) or 0), "elapsed_ms": round(elapsed_ms, 1)},
         )
         return payload
     except SpecNotReady as exc:
@@ -1152,3 +1159,6 @@ mount_ui(app)
 # Optional path prefix (URL_PREFIX=/source) for a shared load balancer that routes one path to this app. Added last so it is the
 # outermost wrapper and strips the prefix before any other middleware (including the token check) sees the request. No-op when unset.
 app.add_middleware(StripPrefixMiddleware)
+
+# Outermost of all: assigns the trace/request id, returns it in X-Request-ID / X-Trace-ID, and writes the one access-log line per request.
+app.add_middleware(TraceContextMiddleware)

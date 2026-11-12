@@ -51,6 +51,14 @@ SEED_REFERENCE_DATA = True                                               # inser
 DOMAIN_LEXICON_CACHE_SECONDS = 60
 COUNTRY_LIMITS_CACHE_SECONDS = 60                                        # how long a country's rail limits are kept before MongoDB is read again
 
+# ---- Logging / tracing (core/observability.py) ----------------------------------------------------------------------------
+# Optional environment overrides, handy to flip without a rebuild: LOG_LEVEL (e.g. DEBUG) and LOG_FORMAT (json | text).
+LOG_LEVEL = "INFO"
+LOG_FORMAT = "auto"                              # auto: JSON lines when running on Cloud Run (K_SERVICE is set), readable text otherwise
+LOG_MAX_MESSAGE_CHARS = 20_000                   # one log entry is cut here (Cloud Logging refuses entries above 256 KB)
+LOG_QUIET_LOGGERS = ("httpx", "httpcore", "urllib3", "pymongo", "google_genai", "google.auth", "asyncio")   # chatty libraries kept at WARNING
+LOG_QUIET_PATHS = ("/health", "/ready")          # probe calls: their access-log line is written at DEBUG unless they fail
+
 # ---- Caches ----------------------------------------------------------------------------------------------------------
 RUNTIME_CACHE_MAX_ITEMS = 256
 PROPOSAL_CACHE_TTL_SECONDS = 1_800
